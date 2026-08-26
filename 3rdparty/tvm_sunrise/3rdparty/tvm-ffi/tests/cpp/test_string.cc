@@ -1,0 +1,653 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+#include <gtest/gtest.h>
+#include <tvm/ffi/any.h>
+#include <tvm/ffi/string.h>
+
+namespace {
+
+using namespace tvm::ffi;
+
+TEST(String, MoveFromStd) {
+  using namespace std;
+  string source = "this is a string";
+  string expect = source;
+  String s(std::move(source));
+  string copy = string(s);
+  EXPECT_EQ(copy, expect);
+  EXPECT_EQ(source.size(), 0);  // NOLINT(bugprone-use-after-move)
+}
+
+TEST(String, CopyFromStd) {
+  using namespace std;
+  string source = "this is a string";
+  string expect = source;  // NOLINT(performance-unnecessary-copy-initialization)
+  String s{source};
+  string copy = string(s);
+  EXPECT_EQ(copy, expect);
+  EXPECT_EQ(source.size(), expect.size());
+}
+
+TEST(String, Assignment) {
+  using namespace std;
+  String s{string{"hello"}};
+  s = string{"world"};
+  EXPECT_EQ(s == "world", true);
+  string s2{"world2"};
+  s = std::move(s2);
+  EXPECT_EQ(s == "world2", true);
+
+  Any r;
+  r = String("hello");
+  EXPECT_EQ(r != nullptr, true);
+}
+
+TEST(String, empty) {
+  using namespace std;
+  String s{"hello"};
+  EXPECT_EQ(s.empty(), false);
+  s = std::string("");
+  EXPECT_EQ(s.empty(), true);
+}
+
+TEST(String, Comparisons) {
+  using namespace std;
+  string source = "a string";
+  string mismatch = "a string but longer";
+  String s{"a string"};
+  String m{mismatch};
+
+  EXPECT_EQ("a str" >= s, false);
+  EXPECT_EQ(s == source, true);
+  EXPECT_EQ(s == mismatch, false);
+  EXPECT_EQ(s == source.data(), true);
+  EXPECT_EQ(s == mismatch.data(), false);
+
+  EXPECT_EQ(s < m, source < mismatch);
+  EXPECT_EQ(s > m, source > mismatch);
+  EXPECT_EQ(s <= m, source <= mismatch);
+  EXPECT_EQ(s >= m, source >= mismatch);
+  EXPECT_EQ(s == m, source == mismatch);
+  EXPECT_EQ(s != m, source != mismatch);
+
+  EXPECT_EQ(m < s, mismatch < source);
+  EXPECT_EQ(m > s, mismatch > source);
+  EXPECT_EQ(m <= s, mismatch <= source);
+  EXPECT_EQ(m >= s, mismatch >= source);
+  EXPECT_EQ(m == s, mismatch == source);
+  EXPECT_EQ(m != s, mismatch != source);
+}
+
+TEST(String, Compare) {
+  // string compare const char*
+  String s{"hello"};
+  EXPECT_EQ(s.compare("hello"), 0);
+  EXPECT_EQ(s.compare(String("hello")), 0);
+
+  EXPECT_EQ(s.compare("hallo"), 1);
+  EXPECT_EQ(s.compare(String("hallo")), 1);
+  EXPECT_EQ(s.compare("hfllo"), -1);
+  EXPECT_EQ(s.compare(String("hfllo")), -1);
+  // s is longer
+  EXPECT_EQ(s.compare("hell"), 1);
+  EXPECT_EQ(s.compare(String("hell")), 1);
+  // s is shorter
+  EXPECT_EQ(s.compare("hello world"), -1);
+  EXPECT_EQ(s.compare(String("helloworld")), -1);
+}
+
+// Check '\0' handling
+TEST(String, NullByteHandling) {
+  using namespace std;
+  // Ensure string still compares equal if it contains '\0'.
+  string v1 = "hello world";
+  size_t v1_size = v1.size();
+  v1[5] = '\0';
+  EXPECT_EQ(v1[5], '\0');
+  EXPECT_EQ(v1.size(), v1_size);
+  String str_v1{v1};
+  EXPECT_EQ(str_v1.compare(v1), 0);
+  EXPECT_EQ(str_v1.size(), v1_size);
+
+  // Ensure bytes after '\0' are taken into account for mismatches.
+  string v2 = "aaa one";
+  string v3 = "aaa two";
+  v2[3] = '\0';
+  v3[3] = '\0';
+  String str_v2{v2};
+  String str_v3{v3};
+  EXPECT_EQ(str_v2.compare(str_v3), -1);
+  EXPECT_EQ(str_v2.size(), 7);
+  // strcmp won't be able to detect the mismatch
+  EXPECT_EQ(strcmp(v2.data(), v3.data()), 0);
+  // string::compare can handle \0 since it knows size
+  EXPECT_LT(v2.compare(v3), 0);
+
+  // If there is mismatch before '\0', should still handle it.
+  string v4 = "acc one";
+  string v5 = "abb two";
+  v4[3] = '\0';
+  v5[3] = '\0';
+  String str_v4{v4};
+  String str_v5{v5};
+  EXPECT_GT(str_v4.compare(str_v5), 0);
+  EXPECT_EQ(str_v4.size(), 7);
+  // strcmp is able to detect the mismatch
+  EXPECT_GT(strcmp(v4.data(), v5.data()), 0);
+  // string::compare can handle \0 since it knows size
+  EXPECT_GT(v4.compare(v5), 0);
+}
+
+TEST(String, CompareSameMemoryRegionDifferentSize) {
+  using namespace std;
+  string source = "a string";
+  String str_source{source};
+  char* memory = const_cast<char*>(str_source.data());
+  EXPECT_EQ(str_source.compare(memory), 0);
+  // This changes the string size
+  memory[2] = '\0';
+  // memory is logically shorter now
+  EXPECT_GT(str_source.compare(memory), 0);
+}
+
+TEST(String, compare) {
+  using namespace std;
+  constexpr auto mismatch1_cstr = "a string but longer";
+  string source = "a string";
+  string mismatch1 = mismatch1_cstr;
+  string mismatch2 = "a strin";
+  string mismatch3 = "a b";
+  string mismatch4 = "a t";
+  String str_source{source};
+  String str_mismatch1{mismatch1_cstr};
+  String str_mismatch2{mismatch2};
+  String str_mismatch3{mismatch3};
+  String str_mismatch4{mismatch4};
+
+  // compare with string
+  EXPECT_EQ(str_source.compare(source), 0);
+  EXPECT_TRUE(str_source == source);
+  EXPECT_TRUE(source == str_source);
+  EXPECT_TRUE(str_source <= source);
+  EXPECT_TRUE(source <= str_source);
+  EXPECT_TRUE(str_source >= source);
+  EXPECT_TRUE(source >= str_source);
+  EXPECT_LT(str_source.compare(mismatch1), 0);
+  EXPECT_TRUE(str_source < mismatch1);
+  EXPECT_TRUE(mismatch1 != str_source);
+  EXPECT_GT(str_source.compare(mismatch2), 0);
+  EXPECT_TRUE(str_source > mismatch2);
+  EXPECT_TRUE(mismatch2 < str_source);
+  EXPECT_GT(str_source.compare(mismatch3), 0);
+  EXPECT_TRUE(str_source > mismatch3);
+  EXPECT_LT(str_source.compare(mismatch4), 0);
+  EXPECT_TRUE(str_source < mismatch4);
+  EXPECT_TRUE(mismatch4 > str_source);
+
+  // compare with char*
+  EXPECT_EQ(str_source.compare(source.data()), 0);
+  EXPECT_TRUE(str_source == source.data());
+  EXPECT_TRUE(source.data() == str_source);
+  EXPECT_TRUE(str_source <= source.data());
+  EXPECT_TRUE(source <= str_source.data());
+  EXPECT_TRUE(str_source >= source.data());
+  EXPECT_TRUE(source >= str_source.data());
+  EXPECT_LT(str_source.compare(mismatch1.data()), 0);
+  EXPECT_TRUE(str_source < mismatch1.data());
+  EXPECT_TRUE(str_source != mismatch1.data());
+  EXPECT_TRUE(mismatch1.data() != str_source);
+  EXPECT_GT(str_source.compare(mismatch2.data()), 0);
+  EXPECT_TRUE(str_source > mismatch2.data());
+  EXPECT_TRUE(mismatch2.data() < str_source);
+  EXPECT_GT(str_source.compare(mismatch3.data()), 0);
+  EXPECT_TRUE(str_source > mismatch3.data());
+  EXPECT_LT(str_source.compare(mismatch4.data()), 0);
+  EXPECT_TRUE(str_source < mismatch4.data());
+  EXPECT_TRUE(mismatch4.data() > str_source);
+
+  // compare with String
+  EXPECT_LT(str_source.compare(str_mismatch1), 0);
+  EXPECT_TRUE(str_source < str_mismatch1);
+  EXPECT_GT(str_source.compare(str_mismatch2), 0);
+  EXPECT_TRUE(str_source > str_mismatch2);
+  EXPECT_GT(str_source.compare(str_mismatch3), 0);
+  EXPECT_TRUE(str_source > str_mismatch3);
+  EXPECT_LT(str_source.compare(str_mismatch4), 0);
+  EXPECT_TRUE(str_source < str_mismatch4);
+}
+
+TEST(String, CString) {
+  using namespace std;
+  string source = "this is a string";
+  string mismatch = "mismatch";
+  String s{source};
+
+  EXPECT_EQ(std::strcmp(s.c_str(), source.data()), 0);
+  EXPECT_NE(std::strcmp(s.c_str(), mismatch.data()), 0);
+}
+
+TEST(String, hash) {
+  using namespace std;
+  string source = "this is a string";
+  String s{source};
+  std::hash<String>()(s);
+
+  std::unordered_map<String, std::string> map;
+  String k1{string{"k1"}};
+  string v1{"v1"};
+  String k2{string{"k2"}};
+  string v2{"v2"};
+  map[k1] = v1;
+  map[k2] = v2;
+
+  EXPECT_EQ(map[k1], v1);
+  EXPECT_EQ(map[k2], v2);
+}
+
+TEST(String, Cast) {
+  using namespace std;
+  string source = "this is a string";
+  String s{source};
+  Any r = s;
+  String s2 = r.cast<String>();
+}
+
+TEST(String, Concat) {
+  String s1("hello");
+  String s2("world");
+  std::string s3("world");
+  String res1 = s1 + s2;
+  String res2 = s1 + s3;
+  String res3 = s3 + s1;
+  String res4 = s1 + "world";
+  String res5 = "world" + s1;
+
+  EXPECT_EQ(res1.compare("helloworld"), 0);
+  EXPECT_EQ(res2.compare("helloworld"), 0);
+  EXPECT_EQ(res3.compare("worldhello"), 0);
+  EXPECT_EQ(res4.compare("helloworld"), 0);
+  EXPECT_EQ(res5.compare("worldhello"), 0);
+
+  String storage_scope;
+  String res = "The input storage scope \"" + storage_scope + "\" is invalid.";
+  EXPECT_EQ(res.compare("The input storage scope \"\" is invalid."), 0);
+}
+
+TEST(String, Any) {
+  // test anyview promotion to any
+  AnyView view = "hello";
+  EXPECT_EQ(view.type_index(), TypeIndex::kTVMFFIRawStr);
+
+  Any b = view;
+  EXPECT_EQ(b.type_index(), TypeIndex::kTVMFFISmallStr);
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  EXPECT_EQ(b.as<String>().value(), "hello");
+  EXPECT_TRUE(b.as<String>().has_value());
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  EXPECT_EQ(b.try_cast<std::string>().value(), "hello");
+
+  std::string s_world = "world";
+  view = s_world;
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  EXPECT_EQ(view.try_cast<std::string>().value(), "world");
+
+  String s{"hello"};
+  Any a = s;
+  EXPECT_EQ(a.type_index(), TypeIndex::kTVMFFISmallStr);
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  EXPECT_EQ(a.as<String>().value(), "hello");
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  EXPECT_EQ(a.try_cast<std::string>().value(), "hello");
+
+  Any c = "long string very long";
+  EXPECT_EQ(c.type_index(), TypeIndex::kTVMFFIStr);
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  EXPECT_EQ(c.as<String>().value(), "long string very long");
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  EXPECT_EQ(c.try_cast<std::string>().value(), "long string very long");
+}
+
+TEST(String, Bytes) {
+  Bytes b0;
+  EXPECT_EQ(b0.size(), 0);
+  EXPECT_EQ(b0.operator std::string(), "");
+
+  // explicitly test zero element
+  std::string s = {'\0', 'a', 'b', 'c'};
+  Bytes b = s;
+  EXPECT_EQ(b.size(), 4);
+  EXPECT_EQ(b.operator std::string(), s);
+
+  TVMFFIByteArray arr{s.data(), static_cast<size_t>(s.size())};
+  Bytes b2 = arr;
+  EXPECT_EQ(b2.size(), 4);
+  EXPECT_EQ(b2.operator std::string(), s);
+}
+
+TEST(String, BytesAny) {
+  std::string s = {'\0', 'a', 'b', 'c'};
+  TVMFFIByteArray arr{s.data(), static_cast<size_t>(s.size())};
+
+  AnyView view = &arr;
+  EXPECT_EQ(view.type_index(), TypeIndex::kTVMFFIByteArrayPtr);
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  EXPECT_EQ(view.try_cast<Bytes>().value().operator std::string(), s);
+
+  Any b = view;
+  EXPECT_EQ(b.type_index(), TypeIndex::kTVMFFISmallBytes);
+
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  EXPECT_EQ(b.try_cast<Bytes>().value().operator std::string(), s);
+  EXPECT_EQ(b.cast<std::string>(), s);
+
+  std::string s2 = "hello long long long string";
+  s2[0] = '\0';
+  Any b2 = Bytes(s2);
+  EXPECT_EQ(b2.type_index(), TypeIndex::kTVMFFIBytes);
+  EXPECT_EQ(b2.try_cast<std::string>().value(),  // NOLINT(bugprone-unchecked-optional-access)
+            s2);
+  EXPECT_EQ(b2.cast<std::string>(), s2);
+}
+
+TEST(String, StdString) {
+  std::string s1 = "test_string";
+  AnyView view1 = s1;
+  EXPECT_EQ(view1.type_index(), TypeIndex::kTVMFFIRawStr);
+  EXPECT_EQ(view1.try_cast<std::string>().value(),  // NOLINT(bugprone-unchecked-optional-access)
+            s1);
+
+  TVMFFIByteArray arr1{s1.data(), static_cast<size_t>(s1.size())};
+  AnyView view2 = &arr1;
+  EXPECT_EQ(view2.type_index(), TypeIndex::kTVMFFIByteArrayPtr);
+  EXPECT_EQ(view2.try_cast<std::string>().value(),  // NOLINT(bugprone-unchecked-optional-access)
+            s1);
+
+  Bytes bytes1 = s1;
+  AnyView view3 = bytes1;
+  EXPECT_EQ(view3.type_index(), TypeIndex::kTVMFFIBytes);
+  EXPECT_EQ(view3.try_cast<std::string>().value(),  // NOLINT(bugprone-unchecked-optional-access)
+            s1);
+
+  String string1 = s1;
+  AnyView view4 = string1;
+  EXPECT_EQ(view4.type_index(), TypeIndex::kTVMFFIStr);
+  EXPECT_EQ(view4.try_cast<std::string>().value(),  // NOLINT(bugprone-unchecked-optional-access)
+            s1);
+
+  // Test with Any
+  Any any1 = s1;
+  EXPECT_EQ(any1.type_index(), TypeIndex::kTVMFFIStr);
+  EXPECT_EQ(any1.try_cast<std::string>().value(),  // NOLINT(bugprone-unchecked-optional-access)
+            s1);
+
+  Any any2 = &arr1;
+  EXPECT_EQ(any2.type_index(), TypeIndex::kTVMFFIBytes);
+  EXPECT_EQ(any2.try_cast<std::string>().value(),  // NOLINT(bugprone-unchecked-optional-access)
+            s1);
+
+  Any any3 = bytes1;
+  EXPECT_EQ(any3.type_index(), TypeIndex::kTVMFFIBytes);
+  EXPECT_EQ(any3.try_cast<std::string>().value(),  // NOLINT(bugprone-unchecked-optional-access)
+            s1);
+
+  Any any4 = string1;
+  EXPECT_EQ(any4.type_index(), TypeIndex::kTVMFFIStr);
+  EXPECT_EQ(any4.try_cast<std::string>().value(),  // NOLINT(bugprone-unchecked-optional-access)
+            s1);
+}
+
+TEST(String, CAPIAccessor) {
+  using namespace std;
+  String s{"hello"};
+  TVMFFIByteArray arr{s.data(), s.size()};
+  EXPECT_EQ(arr.size, 5);
+  EXPECT_EQ(std::string(arr.data, arr.size), "hello");
+}
+
+TEST(String, BytesHash) {
+  std::vector<int64_t> data1(10);
+  std::vector<int64_t> data2(11);
+  for (size_t i = 0; i < data1.size(); ++i) {
+    data1[i] = static_cast<int64_t>(i);
+  }
+  char* data1_ptr = reinterpret_cast<char*>(data1.data());
+  char* data2_ptr = reinterpret_cast<char*>(data2.data()) + 1;
+  std::memcpy(data2_ptr, data1.data(), data1.size() * sizeof(int64_t));
+  // has of aligned and unaligned data should be the same
+  uint64_t hash1 = details::StableHashBytes(data1_ptr, data1.size() * sizeof(int64_t));
+  uint64_t hash2 = details::StableHashBytes(data2_ptr, data1.size() * sizeof(int64_t));
+  EXPECT_EQ(hash1, hash2);
+}
+
+TEST(String, StdHash) {
+  String s1 = "a";
+  String s2(std::string("a"));
+  EXPECT_EQ(std::hash<String>()(s1), std::hash<String>()(s2));
+
+  Bytes s3("a", 1);
+  Bytes s4(std::string("a"));
+  EXPECT_EQ(std::hash<Bytes>()(s3), std::hash<Bytes>()(s4));
+}
+
+TEST(String, Find) {
+  String s{"hello world"};
+  EXPECT_EQ(s.find("world"), 6);
+  EXPECT_EQ(s.find("hello"), 0);
+  EXPECT_EQ(s.find("o"), 4);
+  EXPECT_EQ(s.find("o", 5), 7);
+  EXPECT_EQ(s.find("notfound"), String::npos);
+  EXPECT_EQ(s.find(""), 0);
+  EXPECT_EQ(s.find("", 5), 5);
+  EXPECT_EQ(s.find("", 11), 11);
+  EXPECT_EQ(s.find("", 20), String::npos);
+
+  String pattern{"world"};
+  EXPECT_EQ(s.find(pattern), 6);
+
+  String empty{""};
+  EXPECT_EQ(empty.find("x"), String::npos);
+  EXPECT_EQ(empty.find(""), 0);
+}
+
+TEST(String, Substr) {
+  String s{"hello world"};
+  EXPECT_EQ(s.substr(0, 5), "hello");
+  EXPECT_EQ(s.substr(6, 5), "world");
+  EXPECT_EQ(s.substr(6), "world");
+  EXPECT_EQ(s.substr(0), "hello world");
+  EXPECT_EQ(s.substr(11), "");
+  EXPECT_EQ(s.substr(0, 0), "");
+
+  EXPECT_THROW(s.substr(12), std::out_of_range);
+  EXPECT_THROW(s.substr(100), std::out_of_range);
+
+  String empty{""};
+  EXPECT_EQ(empty.substr(0), "");
+  EXPECT_THROW(empty.substr(1), std::out_of_range);
+}
+
+TEST(String, StartsWith) {
+  String s{"hello world"};
+  EXPECT_TRUE(s.starts_with("hello"));
+  EXPECT_TRUE(s.starts_with("h"));
+  EXPECT_TRUE(s.starts_with(""));
+  EXPECT_TRUE(s.starts_with(String{"hello"}));
+  EXPECT_TRUE(s.starts_with(std::string_view{"hello"}));
+  EXPECT_FALSE(s.starts_with("world"));
+  EXPECT_FALSE(s.starts_with("Hello"));
+  EXPECT_FALSE(s.starts_with("hello world extra"));
+  EXPECT_FALSE(s.starts_with(std::string_view{"world"}));
+
+  String empty{""};
+  EXPECT_TRUE(empty.starts_with(""));
+  EXPECT_TRUE(empty.starts_with(std::string_view{""}));
+  EXPECT_FALSE(empty.starts_with("x"));
+
+  String single{"x"};
+  EXPECT_TRUE(single.starts_with("x"));
+  EXPECT_TRUE(single.starts_with(""));
+  EXPECT_FALSE(single.starts_with("xy"));
+}
+
+TEST(String, EndsWith) {
+  String s{"hello world"};
+  EXPECT_TRUE(s.ends_with("world"));
+  EXPECT_TRUE(s.ends_with("d"));
+  EXPECT_TRUE(s.ends_with(""));
+  EXPECT_TRUE(s.ends_with(String{"world"}));
+  EXPECT_TRUE(s.ends_with(std::string_view{"world"}));
+  EXPECT_FALSE(s.ends_with("hello"));
+  EXPECT_FALSE(s.ends_with("World"));
+  EXPECT_FALSE(s.ends_with("extra hello world"));
+  EXPECT_FALSE(s.ends_with(std::string_view{"hello"}));
+
+  String empty{""};
+  EXPECT_TRUE(empty.ends_with(""));
+  EXPECT_TRUE(empty.ends_with(std::string_view{""}));
+  EXPECT_FALSE(empty.ends_with("x"));
+
+  String single{"x"};
+  EXPECT_TRUE(single.ends_with("x"));
+  EXPECT_TRUE(single.ends_with(""));
+  EXPECT_FALSE(single.ends_with("yx"));
+}
+
+TEST(String, Split) {
+  String s{"a,b,c"};
+  auto parts = s.Split(',');
+  ASSERT_EQ(parts.size(), 3);
+  EXPECT_EQ(parts[0], "a");
+  EXPECT_EQ(parts[1], "b");
+  EXPECT_EQ(parts[2], "c");
+
+  // No delimiter present
+  String s2{"hello"};
+  auto parts2 = s2.Split(',');
+  ASSERT_EQ(parts2.size(), 1);
+  EXPECT_EQ(parts2[0], "hello");
+
+  // Empty string
+  String s3{""};
+  auto parts3 = s3.Split(',');
+  ASSERT_EQ(parts3.size(), 1);
+  EXPECT_EQ(parts3[0], "");
+
+  // Delimiter at boundaries
+  String s4{",a,b,"};
+  auto parts4 = s4.Split(',');
+  ASSERT_EQ(parts4.size(), 4);
+  EXPECT_EQ(parts4[0], "");
+  EXPECT_EQ(parts4[1], "a");
+  EXPECT_EQ(parts4[2], "b");
+  EXPECT_EQ(parts4[3], "");
+
+  // Consecutive delimiters
+  String s5{"a,,b"};
+  auto parts5 = s5.Split(',');
+  ASSERT_EQ(parts5.size(), 3);
+  EXPECT_EQ(parts5[0], "a");
+  EXPECT_EQ(parts5[1], "");
+  EXPECT_EQ(parts5[2], "b");
+}
+
+TEST(String, EscapeStringJSON) {
+  // Basic escaping
+  String s1{"hello"};
+  EXPECT_EQ(EscapeStringJSON(s1), "\"hello\"");
+
+  // Special characters
+  String s2{"line1\nline2\ttab"};
+  EXPECT_EQ(EscapeStringJSON(s2), "\"line1\\nline2\\ttab\"");
+
+  // Backslash and quote
+  String s3{"a\\b\"c"};
+  EXPECT_EQ(EscapeStringJSON(s3), "\"a\\\\b\\\"c\"");
+
+  // Control characters
+  String s4{std::string("a\x01\x1f z", 5)};
+  EXPECT_EQ(EscapeStringJSON(s4), "\"a\\u0001\\u001f z\"");
+}
+
+TEST(String, EscapedStringPyBasic) {
+  // Plain ASCII
+  String s1{"hello world"};
+  EXPECT_EQ(EscapedStringPy(s1), "\"hello world\"");
+
+  // C escape sequences
+  String s2{"a\nb\tc\r"};
+  EXPECT_EQ(EscapedStringPy(s2), "\"a\\nb\\tc\\r\"");
+
+  // Backslash and quote
+  String s3{"a\\b\"c"};
+  EXPECT_EQ(EscapedStringPy(s3), "\"a\\\\b\\\"c\"");
+}
+
+TEST(String, EscapedStringPyControlChars) {
+  // Control characters -> \xNN
+  String s1{std::string("\x01\x02\x7f", 3)};
+  String result = EscapedStringPy(s1);
+  EXPECT_EQ(result, "\"\\x01\\x02\\x7f\"");
+}
+
+TEST(String, EscapedStringPyANSI) {
+  // ANSI escape: ESC[31m (red)
+  String s1{std::string("\x1b[31mred\x1b[0m", 12)};
+  String result = EscapedStringPy(s1);
+  EXPECT_EQ(result, "\"\\x1b[31mred\\x1b[0m\"");
+
+  // ANSI erase line: ESC[K
+  String s2{std::string("\x1b[K", 3)};
+  EXPECT_EQ(EscapedStringPy(s2), "\"\\x1b[K\"");
+}
+
+TEST(String, EscapedStringPyUTF8) {
+  // 2-byte: U+00E9 (é) = C3 A9
+  String s1{std::string("\xc3\xa9", 2)};
+  EXPECT_EQ(EscapedStringPy(s1), "\"\\u00e9\"");
+
+  // 3-byte: U+4E16 (世) = E4 B8 96
+  String s2{std::string("\xe4\xb8\x96", 3)};
+  EXPECT_EQ(EscapedStringPy(s2), "\"\\u4e16\"");
+
+  // 4-byte: U+1F600 (😀) = F0 9F 98 80
+  String s3{std::string("\xf0\x9f\x98\x80", 4)};
+  EXPECT_EQ(EscapedStringPy(s3), "\"\\U0001f600\"");
+}
+
+TEST(String, EscapedStringPyMalformedUTF8) {
+  // Lone continuation byte -> \xNN fallback
+  String s1{std::string("\x80", 1)};
+  EXPECT_EQ(EscapedStringPy(s1), "\"\\x80\"");
+
+  // 2-byte leader followed by non-continuation -> fallback for leader
+  String s2{std::string("\xc3\x20", 2)};
+  String result2 = EscapedStringPy(s2);
+  EXPECT_EQ(result2, "\"\\xc3 \"");
+
+  // 3-byte leader with bad continuation -> fallback for leader
+  String s3{std::string("\xe4\xb8\x20", 3)};
+  String result3 = EscapedStringPy(s3);
+  EXPECT_EQ(result3, "\"\\xe4\\xb8 \"");
+
+  // Truncated 2-byte at end of string
+  String s4{std::string("\xc3", 1)};
+  EXPECT_EQ(EscapedStringPy(s4), "\"\\xc3\"");
+}
+
+}  // namespace

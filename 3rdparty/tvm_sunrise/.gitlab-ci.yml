@@ -1,0 +1,49 @@
+stages:
+  - test
+
+variables:
+  GIT_SUBMODULE_STRATEGY: "none"
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.ci-state/pip"
+
+default:
+  tags:
+    - runtime
+    - pt200
+  interruptible: true
+  timeout: 2h
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+      - archived_failure
+      - unknown_failure
+      - api_failure
+      - data_integrity_failure
+      - scheduler_failure
+      - job_execution_timeout
+
+.tang_ci_rules: &tang_ci_rules
+  rules:
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS && $CI_PIPELINE_SOURCE == "push"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "web"
+
+tvm_tang_on:
+  stage: test
+  resource_group: tvm-tang-ptpu
+  script:
+    - bash ci/scripts/tang_ci.sh on
+  artifacts:
+    when: always
+    reports:
+      junit: .ci-results/tvm-tang-on.xml
+    expire_in: 14 days
+  <<: *tang_ci_rules
+
+tvm_tang_off:
+  stage: test
+  script:
+    - bash ci/scripts/tang_ci.sh off
+  <<: *tang_ci_rules

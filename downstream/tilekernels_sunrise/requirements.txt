@@ -1,0 +1,14 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.10.0
+pytest
+cython
+psutil
+numpy
+einops
+cloudpickle
+openpyxl
+tqdm
+scipy
+matplotlib
+pandas
+pre-commit

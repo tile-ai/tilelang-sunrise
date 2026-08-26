@@ -1,0 +1,433 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+# pylint: disable=invalid-name
+"""Arithmetic data structure and utility"""
+
+import enum
+
+import tvm_ffi
+
+from tvm import ir, tirx
+from tvm.arith import IntSet
+from tvm.runtime import Object
+
+from . import _ffi_api
+
+
+class ProofStrength(enum.IntEnum):
+    """Proof strength of the analysis"""
+
+    DEFAULT = 0
+    SYMBOLIC_BOUND = 1
+
+
+class Extension(enum.Flag):
+    """Extensions enabled for RewriteSimplifier
+
+    Values should match `RewriteSimplifier::Extensions`
+    """
+
+    NoExtensions = 0
+    TransitivelyProveInequalities = 1 << 0
+    ConvertBooleanToAndOfOrs = 1 << 1
+    ApplyConstraintsToBooleanBranches = 1 << 2
+    ComparisonOfProductAndSum = 1 << 3
+
+
+@tvm_ffi.register_object("arith.ModularSet")
+class ModularSet(Object):
+    """Represent range of (coeff * x + base) for x in Z"""
+
+    def __init__(self, coeff, base):
+        self.__init_handle_by_constructor__(_ffi_api.ModularSet, coeff, base)
+
+
+@tvm_ffi.register_object("arith.ConstIntBound")
+class ConstIntBound(Object):
+    """Represent constant integer bound
+
+    Parameters
+    ----------
+    min_value : int
+        The minimum value of the bound.
+
+    max_value : int
+        The maximum value of the bound.
+    """
+
+    POS_INF = (1 << 63) - 1
+    NEG_INF = -POS_INF
+
+    def __init__(self, min_value, max_value):
+        self.__init_handle_by_constructor__(_ffi_api.ConstIntBound, min_value, max_value)
+
+
+class ConstraintScope:
+    """Constraint scope.
+
+    Parameters
+    ----------
+    fenter : function
+        A function that will be called to create an enter context.
+
+    Note
+    ----
+    Do not create object directly, use Analyzer.constraint_scope
+    """
+
+    def __init__(self, fenter):
+        self._fenter = fenter
+        self._fexit = None
+
+    def __enter__(self):
+        self._fexit = self._fenter()
+
+    def __exit__(self, ptype, value, trace):
+        self._fexit()
+
+
+class Analyzer:
+    """Integer arithmetic analyzer
+
+    This is a stateful analyzer class that can
+    be used to perform various symbolic integer analysis.
+    """
+
+    def __init__(self):
+        _mod = _ffi_api.CreateAnalyzer()
+        self._assign_functions(_mod)
+
+    def _assign_functions(self, mod_factory):
+        # Save factory for later use (e.g., clone)
+        self._factory = mod_factory
+        self._const_int_bound = mod_factory("const_int_bound")
+        self._const_int_bound_update = mod_factory("const_int_bound_update")
+        self._const_int_bound_is_bound = mod_factory("const_int_bound_is_bound")
+        self._bind = mod_factory("bind")
+        self._modular_set = mod_factory("modular_set")
+        self._simplify = mod_factory("Simplify")
+        self._rewrite_simplify = mod_factory("rewrite_simplify")
+        self._get_rewrite_simplify_stats = mod_factory("get_rewrite_simplify_stats")
+        self._reset_rewrite_simplify_stats = mod_factory("reset_rewrite_simplify_stats")
+        self._canonical_simplify = mod_factory("canonical_simplify")
+        self._int_set = mod_factory("int_set")
+        self._enter_constraint_context = mod_factory("enter_constraint_context")
+        self._can_prove_equal = mod_factory("can_prove_equal")
+        self._can_prove = mod_factory("can_prove")
+        self._get_smtlib2 = mod_factory("get_smtlib2")
+        self._set_z3_timeout_ms = mod_factory("set_z3_timeout_ms")
+        self._set_z3_rlimit = mod_factory("set_z3_rlimit")
+        self._get_z3_stats = mod_factory("get_z3_stats")
+        self._get_enabled_extensions = mod_factory("get_enabled_extensions")
+        self._set_enabled_extensions = mod_factory("set_enabled_extensions")
+        # Clone factory returns another mod_factory when invoked
+        self._clone_factory = mod_factory("clone")
+
+    def get_smtlib2(self, expr: tirx.PrimExpr = None) -> str:
+        return self._get_smtlib2(expr)
+
+    def set_z3_timeout_ms(self, timeout_ms: int) -> None:
+        """Set z3 timeout in milliseconds.
+
+        Parameters
+        ----------
+        timeout_ms : int
+            The timeout in milliseconds.
+        """
+        self._set_z3_timeout_ms(timeout_ms)
+
+    def set_z3_rlimit(self, max_step: int) -> None:
+        """Set z3 max step.
+
+        Parameters
+        ----------
+        max_step : int
+            The maximum number of steps.
+        """
+        self._set_z3_rlimit(max_step)
+    
+    def get_z3_stats(self) -> str:
+        """Get z3 statistics.
+
+        Returns
+        -------
+        stats : str
+            The z3 statistics.
+        """
+        return self._get_z3_stats()
+
+    def clone(self) -> "Analyzer":
+        """Create a deep copy of this Analyzer, including internal state.
+
+        Returns
+        -------
+        Analyzer
+            A new Analyzer instance with the same analysis state.
+        """
+        # _clone_factory() returns a new factory bound to the cloned C++ Analyzer
+        new_factory = self._clone_factory()
+        obj = Analyzer.__new__(Analyzer)
+        Analyzer._assign_functions(obj, new_factory)
+        return obj
+
+    def const_int_bound(self, expr: tirx.PrimExpr) -> ConstIntBound:
+        """Find constant integer bound for expr.
+
+        Parameters
+        ----------
+        expr : PrimExpr
+            The expression.
+
+        Returns
+        -------
+        bound : ConstIntBound
+            The result bound
+        """
+        return self._const_int_bound(expr)
+
+    def const_int_bound_is_bound(self, var: tirx.Var) -> bool:
+        """Check if a variable is bound to a range.
+
+        Parameters
+        ----------
+        var : tvm.tirx.Var
+            The variable.
+
+        Returns
+        -------
+        result : bool
+            Whether the variable is bound to a range.
+        """
+        return self._const_int_bound_is_bound(var)
+
+    def modular_set(self, expr: tirx.PrimExpr) -> ModularSet:
+        """Find a modular set that expr belongs to.
+
+        Parameters
+        ----------
+        expr : PrimExpr
+            The expression.
+
+        Returns
+        -------
+        result : ModularSet
+            The result.
+        """
+        return self._modular_set(expr)
+
+    def simplify(self, expr: tirx.PrimExpr, steps: int = 2) -> tirx.PrimExpr:
+        """Simplify expression via both rewrite and canonicalization.
+
+        Parameters
+        ----------
+        expr : PrimExpr
+            The expression.
+        steps : The simplification runs in the order of
+                rewrite_simplify (step 1) -> canonical_simplify (step 2) ->
+                rewrite_simplify (step 3) -> canonical_simplify (step 4) -> ...
+                param steps controls how many steps to run.
+                Default is 2, i.e., rewrite_simplify + canonical_simplify.
+
+        Returns
+        -------
+        result : Expr
+            The result.
+        """
+        return self._simplify(expr, steps)
+
+    def rewrite_simplify(self, expr: tirx.PrimExpr) -> tirx.PrimExpr:
+        """Simplify expression via rewriting rules.
+
+        Parameters
+        ----------
+        expr : PrimExpr
+            The expression.
+
+        Returns
+        -------
+        result : Expr
+            The result.
+        """
+        return self._rewrite_simplify(expr)
+
+    @property
+    def rewrite_simplify_stats(self):
+        return self._get_rewrite_simplify_stats()
+
+    def reset_rewrite_simplify_stats(self):
+        self._reset_rewrite_simplify_stats()
+
+    def canonical_simplify(self, expr: tirx.PrimExpr) -> tirx.PrimExpr:
+        """Simplify expression via canonicalization.
+
+        Parameters
+        ----------
+        expr : PrimExpr
+            The expression.
+
+        Returns
+        -------
+        result : Expr
+            The result.
+        """
+        return self._canonical_simplify(expr)
+
+    def int_set(self, expr: tirx.PrimExpr, dom_map: dict[tirx.Var, IntSet]) -> IntSet:
+        """Compute a symbolic IntSet that covers expr for all values in dom_map.
+
+        Parameters
+        ----------
+        expr : PrimExpr
+            The expression.
+
+        dom_map : Dict[tvm.tirx.Var, tvm.arith.IntSet]
+            The domain for variables to be relaxed.
+
+        Returns
+        -------
+        result : IntSet
+            The result.
+        """
+        return self._int_set(expr, dom_map)
+
+    def can_prove(
+        self, expr: tirx.PrimExpr, strength: ProofStrength = ProofStrength.DEFAULT
+    ) -> bool:
+        """Check whether we can prove expr to be true.
+
+        Parameters
+        ----------
+        expr : PrimExpr
+            The expression.
+
+        strength: ProofStrength
+            The proof strength
+
+        Returns
+        -------
+        result : Expr
+            The result.
+        """
+        return self._can_prove(expr, strength)
+
+    def bind(
+        self,
+        var: tirx.Var,
+        expr: tirx.PrimExpr | ir.Range,
+        allow_override: bool = False,
+    ) -> None:
+        """Bind a variable to the expression.
+
+        Parameters
+        ----------
+        var : tvm.tirx.Var
+            The variable.
+
+        expr : Union[tirx.PrimExpr, ir.Range]
+            The expression or the range to bind to.
+
+        allow_override : bool
+            Whether to allow overriding an existing binding for the variable.
+        """
+        return self._bind(var, expr, allow_override)
+
+    def constraint_scope(self, constraint: tirx.PrimExpr) -> ConstraintScope:
+        """Create a constraint scope.
+
+        Parameters
+        ----------
+        constraint : PrimExpr
+            The constraint expression.
+
+        returns
+        -------
+        scope : ConstraintScope
+            The constraint scope
+
+        Examples
+        --------
+        .. code-block:: python
+
+          x = te.var("x")
+          analyzer = tvm.arith.Analyzer()
+          with analzyer.constraint_scope(x % 3 == 0):
+              # constraint in effect
+              assert analyzer.modular_set(x).coeff == 3
+          # constraint no longer in effect
+          assert analyzer.modular_set(x).coeff != 3
+        """
+
+        def _fenter():
+            return self._enter_constraint_context(constraint)
+
+        return ConstraintScope(_fenter)
+
+    def update(self, var: tirx.Var, info: ConstIntBound, override: bool = False) -> None:
+        """Update infomation about var
+
+        Parameters
+        ----------
+        var : tvm.tirx.Var
+            The variable.
+
+        info : tvm.Object
+            Related information.
+
+        override : bool
+            Whether allow override.
+        """
+        if isinstance(info, ConstIntBound):
+            self._const_int_bound_update(var, info, override)
+        else:
+            raise TypeError(f"Do not know how to handle type {type(info)}")
+
+    def can_prove_equal(self, lhs: tirx.PrimExpr, rhs: tirx.PrimExpr) -> bool:
+        """Whether we can prove that lhs == rhs
+
+        Parameters
+        ----------
+        lhs: PrimExpr
+            The left-hand side of the comparison
+
+        rhs: PrimExpr
+            The right-hand side of the comparison
+
+        Returns
+        -------
+        result: bool
+            Whether we can prove that lhs == rhs
+        """
+        return self._can_prove_equal(lhs, rhs)
+
+    @property
+    def enabled_extensions(self) -> Extension:
+        """Return the currently enabled extensions"""
+        value = self._get_enabled_extensions()
+        return Extension(value)
+
+    @enabled_extensions.setter
+    def enabled_extensions(self, flags: int | Extension):
+        """Enable extensions for the analyzer
+
+        Parameters
+        ----------
+        flags: Union[int,Extension]
+
+            The extensions to enable.
+        """
+        flags = Extension(flags).value
+        self._set_enabled_extensions(flags)

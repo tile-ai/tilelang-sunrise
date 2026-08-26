@@ -1,0 +1,83 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Publish OrcJIT wheel
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (manual run)"
+        required: true
+
+jobs:
+  build_wheels:
+    name: ${{ matrix.os }} (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-latest, arch: x86_64, build: "cp312-manylinux_x86_64"}
+          - {os: ubuntu-24.04-arm, arch: aarch64, build: "cp312-manylinux_aarch64"}
+          - {os: macos-14, arch: arm64, build: "cp312-macosx_arm64"}
+          - {os: windows-latest, arch: AMD64, build: "cp312-win_amd64"}
+
+    steps:
+      - name: Checkout repository (for local composite action)
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Build OrcJIT wheel
+        uses: ./.github/actions/build-orcjit-wheel
+        with:
+          arch: ${{ matrix.arch }}
+          build: ${{ matrix.build }}
+          checkout_ref: ${{ inputs.tag }}
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: cibw-orcjit-wheels-${{ matrix.os }}-${{ matrix.arch }}-${{ strategy.job-index }}
+          path: ./wheelhouse/*.whl
+
+  upload_pypi:
+    needs: [build_wheels]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+      attestations: write
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cibw-orcjit-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate artifact attestation for wheels
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: dist/*
+
+      - name: Publish package distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e  # v1.13.0
+        with:
+          attestations: true
+          verbose: true

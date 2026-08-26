@@ -1,0 +1,86 @@
+stages:
+  - .pre
+  - test
+  - .post
+
+variables:
+  TILELANG_TEST: "true"
+  TILEOPS_PROJECT_DIR: "."
+
+workflow:
+  auto_cancel:
+    on_new_commit: interruptible
+
+default:
+  interruptible: true
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+      - archived_failure
+      - unknown_failure
+      - api_failure
+      - data_integrity_failure
+      - scheduler_failure
+      - job_execution_timeout
+
+tileops_lint:
+  stage: .pre
+  tags: [runtime, pt200]
+  needs: []
+  script:
+    - bash "$CI_PROJECT_DIR/$TILEOPS_PROJECT_DIR/ci/lint.sh"
+  allow_failure: false
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS && $CI_PIPELINE_SOURCE == "push"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web"
+
+tileops_test:
+  stage: test
+  needs: []
+  tags: [runtime, pt200]
+  script:
+    - cd "$CI_PROJECT_DIR/$TILEOPS_PROJECT_DIR"
+    - echo "start TileOPs build and test"
+    - bash ./ci/test.sh
+  after_script: []
+  allow_failure: false
+  artifacts:
+    name: "$CI_PIPELINE_ID_$CI_JOB_NAME_report"
+    paths:
+      - "$TILEOPS_PROJECT_DIR/*.csv"
+      - "$TILEOPS_PROJECT_DIR/ci_failure_reports/"
+    reports:
+      junit: "$TILEOPS_PROJECT_DIR/*.xml"
+    when: always
+    expire_in: 4 weeks
+  rules:
+    # The public tree intentionally carries no private runtime package paths.
+    - if: '$TARGET_TORCH_PTPU_PKG == null || $TARGET_TORCH_PTPU_PKG == "" || $TARGET_TRITON_PKG == null || $TARGET_TRITON_PKG == "" || $LLVM_HOME == null || $LLVM_HOME == ""'
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS && $CI_PIPELINE_SOURCE == "push"
+      when: never
+    - if: ($TILELANG_TEST == "false")
+      when: manual
+      allow_failure: true
+    - if: ($CI_PIPELINE_SOURCE == "merge_request_event")
+      changes:
+        paths:
+          - "tileops/**/*"
+          - "workloads/**/*"
+          - "benchmarks/**/*"
+          - "tests/**/*"
+          - "scripts/**/*"
+          - "pyproject.toml"
+          - "ci/**/*"
+          - "ci_test_case_list_tileops.txt"
+          - ".gitlab-ci.yml"
+    - if: ($CI_PIPELINE_SOURCE == "schedule")
+    - if: ($CI_PIPELINE_SOURCE == "web")

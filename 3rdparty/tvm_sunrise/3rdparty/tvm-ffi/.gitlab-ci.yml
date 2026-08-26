@@ -1,0 +1,32 @@
+stages:
+  - build
+  - ptpu
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.ci-state/pip"
+  SETUPTOOLS_SCM_PRETEND_VERSION: "0.1.11+sunrise.1"
+
+tvm_ffi_cpu_wheel:
+  stage: build
+  tags:
+    - runtime
+    - pt200
+  script:
+    - bash ci/run_ci.sh cpu
+  artifacts:
+    when: always
+    paths:
+      - dist/
+    expire_in: 14 days
+
+tvm_ffi_ptpu_smoke:
+  stage: ptpu
+  tags:
+    - runtime
+    - pt200
+  resource_group: tvm-ffi-ptpu
+  needs:
+    - job: tvm_ffi_cpu_wheel
+      artifacts: true
+  script:
+    - bash ci/run_ci.sh ptpu

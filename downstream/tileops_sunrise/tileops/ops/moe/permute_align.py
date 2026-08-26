@@ -1,0 +1,80 @@
+"""MoE permute-align op: routes tokens to experts and pads to tile boundary."""
+
+from typing import Dict, Optional, Tuple
+
+import torch
+
+from tileops.kernels.kernel_base import Kernel
+from tileops.kernels.moe import MoePermuteAlignKernel
+
+from ..op_base import Op
+
+__all__ = ["MoePermuteAlignFwdOp"]
+
+
+class MoePermuteAlignFwdOp(Op):
+    """Route tokens to experts and pad each expert's token count to block_size.
+
+    Takes ``topk_ids`` and produces the three index arrays required by MoE
+    grouped GEMM: sorted token indices, per-block expert ids, and the total
+    padded token count.
+
+    Args:
+        total_tokens: Number of input tokens T.
+        top_k: Number of experts selected per token K.
+        num_experts: Number of experts.
+        block_size: GEMM tile size (M dimension); default 64.
+        kernel_map: Optional kernel override dict.
+        tune: Whether to autotune the kernel.
+
+    Example:
+        >>> op = MoePermuteAlignFwdOp(total_tokens=4, top_k=8, num_experts=8, block_size=16)
+        >>> sorted_ids, expert_ids, num_post_pad = op(topk_ids)
+    """
+
+    def __init__(
+        self,
+        total_tokens: int,
+        top_k: int,
+        num_experts: int,
+        block_size: int = 64,
+        kernel_map: Optional[Dict[str, Kernel]] = None,
+        tune: bool = False,
+    ) -> None:
+        self.total_tokens = total_tokens
+        self.top_k = top_k
+        self.num_experts = num_experts
+        self.block_size = block_size
+        self.numel = total_tokens * top_k
+
+        self.dispatch_kernel(kernel_map)
+        self.kernel = self.kernel_map["permute_align_kernel"](
+            self.numel, num_experts, block_size
+        )
+
+    @property
+    def default_kernel_map(self) -> Dict[str, Kernel]:
+        return {"permute_align_kernel": MoePermuteAlignKernel}
+
+    def eval_roofline(self) -> tuple[int, int]:
+        max_padded = self.numel + (self.num_experts + 1) * (self.block_size - 1)
+        num_blocks = (max_padded + self.block_size - 1) // self.block_size
+        return (
+            0,
+            self.numel * 4 + max_padded * 4 + num_blocks * 4 + 4,
+        )
+
+    def forward(
+        self, topk_ids: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run permute-align.
+
+        Args:
+            topk_ids: [total_tokens, top_k] int32 expert indices (0-indexed).
+
+        Returns:
+            sorted_token_ids: [max_num_tokens_padded] int32
+            expert_ids:       [num_blocks] int32
+            num_tokens_post_pad: [1] int32
+        """
+        return self.kernel(topk_ids)

@@ -1,0 +1,295 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+[project]
+name = "apache-tvm-ffi"
+dynamic = ["version"]
+description = "tvm ffi"
+
+authors = [{ name = "TVM FFI team" }]
+readme = "README.md"
+license = { text = "Apache 2.0" }
+classifiers = [
+  "License :: OSI Approved :: Apache Software License",
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Education",
+  "Intended Audience :: Science/Research",
+]
+keywords = ["machine learning", "inference"]
+requires-python = ">=3.8"
+dependencies = ["typing-extensions>=4.5"]
+
+[project.urls]
+Homepage = "https://github.com/apache/tvm-ffi"
+GitHub = "https://github.com/apache/tvm-ffi"
+
+[project.optional-dependencies]
+cpp = ["ninja"]
+
+[dependency-groups]
+torch = [
+  "torch; python_version < '3.14'", # pytorch does not yet ship with 3.14t
+  "setuptools",                     # setuptools is needed by torch jit for best perf
+  "ninja",
+  "numpy",
+  "ml_dtypes",
+]
+test = [{ include-group = "torch" }, "pytest"]
+dev = [
+  { include-group = "test" },
+  "pre-commit",
+  "ruff",
+  "ty==0.0.15",
+  "clang-format",
+  "clang-tidy",
+  "ipdb",
+  "ipython",
+  "cython>=3.0",
+  "cmake",
+  "scikit-build-core",
+  "tomli",
+  "setuptools-scm",
+]
+docs = [
+  "autodocsumm",
+  "breathe",
+  "exhale",
+  "linkify-it-py",
+  "matplotlib",
+  "myst-parser",
+  "nbconvert",
+  "nbsphinx",
+  "nbstripout",
+  # TODO: unpin when sphinx-toolbox fixes `from sphinx.ext.autodoc import logger` (removed in Sphinx 9)
+  # Blocked by: sphinx-toolbox/utils.py imports logger from sphinx.ext.autodoc (broken as of v4.1.2)
+  "sphinx<9",
+  "sphinx-autobuild",
+  "sphinx-book-theme",
+  "sphinx-copybutton",
+  "sphinx-design",
+  "sphinx-reredirects",
+  "sphinx-tabs",
+  "sphinx-toolbox",
+  "sphinx-autodoc-typehints",
+  "sphinxcontrib-mermaid",
+  "sphinxcontrib-napoleon",
+  "sphinxcontrib_httpdomain",
+  "setuptools",
+  "setuptools-scm",
+  "tomli",
+  "urllib3",
+]
+
+[project.scripts]
+tvm-ffi-config = "tvm_ffi.config:__main__"
+tvm-ffi-stubgen = "tvm_ffi.stub.cli:__main__"
+
+[build-system]
+requires = ["scikit-build-core>=0.10.0", "cython>=3.0", "setuptools-scm"]
+build-backend = "scikit_build_core.build"
+
+[tool.scikit-build]
+metadata.version.provider = "scikit_build_core.metadata.setuptools_scm"
+wheel.py-api = "cp312"
+minimum-version = "build-system.requires"
+ninja.version = ">=1.11"
+ninja.make-fallback = false
+
+# Build configuration
+build-dir = "build"
+build.verbose = true
+
+# Editable install configuration
+editable.rebuild = false
+editable.verbose = true
+
+# CMake configuration
+cmake.version = "CMakeLists.txt"
+cmake.build-type = "Release"
+cmake.args = [
+  "-DTVM_FFI_ATTACH_DEBUG_SYMBOLS=ON",
+  "-DTVM_FFI_BUILD_TESTS=OFF",
+  "-DTVM_FFI_BUILD_PYTHON_MODULE=ON",
+]
+
+# Logging
+logging.level = "INFO"
+
+# Wheel configuration
+wheel.packages = ["python/tvm_ffi"]
+wheel.install-dir = "tvm_ffi"
+
+# Source distribution configuration
+sdist.include = [
+  # Build files
+  "/CMakeLists.txt",
+  "/pyproject.toml",
+  "/cmake/**/*",
+  # Source code
+  "/src/**/*.cc",
+  "/include/**/*",
+
+  # python and cython
+  "/python/tvm_ffi/**/*.py",
+  "/python/tvm_ffi/**/*.pyx",
+  "/python/tvm_ffi/**/*.pyi",
+  "/python/tvm_ffi/py.typed",
+  "/python/tvm_ffi/_version.py",
+
+  # Third party files
+  "/3rdparty/libbacktrace/**/*",
+  "/3rdparty/dlpack/include/*/*",
+
+  # Documentation and metadata
+  "/docs/**/*",
+  "/LICENSE",
+  "/README.md",
+  "/NOTICE",
+
+  # Tests
+  "/tests/**/*",
+]
+
+sdist.exclude = [
+  "**/.git",
+  "**/.github",
+  "**/__pycache__",
+  "**/*.pyc",
+  "build",
+  "dist",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+include = ["python/**/*.py", "tests/**/*.py"]
+line-length = 100
+indent-width = 4
+target-version = "py38"
+
+[tool.ruff.lint]
+select = [
+  "UP",  # pyupgrade, https://docs.astral.sh/ruff/rules/#pyupgrade-up
+  "PL",  # pylint, https://docs.astral.sh/ruff/rules/#pylint-pl
+  "I",   # isort, https://docs.astral.sh/ruff/rules/#isort-i
+  "RUF", # ruff, https://docs.astral.sh/ruff/rules/#ruff-specific-rules-ruf
+  "NPY", # numpy, https://docs.astral.sh/ruff/rules/#numpy-specific-rules-npy
+  "F",   # pyflakes, https://docs.astral.sh/ruff/rules/#pyflakes-f
+  "FA",  # flake8-future-annotations, https://docs.astral.sh/ruff/rules/#flake8-future-annotations-fa
+  "ANN", # flake8-annotations, https://docs.astral.sh/ruff/rules/#flake8-annotations-ann
+  "PTH", # flake8-use-pathlib, https://docs.astral.sh/ruff/rules/#flake8-use-pathlib-pth
+  "D",   # pydocstyle, https://docs.astral.sh/ruff/rules/#pydocstyle-d
+]
+ignore = [
+  "PLR2004", # pylint: magic-value-comparison
+  "ANN401",  # flake8-annotations: any-type
+  "D105",    # pydocstyle: undocumented-magic-method
+  "D107",    # pydocstyle: undocumented-public-init
+  "D203",    # pydocstyle: incorrect-blank-line-before-class
+  "D213",    # pydocstyle: multi-line-summary-second-line
+]
+fixable = ["ALL"]
+unfixable = []
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"] # pyflakes: unused-import
+"tests/*" = [
+  "E741", # pycodestyle: ambiguous-variable-name
+  "D100", # pydocstyle: undocumented-public-module
+  "D101", # pydocstyle: undocumented-public-class
+  "D103", # pydocstyle: undocumented-public-function
+  "D107", # pydocstyle: undocumented-public-init
+  "D205", # pydocstyle: missing-blank-line-after-summary
+]
+
+[tool.ruff.lint.pylint]
+max-args = 10
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+docstring-code-format = true
+docstring-code-line-length = 80
+
+[tool.cibuildwheel]
+build-verbosity = 1
+
+# only build up to cp312, cp312
+# will be abi3 and can be used in future versions
+# ship 314t threaded nogil version
+build = ["cp38-*", "cp39-*", "cp310-*", "cp311-*", "cp312-*", "cp314t-*"]
+skip = ["*musllinux*"]
+# we only need to test on cp312
+test-skip = ["cp38-*", "cp39-*", "cp310-*", "cp311-*"]
+# focus on testing abi3 wheel
+build-frontend = "build[uv]"
+test-command = "pytest {package}/tests/python -vvs"
+test-groups = ["test"]
+
+[tool.cibuildwheel.linux]
+archs = ["x86_64", "aarch64"]
+
+[tool.cibuildwheel.macos]
+archs = ["x86_64", "arm64"]
+environment = { MACOSX_DEPLOYMENT_TARGET = "10.14" }
+
+[tool.cibuildwheel.windows]
+archs = ["AMD64"]
+
+[tool.ty.environment]
+python-version = "3.9"
+extra-paths = ["python", "examples", "tests/python"]
+
+[tool.ty.src]
+include = ["python/tvm_ffi/**", "examples/**", "tests/python/**"]
+exclude = [".venv/**", "build/**", "dist/**"]
+
+[tool.ty.rules]
+unused-ignore-comment = "ignore"
+
+[tool.ty.analysis]
+allowed-unresolved-imports = [
+  "torch",
+  "torch.*",
+  "torch.utils.*",
+  "my_ffi_extension",
+  "my_ffi_extension.*",
+  "_pytest.*",
+  "cupy",
+  "cupy.*",
+  "paddle",
+  "paddle.*",
+  "triton",
+  "triton.*",
+  "cuda.bindings",
+  "cuda.bindings.*",
+  "torch_c_dlpack_ext",
+]
+
+[tool.uv]
+exclude-newer = "14 days"
+
+[tool.uv.dependency-groups]
+docs = { requires-python = ">=3.13" }
+
+[tool.setuptools_scm]
+version_file = "python/tvm_ffi/_version.py"
+write_to = "python/tvm_ffi/_version.py"

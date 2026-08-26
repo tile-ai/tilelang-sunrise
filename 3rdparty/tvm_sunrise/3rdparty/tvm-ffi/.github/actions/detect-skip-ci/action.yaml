@@ -1,0 +1,121 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Detect Skip CI
+description: >
+  Detects if commit message contains [skip ci] to skip CI.
+  Also detects if changes are docs-only and can be skipped.
+
+inputs:
+  github_event_name:
+    description: 'GitHub event name (push or pull_request)'
+    required: true
+  pr_base_ref:
+    description: 'Base branch ref of the pull request (only required for pull_request events)'
+    required: false
+  pr_head_sha:
+    description: 'Head SHA of the pull request (only required for pull_request events)'
+    required: false
+
+runs:
+  using: "composite"
+  steps:
+    - name: Checkout code
+      uses: actions/checkout@v5
+      with:
+        fetch-depth: 0
+
+    - name: Detect [skip ci] and docs-only changes
+      shell: bash
+      id: detect
+      run: |
+        set -e
+
+        echo "Event: ${{ inputs.github_event_name }}"
+        if [[ "${{ inputs.github_event_name }}" == "workflow_dispatch" ]]; then
+          echo "should_skip_ci_commit=false" >> $GITHUB_OUTPUT
+          echo "should_skip_ci_docs_only=false" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        if [[ "${{ inputs.github_event_name }}" == "pull_request" ]]; then
+          echo "Fetching base branch '${{ inputs.pr_base_ref }}' for diff..."
+          # Get commit message from PR head commit first
+          if ! commit_message=$(git log -1 --pretty=%B ${{ inputs.pr_head_sha }} 2>/dev/null); then
+            echo "Warning: Failed to get commit message, assuming no skip"
+            commit_message=""
+          fi
+          echo "Commit message: $commit_message"
+
+          if ! git fetch origin "${{ inputs.pr_base_ref }}" 2>/dev/null; then
+            echo "Warning: Failed to fetch base branch, assuming all files changed"
+            changed_files=$(git ls-files)
+          else
+            # Get list of changed files between base and PR head
+            changed_files=$(git diff --name-only origin/${{ inputs.pr_base_ref }} ${{ inputs.pr_head_sha }})
+          fi
+        else
+          # For push event, get head commit message and diff against previous commit
+          if ! commit_message=$(git log -1 --pretty=%B 2>/dev/null); then
+            echo "Warning: Failed to get commit message, assuming no skip"
+            commit_message=""
+          fi
+          echo "Commit message: $commit_message"
+
+          # Handle case where there's no previous commit (initial commit)
+          if ! changed_files=$(git diff --name-only HEAD^ HEAD 2>/dev/null); then
+            echo "Warning: No previous commit found, assuming all files changed"
+            changed_files=$(git ls-files)
+          fi
+        fi
+
+        echo "Changed files:"
+        echo "$changed_files"
+
+        # Check for [bypass ci] in commit message
+        if [[ "$commit_message" == "[bypass ci]"* ]]; then
+          echo "[INFO] [bypass ci] detected in commit message, skipping CI ..."
+          echo "should_skip_ci_commit=true" >> $GITHUB_OUTPUT
+        else
+          echo "should_skip_ci_commit=false" >> $GITHUB_OUTPUT
+        fi
+
+        # check if changes are docs-only
+        # Check if all changed files are docs-only:
+        # Customize the docs paths/extensions below as needed
+        are_changes_docs_only=true
+        for file in $changed_files; do
+          if [[ ! "$file" =~ ^docs/ ]] && [[ ! "$file" =~ \.md$ ]]; then
+            are_changes_docs_only=false
+            break
+          fi
+        done
+
+        if [[ "$are_changes_docs_only" == "true" ]]; then
+          echo "[INFO] Changes are docs-only, skipping tests ..."
+          echo "should_skip_ci_docs_only=true" >> $GITHUB_OUTPUT
+        else
+          echo "should_skip_ci_docs_only=false" >> $GITHUB_OUTPUT
+        fi
+
+outputs:
+  should_skip_ci_commit:
+    description: 'Set to true if [bypass ci] detected in commit message'
+    value: '${{ steps.detect.outputs.should_skip_ci_commit }}'
+  should_skip_ci_docs_only:
+    description: 'Set to true if changes are docs-only and CI can be skipped'
+    value: '${{ steps.detect.outputs.should_skip_ci_docs_only }}'

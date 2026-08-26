@@ -1,0 +1,438 @@
+name: Nightly
+
+permissions: read-all
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 18 * * *"
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+# ---------------------------------------------------------------------------
+# All nightly jobs run on a containerized self-hosted runner (label: nightly).
+# The runner container is provisioned by the host with GPU access, persistent
+# cache mounts, and the runtime environment variables below.
+# ---------------------------------------------------------------------------
+
+env:
+  TILELANG_CACHE_DIR: /ci-cache/tilelang
+  TILELANG_TMP_DIR: /ci-cache/tilelang/tmp
+  TRITON_CACHE_DIR: /ci-cache/triton
+  PIP_CACHE_DIR: /ci-cache/pip
+  MAX_JOBS: "64"
+
+jobs:
+  # =========================================================================
+  # Phase 1 — Benchmark (exclusive GPU access for accurate profiling)
+  #
+  # The persistent /ci-cache (TILELANG_CACHE_DIR) carries compiled kernels and
+  # autotuner results across runs; benchmark setup repopulates it on a cold key
+  # (e.g. after a tilelang bump). No separate warmup phase. For a one-off cold
+  # cache, run scripts/warmup_kernel_cache.py manually.
+  # =========================================================================
+  benchmark:
+    if: ${{ github.repository == 'tile-ai/TileOPs' && (github.event_name == 'schedule' || github.ref == 'refs/heads/main') }}
+    timeout-minutes: 120
+    runs-on: [self-hosted, tile-ops, nightly]
+    env:
+      # Keep the long benchmark suite from fragmenting CUDA allocator segments
+      # before late large MoE input tensors allocate 14-21 GiB weight blocks.
+      PYTORCH_ALLOC_CONF: expandable_segments:True
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify nightly runner environment
+        run: scripts/ci/verify_nightly_runner.sh
+        shell: bash
+
+      - name: Install TileOPs (image-baked stack, --no-deps)
+        run: bash scripts/ci/install_tileops.sh
+        shell: bash
+
+      - name: Run benchmark ops
+        id: benchmark_tests
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+
+          # Validate GPU frequency
+          TARGET_CLOCK_MHZ=1500
+          RETRIES=5
+          for i in $(seq 1 "${RETRIES}"); do
+            gpu_clock=$(nvidia-smi --query-gpu=clocks.current.graphics --format=csv,noheader,nounits | xargs)
+            echo "GPU clock: ${gpu_clock} MHz (attempt ${i}/${RETRIES})"
+            if [ "${gpu_clock}" = "${TARGET_CLOCK_MHZ}" ]; then break; fi
+            if [ "${i}" -eq "${RETRIES}" ]; then
+              echo "::error::GPU frequency validation failed. Expected ${TARGET_CLOCK_MHZ} MHz."
+              exit 1
+            fi
+            sleep 2
+          done
+
+          export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
+          echo "Runtime cache env:"
+          echo "TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR:-}"
+          echo "TILELANG_TMP_DIR=${TILELANG_TMP_DIR:-}"
+          echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-}"
+
+          set -o pipefail
+          python3 -m pip install -q -c constraints.txt pytest-timeout
+          python3 -m pytest -q benchmarks/ops --timeout=900 --timeout-method=thread --junit-xml=bench_results.xml | tee tileops_benchmarks.log
+
+          if [ -f profile_run.log ]; then
+            { echo; echo "===== profile_run.log summary ====="; cat profile_run.log; } >> tileops_benchmarks.log
+          else
+            echo "::warning::profile_run.log not found; benchmark may have failed partially" >> tileops_benchmarks.log
+          fi
+        shell: bash
+
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: tileops_benchmark_${{ github.run_id }}
+          path: |
+            tileops_benchmarks.log
+            bench_results.xml
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Fail benchmark job if pytest failed
+        if: ${{ always() && steps.benchmark_tests.outcome == 'failure' }}
+        run: exit 1
+        shell: bash
+
+  # =========================================================================
+  # Phase 2 — Op correctness tests (serial after benchmark for GPU exclusivity)
+  #
+  # Runs the `full` and `nightly` tiers. The `smoke` tier is the PR critical
+  # path and is already validated by every PR and every push-to-main gpu-smoke
+  # (-m "smoke or full"), so re-running it here is pure duplication. `nightly`
+  # is the heavy tier that runs nowhere else; `full` stays as a scheduled
+  # regression / environment-drift net.
+  # =========================================================================
+  op_test:
+    if: ${{ always() && github.repository == 'tile-ai/TileOPs' && (github.event_name == 'schedule' || github.ref == 'refs/heads/main') }}
+    needs: [benchmark]
+    timeout-minutes: 180
+    runs-on: [self-hosted, tile-ops, nightly]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify nightly runner environment
+        run: scripts/ci/verify_nightly_runner.sh
+        shell: bash
+
+      - name: Install TileOPs (image-baked stack, --no-deps)
+        run: bash scripts/ci/install_tileops.sh
+        shell: bash
+
+      - name: Run full op tests
+        id: op_tests
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+
+          export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
+          echo "Runtime cache env:"
+          echo "TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR:-}"
+          echo "TILELANG_TMP_DIR=${TILELANG_TMP_DIR:-}"
+          echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-}"
+
+          set -o pipefail
+          python3 -m pip install -q -c constraints.txt pytest-timeout
+          python3 -m pytest tests/ -m "full or nightly" -v --tb=short --timeout=900 --timeout-method=thread --junit-xml=test_results.xml | tee tileops_op_test.log
+        shell: bash
+
+      - name: Download benchmark artifacts
+        uses: actions/download-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: tileops_benchmark_${{ github.run_id }}
+        continue-on-error: true
+
+      - name: Resolve previous perf history artifact
+        id: perf_history_source
+        if: ${{ always() }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const workflowId = "nightly.yml";
+            const currentRunId = context.runId;
+            const runs = await github.paginate(
+              github.rest.actions.listWorkflowRuns,
+              {
+                owner,
+                repo,
+                workflow_id: workflowId,
+                branch: "main",
+                status: "completed",
+                per_page: 100,
+              },
+            );
+
+            for (const run of runs) {
+              if (run.id === currentRunId || run.conclusion !== "success") {
+                continue;
+              }
+
+              const artifacts = await github.paginate(
+                github.rest.actions.listWorkflowRunArtifacts,
+                {
+                  owner,
+                  repo,
+                  run_id: run.id,
+                  per_page: 100,
+                },
+              );
+
+              const artifact = artifacts.find(
+                (candidate) =>
+                  !candidate.expired && candidate.name === "tileops_perf_history",
+              );
+              if (!artifact) {
+                continue;
+              }
+
+              core.info(
+                `Using perf history artifact from run ${run.id} (${run.html_url})`,
+              );
+              core.setOutput("run_id", String(run.id));
+              return;
+            }
+
+            core.info("No previous perf history artifact found; nightly report will start a new history baseline.");
+
+      - name: Download previous perf history
+        uses: actions/download-artifact@v4
+        if: ${{ always() && steps.perf_history_source.outputs.run_id != '' }}
+        with:
+          name: tileops_perf_history
+          path: .perf_history
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.perf_history_source.outputs.run_id }}
+
+      - name: Generate nightly report
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+
+          export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
+
+          HISTORY_ARGS=()
+          if [ -f .perf_history/perf_history.json ]; then
+            HISTORY_ARGS=(--history .perf_history/perf_history.json)
+          fi
+
+          python3 scripts/nightly_report.py \
+            --test-xml test_results.xml \
+            --bench-xml bench_results.xml \
+            "${HISTORY_ARGS[@]}" \
+            --output nightly_report.md \
+            --history-out perf_history.json \
+            || echo "::warning::nightly_report.py failed"
+        shell: bash
+
+      - name: Post nightly report to step summary
+        if: ${{ always() && hashFiles('nightly_report.md') != '' }}
+        run: cat nightly_report.md >> "$GITHUB_STEP_SUMMARY"
+        shell: bash
+
+      - name: Upload op test artifacts
+        uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: tileops_op_test_${{ github.run_id }}
+          path: |
+            test_results.xml
+            tileops_op_test.log
+            nightly_report.md
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload perf history
+        uses: actions/upload-artifact@v4
+        if: ${{ always() && hashFiles('perf_history.json') != '' }}
+        with:
+          name: tileops_perf_history
+          path: perf_history.json
+          overwrite: true
+          retention-days: 14
+
+      - name: Fail op test job if pytest failed
+        if: ${{ always() && steps.op_tests.outcome == 'failure' }}
+        run: exit 1
+        shell: bash
+
+  # =========================================================================
+  # Phase 2b — Publish benchmark data to the nightly-bench orphan branch
+  # Consumed by tile-ai/TileOPs.github.io to render the docs Benchmarks page.
+  # Runs on a github-hosted runner (no GPU needed) and uses the default token
+  # to force-push the day's XML snapshot, mirroring the manifest-stats pattern.
+  # =========================================================================
+  publish-bench-data:
+    if: ${{ always() && github.repository == 'tile-ai/TileOPs' && (github.event_name == 'schedule' || github.ref == 'refs/heads/main') }}
+    needs: [op_test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Download benchmark artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tileops_benchmark_${{ github.run_id }}
+          path: _bench
+        continue-on-error: true
+
+      - name: Download op test artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tileops_op_test_${{ github.run_id }}
+          path: _optest
+        continue-on-error: true
+
+      - name: Assemble publish payload
+        id: assemble
+        run: |
+          set -euo pipefail
+          mkdir -p _publish
+          ok=1
+          if [ -f _bench/bench_results.xml ]; then
+            cp _bench/bench_results.xml _publish/bench_results.xml
+          else
+            echo "::warning::bench_results.xml missing; skipping nightly-bench publish"
+            ok=0
+          fi
+          if [ -f _optest/test_results.xml ]; then
+            cp _optest/test_results.xml _publish/test_results.xml
+          else
+            echo "::warning::test_results.xml missing; page will render without test status"
+          fi
+          if [ "$ok" -eq 1 ]; then
+            run_date="$(date -u +%Y-%m-%d)"
+            printf '{\n  "commit": "%s",\n  "date": "%s",\n  "gpu": "NVIDIA H200",\n  "run_id": "%s"\n}\n' \
+              "${GITHUB_SHA}" "${run_date}" "${GITHUB_RUN_ID}" > _publish/meta.json
+          fi
+          echo "ok=${ok}" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      - name: Publish to nightly-bench branch
+        if: ${{ steps.assemble.outputs.ok == '1' }}
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: nightly-bench
+          publish_dir: _publish
+          force_orphan: true
+          commit_message: "chore(bench): nightly benchmark data from ${{ github.sha }}"
+          user_name: "github-actions[bot]"
+          user_email: "41898282+github-actions[bot]@users.noreply.github.com"
+
+  # =========================================================================
+  # Phase 3 — Packaging and smoke test
+  # =========================================================================
+  packaging:
+    if: ${{ always() && github.repository == 'tile-ai/TileOPs' && (github.event_name == 'schedule' || github.ref == 'refs/heads/main') }}
+    needs: [op_test]
+    permissions:
+      contents: write
+    runs-on: [self-hosted, tile-ops, nightly]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Verify nightly runner environment
+        run: scripts/ci/verify_nightly_runner.sh
+        shell: bash
+
+      - name: Install TileOPs (image-baked stack, --no-deps)
+        run: bash scripts/ci/install_tileops.sh
+        shell: bash
+
+      - name: Build and test wheel package
+        run: |
+          set -euo pipefail
+          exec > >(tee packaging.log) 2>&1
+
+          # Validate GPU frequency
+          TARGET_CLOCK_MHZ=1500
+          RETRIES=5
+          for i in $(seq 1 "${RETRIES}"); do
+            gpu_clock=$(nvidia-smi --query-gpu=clocks.current.graphics --format=csv,noheader,nounits | xargs)
+            echo "GPU clock: ${gpu_clock} MHz (attempt ${i}/${RETRIES})"
+            if [ "${gpu_clock}" = "${TARGET_CLOCK_MHZ}" ]; then break; fi
+            if [ "${i}" -eq "${RETRIES}" ]; then
+              echo "::error::GPU frequency validation failed. Expected ${TARGET_CLOCK_MHZ} MHz."
+              exit 1
+            fi
+            sleep 2
+          done
+
+          python3 -m pip install -c constraints.txt build pytest pytest-timeout
+
+          echo "=== Build wheel package ==="
+          python3 -m build --wheel
+          echo "=== Build artifacts ==="
+          ls -lh dist/*.whl
+
+          echo "=== Install built wheel ==="
+          python3 -m pip install dist/*.whl
+
+          TMP_TEST_DIR="$(mktemp -d "${RUNNER_TEMP}/packaging-test.XXXXXX")"
+          cp -r tests "${TMP_TEST_DIR}/tests"
+          cp pyproject.toml "${TMP_TEST_DIR}/"
+          cd "${TMP_TEST_DIR}"
+
+          echo "=== Runtime cache env ==="
+          echo "TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR:-}"
+          echo "TILELANG_TMP_DIR=${TILELANG_TMP_DIR:-}"
+          echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-}"
+
+          echo "=== Run pytest packaging ==="
+          python3 -m pytest -q tests/ops -m "packaging" \
+            --timeout=900 --timeout-method=thread \
+            --junit-xml="${GITHUB_WORKSPACE}/packaging_smoke.xml"
+        shell: bash
+
+      - name: Upload wheel artifact
+        if: ${{ success() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: tileops-wheel-${{ github.sha }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload packaging logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: packaging-logs-${{ github.sha }}
+          path: |
+            packaging.log
+            packaging_smoke.xml
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Publish wheel to GitHub Release (tag only)
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.whl
+          fail_on_unmatched_files: true

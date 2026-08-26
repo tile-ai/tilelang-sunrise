@@ -1,0 +1,206 @@
+"""Benchmark for FusedMoEExpertsNopadPersistent3WGFwdOp.
+
+Measures the permute + grouped-GEMM + unpermute pipeline without routing.
+The nopad (3WG persistent kernel) layout is benchmarked
+against vLLM Triton fused_experts and vLLM CUTLASS fused_experts (when available).
+
+Workloads match the manifest entries (shared workload set):
+
+  Model              T     H     F     E    K
+  Qwen3-235B-A22B   512  7168  2048  128   8   (decode)
+  Qwen3-235B-A22B  4096  7168  2048  128   8   (prefill)
+  DeepSeek-V3       512  7168  2048  256   8   (decode)
+  DeepSeek-V3      4096  7168  2048  256   8   (prefill)
+
+Baselines:
+  - tileops-nopad-3wg: FusedMoEExpertsNopadPersistent3WGFwdOp (default 3WG kernel)
+  - vllm-triton:       vLLM Triton fused_experts (default backend)
+  - vllm-cutlass:      vLLM CUTLASS fused_experts (when importable)
+  - torch-ref:         per-expert GEMM loop with index_add_ (fallback)
+"""
+
+import warnings
+
+import pytest
+import torch
+import torch.nn.functional as F
+
+try:
+    from vllm.model_executor.layers.fused_moe.fused_moe import (
+        fused_experts as _vllm_fused_experts,
+    )
+    _VLLM_TRITON_AVAILABLE = True
+except ImportError:
+    _VLLM_TRITON_AVAILABLE = False
+
+try:
+    from vllm.model_executor.layers.fused_moe.cutlass_moe import (
+        cutlass_moe_fp16 as _vllm_cutlass_moe,
+    )
+    _VLLM_CUTLASS_AVAILABLE = True
+except ImportError:
+    try:
+        from vllm.model_executor.layers.fused_moe.cutlass_moe import (
+            cutlass_moe as _vllm_cutlass_moe,
+        )
+        _VLLM_CUTLASS_AVAILABLE = True
+    except ImportError as _cutlass_import_err:
+        _VLLM_CUTLASS_AVAILABLE = False
+        warnings.warn(
+            f"vLLM CUTLASS MoE baseline unavailable ({_cutlass_import_err}); "
+            "the vllm-cutlass column will be omitted from results.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+from benchmarks.benchmark_base import BenchmarkReport, ManifestBenchmark
+from tileops.manifest import load_workloads
+from tileops.ops.moe import (
+    FusedMoEExpertsNopadPersistent3WGFwdOp,
+)
+from workloads.workload_base import WorkloadBase
+
+_OP_NAME = "FusedMoEExpertsNopadPersistent3WGFwdOp"  # manifest entry name
+
+
+# Workload
+
+
+class MoEExpertsTest(WorkloadBase):
+    def __init__(self, num_tokens, num_experts, top_k, hidden_size, ffn_size, dtype):
+        self.num_tokens = num_tokens
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.hidden_size = hidden_size
+        self.ffn_size = ffn_size
+        self.dtype = dtype
+
+    def gen_inputs(self):
+        torch.manual_seed(42)
+        dev = "cuda"
+        hidden = torch.randn(self.num_tokens, self.hidden_size, dtype=self.dtype, device=dev)
+        w1 = torch.randn(self.num_experts, self.ffn_size * 2, self.hidden_size, dtype=self.dtype, device=dev) * 0.02
+        w2 = torch.randn(self.num_experts, self.hidden_size, self.ffn_size, dtype=self.dtype, device=dev) * 0.02
+        topk_weights = torch.softmax(
+            torch.randn(self.num_tokens, self.top_k, dtype=torch.float32, device=dev), dim=-1
+        )
+        topk_ids = torch.randint(0, self.num_experts, (self.num_tokens, self.top_k), dtype=torch.int32, device=dev)
+        return hidden, w1, w2, topk_weights, topk_ids
+
+    def ref_program(self, *args):
+        return None
+
+
+# Benchmark class
+
+
+# Manifest-driven parametrize
+
+
+def _manifest_params():
+    params = []
+    for w in load_workloads(_OP_NAME):
+        label = w.get("label", "unlabeled")
+        for dtype_str in w["dtypes"]:
+            dtype = getattr(torch, dtype_str)
+            params.append(pytest.param(
+                w["num_tokens"], w["num_experts"], w["top_k"],
+                w["hidden_size"], w["ffn_size"], dtype,
+                id=f"{label}-{dtype_str}",
+            ))
+    return params
+
+
+# Benchmark test
+
+
+@pytest.mark.parametrize(
+    "num_tokens, num_experts, top_k, hidden_size, ffn_size, dtype",
+    _manifest_params(),
+)
+def test_moe_experts_nopad_bench(
+    num_tokens: int, num_experts: int, top_k: int, hidden_size: int,
+    ffn_size: int, dtype: torch.dtype,
+) -> None:
+    test = MoEExpertsTest(num_tokens, num_experts, top_k, hidden_size, ffn_size, dtype)
+    hidden, w1, w2, topk_weights, topk_ids = test.gen_inputs()
+
+    kwargs = dict(
+        num_tokens=num_tokens, num_experts=num_experts, top_k=top_k,
+        hidden_size=hidden_size, ffn_size=ffn_size, dtype=dtype,
+    )
+    output = torch.empty(num_tokens, hidden_size, dtype=dtype, device="cuda")
+    ws1 = torch.empty(0, dtype=dtype, device="cuda")
+    ws2 = torch.empty(0, dtype=dtype, device="cuda")
+
+    # -- TileOPs nopad (3WG persistent) --------------------------------------
+    nopad = FusedMoEExpertsNopadPersistent3WGFwdOp(**kwargs)
+    bm = ManifestBenchmark(_OP_NAME, nopad, test)
+
+    def _nopad_fn(hidden, w1, w2, topk_weights, topk_ids):
+        nopad.forward(
+            output, hidden, w1, w2, topk_weights, topk_ids,
+            expert_map=None, workspace1=ws1, workspace2=ws2, num_experts=num_experts,
+        )
+        return output
+
+    _nopad_fn(hidden, w1, w2, topk_weights, topk_ids)  # warmup / JIT compile
+    torch.cuda.synchronize()
+
+    result = bm.profile(_nopad_fn, hidden, w1, w2, topk_weights, topk_ids)
+    BenchmarkReport.record(nopad, locals(), result, tag="tileops-nopad-3wg")
+
+    # -- vLLM Triton baseline -------------------------------------------------
+    if _VLLM_TRITON_AVAILABLE:
+        def _vllm_triton_fn(hidden, w1, w2, topk_weights, topk_ids):
+            return _vllm_fused_experts(hidden, w1, w2, topk_weights, topk_ids)
+
+        _vllm_triton_fn(hidden, w1, w2, topk_weights, topk_ids)  # warmup
+        torch.cuda.synchronize()
+
+        result_triton = bm.profile(_vllm_triton_fn, hidden, w1, w2, topk_weights, topk_ids)
+        BenchmarkReport.record(nopad, locals(), result_triton, tag="vllm-triton")
+
+    # -- vLLM CUTLASS baseline ------------------------------------------------
+    if _VLLM_CUTLASS_AVAILABLE:
+        try:
+            def _vllm_cutlass_fn(hidden, w1, w2, topk_weights, topk_ids):
+                return _vllm_cutlass_moe(hidden, w1, w2, topk_weights, topk_ids)
+
+            _vllm_cutlass_fn(hidden, w1, w2, topk_weights, topk_ids)  # warmup
+            torch.cuda.synchronize()
+
+            result_cutlass = bm.profile(_vllm_cutlass_fn, hidden, w1, w2, topk_weights, topk_ids)
+            BenchmarkReport.record(nopad, locals(), result_cutlass, tag="vllm-cutlass")
+        except Exception as e:
+            print(f"[vllm-cutlass] skipped: {e}")
+
+    # -- Torch fallback -------------------------------------------------------
+    if not _VLLM_TRITON_AVAILABLE:
+        output_buf = torch.zeros(num_tokens, hidden_size, dtype=torch.float32, device=hidden.device)
+        ids_i64 = topk_ids.to(torch.int64)
+
+        def _torch_fn(hidden, w1, w2, topk_weights, topk_ids):
+            output_buf.zero_()
+            for e in range(num_experts):
+                mask = (ids_i64 == e)
+                if not mask.any():
+                    continue
+                t_idx, k_idx = mask.nonzero(as_tuple=True)
+                h = hidden[t_idx].float()
+                gate_up = h @ w1[e].float().t()
+                ffn_dim = w1.shape[1] // 2
+                act = F.silu(gate_up[:, :ffn_dim]) * gate_up[:, ffn_dim:]
+                down = act @ w2[e].float().t()
+                output_buf.index_add_(0, t_idx, down * topk_weights[t_idx, k_idx].float().unsqueeze(-1))
+            return output_buf.to(hidden.dtype)
+
+        _torch_fn(hidden, w1, w2, topk_weights, topk_ids)  # warmup
+        torch.cuda.synchronize()
+
+        result_torch = bm.profile(_torch_fn, hidden, w1, w2, topk_weights, topk_ids)
+        BenchmarkReport.record(nopad, locals(), result_torch, tag="torch-ref")
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-vvs"])
