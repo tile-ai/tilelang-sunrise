@@ -1,0 +1,218 @@
+stages:
+  - review
+  - build
+  - test
+
+variables:
+  TILELANG_TEST: "true"
+  # Per-case retries on FAIL/TIMEOUT/OOM until PASS/SKIPPED (ci/lib.sh).
+  CASE_REPEAT: "3"
+
+workflow:
+  auto_cancel:
+    on_new_commit: interruptible
+
+default:
+  interruptible: true
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+      - archived_failure
+      - unknown_failure
+      - api_failure
+      - data_integrity_failure
+      - scheduler_failure
+      - job_execution_timeout
+
+# Reusable rule sets ----------------------------------------------------------
+# TileLang lint and change detection intentionally ignore vendored dependencies
+# and downstream projects.
+.tilelang_code_changes: &tilelang_code_changes
+  - "src/**/*"
+  - "tilelang/**/*"
+  - "testing/**/*"
+  - "examples/**/*"
+  - "benchmark/**/*"
+  - "CMakeLists.txt"
+  - "cmake/**/*"
+  - "VERSION"
+  - "version_provider.py"
+  - "pyproject.toml"
+  - "requirements*.txt"
+  - "ci/**/*"
+  - "ci_test_case_list_tilelang.txt"
+  - "ci_test_case_list_tilelang_s3.txt"
+  - ".gitlab-ci.yml"
+
+.ci_rules: &ci_rules
+  rules:
+    # avoid duplicate pipeline
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS && $CI_PIPELINE_SOURCE == "push"
+      when: never
+    - if: ($TILELANG_TEST == "false")
+      when: manual
+      allow_failure: true
+    - &product_mr_changes
+      if: ($CI_PIPELINE_SOURCE == "merge_request_event")
+      changes:
+        paths: *tilelang_code_changes
+    - if: ($CI_PIPELINE_SOURCE == "schedule")
+    - if: ($CI_PIPELINE_SOURCE == "web")
+
+.lint_rules: &lint_rules
+  rules:
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS && $CI_PIPELINE_SOURCE == "push"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        paths: *tilelang_code_changes
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes:
+        paths: *tilelang_code_changes
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web"
+
+# On failed/canceled jobs: ensure dmesg.log + pt.log are in the workspace for artifacts.
+# (EXIT trap in ci/lib.sh also saves them; after_script covers early failures / cancel.)
+.after_script_device_logs: &after_script_device_logs
+  - |
+    if [[ "${CI_JOB_STATUS:-}" != "success" ]]; then
+      # shellcheck disable=SC1091
+      source "${CI_PROJECT_DIR:-.}/ci/lib.sh"
+      ci_save_device_logs || true
+    fi
+
+lint_changed:
+  stage: review
+  tags: [runtime, pt200]
+  needs: []
+  interruptible: true
+  # Need full history so the diff base for changed-files lint is reachable.
+  variables:
+    GIT_DEPTH: 0
+  script:
+    - bash ./ci/lint.sh changed
+  allow_failure: false
+  <<: *lint_rules
+
+lint_all:
+  stage: review
+  tags: [runtime, pt200]
+  needs: []
+  interruptible: true
+  script:
+    - bash ./ci/lint.sh all
+  allow_failure: true
+  artifacts:
+    name: "${CI_PIPELINE_ID}_${CI_JOB_NAME}_lint"
+    paths:
+      - lint_reports/
+    when: always
+    expire_in: 1 week
+  <<: *lint_rules
+
+tilelang_build:
+  stage: build
+  needs: []
+  tags: [runtime, pt200]
+  script:
+    - echo "start tilelang build"
+    - bash ./ci/build.sh
+  after_script: *after_script_device_logs
+  allow_failure: false
+  artifacts:
+    name: "$CI_PIPELINE_ID_$CI_JOB_NAME_report"
+    paths:
+      - ./*.csv
+      - dist/apache_tvm_ffi-*.whl
+      - dist/tilelang_sunrise-*.whl
+      - dmesg.log
+      - pt.log
+    reports:
+      junit: ./*.xml
+    when: always
+    expire_in: 4 weeks
+  <<: *ci_rules
+
+tilelang_test:
+  stage: test
+  needs: ["tilelang_build"]
+  tags: [runtime, pt200]
+  script:
+    - echo "start tilelang release validation test"
+    - bash ./ci/test.sh
+  after_script: *after_script_device_logs
+  allow_failure: false
+  artifacts:
+    name: "${CI_PIPELINE_ID}_${CI_JOB_NAME}_failreport"
+    paths:
+      - ci_failure_reports/
+      - dmesg.log
+      - pt.log
+    when: always
+    expire_in: 4 weeks
+  <<: *ci_rules
+
+# Preserve the S3/STCUV2 validation entry as a non-blocking manual job.
+tilelang_test_s3:
+  stage: test
+  needs: ["tilelang_build"]
+  tags: [runtime, pt200]
+  script:
+    - echo "start tilelang S3 ISS simulator test (preserved, unverified)"
+    - bash ./ci/s3/test_s3.sh
+  after_script: *after_script_device_logs
+  allow_failure: true
+  artifacts:
+    name: "${CI_PIPELINE_ID}_${CI_JOB_NAME}_failreport"
+    paths:
+      - ci_failure_reports/
+      - dmesg.log
+      - pt.log
+    when: always
+    expire_in: 4 weeks
+  rules:
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS && $CI_PIPELINE_SOURCE == "push"
+      when: never
+    - if: '$TANG_S3_PTCC_PATH == null || $TANG_S3_PTCC_PATH == "" || $TANG_S3_ISS_PATH == null || $TANG_S3_ISS_PATH == "" || $TANG_S3_LOADER_PATH == null || $TANG_S3_LOADER_PATH == ""'
+      when: never
+    - <<: *product_mr_changes
+      when: manual
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: manual
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: manual
+
+# Validate the two vendored downstream projects against the wheel produced by
+# this TileLang pipeline. Their own lint and standalone CI are not run here.
+validate:
+  stage: test
+  needs: ["tilelang_build"]
+  tags: [runtime, pt200]
+  parallel:
+    matrix:
+      - OP: tileops_sunrise
+      - OP: tilekernels_sunrise
+  script:
+    - echo "start $OP release validation test"
+    - bash ./ci/validate_operator.sh
+  after_script: *after_script_device_logs
+  allow_failure: true
+  artifacts:
+    name: "${CI_PIPELINE_ID}_validate_${OP}_failreport"
+    paths:
+      - ci_failure_reports/
+      - dmesg.log
+      - pt.log
+    when: always
+    expire_in: 4 weeks
+  rules:
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS && $CI_PIPELINE_SOURCE == "push"
+      when: never
+    - *product_mr_changes
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: manual
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: manual

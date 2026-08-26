@@ -1,0 +1,138 @@
+[project]
+name = "tileops"
+version = "0.0.1.dev2"
+description = "TileOPs kernels for efficient LLM inference."
+readme = "README.md"
+authors = [{ name="Tile-AI"}]
+dependencies = [
+    "torch>=2.1.0,<2.11.0",
+    "tilelang-sunrise>=0.1.13,<0.1.14",
+    "apache-tvm-ffi>=0.1.11,<0.1.12",
+    "einops",
+    "pyyaml>=6.0",
+]
+requires-python = ">=3.10"
+license = {text = "MIT"}
+keywords = ["llm", "inference", "gpu", "kernel", "tiling"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/tile-ai/TileOPs"
+Repository = "https://github.com/tile-ai/TileOPs"
+Issues = "https://github.com/tile-ai/TileOPs/issues"
+
+[project.optional-dependencies]
+dev = [
+    "ruff==0.14.13",
+    "codespell==2.4.1",
+    "pytest>=8.0",
+    "pytest-xdist>=3.0",
+    "pyyaml>=6.0",
+]
+bench = [
+    "flash-attn==2.8.3",
+    "flash-attn-interface>=2.8.3",
+    "flash-linear-attention==0.4.2",
+    "flashinfer>=0.6.6",
+    "vllm==0.18.0",
+    "sgl-kernel==0.3.21",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+exclude = ["tests", "tests.*", "benchmarks", "benchmarks.*"]
+
+[tool.setuptools.package-data]
+tileops = ["kernels/moe/_atomic_helper.h", "manifest/*.yaml"]
+
+[tool.codespell]
+ignore-words-list = "nd, te, ist, LOD, offen, NotIn, HSA"
+skip = [
+    "build",
+    "dist",
+    ".venv"
+]
+
+[tool.ruff]
+line-length = 100
+
+# NOTE: Please gradually tighten static code checks and other validations in the future.
+# The current exemptions are in place to ensure normal project development.
+[tool.ruff.lint]
+select = [
+    # pycodestyle
+    "E",
+    # Pyflakes
+    "F",
+    # pyupgrade
+    # "UP",
+    # flake8-bugbear
+    "B",
+    # flake8-simplify
+    "SIM",
+    # isort
+    "I",
+    # pydocstyle (Google Docstrings)
+    # "D",
+    # pep8-naming (naming conventions)
+    "N",
+    # ruff-specific: sort __all__
+    "RUF022",
+    # flake8-annotations (type hints) — enable when codebase has sufficient coverage
+    # "ANN",
+]
+ignore = [
+    # ambiguous name
+    "E741",
+    # line too long (allow some flexibility)
+    "E501",
+    # key in dict.keys()
+    "SIM118",
+    # memory leaks
+    "B019",
+    # No such file or directory
+    "E902",
+    # pep8-naming: allow 'import as T'
+    "N812",
+    # pep8-naming: ignore naming convention violations (common in ML/kernel code)
+    "N801",  # Class name should use CapWords convention
+    "N802",  # Function name should be lowercase
+    "N803",  # Argument name should be lowercase
+    "N806",  # Variable in function should be lowercase
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["tileops"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+"bench_*.py" = ["F401"]
+# __all__ intentionally grouped by category, not alphabetical
+"tileops/kernels/elementwise.py" = ["RUF022"]
+"tileops/ops/__init__.py" = ["RUF022"]
+"tileops/ops/elementwise.py" = ["RUF022"]
+"tileops/ops/reduction/__init__.py" = ["RUF022"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "benchmarks/tests"]
+python_files = ["test_*.py", "bench_*.py"]
+markers = [
+    "smoke: fast PR critical-path tests",
+    "full: standard correctness coverage",
+    "nightly: exhaustive or long-running coverage",
+    "packaging: minimal wheel-install sanity check (one case per op family)",
+]

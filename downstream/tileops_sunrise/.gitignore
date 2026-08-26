@@ -1,0 +1,83 @@
+# Compiled Object files
+*.o
+*.obj
+*.pyc
+
+# Editor files
+*~
+*.swp
+*.swo
+.vscode/
+.vs/
+.idea/*
+
+# Build artifacts
+build/
+dist/
+wheelhouse/
+build_sdist/
+__pycache__
+*.egg-info
+
+# Virtual environments
+venv/
+.venv/
+.tox/
+
+# Git merge artifacts
+*.orig
+\#*
+\.#*
+
+# macOS
+**/.DS_Store
+
+# Logs and data
+*.log
+*.pkl_*
+
+# Test / lint caches
+.pytest_cache
+.hypothesis
+.ruff_cache
+.cache/
+
+# Output / profiling
+output/
+output*/
+profile_out/
+tmp/
+.tmp/
+debug/
+
+# Local lock / scheduler state
+/.lock
+.claude/*.lock
+
+# Exception: keep the debug folder for tests
+!testing/python/debug
+
+# Secrets and credentials
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+secrets.yaml
+secrets.yml
+
+docs/plans/
+.humanize*
+.foundry/runs/
+.foundry/migrations/
+.foundry/plan/
+.foundry/config.local.json
+
+CLAUDE.local.md
+.claude/worktrees/
+docs/superpowers/
+*.ncu-rep
+
+# Internal CI runtime state
+/.ci-state/
+/tilelang/

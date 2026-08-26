@@ -1,0 +1,243 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+      # dev branch is used for testing purposes
+      - dev
+
+jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    outputs:
+      should_skip_ci_commit: ${{ steps.detect.outputs.should_skip_ci_commit }}
+      should_skip_ci_docs_only: ${{ steps.detect.outputs.should_skip_ci_docs_only }}
+      cpp_changed: ${{ steps.cpp_files.outputs.changed }}
+      cpp_files: ${{ steps.cpp_files.outputs.files }}
+      orcjit_changed: ${{ steps.orcjit_files.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Detect skip ci and docs changes
+        id: detect
+        uses: ./.github/actions/detect-skip-ci
+        with:
+          github_event_name: ${{ github.event_name }}
+          pr_base_ref: ${{ github.event.pull_request.base.ref || '' }}
+          pr_head_sha: ${{ github.event.pull_request.head.sha || '' }}
+      - name: Get changed C++ files
+        id: cpp_files
+        run: |
+          FILES=$(git diff --name-only --diff-filter=ACMR origin/${{ github.base_ref }}...HEAD -- \
+            src/ tests/ | grep -E '\.(c|cc|cpp|cxx)$' | tr '\n' ' ')
+          echo "files=$FILES" >> $GITHUB_OUTPUT
+          [ -n "$FILES" ] && echo "changed=true" >> $GITHUB_OUTPUT || echo "changed=false" >> $GITHUB_OUTPUT
+      - name: Get changed OrcJIT files
+        id: orcjit_files
+        run: |
+          FILES=$(git diff --name-only --diff-filter=ACMR origin/${{ github.base_ref }}...HEAD -- \
+            addons/tvm_ffi_orcjit/ .github/actions/build-orcjit-wheel/ | tr '\n' ' ')
+          echo "files=$FILES" >> $GITHUB_OUTPUT
+          [ -n "$FILES" ] && echo "changed=true" >> $GITHUB_OUTPUT || echo "changed=false" >> $GITHUB_OUTPUT
+
+  lint:
+    needs: [prepare]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Set up uv
+        uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098  # v7.3.1
+      - name: Set up Python environment
+        run: uv sync --group dev --no-install-project
+      - uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd  # v3.0.1
+
+  clang-tidy:
+    needs: [prepare]
+    if: needs.prepare.outputs.cpp_changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Set up uv
+        uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098  # v7.3.1
+        with:
+          python-version: 3.13
+      - uses: ./.github/actions/detect-env-vars
+        id: env_vars
+      - name: Run clang-tidy
+        run: |
+          uv run --no-project --with "clang-tidy==21.1.1"     \
+            python tests/lint/clang_tidy_precommit.py         \
+              --build-dir=build-pre-commit                    \
+              --jobs=${{ steps.env_vars.outputs.cpu_count }}  \
+              ${{ needs.prepare.outputs.cpp_files }}
+
+  doc:
+    needs: [lint, prepare]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Set up uv
+        uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098  # v7.3.1
+        with:
+          python-version: 3.13
+      - name: Generate docs
+        run: |
+          sudo apt install doxygen
+          BUILD_CPP_DOCS=1 uv run --group docs sphinx-build -W --keep-going -b html docs docs/_build/html
+
+  test:
+    needs: [lint, prepare]
+    if: >
+      needs.prepare.outputs.should_skip_ci_commit != 'true' &&
+      needs.prepare.outputs.should_skip_ci_docs_only != 'true'
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - {os: ubuntu-latest, arch: x86_64, python_version: '3.14t'}
+          - {os: ubuntu-24.04-arm, arch: aarch64, python_version: '3.8'}
+          - {os: windows-latest, arch: AMD64, python_version: '3.9'}
+          - {os: macos-14, arch: arm64, python_version: '3.13'}
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Print current commit
+        run: git log -1 --oneline
+
+      # Detect CPU count
+      - uses: ./.github/actions/detect-env-vars
+        id: env_vars
+      - name: Print CPU count
+        run: |
+          echo "CPU count: ${{ steps.env_vars.outputs.cpu_count }}"
+
+      # Run C++ tests
+      - name: Run cpp tests
+        if: ${{ matrix.os != 'windows-latest' }}
+        env:
+          CMAKE_BUILD_PARALLEL_LEVEL: ${{ steps.env_vars.outputs.cpu_count }}
+        run: |
+          cmake . -B build_test -DTVM_FFI_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Debug
+          cmake --build build_test --clean-first --config Debug --target tvm_ffi_tests
+          ctest -V -C Debug --test-dir build_test --output-on-failure
+      - name: Run cpp tests[windows]
+        if: ${{ matrix.os == 'windows-latest' }}
+        shell: cmd
+        env:
+          CMAKE_BUILD_PARALLEL_LEVEL: ${{ steps.env_vars.outputs.cpu_count }}
+        run: >
+          cmake . -B build_test -DTVM_FFI_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Debug &&
+          cmake --build build_test --clean-first --config Debug --target tvm_ffi_tests &&
+          ctest -V -C Debug --test-dir build_test --output-on-failure
+
+      - name: Locate and Set VsDevCmd Path [windows]
+        if: ${{ matrix.os == 'windows-latest' }}
+        shell: pwsh
+        run: |
+          # Captures the output (path) from your Python script
+          $vsPath = python .github/workflows/utils/locate_vsdevcmd_bat.py
+
+          # Sets an environment variable for all subsequent steps in this job
+          "VS_DEV_CMD_PATH=$vsPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # Run Python tests
+      - name: Setup Python ${{ matrix.python_version }}
+        uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098  # v7.3.1
+        with:
+          python-version: ${{ matrix.python_version }}
+          activate-environment: true
+      - name: Build and install python package
+        env:
+          CMAKE_BUILD_PARALLEL_LEVEL: ${{ steps.env_vars.outputs.cpu_count }}
+        run: |
+          uv pip install --reinstall --verbose --group test -e .
+      - name: Run python tests
+        if: ${{ matrix.os != 'windows-latest' }}
+        run: |
+          pytest -vvs tests/python
+      - name: Run python tests [windows]
+        if: ${{ matrix.os == 'windows-latest' }}
+        shell: cmd
+        run: |
+          call "%VS_DEV_CMD_PATH%"
+          pytest -vvs tests/python
+
+      # Run Rust tests, must happen after installing the pip package.
+      - name: Run rust tests
+        working-directory: rust
+        run: |
+          cargo test
+
+  orcjit:
+    needs: [lint, prepare]
+    if: >
+      needs.prepare.outputs.orcjit_changed == 'true' &&
+      needs.prepare.outputs.should_skip_ci_commit != 'true' &&
+      needs.prepare.outputs.should_skip_ci_docs_only != 'true'
+    name: orcjit ${{ matrix.os }} (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-latest, arch: x86_64, build: "cp312-manylinux_x86_64"}
+          - {os: ubuntu-24.04-arm, arch: aarch64, build: "cp312-manylinux_aarch64"}
+          - {os: macos-14, arch: arm64, build: "cp312-macosx_arm64"}
+          - {os: windows-latest, arch: AMD64, build: "cp312-win_amd64"}
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Build OrcJIT wheel
+        uses: ./.github/actions/build-orcjit-wheel
+        with:
+          arch: ${{ matrix.arch }}
+          build: ${{ matrix.build }}
+          checkout_ref: ${{ github.sha }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cibw-orcjit-wheels-${{ matrix.os }}-${{ matrix.arch }}-${{ strategy.job-index }}
+          path: wheelhouse/*.whl

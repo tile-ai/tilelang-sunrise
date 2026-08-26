@@ -1,0 +1,7 @@
+{
+    "out": "dist/docs",
+    "readme": "none",
+    "excludeProtected": true,
+    "excludePrivate": true,
+    "exclude": ["**/node_modules/**"]
+}

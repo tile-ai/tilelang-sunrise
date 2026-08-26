@@ -1,0 +1,331 @@
+# Op Interface Design
+
+Step-by-step playbook for scaffolding a new op from a manifest entry, plus short concepts and links to [`ops-design-reference.md`](ops-design-reference.md) for the authoritative per-slot rules.
+
+## Concepts
+
+Every operator is split into two classes — **Op** (host-side: validates inputs, dispatches to Kernel, assembles output) and **Kernel** (device-side: owns the TileLang program, tile configuration, JIT compilation). The two layers are independently modifiable — changing a Kernel's tile strategy does not require changing the Op.
+
+### Class hierarchy
+
+```
+Op                          ← L1: thin base, shared by all ops
+  └── FamilyBase            ← L2: family-specific forward() flow (optional)
+        └── ConcreteOp      ← L3: leaf class emitted by the scaffold
+```
+
+- **L1 (`Op`):** shared host-side plumbing (dispatch, kernel caching, autotune) plus the contracts for the three codegen methods (`_infer_output_shapes`, `_validate_dtypes`, `eval_roofline`).
+- **L2 (`FamilyBase`):** per-family shared `forward()` pipeline (one per family). **Not produced by this playbook** — see [Family-Base Refactoring](#family-base-refactoring).
+- **L3 (`ConcreteOp`):** this playbook's target. New ops start by inheriting L1 directly (T2 shape); see [Family-Base Refactoring](#family-base-refactoring) for when a family graduates to L2.
+
+### Execution timing
+
+**Do it at the first moment all required information is known, do it once, cache the result.**
+
+| Op category    | When all info is known                                      | Behaviour                                                |
+| -------------- | ----------------------------------------------------------- | -------------------------------------------------------- |
+| Fixed-rank     | `__init__` (all dims provided)                              | `_infer_output_shapes` runs once at init.                |
+| Arbitrary-rank | `__init__` for `static_dims`; `forward` for everything else | Kernel built on first encounter, cached by `_cache_key`. |
+
+`_validate_dtypes` runs on every `forward()` call — dtype validity depends on the actual tensors passed, not just their shapes. Roofline timing and formula semantics are defined in [roofline.md](roofline.md). See [Parameter Design](ops-design-reference.md#parameter-design) for fixed-rank vs arbitrary-rank details and [Codegen Details](ops-design-reference.md#codegen) for calling conventions.
+
+## Scaffolding an Op from a Manifest Entry
+
+The scaffold emits a T2 (L1-direct) op file from one manifest entry. Each step has typed **Input** (manifest fields consumed), **Output** (the code fragment produced), **Validation** (concrete check), and a **Reference** link to the authoritative slot rule in [`ops-design-reference.md`](ops-design-reference.md). Examples scaffold the fictional `ExampleCumsumFwdOp` (cumulative-sum semantics) in T2 (L1-direct) form from an equally fictional manifest entry; nothing in them mirrors a shipped file.
+
+### Step 1: File header + imports
+
+**Input.** `source.kernel_map` values (Kernel classes to import).
+
+**Output.**
+
+```python
+"""Cumulative sum operator (host-side Op layer).
+
+Provides:
+  - ExampleCumsumFwdOp: y = cumsum(x, dim=-1)
+"""
+
+import math
+from typing import Dict, Optional
+
+import torch
+
+from tileops.kernels.kernel_base import Kernel
+from tileops.kernels.reduction._primitives import DEFAULT_ALIGNMENT, align_up
+from tileops.kernels.reduction.example_cumsum import ExampleCumsumKernel
+
+from ..op_base import Op
+```
+
+**Validation.** Every concrete-Kernel import matches one `source.kernel_map` value verbatim. The `Kernel` base import and `..op_base` relative import are fixed.
+
+**Reference.** [Slot S1](ops-design-reference.md#slot-s1), [S2](ops-design-reference.md#slot-s2), [S3](ops-design-reference.md#slot-s3), [S4](ops-design-reference.md#slot-s4).
+
+### Step 2: Class declaration + docstring + `__all__`
+
+**Input.** Manifest entry key (= class name); `signature.inputs`, `signature.params`, `static_dims`, per-tensor `dtype` (Args block content).
+
+**Output.**
+
+```python
+__all__ = ["ExampleCumsumFwdOp"]
+
+
+class ExampleCumsumFwdOp(Op):
+    """Cumulative sum operator: y = cumsum(x, dim=-1).
+
+    Output has the same shape and dtype as input.
+
+    Args:
+        N: Hidden dimension (size along the reduction axis), committed
+            at ctor via ``static_dims: N: "x.shape[dim]"``.
+        dtype: Data type (float32, float16, or bfloat16).
+        dim: Reduction dimension (default -1).
+        kernel_map: Optional override for kernel dispatch.
+        tune: Whether to autotune (default False).
+    """
+```
+
+**Validation.** Class name ≡ manifest entry key, byte-exact (`ExampleCumsumFwdOp`). Every `Args:` entry appears as an `__init__` kwarg in Step 3; no extras.
+
+**Reference.** [Slot S5](ops-design-reference.md#slot-s5), [S6](ops-design-reference.md#slot-s6), [S7](ops-design-reference.md#slot-s7).
+
+### Step 3: `_static_axes` + `__init__` signature and body
+
+**Input.** `static_dims` (literal-axis → class-level `_static_axes` frozenset; param-axis → empty class-level default, bind at `forward()` after `dim % x.ndim` normalization); `signature.params`; `dtype`.
+
+**Output.**
+
+```python
+    # static_dims: N: "x.shape[dim]" — the axis is param-dependent
+    # (may be negative like dim=-1), so the concrete (input_index,
+    # axis) pair cannot be resolved until x.ndim is known. Leave the
+    # class-level default empty; bind in forward() after normalizing
+    # dim against x.ndim (Op base requires a non-negative axis).
+    _static_axes: frozenset[tuple[int, int]] = frozenset()
+
+    def __init__(
+        self,
+        *,
+        N: int,
+        dtype: torch.dtype,
+        dim: int = -1,
+        kernel_map: Optional[Dict[str, Kernel]] = None,
+        tune: bool = False,
+    ):
+        self.N = N
+        self.dtype = dtype
+        self.dim = dim
+        self.tune = tune
+        self.N_padded = align_up(N, DEFAULT_ALIGNMENT)
+        self.dispatch_kernel(kernel_map)
+        # M is not a static_dim — deferred to forward() where x.ndim
+        # is known and M is derived from the non-reduction axes.
+        self._kernel_cache: Dict[tuple, Kernel] = {}
+```
+
+**Validation.** Every `__init__` kwarg has a manifest source (`static_dims` or `signature.params` or `dtype`); no extras except `kernel_map` / `tune`. In particular, `M` is NOT a ctor kwarg — `ExampleCumsumFwdOp.static_dims` declares only `N`, so `M` is derived at forward time. Keyword-only via `*`, no defaults on `static_dims` entries. `_static_axes` matches the manifest axis form (literal-int axis → populated class-level frozenset; param-dependent axis → empty class-level default, bound at forward after `dim % x.ndim` normalization).
+
+**Reference.** [Slot S21](ops-design-reference.md#slot-s21), [S12](ops-design-reference.md#slot-s12), [S13](ops-design-reference.md#slot-s13).
+
+### Step 4: `default_kernel_map` + `forward`
+
+**Input.** Manifest `source.kernel_map`; `signature.inputs`; `static_dims` (for the forward-time commitment check); `shape_rules` (for `dim` range validation).
+
+**Output.**
+
+```python
+    @property
+    def default_kernel_map(self) -> Dict[str, Kernel]:
+        return {"example_cumsum_fwd": ExampleCumsumKernel}
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self._validate_dtypes(x)
+        if not x.is_cuda:
+            raise ValueError("x must be a CUDA tensor")
+        # Validate `dim` against shape_rule `-x.ndim <= dim < x.ndim`
+        # and normalize to a non-negative axis (Op._static_axes contract).
+        if not -x.ndim <= self.dim < x.ndim:
+            raise ValueError(
+                f"dim {self.dim} out of range for x.ndim={x.ndim}")
+        dim = self.dim % x.ndim
+        # Validate the static_dims commitment: x.shape[dim] == N
+        if x.shape[dim] != self.N:
+            raise ValueError(
+                f"static_dim mismatch: expected x.shape[{dim}] == {self.N}, "
+                f"got {x.shape[dim]}")
+        # Bind _static_axes now that the concrete axis is known.
+        self._static_axes = frozenset({(0, dim)})
+        # Derive M (product of non-reduction dims) and cache kernel by (M,).
+        M = math.prod(s for i, s in enumerate(x.shape) if i != dim)
+        self.M = M  # stored for eval_roofline
+        key = (M,)
+        if key not in self._kernel_cache:
+            self._kernel_cache[key] = self.kernel_map["example_cumsum_fwd"](
+                M, self.N, "sum", self.dtype, tune=self.tune)
+        kernel = self._kernel_cache[key]
+        # Move reduction axis to last, reshape to (M, N), compute, restore.
+        orig_shape = x.shape
+        x2 = x.movedim(dim, -1).contiguous().reshape(M, self.N)
+        y2 = kernel(x2)
+        if self.N_padded != self.N:
+            y2 = y2[:, : self.N]
+        y = y2.reshape(*orig_shape[:dim], *orig_shape[dim + 1:], self.N)
+        return y.movedim(-1, dim)
+```
+
+**Validation.** `default_kernel_map` keys / values match manifest `source.kernel_map` verbatim. `forward` calls `self._validate_dtypes(...)` first (not inline dtype comparisons — that is Step 5's job). Every `static_dims` commitment is validated against the actual tensor shape at the normalized axis before the kernel is called. `_static_axes` is bound from the normalized (non-negative) axis before the kernel cache lookup. Padding trim emitted iff the kernel operates on `align_up(N, DEFAULT_ALIGNMENT)` (`self.N_padded != self.N`).
+
+**Reference.** [Slot S14](ops-design-reference.md#slot-s14), [S15](ops-design-reference.md#slot-s15), [S16](ops-design-reference.md#slot-s16).
+
+### Step 5: `_infer_output_shapes` + `_validate_dtypes`
+
+**Input.** Manifest `shape_rules` (for S17); per-tensor `dtype` and `dtype_combos` (for S18).
+
+**Output.**
+
+```python
+class ExampleCumsumFwdOp(Op):
+    ...
+
+    def _infer_output_shapes(self, x_shape: tuple) -> Dict[str, tuple]:
+        return {"y": x_shape}
+
+    def _validate_dtypes(self, x: torch.Tensor) -> None:
+        if x.dtype not in {torch.float32, torch.float16, torch.bfloat16}:
+            raise ValueError(f"x.dtype must be float32/float16/bfloat16, got {x.dtype}")
+```
+
+**Validation.** `python scripts/validate_manifest.py` exercises both methods at CI on every op with `status: implemented`; `spec-only` entries skip L2/L3. **L2 parity:** `_infer_output_shapes(mock_inputs)` must agree with `shape_rules`. **L3 parity:** `_validate_dtypes` must accept exactly the declared `dtype` union / `dtype_combos` and reject everything else. Parity disagreements route to `strict_errors`; advisory mode (default) reports them as warnings, `--strict` / `MANIFEST_STRICT_BLOCKING=1` makes them blocking.
+
+**Reference.** [Slot S17](ops-design-reference.md#slot-s17), [S18](ops-design-reference.md#slot-s18).
+
+### Step 6: `eval_roofline`
+
+**Input.** Manifest `roofline.vars`, `roofline.flops`, `roofline.bytes`.
+
+**Output.**
+
+```python
+class ExampleCumsumFwdOp(Op):
+    ...
+
+    def eval_roofline(self) -> tuple[int, int]:
+        flops = self.M * self.N
+        bytes_ = 2 * self.M * self.N * self.dtype.itemsize
+        return flops, bytes_
+```
+
+**Validation.** The body is **plain Python** reading `self.*` attributes. No class-level roofline expression strings, no `ast.parse`, no shared L1 evaluator — prohibited by [`roofline.md §4.4.6` Evaluator Surface Boundary](roofline.md#446-evaluator-surface-boundary). Return type is `tuple[int, int]`, not `float` or `numpy`. Expressions derive directly from `roofline.vars` bindings + `roofline.flops` + `roofline.bytes`; see [`roofline.md §4.4` Op Codegen](roofline.md#44-op-codegen).
+
+**Reference.** [Slot S19](ops-design-reference.md#slot-s19).
+
+### Step 7: Package registration
+
+**Input.** The class name (Step 2) and the op's source filename.
+
+**Output (append to `tileops/ops/reduction/__init__.py`):**
+
+```python
+# --- ExampleCumsumKernel ops ---
+from .example_cumsum import ExampleCumsumFwdOp
+```
+
+…with a matching entry added to the module's `__all__` list.
+
+**Validation.** The import sits under its family's grouping comment block; a matching `__all__` entry is present (otherwise `from tileops.ops.reduction import *` silently drops the op).
+
+**Reference.** [Slot S20](ops-design-reference.md#slot-s20).
+
+### Slot coverage
+
+| Step | Slots produced                                                                                                       |
+| ---- | -------------------------------------------------------------------------------------------------------------------- |
+| 1    | S1, S2, S3, S4                                                                                                       |
+| 2    | S5, S6, S7                                                                                                           |
+| 3    | S21, S12, S13                                                                                                        |
+| 4    | S14, S15, S16                                                                                                        |
+| 5    | S17, S18                                                                                                             |
+| 6    | S19                                                                                                                  |
+| 7    | S20                                                                                                                  |
+| —    | S8-S11: reserved — intentionally skipped from slot iteration (T1 thin-wrapper slots, out of scope for this playbook) |
+
+## Out of Scope
+
+This playbook emits exactly the 17 slots above. The following are **not** produced by the scaffold — each needs separate treatment:
+
+- **Family-specific protocol variables.** `_op_kind` (reduction), `_kernel_key`, `_kernel_cls` (norm + reduction T1 wrappers), `_kernel_handles_padding`, `_op_name`, `kernel_cls`. Kernel-dispatch-convention-dependent; cannot be mechanically derived from the manifest. See [Family-Base Protocol (Appendix)](ops-design-reference.md#base-class-protocol).
+- **Optional hooks.** `_pad_value`, `_validate_dim`, `_pre_kernel`, `_post_kernel`. Op-specific business logic (e.g., `ArgmaxFwdOp._pad_value = -inf`). See [Optional Hooks (Appendix)](ops-design-reference.md#optional-hooks-appendix).
+- **`_cache_key` override.** The default projection via `_static_axes` is correct but sometimes over-fragmenting. Override logic depends on what subset of the input shape the kernel actually depends on — kernel-math-specific.
+- **Family-base (T1) subclassing.** See [Family-Base Refactoring](#family-base-refactoring).
+- **Kernel implementations themselves.** The playbook's scope is the Op (host) layer. See [Implementing a Kernel](#implementing-a-kernel) for the kernel-side interface surface.
+- **`torch_compile_fullgraph` declaration.** Requires registered compile-test evidence. Semantics: [manifest.md](manifest.md#torch_compile_fullgraph).
+- **Compile dispatch boundary.** See [Compile Dispatch Boundary](#compile-dispatch-boundary).
+
+## Implementing a Kernel
+
+Kernel implementation is not covered by the scaffold-op skill. The device-side interface a scaffolded Op depends on — required `__init__` / `forward` / `kernel`, optional `default_config` / `autotune_configs` / `supported_archs` — is specified in [Kernel base class attributes](ops-design-reference.md#base-class-protocol).
+
+## Compile Dispatch Boundary
+
+Contract for every op declaring `torch_compile_fullgraph` while resolving
+kernels at call time.
+
+**Invariant.** A dynamo-traced `forward` MUST NOT construct a `Kernel` or
+enter a TileLang builder. Kernel-cache misses run TileLang JIT machinery
+(`inspect`-based signature handling) that dynamo cannot trace; an eager
+warm-up before `torch.compile` only hides the miss path and does not
+satisfy the cold-call contract.
+
+**Mechanism** (`tileops/ops/compile_boundary.py`; reference adopters:
+`pool.py`, `norm/batch_norm.py`):
+
+1. `Op.dispatch_kernel` registers every op in a weak instance registry at
+   `__init__` time and stores `self._instance_key`.
+1. The family defines one `torch.library.custom_op` per output arity. Its
+   eager body resolves the instance from the registry and calls
+   `self._eager_forward` — cache lookup, Kernel construction, and launch
+   all run untraced. Its fake derives output shapes from
+   `_infer_output_shapes` and dtypes from the manifest contract.
+1. `forward` becomes a single dispatch call:
+   `return _family_fwd(input, self._instance_key)`; the previous body is
+   renamed `_eager_forward` unchanged.
+
+**Constraints.**
+
+- The instance key is a **string**: dynamo bakes string custom-op
+  arguments as static constants, while an `int` key is generalized to an
+  unhashable `SymInt` once a second instance compiles through the same
+  frame. Stale-graph safety comes from dynamo's ID_MATCH guard holding a
+  weak reference to the compiled callable: a dead instance forces
+  recompilation, so a reused `id()` cannot resolve against a stale graph.
+- The boundary covers forward-only compilation. Declaring
+  `torch_compile_fullgraph` on an op whose compiled graph must
+  backpropagate additionally requires registering an autograd formula for
+  the dispatch custom op.
+- Ops that pre-build their kernel at `__init__` (constructor-known shapes)
+  do not need the boundary; the invariant still applies to their
+  `forward`.
+
+## Family-Base Refactoring
+
+The scaffold emits T2 (L1-direct) ops only; once a family accumulates 2-3 ops sharing an identical `forward()` flow, a separate family-specific refactoring (not scaffold-op) extracts an L2 base and rewrites the concrete ops as T1 thin wrappers — see [Development Path](ops-design-reference.md#development-path) for when to extract and [Adding a New Family Base](ops-design-reference.md#adding-a-new-family-base) for the process.
+
+### Dimension-parametrized families
+
+Families whose ops differ only in spatial rank (1d/2d/3d variants of one operation) use a single generic base parametrized by a class-attribute `ndim`; variant axes beyond rank (e.g. an indices output) are additional class attributes, not subclass method bodies.
+
+- Concrete public classes MUST keep `eval_roofline` and `_validate_dtypes` in their own class body (delegating to a shared helper is fine) — manifest codegen resolves both per concrete class, and a definition inherited from an intermediate base is silently shadowed or bypassed.
+- The generic base MUST preserve each variant's kernel-cache key contents and kernel constructor keyword names; rank-dependent naming is table-driven, never positional.
+- Genuine per-rank behavior differences (parameter availability, fast-path policy) stay as explicit subclass overrides; the refactor MUST NOT normalize them.
+
+## Further Reference
+
+- [Slot Rules](ops-design-reference.md#slot-rules) — full Rule / Derivation / Example / Common mistakes per slot
+- [Codegen Details](ops-design-reference.md#codegen) — calling conventions, inheritance rules, consistency enforcement
+- [Base Class Protocol](ops-design-reference.md#base-class-protocol) — `Op` and `Kernel` base class attributes
+- [Naming Conventions](ops-design-reference.md#naming-conventions) — class / `kernel_map` / builder function rules
+- [Parameter Design](ops-design-reference.md#parameter-design) — static vs dynamic op comparison
+- [manifest.md](manifest.md) — manifest entry structure, `static_dims`, `shape_rules`, `roofline`
+- [roofline.md](roofline.md) — roofline formula syntax, codegen, evaluator surface boundary

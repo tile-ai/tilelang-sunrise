@@ -1,0 +1,15 @@
+* text eol=lf
+*.bat eol=crlf
+
+*.svg binary
+*.jpg binary
+*.jpeg binary
+*.png binary
+*.gif binary
+
+*.h linguist-language=C++
+
+# Preserve vendored source snapshots byte-for-byte. Their upstream formatting
+# is checked in the component repositories, not as TileLang-Sunrise changes.
+3rdparty/tvm_sunrise/** -whitespace
+downstream/** -whitespace

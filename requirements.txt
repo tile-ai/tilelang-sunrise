@@ -1,0 +1,12 @@
+# Runtime requirements
+
+apache-tvm-ffi==0.1.11+sunrise.1
+cloudpickle
+ml-dtypes
+numpy>=1.23.5
+psutil
+# Install the matching PTPU-enabled torch distribution before TileLang.
+torch>=2.7; platform_system == 'Darwin'
+tqdm>=4.62.3
+typing-extensions>=4.10.0
+z3-solver>=4.13.0,<4.15.5

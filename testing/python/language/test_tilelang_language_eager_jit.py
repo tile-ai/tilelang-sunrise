@@ -1,0 +1,259 @@
+import tilelang.testing
+import tilelang
+import tilelang.language as T
+from itertools import product
+import torch
+from tilelang.utils.device import get_current_device
+
+
+def test_jit2_gemm():
+    @tilelang.jit(verbose=True)
+    def gemm(
+        A,
+        B,
+        C,
+        dtype: T.dtype = T.float16,
+        accum_dtype: T.dtype = T.float32,
+        block_M: int = 64,
+        block_N: int = 64,
+        block_K: int = 64,
+    ):
+        M, N, K = T.const("M N K")
+
+        A: T.Tensor[[M, K], dtype]
+        B: T.Tensor[[K, N], dtype]
+        C: T.Tensor[[M, N], dtype]
+
+        with T.Kernel(T.ceildiv(M, block_M), T.ceildiv(N, block_N)) as (by, bx):
+            A_shared = T.alloc_shared((block_M, block_K), dtype)
+            B_shared = T.alloc_shared((block_K, block_N), dtype)
+            C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
+
+            T.clear(C_local)
+            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
+                T.copy(A[by * block_M, k * block_K], A_shared)
+                T.copy(B[k * block_K, bx * block_N], B_shared)
+                T.gemm(A_shared, B_shared, C_local)
+
+            T.copy(C_local, C[by * block_M, bx * block_N])
+
+    device = get_current_device()
+    A = torch.randn(1024, 1024, dtype=torch.float16, device=device)
+    B = torch.randn(1024, 1024, dtype=torch.float16, device=device)
+    C = torch.randn(1024, 1024, dtype=torch.float16, device=device)
+    gemm(A, B, C)
+    C_ref = A @ B
+    if device.type == "ptpu":
+        torch.ptpu.synchronize(device)
+    torch.testing.assert_close(C.cpu(), C_ref.cpu(), atol=1e-2, rtol=1e-2)
+
+
+def test_jit2_gemm_ptr():
+    @tilelang.jit
+    def gemm_ptr(
+        A: T.ptr,
+        B: T.ptr,
+        C: T.ptr,
+        M: int,
+        N: int,
+        K: int,
+        dtype: T.dtype,
+        out_dtype: T.dtype,
+        block_M: int = 64,
+        block_N: int = 64,
+        block_K: int = 32,
+    ):
+        A = T.make_tensor(A, (M, K), dtype)
+        B = T.make_tensor(B, (K, N), dtype)
+        C = T.make_tensor(C, (M, N), out_dtype)
+        with T.Kernel(T.ceildiv(M, block_M), T.ceildiv(N, block_N), threads=128) as (bx, by):
+            A_shared = T.alloc_shared((block_M, block_K), dtype)
+            B_shared = T.alloc_shared((block_K, block_N), dtype)
+            C_local = T.alloc_fragment((block_M, block_N), out_dtype)
+            T.clear(C_local)
+            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
+                T.copy(A[bx * block_M, k * block_K], A_shared)
+                T.copy(B[k * block_K, by * block_N], B_shared)
+                T.gemm(A_shared, B_shared, C_local)
+            T.copy(C_local, C[bx * block_M, by * block_N])
+
+    device = get_current_device()
+    in_dtypes = [T.float16, T.float32] if device.type == "ptpu" else [T.float16, T.tfloat32]
+    prod = list(product(in_dtypes, [T.float32]))
+    gemm_ptr.par_compile(
+        [
+            {"A": T.ptr(), "B": T.ptr(), "C": T.ptr(), "M": 1024, "N": 1024, "K": 1024, "dtype": in_dtype, "out_dtype": out_dtype}
+            for in_dtype, out_dtype in prod
+        ]
+    )
+    for in_dtype, out_dtype in prod:
+        in_dtype = in_dtype.as_torch()
+        out_dtype = out_dtype.as_torch()
+        A = torch.randn(1024, 1024, dtype=in_dtype, device=device)
+        B = torch.randn(1024, 1024, dtype=in_dtype, device=device)
+        C_ref = (A @ B).to(out_dtype)
+        C = torch.empty(1024, 1024, dtype=out_dtype, device=device)
+        gemm_ptr(A, B, C, 1024, 1024, 1024, in_dtype, out_dtype)
+        if device.type == "ptpu":
+            torch.ptpu.synchronize(device)
+        torch.testing.assert_close(C.cpu(), C_ref.cpu(), atol=1e-2, rtol=1e-2)
+
+
+def test_jit2_many_annot():
+    @T.macro
+    def copy_impl(A, B):
+        M, N = A.shape
+        M_, N_ = B.shape
+        assert M == M_, f"M mismatch {M} {M_}"
+        assert N == N_, f"N mismatch {N} {N_}"
+        # assert tuple(A.shape) == tuple(B.shape), f"Invalid tensor shape: {A.shape}, {B.shape}"
+        with T.Kernel(T.ceildiv(M, 128), T.ceildiv(N, 128), threads=128) as (bx, by):
+            T.copy(A[bx * 128 : bx * 128 + 128, by * 128 : by * 128 + 128], B[bx * 128 : bx * 128 + 128, by * 128 : by * 128 + 128])
+
+    @tilelang.jit
+    def copy1(A, B):
+        N, M = T.const("N, M")
+        A: T.Tensor[[N, M], T.float32]
+        B: T.Tensor[[N, M], T.float32]
+        copy_impl(A, B)
+
+    @tilelang.jit
+    def copy2(
+        A: T.Tensor[[128, 128], T.float32],
+        B: T.Tensor[[128, 128], T.float32],
+    ):
+        copy_impl(A, B)
+
+    @tilelang.jit
+    def copy3(A, B):
+        N = T.const("N")
+        A: T.Tensor[[N, 128], T.float32]
+        B: T.Tensor[[N, 128], T.float32]
+        copy_impl(A, B)
+
+    @tilelang.jit
+    def copy4(A, B):
+        N = T.dynamic("N")
+        M = T.const("M")
+        A: T.Tensor[[N, M], T.float32]
+        B: T.Tensor[[N, M], T.float32]
+        copy_impl(A, B)
+
+    @tilelang.jit
+    def copy5(A, B):
+        N, M, N_, M_ = T.const("N, M, N_, M_")
+        A: T.StridedTensor[[N, M], [N_, M_], T.float32]
+        B: T.StridedTensor[[N, M], [N_, M_], T.float32]
+        copy_impl(A, B)
+
+    @tilelang.jit
+    def copy6(A, B):
+        N = T.dynamic("N")
+        M, N_, M_ = T.const("M, N_, M_")
+        A: T.StridedTensor[[N, M], [N_, M_], T.float32]
+        B: T.StridedTensor[[N, M], [N_, M_], T.float32]
+        copy_impl(A, B)
+
+    tilelang.par_compile([copy.get_tir(T.Tensor((128, 128)), T.Tensor((128, 128))) for copy in [copy1, copy2, copy3, copy4]])
+
+    device = get_current_device()
+    for copy in [copy1, copy2, copy3, copy4]:
+        A = torch.randn(128, 128, device=device)
+        B = torch.empty(128, 128, device=device)
+        copy(A, B)
+        if device.type == "ptpu":
+            torch.ptpu.synchronize(device)
+        assert torch.equal(B.cpu(), A.cpu())
+
+    for copy in [copy5, copy6]:
+        A = torch.randn(128, 2, 128, 2, device=device)
+        B = torch.randn(128, 2, 128, 2, device=device)
+        copy(A[:, 0, :, 0], B[:, 0, :, 0])
+        if device.type == "ptpu":
+            torch.ptpu.synchronize(device)
+        assert torch.equal(A[:, 0, :, 0].cpu(), B[:, 0, :, 0].cpu())
+
+
+def test_jit2_return():
+    @T.macro
+    def copy_impl(A):
+        M, N = A.shape
+        B = T.empty(M, N, dtype=A.dtype)
+        with T.Kernel(T.ceildiv(M, 128), T.ceildiv(N, 128), threads=128) as (bx, by):
+            T.copy(A[bx * 128 : bx * 128 + 128, by * 128 : by * 128 + 128], B[bx * 128 : bx * 128 + 128, by * 128 : by * 128 + 128])
+        return B
+
+    @tilelang.jit
+    def copy1(A):
+        M, N = T.const("M, N")
+        A: T.Tensor[[M, N], T.float32]
+        return copy_impl(A)
+
+    @tilelang.jit
+    def copy2(A):
+        A: T.Tensor[[128, 128], T.float32]
+        return copy_impl(A)
+
+    @tilelang.jit
+    def copy3(A):
+        N = T.const("N")
+        A: T.Tensor[[N, 128], T.float32]
+        return copy_impl(A)
+
+    @tilelang.jit
+    def copy4(A):
+        N = T.dynamic("N")
+        M = T.const("M")
+        A: T.Tensor[[N, M], T.float32]
+        return copy_impl(A)
+
+    @tilelang.jit
+    def copy5(A):
+        N, M, N_, M_ = T.const("N, M, N_, M_")
+        A: T.StridedTensor[[N, M], [N_, M_], T.float32]
+        return copy_impl(A)
+
+    @tilelang.jit
+    def copy6(A):
+        N = T.dynamic("N")
+        M, N_, M_ = T.const("M, N_, M_")
+        A: T.StridedTensor[[N, M], [N_, M_], T.float32]
+        return copy_impl(A)
+
+    device = get_current_device()
+    for copy in [copy1, copy2, copy3, copy4]:
+        A = torch.randn(128, 128, device=device)
+        B = copy(A)
+        if device.type == "ptpu":
+            torch.ptpu.synchronize(device)
+        assert torch.equal(B.cpu(), A.cpu())
+
+    for copy in [copy5, copy6]:
+        A = torch.randn(128, 2, 128, 2, device=device)
+        B = copy(A[:, 0, :, 0])
+        if device.type == "ptpu":
+            torch.ptpu.synchronize(device)
+        assert torch.equal(A[:, 0, :, 0].cpu(), B.cpu())
+
+
+def test_jit2_compile_with_consts():
+    @tilelang.jit
+    def transpose(X, Y, block_M, block_N):
+        M, N = T.const("M N")
+        X: T.Tensor[[M, N], T.float32]
+        Y: T.Tensor[[N, M], T.float32]
+
+        with T.Kernel(T.ceildiv(M, block_M), T.ceildiv(N, block_N), threads=128) as (bx, by):
+            X_tile = T.alloc_shared((block_M, block_N), T.float32)
+            Y_tile = T.alloc_shared((block_N, block_M), T.float32)
+
+            T.copy(X[bx * block_M, by * block_N], X_tile)
+            for i, j in T.Parallel(block_M, block_N):
+                Y_tile[j, i] = X_tile[i, j]
+            T.copy(Y_tile, Y[by * block_N, bx * block_M])
+
+    transpose.compile(M=1024, N=1024, block_M=64, block_N=64)
+
+
+if __name__ == "__main__":
+    tilelang.testing.main()

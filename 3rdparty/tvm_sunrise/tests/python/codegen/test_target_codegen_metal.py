@@ -1,0 +1,238 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+import numpy as np
+
+import tvm
+import tvm.testing
+from tvm.script import ir as I
+from tvm.script import tirx as T
+
+
+@tvm.testing.requires_gpu
+@tvm.testing.requires_metal
+def test_metal_inf_nan():
+    target = "metal"
+
+    def check_inf_nan(dev, n, value, dtype):
+        @I.ir_module
+        class Module:
+            @T.prim_func
+            def main(
+                A: T.Buffer((1,), dtype),
+                C: T.Buffer((1,), dtype),
+            ):
+                T.func_attr({"tirx.noalias": True})
+                for i in T.thread_binding(1, thread="threadIdx.x"):
+                    with T.sblock("C"):
+                        v_i = T.axis.spatial(1, i)
+                        T.reads()
+                        T.writes(C[v_i])
+                        C[v_i] = T.Cast(dtype, value)
+
+        fun = tvm.compile(Module, target=target)
+        a = tvm.runtime.empty((n,), dtype, dev)
+        c = tvm.runtime.empty((n,), dtype, dev)
+        # Only need to test compiling here
+        fun(a, c)
+
+    dev = tvm.device(target, 0)
+
+    check_inf_nan(dev, 1, -float("inf"), "float32")
+    check_inf_nan(dev, 1, -float("inf"), "float16")
+    check_inf_nan(dev, 1, float("inf"), "float32")
+    check_inf_nan(dev, 1, float("inf"), "float16")
+    check_inf_nan(dev, 1, float("nan"), "float32")
+    check_inf_nan(dev, 1, float("nan"), "float16")
+
+
+@tvm.testing.requires_gpu
+@tvm.testing.requires_metal
+def test_unaligned_vectorize():
+    @tvm.script.ir_module
+    class IRModule:
+        @T.prim_func
+        def main(A: T.Buffer((2, 3), "float32"), B: T.Buffer((6,), "float32")):
+            T.func_attr({"global_symbol": "main"})
+            for i0_1 in T.thread_binding(3, thread="threadIdx.x"):
+                for i0_0 in T.vectorized(2):
+                    with T.sblock("block"):
+                        vi0 = T.axis.spatial(6, i0_0 * 3 + i0_1)
+                        B[vi0] = A[vi0 // 3, vi0 % 3]
+
+    target = "metal"
+    dev = tvm.metal()
+
+    a = (np.arange(6).reshape(2, 3)).astype("float32")
+    a_nd = tvm.runtime.tensor(a, dev)
+    b_nd = tvm.runtime.empty((6,), "float32", dev)
+    f = tvm.compile(IRModule, target=target)
+    f(a_nd, b_nd)
+    tvm.testing.assert_allclose(b_nd.numpy(), a.reshape(6), atol=1e-5, rtol=1e-5)
+
+
+@tvm.testing.requires_gpu
+@tvm.testing.requires_metal
+def test_metal_erf():
+    target = "metal"
+
+    def check_erf(dev, n, dtype):
+        @I.ir_module
+        class Module:
+            @T.prim_func
+            def main(
+                A: T.Buffer((1,), dtype),
+                C: T.Buffer((1,), dtype),
+            ):
+                T.func_attr({"tirx.noalias": True})
+                for i0 in T.thread_binding(1, thread="threadIdx.x"):
+                    with T.sblock("C"):
+                        v_i0 = T.axis.spatial(1, i0)
+                        T.reads(A[v_i0])
+                        T.writes(C[v_i0])
+                        C[v_i0] = T.erf(A[v_i0])
+
+        fun = tvm.compile(Module, target=target)
+        a = tvm.runtime.empty((n,), dtype, dev)
+        c = tvm.runtime.empty((n,), dtype, dev)
+        # Only need to test compiling here
+        fun(a, c)
+
+    dev = tvm.device(target, 0)
+
+    check_erf(dev, 1, "float32")
+    check_erf(dev, 1, "float16")
+
+
+@tvm.testing.requires_gpu
+@tvm.testing.requires_metal
+def test_ramp():
+    target = "metal"
+
+    @tvm.script.ir_module
+    class IRModule:
+        @T.prim_func
+        def main(A: T.Buffer((1, 2), "int32")):
+            T.func_attr({"global_symbol": "main"})
+            for i in T.thread_binding(1, thread="threadIdx.x"):
+                with T.sblock("block"):
+                    tx = T.axis.spatial(1, i)
+                    r = T.ramp(tx, 3, 2)
+                    A[0, T.ramp(0, 1, 2)] = r
+
+    f = tvm.compile(IRModule, target=target)
+    dev = tvm.metal()
+    a_nd = tvm.runtime.empty((1, 2), "int32", dev)
+    f(a_nd)
+    assert tuple(a_nd.numpy()[0, :]) == (0, 3)
+
+
+@tvm.testing.requires_gpu
+@tvm.testing.requires_metal
+def test_select_vectorize():
+    @tvm.script.ir_module
+    class IRModule:
+        @T.prim_func
+        def main(A: T.Buffer((6), "float32"), B: T.Buffer((6,), "float32")):
+            T.func_attr({"global_symbol": "main"})
+            for i0_1 in T.thread_binding(3, thread="threadIdx.x"):
+                for i0_0 in T.vectorized(2):
+                    with T.sblock("block"):
+                        vi0 = T.axis.spatial(6, i0_0 * 3 + i0_1)
+                        B[vi0] = T.Select((vi0 % 2) == 0, A[vi0], T.float32(0))
+
+    target = "metal"
+    dev = tvm.metal()
+    a = np.arange(6).astype("float32")
+    a_nd = tvm.runtime.tensor(a, dev)
+    b_nd = tvm.runtime.empty((6,), "float32", dev)
+    f = tvm.compile(IRModule, target=target)
+    f(a_nd, b_nd)
+    a.reshape(3, 2)[:, 1] = 0
+    tvm.testing.assert_allclose(b_nd.numpy(), a, atol=1e-5, rtol=1e-5)
+
+
+@tvm.testing.requires_gpu
+@tvm.testing.requires_metal
+def test_vectorized_uint8():
+    @T.prim_func
+    def func(A: T.Buffer((16), "uint8"), B: T.Buffer((16), "float32")):
+        for i in T.thread_binding(4, thread="threadIdx.x"):
+            for j in T.vectorized(4):
+                with T.sblock("block"):
+                    vi = T.axis.spatial(16, i * 4 + j)
+                    B[vi] = T.Cast("float32", A[vi])
+
+    dev = tvm.metal()
+    a = np.arange(16).astype("uint8")
+    a_nd = tvm.runtime.tensor(a, dev)
+    b_nd = tvm.runtime.empty((16,), "float32", dev)
+    f = tvm.compile(func, target="metal")
+    f(a_nd, b_nd)
+    tvm.testing.assert_allclose(b_nd.numpy(), a.astype("float32"), atol=1e-5, rtol=1e-5)
+
+
+@tvm.testing.requires_metal(support_required="compile-only")
+def test_func_with_trailing_pod_params():
+    from tvm.contrib import xcode  # pylint: disable=import-outside-toplevel
+
+    @T.prim_func
+    def func(A: T.Buffer((16), "float32"), B: T.Buffer((16), "float32"), x: T.float32):
+        for i in T.thread_binding(16, thread="threadIdx.x"):
+            with T.sblock("block"):
+                vi = T.axis.spatial(16, i)
+                B[vi] = A[vi] + x
+
+    @tvm.register_global_func("tvm_callback_metal_compile")
+    def compile_metal(src, target):
+        return xcode.compile_metal(src)
+
+    mod = tvm.IRModule({"main": func})
+
+    f = tvm.tirx.build(mod, target="metal")
+    src: str = f.imports[0].inspect_source()
+    occurrences = src.count("struct func_kernel_args_t")
+    assert occurrences == 1, occurrences
+
+
+@tvm.testing.requires_metal(support_required="compile-only")
+def test_export_load_with_fallback(monkeypatch, tmp_path):
+    """Force the codegen wrapper into the fallback branch, then export."""
+    n = 1024
+
+    @I.ir_module
+    class Module:
+        @T.prim_func
+        def main(A: T.Buffer((n,), "float32"), B: T.Buffer((n,), "float32")):
+            T.func_attr({"tirx.noalias": True})
+            for i_0 in T.thread_binding(n // 32, thread="blockIdx.x"):
+                for i_1 in T.thread_binding(32, thread="threadIdx.x"):
+                    with T.sblock("B"):
+                        v_i = T.axis.spatial(n, i_0 * 32 + i_1)
+                        T.reads(A[v_i])
+                        T.writes(B[v_i])
+                        B[v_i] = A[v_i] + 1.0
+
+    monkeypatch.setenv("TVM_COMPILE_FORCE_FALLBACK", "1")
+    host_lib = tvm.compile(Module, target="metal")
+    monkeypatch.delenv("TVM_COMPILE_FORCE_FALLBACK")
+
+    lib_path = str(tmp_path / "lib.so")
+    host_lib.export_library(lib_path)
+
+
+if __name__ == "__main__":
+    tvm.testing.main()

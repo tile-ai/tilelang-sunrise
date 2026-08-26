@@ -1,0 +1,24 @@
+.DS_Store
+build
+dist
+*.egg-info
+*.pyc
+__pycache__/
+
+# PyCharm Settings
+.idea/
+*.iml
+*.iws
+
+# Python packaging version file
+_version.py
+
+# VSCode Settings
+/.vscode
+
+# workspace
+workspace
+
+# CI runtime state (job-isolated)
+.ci-state/
+/tilelang/

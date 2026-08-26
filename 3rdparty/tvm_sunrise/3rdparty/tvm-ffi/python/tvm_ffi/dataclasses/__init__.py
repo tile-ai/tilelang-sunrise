@@ -1,0 +1,46 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+"""FFI dataclass decorators: ``c_class`` for C++-backed types, ``py_class`` for Python-defined types."""
+
+from tvm_ffi.core import MISSING, Object
+
+from .c_class import c_class
+from .common import asdict, astuple, fields, is_dataclass, replace
+from .enum import Enum, EnumAttrMap, IntEnum, StrEnum, auto, entry
+from .field import KW_ONLY, Field, field
+from .py_class import py_class
+
+__all__ = [
+    "KW_ONLY",
+    "MISSING",
+    "Enum",
+    "EnumAttrMap",
+    "Field",
+    "IntEnum",
+    "Object",
+    "StrEnum",
+    "asdict",
+    "astuple",
+    "auto",
+    "c_class",
+    "entry",
+    "field",
+    "fields",
+    "is_dataclass",
+    "py_class",
+    "replace",
+]

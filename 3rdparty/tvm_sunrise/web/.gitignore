@@ -1,0 +1,8 @@
+.vscode
+*~
+out
+node_modules
+build
+debug
+.tensor_cache
+src/tvmjs_runtime_wasi.js

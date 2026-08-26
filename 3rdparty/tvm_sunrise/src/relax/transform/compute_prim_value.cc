@@ -1,0 +1,99 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+#include <tvm/ffi/reflection/registry.h>
+#include <tvm/relax/expr_functor.h>
+#include <tvm/relax/transform.h>
+#include <tvm/s_tir/transform.h>
+#include <tvm/tirx/analysis.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/stmt_functor.h>
+
+namespace tvm {
+namespace relax {
+
+namespace {
+
+class PrimValueComputeInjector : public ExprMutator {
+ public:
+  IRModule Finalize() const { return builder_->Finalize(); }
+
+  using ExprMutator::VisitExpr_;
+
+  Expr VisitExpr_(const PrimValueNode* op) override {
+    auto node = Downcast<PrimValue>(ExprMutator::VisitExpr_(op));
+
+    if (node->value->IsInstance<tirx::IntImmNode>() || node->value->IsInstance<tirx::VarNode>()) {
+      return node;
+    }
+
+    auto ret_dtype = node->value->dtype;
+    auto param_vars = tirx::UndefinedVars(node->value);
+    tirx::Stmt body = tirx::Evaluate(tirx::Call(ret_dtype, tirx::builtin::ret(), {node->value}));
+
+    tirx::PrimFunc func(param_vars, body, PrimType(ret_dtype), {},
+                        DictAttrs({{tirx::attr::kIsHostFunc, true}}));
+    func = s_tir::RenewDefs(func);
+
+    auto callee = builder_->AddFunction(func, "compute_symbolic_expr");
+
+    return relax::Call(callee, param_vars.Map([](const tirx::Var& tir_var) -> relax::Expr {
+      return relax::PrimValue(tir_var);
+    }));
+  }
+};
+
+}  // namespace
+
+namespace transform {
+
+Pass ComputePrimValue() {
+  auto pass_func = [=](IRModule mod, PassContext pc) -> IRModule {
+    PrimValueComputeInjector mutator;
+
+    IRModule updates;
+    for (const auto& [gvar, base_func] : mod->functions) {
+      if (auto func = base_func.as<Function>()) {
+        auto updated = Downcast<Function>(mutator(func.value()));
+        if (!updates.same_as(base_func)) {
+          updates->Add(gvar, updated);
+        }
+      }
+    }
+
+    if (updates->functions.size()) {
+      auto write_ptr = mod.CopyOnWrite();
+      write_ptr->Update(updates);
+      write_ptr->Update(mutator.Finalize());
+    }
+
+    return mod;
+  };
+  return CreateModulePass(pass_func, 0, "ComputePrimValue", {});
+}
+
+TVM_FFI_STATIC_INIT_BLOCK() {
+  namespace refl = tvm::ffi::reflection;
+  refl::GlobalDef().def("relax.transform.ComputePrimValue", ComputePrimValue);
+}
+
+}  // namespace transform
+
+}  // namespace relax
+}  // namespace tvm

@@ -1,0 +1,55 @@
+# ============================================================
+# TileKernels CI Test Case List
+# ============================================================
+# Each line should be a path to a test .py file.
+# Lines starting with # are ignored.
+# Blank lines are ignored.
+# ============================================================
+
+# --- engram ---
+tests/engram/test_engram_gate_fwd.py
+# tests/engram/test_engram_gate_bwd.py
+tests/engram/test_engram_fused_weight.py
+tests/engram/test_engram_grad_w_reduce.py
+tests/engram/test_engram_hash.py
+
+# --- mhc ---
+tests/mhc/test_expand.py
+tests/mhc/test_head_compute_mix.py
+# tests/mhc/test_post.py
+tests/mhc/test_pre_split_mixes.py
+tests/mhc/test_sinkhorn.py
+tests/mhc/test_pre_apply_mix.py
+tests/mhc/test_norm_fn.py
+tests/mhc/test_pre_big_fuse.py
+# tests/mhc/test_multilayer_recompute.py
+
+# --- moe ---
+tests/moe/test_topk_gate.py
+tests/moe/test_topk_sum_and_topk_idx.py
+tests/moe/test_top2_sum_gate.py
+tests/moe/test_inplace_unique_group_indices.py
+tests/moe/test_group_count.py
+# tests/moe/test_reduce_fused.py  # disabled: BF16 scale-factor numerical mismatch
+tests/moe/test_normalize_weight.py
+tests/moe/test_mask_indices_by_tp.py
+tests/moe/test_expand_to_fused.py
+tests/moe/test_aux_fi.py
+tests/moe/test_get_fused_mapping.py
+
+# --- quant ---
+# tests/quant/test_swiglu_forward_and_per_token_cast.py
+# tests/quant/test_swiglu_forward_and_per_channel_cast_and_transpose.py
+# tests/quant/test_swiglu_backward_and_per_token_cast.py
+# tests/quant/test_per_token_cast_to_e5m6.py
+# tests/quant/test_per_token_cast.py
+# tests/quant/test_per_channel_cast_fused.py
+# tests/quant/test_per_channel_cast_and_transpose.py
+# tests/quant/test_per_channel_cast.py
+# tests/quant/test_per_block_cast_lossless.py
+# tests/quant/test_per_block_cast.py
+# tests/quant/test_cast_back_e5m6.py
+# tests/quant/test_cast_back.py
+
+# --- transpose ---
+tests/transpose/test_transpose.py
