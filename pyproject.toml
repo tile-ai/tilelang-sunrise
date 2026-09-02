@@ -75,7 +75,8 @@ torch = [
 
 [build-system]
 requires = [
-    "cython>=3.1.0",
+    # Cython 3.3 requires Py_LIMITED_API >= 3.9, while this wheel targets cp38.
+    "cython>=3.1.0,<3.3",
     "scikit-build-core",
     "z3-solver>=4.13.0,<4.15.5",
     # Not for auditwheel, explicitly add patchelf for repairing libz3.so.

@@ -1,0 +1,169 @@
+name: Sunrise S2
+
+on:
+  push:
+    branches:
+      - "**"
+      - "!dependabot/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sunrise-s2
+  cancel-in-progress: false
+
+jobs:
+  trust_boundary:
+    name: trust_boundary
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out the trusted repository commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Enforce the repository event boundary
+        run: bash ci/github_actions.sh trust
+
+  tilelang_build:
+    name: tilelang_build
+    needs: trust_boundary
+    runs-on: [self-hosted, linux, x64, sunrise-s2, tilelang-sunrise]
+    timeout-minutes: 60
+    steps:
+      - name: Check out the tested commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Export the shared CI environment
+        run: bash ci/github_actions.sh export tilelang_build
+      - name: Check S2 health
+        run: source ci/lib.sh && ci_check_card_state
+      - name: Build TileLang-Sunrise wheels
+        run: bash ci/build.sh
+      - name: Upload the tested wheels
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tilelang-sunrise-wheels
+          path: |
+            dist/apache_tvm_ffi-*.whl
+            dist/tilelang_sunrise-*.whl
+          if-no-files-found: error
+          retention-days: 28
+      - name: Upload sanitized build evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tilelang-build-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            *.csv
+            *.xml
+            ci_failure_reports/
+            sunrise_device_summary.json
+          if-no-files-found: ignore
+          retention-days: 28
+
+  tilelang_test:
+    name: tilelang_test
+    needs: tilelang_build
+    runs-on: [self-hosted, linux, x64, sunrise-s2, tilelang-sunrise]
+    timeout-minutes: 180
+    steps:
+      - name: Check out the tested commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Download the tested wheels
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: tilelang-sunrise-wheels
+          path: dist
+      - name: Export the shared CI environment
+        run: bash ci/github_actions.sh export tilelang_test
+      - name: Run TileLang release validation
+        run: bash ci/test.sh
+      - name: Upload sanitized TileLang evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tilelang-test-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ci_failure_reports/
+            sunrise_device_summary.json
+          if-no-files-found: ignore
+          retention-days: 28
+
+  tilekernels_sunrise:
+    name: tilekernels_sunrise
+    needs: [tilelang_build, tilelang_test]
+    if: ${{ always() && needs.tilelang_build.result == 'success' && (needs.tilelang_test.result == 'success' || needs.tilelang_test.result == 'failure') }}
+    runs-on: [self-hosted, linux, x64, sunrise-s2, tilelang-sunrise]
+    timeout-minutes: 90
+    continue-on-error: true
+    steps:
+      - name: Check out the tested commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Download the tested wheels
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: tilelang-sunrise-wheels
+          path: dist
+      - name: Export the shared CI environment
+        run: bash ci/github_actions.sh export tilekernels_sunrise
+      - name: Validate vendored TileKernels
+        env:
+          OP: tilekernels_sunrise
+        run: bash ci/validate_operator.sh
+      - name: Upload sanitized TileKernels evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tilekernels-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ci_failure_reports/
+            sunrise_device_summary.json
+          if-no-files-found: ignore
+          retention-days: 28
+
+  tileops_sunrise:
+    name: tileops_sunrise
+    needs: [tilelang_build, tilelang_test, tilekernels_sunrise]
+    if: ${{ always() && needs.tilelang_build.result == 'success' && (needs.tilelang_test.result == 'success' || needs.tilelang_test.result == 'failure') && (needs.tilekernels_sunrise.result == 'success' || needs.tilekernels_sunrise.result == 'failure') }}
+    runs-on: [self-hosted, linux, x64, sunrise-s2, tilelang-sunrise]
+    timeout-minutes: 150
+    continue-on-error: true
+    steps:
+      - name: Check out the tested commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Download the tested wheels
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: tilelang-sunrise-wheels
+          path: dist
+      - name: Export the shared CI environment
+        run: bash ci/github_actions.sh export tileops_sunrise
+      - name: Validate vendored TileOps
+        env:
+          OP: tileops_sunrise
+        run: bash ci/validate_operator.sh
+      - name: Upload sanitized TileOps evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tileops-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ci_failure_reports/
+            sunrise_device_summary.json
+          if-no-files-found: ignore
+          retention-days: 28

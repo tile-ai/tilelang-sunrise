@@ -1,0 +1,55 @@
+name: Sunrise Lint
+
+on:
+  push:
+    branches:
+      - "**"
+      - "!dependabot/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sunrise-lint-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint_changed:
+    name: lint_changed
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the tested commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Export the shared CI environment
+        run: bash ci/github_actions.sh export lint_changed
+      - name: Run changed-files lint
+        run: bash ci/lint.sh changed
+
+  lint_all:
+    name: lint_all
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - name: Check out the tested commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Export the shared CI environment
+        run: bash ci/github_actions.sh export lint_all
+      - name: Run full lint audit
+        run: bash ci/lint.sh all
+      - name: Upload the lint report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lint-all-${{ github.run_id }}-${{ github.run_attempt }}
+          path: lint_reports/
+          if-no-files-found: warn
+          retention-days: 28

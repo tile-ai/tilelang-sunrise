@@ -1,0 +1,2 @@
+# Exact case label<TAB>timeout_seconds. The shared CI parser rejects stale entries.
+tests/ops/test_grouped_gemm.py	2700

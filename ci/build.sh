@@ -27,6 +27,10 @@ pushd "$TILELANG_HOME"
     check_exec pip install "scikit-build-core" "z3-solver>=4.13.0,<4.15.5" "patchelf>=0.17.2"
     check_exec pip wheel --no-build-isolation --no-deps . -w "$DIST_DIR" -v
 popd
+
+echo "================================ verify installed wheel ================================"
+ci_install_tilelang_whl "$DIST_DIR"
+ci_assert_tilelang_tang_registration
 }
 
 echo "================================ Build artifacts ================================"
