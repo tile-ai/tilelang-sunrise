@@ -15,6 +15,12 @@ export TARGET_TORCH_VERSION TARGET_TRITON_VERSION TARGET_TORCH_PKG_URL
 export TARGET_TORCH_PTPU_PKG TARGET_TRITON_PKG
 TARGET_TVM_FFI_VERSION="${TARGET_TVM_FFI_VERSION:-0.1.11+sunrise.1}"
 
+# GitLab keeps the existing password-backed reset path.  The public GitHub
+# runner selects sudo-n and only receives one exact NOPASSWD pt_smi command.
+TILELANG_CI_RESET_MODE="${TILELANG_CI_RESET_MODE:-password}"
+TILELANG_CI_PUBLIC_LOGS="${TILELANG_CI_PUBLIC_LOGS:-0}"
+export TILELANG_CI_RESET_MODE TILELANG_CI_PUBLIC_LOGS
+
 # -------------------- Host toolchain paths (machine-specific) --------------------
 LLVM_HOME="${LLVM_HOME:-}"
 LLVM_VERSION_MAJOR="${LLVM_VERSION_MAJOR:-20}"
@@ -105,6 +111,10 @@ ci_list_card_clients () {
     clients=$(ci_card_ctx_clients "${state_dir}")
     if [[ -z ${clients} ]]; then
         echo "ci_check_card_state: no ctx@pid clients under ${state_dir}"
+        return 0
+    fi
+    if [[ "${TILELANG_CI_PUBLIC_LOGS:-0}" == "1" ]]; then
+        echo "ci_check_card_state: device has active clients (details redacted for public CI)"
         return 0
     fi
     echo "ci_check_card_state: clients under ${state_dir}:"
@@ -265,27 +275,59 @@ ci_failure_report_dir () {
     echo "${CI_FAILURE_REPORT_DIR:-${CI_PROJECT_DIR:-$PWD}/ci_failure_reports}"
 }
 
-# Append one JSONL record (one line per case, all statuses). The inline python3 is
-# used only as a JSON encoder for safe escaping of arbitrary log text; it does not
-# run the test case. PASS/SKIPPED pass an empty logfile to omit log_tail.
-# Args: suite case command status exit_code elapsed reason logfile
+# Append one JSONL record. Calls with attempt metadata emit a case_attempt;
+# calls without it retain the existing final case_result schema. The inline
+# python3 only JSON-encodes arbitrary log text; it does not run the test case.
+# PASS/SKIPPED pass an empty logfile to omit log_tail.
+# Args: suite case command status exit_code elapsed reason logfile timeout_seconds
+#       [attempt max_attempts will_retry]
 ci_record_case_result () {
     local suite="$1" case_id="$2" command="$3" status="$4" exit_code="$5" elapsed="$6" reason="$7" logfile="$8"
+    local timeout_seconds="$9" attempt="${10:-}" max_attempts="${11:-}" will_retry="${12:-0}"
     local report_dir; report_dir="$(ci_failure_report_dir)"
     mkdir -p "$report_dir"
     local tail_chars="${CI_CASE_LOG_TAIL_CHARS:-6000}"
     local tail=""
     [[ -n "$logfile" && -f "$logfile" ]] && tail="$(tail -c "$tail_chars" "$logfile")"
     python3 - "$report_dir/${suite}.jsonl" "$suite" "$case_id" "$command" "$status" \
-              "$exit_code" "$elapsed" "$reason" "$tail" <<'PY'
+              "$exit_code" "$elapsed" "$reason" "$tail" "$timeout_seconds" "$attempt" "$max_attempts" "$will_retry" <<'PY'
 import json, os, sys
-out, suite, case_id, command, status, exit_code, elapsed, reason, tail = sys.argv[1:10]
+out, suite, case_id, command, status, exit_code, elapsed, reason, tail, timeout_seconds, attempt, max_attempts, will_retry = sys.argv[1:14]
 rec = {
-    "schema_version": 2, "record_kind": "case_result",
+    "schema_version": 2, "record_kind": "case_attempt" if attempt else "case_result",
     "suite": suite, "job": os.getenv("CI_JOB_NAME", ""), "case": case_id,
     "command": command, "cwd": os.getcwd(), "status": status,
     "exit_code": int(exit_code), "elapsed_seconds": int(elapsed),
+    "timeout_seconds": int(timeout_seconds),
     "failure_reason": reason, "log_tail": tail,
+    "pipeline_id": os.getenv("CI_PIPELINE_ID", ""), "job_id": os.getenv("CI_JOB_ID", ""),
+    "job_name": os.getenv("CI_JOB_NAME", ""), "commit_sha": os.getenv("CI_COMMIT_SHA", ""),
+    "project_id": os.getenv("CI_PROJECT_ID", ""), "mr_iid": os.getenv("CI_MERGE_REQUEST_IID", ""),
+}
+if attempt:
+    rec.update({
+        "attempt": int(attempt),
+        "max_attempts": int(max_attempts),
+        "will_retry": will_retry == "1",
+    })
+with open(out, "a", encoding="utf-8") as fh:
+    fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+PY
+}
+
+ci_record_device_recovery () {
+    local suite="$1" case_id="$2" attempt="$3" device="$4" status="$5" exit_code="$6" reason="$7"
+    local report_dir; report_dir="$(ci_failure_report_dir)"
+    mkdir -p "$report_dir"
+    python3 - "$report_dir/${suite}.jsonl" "$suite" "$case_id" "$attempt" "$device" \
+              "$status" "$exit_code" "$reason" <<'PY'
+import json, os, sys
+out, suite, case_id, attempt, device, status, exit_code, reason = sys.argv[1:9]
+rec = {
+    "schema_version": 2, "record_kind": "device_recovery",
+    "suite": suite, "job": os.getenv("CI_JOB_NAME", ""), "case": case_id,
+    "attempt": int(attempt), "action": "reset", "device": device,
+    "status": status, "exit_code": int(exit_code), "reason": reason,
     "pipeline_id": os.getenv("CI_PIPELINE_ID", ""), "job_id": os.getenv("CI_JOB_ID", ""),
     "job_name": os.getenv("CI_JOB_NAME", ""), "commit_sha": os.getenv("CI_COMMIT_SHA", ""),
     "project_id": os.getenv("CI_PROJECT_ID", ""), "mr_iid": os.getenv("CI_MERGE_REQUEST_IID", ""),
@@ -300,28 +342,64 @@ PY
 # Bound sudo/pt_smi so a stuck reset cannot block GitLab cancel forever.
 ci_reset_gpu_on_timeout () {
     local dev="${TANG_VISIBLE_DEVICES:-0}"
-    local ret
+    local mode="${TILELANG_CI_RESET_MODE:-password}"
+    local suite="${1:-unknown}" case_id="${2:-unknown}" attempt="${3:-0}"
+    local ret=0
     if [[ ${CI_SHUTTING_DOWN:-0} -eq 1 ]]; then
         echo "ci_reset_gpu_on_timeout: skip (job cancelling)"
+        ci_record_device_recovery "$suite" "$case_id" "$attempt" "$dev" SKIPPED 0 "job cancelling" || true
         return 0
     fi
     echo "Resetting Tang device $dev after timeout ..."
-    if ! command -v pt_smi >/dev/null 2>&1; then
-        echo "WARNING: pt_smi is unavailable; cannot reset timed-out Tang device"
-        return 0
-    fi
-    if [[ -z "${SUDO_MAGICWORD:-}" ]]; then
-        echo "WARNING: SUDO_MAGICWORD is unavailable; cannot reset timed-out Tang device"
-        return 0
-    fi
-    if ! printf '%s\n' "$SUDO_MAGICWORD" | sudo -S -p '' \
-            timeout --foreground --kill-after=10s 60 pt_smi -r -i "$dev"; then
-        ret=$?
+    case "$mode" in
+        sudo-n)
+            if [[ "$dev" != "0" ]]; then
+                echo "WARNING: public runner reset is restricted to Tang device 0 (got $dev)"
+                ci_record_device_recovery "$suite" "$case_id" "$attempt" "$dev" SKIPPED 0 \
+                    "public reset is restricted to device 0" || true
+                return 0
+            fi
+            /usr/bin/timeout --foreground --kill-after=10s 60 \
+                /usr/bin/sudo -n /usr/bin/pt_smi -r -i 0 || ret=$?
+            ;;
+        password)
+            if ! command -v pt_smi >/dev/null 2>&1; then
+                echo "WARNING: pt_smi is unavailable; cannot reset timed-out Tang device"
+                ci_record_device_recovery "$suite" "$case_id" "$attempt" "$dev" SKIPPED 0 \
+                    "pt_smi is unavailable" || true
+                return 0
+            fi
+            if [[ -z "${SUDO_MAGICWORD:-}" ]]; then
+                echo "WARNING: SUDO_MAGICWORD is unavailable; cannot reset timed-out Tang device"
+                ci_record_device_recovery "$suite" "$case_id" "$attempt" "$dev" SKIPPED 0 \
+                    "reset credential is unavailable" || true
+                return 0
+            fi
+            printf '%s\n' "$SUDO_MAGICWORD" | sudo -S -p '' \
+                /usr/bin/timeout --foreground --kill-after=10s 60 pt_smi -r -i "$dev" || ret=$?
+            ;;
+        disabled)
+            echo "WARNING: Tang reset is disabled; runner operator intervention may be required"
+            ci_record_device_recovery "$suite" "$case_id" "$attempt" "$dev" SKIPPED 0 \
+                "reset mode is disabled" || true
+            return 0
+            ;;
+        *)
+            echo "WARNING: unsupported TILELANG_CI_RESET_MODE=$mode; Tang device was not reset"
+            ci_record_device_recovery "$suite" "$case_id" "$attempt" "$dev" SKIPPED 0 \
+                "unsupported reset mode" || true
+            return 0
+            ;;
+    esac
+    if [[ $ret -ne 0 ]]; then
         echo "WARNING: Tang reset failed (exit=${ret}); runner operator intervention may be required"
+        ci_record_device_recovery "$suite" "$case_id" "$attempt" "$dev" FAIL "$ret" \
+            "pt_smi reset failed" || true
         ci_dump_device_status
         return 0
     fi
     echo "ci_reset_gpu_on_timeout: pt_smi -r -i ${dev} OK"
+    ci_record_device_recovery "$suite" "$case_id" "$attempt" "$dev" PASS 0 "" || true
 }
 
 # Best-effort pytest skip detection from one case's output. Used by the caller only
@@ -384,6 +462,39 @@ ci_cleanup_state () {
 # so GitLab artifacts can collect them (paths must be under CI_PROJECT_DIR).
 ci_save_device_logs () {
     local dest="${CI_PROJECT_DIR:-$PWD}"
+    if [[ "${TILELANG_CI_PUBLIC_LOGS:-0}" == "1" ]]; then
+        local dev="${TANG_VISIBLE_DEVICES:-0}"
+        local state_file="/proc/pt/ptpu${dev}/state"
+        local state_val="missing" usage_val="" fatal_val=""
+        if [[ -r "$state_file" ]]; then
+            state_val=$(awk -F: '/^[[:space:]]*state:/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$state_file")
+            usage_val=$(awk -F: '/^[[:space:]]*usage:/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$state_file")
+            fatal_val=$(awk -F: '/^[[:space:]]*fatal_error:/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$state_file")
+        fi
+        mkdir -p "$dest"
+        python3 - "$dest/sunrise_device_summary.json" "$dev" "$state_val" "$usage_val" "$fatal_val" <<'PY'
+import json
+import os
+import sys
+
+path, device, state, usage, fatal_error = sys.argv[1:]
+record = {
+    "schema_version": 1,
+    "device": device,
+    "state": state,
+    "usage": usage,
+    "fatal_error": fatal_error,
+    "commit_sha": os.getenv("CI_COMMIT_SHA", ""),
+    "job_name": os.getenv("CI_JOB_NAME", ""),
+    "run_id": os.getenv("CI_PIPELINE_ID", ""),
+}
+with open(path, "w", encoding="utf-8") as output:
+    json.dump(record, output, ensure_ascii=False, sort_keys=True)
+    output.write("\n")
+PY
+        echo "ci_save_device_logs: wrote sanitized public summary ${dest}/sunrise_device_summary.json"
+        return 0
+    fi
     local dmesg_log="${dest}/dmesg.log"
     local pt_log_src="/var/log/pt200/pt.log"
     local pt_log_dst="${dest}/pt.log"
@@ -404,15 +515,24 @@ ci_save_device_logs () {
 ci_create_conda_env () {
     : "${TARGET_TORCH_PTPU_PKG:?Set TARGET_TORCH_PTPU_PKG to an accessible torch_ptpu wheel}"
     : "${TARGET_TRITON_PKG:?Set TARGET_TRITON_PKG to an accessible Triton wheel}"
-    if ! command -v conda >/dev/null 2>&1 && [[ -n ${HOME:-} && -f "$HOME/.bashrc" ]]; then
+    local conda_exe=""
+    if command -v conda >/dev/null 2>&1; then
+        conda_exe="$(command -v conda)"
+    elif [[ -n ${HOME:-} && -f "$HOME/.bashrc" ]]; then
         source "$HOME/.bashrc"
+        if command -v conda >/dev/null 2>&1; then
+            conda_exe="$(command -v conda)"
+        fi
     fi
-    if ! command -v conda >/dev/null 2>&1; then
-        echo "ERROR: conda is not available on PATH"
+    if [[ -z "$conda_exe" && -n ${CONDA_EXE:-} && -x $CONDA_EXE ]]; then
+        conda_exe="$CONDA_EXE"
+    fi
+    if [[ -z "$conda_exe" ]]; then
+        echo "ERROR: conda is not available on PATH and CONDA_EXE is not executable"
         return 1
     fi
     local conda_base conda_init
-    conda_base="$(conda info --base)"
+    conda_base="$("$conda_exe" info --base)"
     conda_init="$conda_base/etc/profile.d/conda.sh"
     if [[ ! -f $conda_init ]]; then
         echo "ERROR: conda shell initialization script not found: $conda_init"
@@ -426,7 +546,9 @@ ci_create_conda_env () {
         exit 1
     fi
     python -m pip install --upgrade pip
-    conda install numpy psutil cython pytest -y
+    # Keep this aligned with pyproject.toml: the wheel targets the Python 3.8
+    # Limited API, which Cython 3.3 no longer supports.
+    conda install numpy psutil "cython>=3.1.0,<3.3" pytest -y
     pip install einops cloudpickle tqdm scipy matplotlib pytest-instafail
     pip install torch=="$TARGET_TORCH_VERSION" --index-url "$TARGET_TORCH_PKG_URL"
     check_exec pip3 install "$TARGET_TORCH_PTPU_PKG"
@@ -462,11 +584,15 @@ PY
 
 # Export TANG/PTPU runtime + build env vars. Call after the conda env is active.
 ci_export_tang_env () {
-    : "${LLVM_HOME:?Set LLVM_HOME to an LLVM installation compatible with the TANG toolchain}"
     local tang_cmake_prefix="${TANGRT_PATH%/}/targets/linux-x86_64"
     local conda_cmake_prefix="${CONDA_PREFIX:?A conda environment must be active}"
     export ENV_PATH=$CONDA_PREFIX
-    export LLVM_HOME LLVM_VERSION_MAJOR LLVM_VERSION_MINOR
+    if [[ -n "$LLVM_HOME" ]]; then
+        export LLVM_HOME
+    else
+        unset LLVM_HOME
+    fi
+    export LLVM_VERSION_MAJOR LLVM_VERSION_MINOR
     export TANGRT_PATH STPU_TANGRT_PATH VENDOR_INCLUDE_DIRS PTCC_PATH CMAKE_PATH CMAKE_ROOT
     # Prefer the physical target prefix over /usr/local/tangrt-* symlinks.  The
     # vendor package computes imported library paths relative to its config
@@ -558,6 +684,27 @@ ci_install_tilelang_whl () {
     check_exec pip install --no-deps "$tl_whl"
 }
 
+# Verify the installed wheel from outside the source checkout.  This catches a
+# missing native library or TANG registration without accidentally importing the
+# in-tree Python package.
+ci_assert_tilelang_tang_registration () {
+    local launch_cwd="${CI_TMP_DIR:?ci_init_state must run before wheel verification}"
+    (
+        cd "$launch_cwd"
+        python3 - <<'PY'
+import tilelang
+import tvm
+
+print(f"installed tilelang: {tilelang.__file__}")
+print(f"tvm source: {tvm.__file__}")
+registered = tvm.get_global_func("target.build.tilelang_tang", allow_missing=True)
+if registered is None:
+    raise SystemExit("target.build.tilelang_tang is not registered")
+print("target.build.tilelang_tang: registered")
+PY
+    )
+}
+
 # Run one puzzle script body (no timeout). Caller wraps with ci_run_timed.
 # Fail on non-zero exit or "Results match: False" in the logfile.
 ci_puzzle_postcheck () {
@@ -602,6 +749,18 @@ ci_run_timed () {
     return "$ret"
 }
 
+# GNU timeout normally returns 124. Tang/Python teardown may instead surface a
+# child status. Signal exits at the limit, or any nonzero exit after the limit,
+# are timeouts and require recovery; short-lived signal failures remain FAIL.
+ci_result_is_timeout () {
+    local ret="$1" elapsed="$2" case_timeout="$3"
+    [[ "$ret" -eq 124 ]] && return 0
+    if (( elapsed >= case_timeout )) && [[ "$ret" -eq 137 || "$ret" -eq 143 ]]; then
+        return 0
+    fi
+    (( elapsed >= case_timeout ))
+}
+
 # Initialize the shared report directory once.  A job may run multiple lists
 # (pytest files followed by direct scripts); later suites must not erase the
 # evidence produced by earlier suites.
@@ -619,9 +778,11 @@ ci_prepare_failure_reports () {
 # Run a test-case list. $1=list file, $2=mode (command|pytest|puzzle).
 # In pytest mode, bare Python paths use pytest while "python path.py" entries
 # run as direct commands.
-# Honors TEST_MARKER, CASE_TIMEOUT, CASE_REPEAT, TILELANG_CACHE_DIR.
-# CASE_REPEAT (default 3): per-case attempts until PASS/SKIPPED; only the final
-# attempt is tallied/reported (no batching).
+# Honors TEST_MARKER, CASE_TIMEOUT, CASE_REPEAT, TILELANG_CACHE_DIR. An optional
+# sibling <list-name>_timeouts.tsv maps an exact case label to a larger/smaller
+# timeout in seconds. Unknown, duplicate, or malformed mappings fail closed.
+# CASE_REPEAT (default 3): per-case attempts until PASS/SKIPPED. Every attempt
+# is reported; only the final case outcome is tallied (no batching).
 # Returns 1 if any case fails.
 ci_run_test_list () {
     local list_file="$1" mode="${2:-pytest}" suite="${3:-}"
@@ -629,6 +790,7 @@ ci_run_test_list () {
     local case_repeat="${CASE_REPEAT:-3}"
     local cache_dir="${TILELANG_CACHE_DIR:-$HOME/.tilelang/cache}"
     local list_root; list_root="$(cd "$(dirname "$list_file")" && pwd)"
+    local timeout_file="${CASE_TIMEOUT_FILE:-${list_file%.txt}_timeouts.tsv}"
 
     if ! [[ $case_repeat =~ ^[1-9][0-9]*$ ]]; then
         echo "ERROR: Invalid CASE_REPEAT=$case_repeat (need positive integer)"
@@ -648,6 +810,7 @@ ci_run_test_list () {
     ci_assert_runtime_stack
 
     local -a cmds=() labels=() case_modes=()
+    local -A case_timeouts=()
     local line
     while IFS= read -r line; do
         [[ $line =~ ^#.*$ ]] && continue
@@ -683,10 +846,48 @@ ci_run_test_list () {
         esac
     done < "$list_file"
 
+    if [[ -f "$timeout_file" ]]; then
+        local timeout_case timeout_value
+        while IFS= read -r line || [[ -n $line ]]; do
+            [[ $line =~ ^[[:space:]]*# ]] && continue
+            [[ -z $line ]] && continue
+            timeout_case="${line%%$'\t'*}"
+            timeout_value="${line#*$'\t'}"
+            if [[ "$timeout_case" == "$line" || -z "$timeout_case" || \
+                  "$timeout_value" == *$'\t'* || ! "$timeout_value" =~ ^[1-9][0-9]*$ ]]; then
+                echo "ERROR: Invalid timeout mapping in $timeout_file: $line"
+                return 1
+            fi
+            if [[ -n "${case_timeouts[$timeout_case]+set}" ]]; then
+                echo "ERROR: Duplicate timeout mapping for $timeout_case in $timeout_file"
+                return 1
+            fi
+            case_timeouts["$timeout_case"]="$timeout_value"
+        done < "$timeout_file"
+    fi
+
     local num=${#cmds[@]}
     echo "Total test cases: $num   (mode: $mode, marker: ${TEST_MARKER:-all}, repeat: ${case_repeat})"
     if [[ $num -eq 0 ]]; then
         echo "Error: no valid test cases found in $list_file"; return 1
+    fi
+
+    if (( ${#case_timeouts[@]} > 0 )); then
+        local override_case candidate found
+        for override_case in "${!case_timeouts[@]}"; do
+            found=0
+            for candidate in "${labels[@]}"; do
+                if [[ "$candidate" == "$override_case" ]]; then
+                    found=1
+                    break
+                fi
+            done
+            if [[ $found -eq 0 ]]; then
+                echo "ERROR: Timeout mapping does not match a case in $list_file: $override_case"
+                return 1
+            fi
+        done
+        echo "Per-case timeout mappings: $timeout_file"
     fi
 
     # Clear stale reports only before this job's first list.  Subsequent lists
@@ -695,9 +896,12 @@ ci_run_test_list () {
 
     local -a results=()
     local success=0 fail=0 skipped=0 i ret start end elapsed line_result
-    local attempt case_status reason rec_log current_mode launch_cwd logfile
+    local attempt case_status reason rec_log current_mode launch_cwd logfile current_timeout
+    local needs_timeout_reset will_retry
     for ((i=0; i<num; i++)); do
         echo ">>>>>>> running case $((i+1))/$num: ${labels[$i]} <<<<<<<<"
+        current_timeout="${case_timeouts[${labels[$i]}]:-$case_timeout}"
+        echo "Case timeout: ${current_timeout}s"
         current_mode="${case_modes[$i]}"
         launch_cwd=""
         if [[ "$current_mode" == "pytest" && -n "${PYTEST_LAUNCH_CWD:-}" ]]; then
@@ -707,6 +911,7 @@ ci_run_test_list () {
         # Per-case retry: up to CASE_REPEAT attempts until PASS/SKIPPED; tally once.
         case_status="" reason="" ret=1 elapsed=0 rec_log=""
         for (( attempt = 1; attempt <= case_repeat; attempt++ )); do
+            needs_timeout_reset=0
             if [[ ${CI_SHUTTING_DOWN:-0} -eq 1 ]]; then
                 exit 143
             fi
@@ -718,7 +923,7 @@ ci_run_test_list () {
             start=$(date +%s)
             # `|| ret=$?` keeps set -e callers from aborting before we classify the result.
             ret=0
-            ci_run_timed "$case_timeout" "$logfile" "${cmds[$i]}" "$launch_cwd" || ret=$?
+            ci_run_timed "$current_timeout" "$logfile" "${cmds[$i]}" "$launch_cwd" || ret=$?
             if [[ "$current_mode" == "puzzle" ]]; then
                 ci_puzzle_postcheck "$logfile" "$ret" || ret=$?
             fi
@@ -728,13 +933,23 @@ ci_run_test_list () {
                 case_status="SKIPPED"; reason="no tests ran / all skipped"; rec_log=""
             elif [[ $ret -eq 0 ]]; then
                 case_status="PASS"; reason=""; rec_log=""
-            elif [[ $ret -eq 124 ]]; then
-                case_status="TIMEOUT"; reason="timed out after ${case_timeout}s"; rec_log="$logfile"
-                ci_reset_gpu_on_timeout
+            elif ci_result_is_timeout "$ret" "$elapsed" "$current_timeout"; then
+                case_status="TIMEOUT"; reason="timed out after ${current_timeout}s (exit ${ret})"; rec_log="$logfile"
+                needs_timeout_reset=1
             elif [[ $ret -eq 137 ]]; then
-                case_status="FAIL"; reason="OOM (exit 137)"; rec_log="$logfile"
+                case_status="FAIL"; reason="terminated by SIGKILL (exit 137)"; rec_log="$logfile"
             else
                 case_status="FAIL"; reason="exit code $ret"; rec_log="$logfile"
+            fi
+
+            will_retry=0
+            if [[ $case_status != "PASS" && $case_status != "SKIPPED" && $attempt -lt $case_repeat ]]; then
+                will_retry=1
+            fi
+            ci_record_case_result "$suite" "${labels[$i]}" "${cmds[$i]}" "$case_status" \
+                "$ret" "$elapsed" "$reason" "$rec_log" "$current_timeout" "$attempt" "$case_repeat" "$will_retry"
+            if [[ $needs_timeout_reset -eq 1 ]]; then
+                ci_reset_gpu_on_timeout "$suite" "${labels[$i]}" "$attempt"
             fi
 
             if [[ $case_status == "PASS" || $case_status == "SKIPPED" ]]; then
@@ -763,7 +978,8 @@ ci_run_test_list () {
                 line_result="FAILURE: ${labels[$i]} (exit $ret, ${elapsed}s)"; fail=$((fail+1)) ;;
         esac
         # Record every case (PASS/SKIPPED carry no log_tail to bound artifact size).
-        ci_record_case_result "$suite" "${labels[$i]}" "${cmds[$i]}" "$case_status" "$ret" "$elapsed" "$reason" "$rec_log"
+        ci_record_case_result "$suite" "${labels[$i]}" "${cmds[$i]}" "$case_status" \
+            "$ret" "$elapsed" "$reason" "$rec_log" "$current_timeout"
         [[ -n $rec_log ]] && rm -f "$rec_log"
         results+=("$line_result")
         echo "  -> $line_result"

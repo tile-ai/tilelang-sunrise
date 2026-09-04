@@ -69,7 +69,9 @@ class BatchNormFwdFixture(FixtureBase):
             pytest.param(4, 64, (64, 64), torch.float16, True, marks=pytest.mark.full),
             # BatchNorm2d – (N, C, H, W)
             pytest.param(8, 64, (1024, 1024), torch.float16, True, marks=pytest.mark.full),
-            pytest.param(8, 64, (2048, 2048), torch.float16, False, marks=pytest.mark.full),
+            # Keep the 2048x2048 spatial path while bounding the CPU reference
+            # memory footprint for 32 GiB CI hosts.
+            pytest.param(2, 64, (2048, 2048), torch.float16, False, marks=pytest.mark.full),
             pytest.param(4, 128, (32, 32), torch.bfloat16, True, marks=pytest.mark.full),
             # Non-aligned spatial: H*W=900, exercises partial-tile path
             pytest.param(8, 64, (30, 30), torch.float16, True, marks=pytest.mark.full),
