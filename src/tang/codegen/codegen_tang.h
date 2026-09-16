@@ -56,6 +56,7 @@ public:
   void VisitExpr_(const CastNode *op, std::ostream &os) final;
   void VisitExpr_(const MinNode *op, std::ostream &os) final;
   void VisitExpr_(const MaxNode *op, std::ostream &os) final;
+  void VisitExpr_(const NotNode *op, std::ostream &os) final;
   void VisitStmt_(const EvaluateNode *op) final;
   void VisitStmt_(const AllocBufferNode *op) final;
   void VisitStmt_(const AttrStmtNode *op) final;
@@ -129,10 +130,6 @@ private:
   bool enable_warp_shuffle_{false};
   // whether need __clang_tang_builtin_vars.h
   bool need___clang_tang_builtin_vars_h{false};
-  // whether need need___clang_tang_fp16.h
-  bool need___clang_tang_fp16_h{false};
-  // whether need need___clang_tang_bf16.h
-  bool need___clang_tang_bf16_h{false};
   // whether need mma.h
   bool need_mma_h_{false};
   // whether need tl mma instruction header
@@ -146,8 +143,13 @@ private:
   // whether need tcgen_05 common header
   bool need_tcgen05_common_h_{false};
   // whether need the TANG swizzled bulk-copy helper header
-  // (tang/copy_fcp_g_s.h)
+  // (tang/copy_global_shm.h)
   bool need_cp_async_bulk_h_{false};
+  // whether need the TANG tmem<->smem copy helper header (tang/copy_tmem_shm.h)
+  bool need_cp_tmem_smem_h_{false};
+  // whether need the TANG mbarrier header (tang/barrier.h), which defines the
+  // Barrier type this codegen names in mbarrier_dtype_
+  bool need_barrier_h_{false};
   // whether need cast_smem_ptr_to_int helper function
   bool need_cast_smem_ptr_to_int_{false};
   // whether need cooperative_groups.h

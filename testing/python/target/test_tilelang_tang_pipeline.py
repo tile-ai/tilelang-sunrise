@@ -1,7 +1,7 @@
 import pytest
 
 import tilelang.language as T
-from tilelang.backend.pass_pipeline import resolve_pipeline
+from tilelang.backend import create_backend_context, get_backend
 from tilelang.engine.lower import device_codegen_without_compile, lower_to_host_device_ir
 from tilelang.tang.subtarget import (
     TangSubtarget as S,
@@ -27,7 +27,7 @@ def test_tang_transform_is_registered(name):
 
 
 def test_tang_pipeline_is_registered():
-    pipeline = resolve_pipeline(Target({"kind": "tang", "arch": "stcuv2"}))
+    pipeline = get_backend("tang").get_pipeline(Target({"kind": "tang", "arch": "stcuv2"}))
     assert pipeline.name == "tang"
 
 
@@ -40,12 +40,33 @@ def test_tang_pipeline_lowers_minimal_kernel(arch):
 
     host_mod, device_mod, _, target, _ = lower_to_host_device_ir(
         main.with_attr("global_symbol", "main"),
-        target={"kind": "tang", "arch": arch},
+        create_backend_context({"kind": "tang", "arch": arch}),
     )
 
     assert target.attrs["arch"] == arch
     assert len(host_mod.functions) == 1
     assert len(device_mod.functions) == 1
+
+
+@pytest.mark.parametrize("arch", ["stcu", "stcuv2"])
+def test_tang_pipeline_lowers_reducer(arch):
+    @T.prim_func
+    def main(A: T.Tensor((8,), "float32"), B: T.Tensor((1,), "float32")):
+        with T.Kernel(1, threads=128):
+            src = T.alloc_fragment((8,), "float32")
+            T.copy(A, src)
+            acc = T.alloc_reducer((1,), "float32", op="sum")
+            T.reducer_init(acc)
+            for i in T.Parallel(8):
+                T.reducer_update(acc[0], src[i])
+            result = T.alloc_fragment((1,), "float32")
+            T.finalize_reducer(acc, result)
+            T.copy(result, B)
+
+    source = _lower_tang_source(main, arch=arch)
+    assert "tl::SumOp" in source
+    assert "reducer_update" not in source
+    assert "finalize_reducer" not in source
 
 
 @pytest.mark.parametrize(
@@ -109,12 +130,13 @@ def test_tang_pipeline_lowers_shared_cumsum():
 
 def _lower_tang_source(func, arch="stcu"):
     requested_target = Target({"kind": "tang", "arch": arch})
+    context = create_backend_context(requested_target)
     with requested_target:
         _, device_mod, _, target, _ = lower_to_host_device_ir(
             func.with_attr("global_symbol", "main"),
-            target=requested_target,
+            context,
         )
-    return device_codegen_without_compile(device_mod, target).inspect_source("tang")
+    return device_codegen_without_compile(device_mod, context).inspect_source("tang")
 
 
 def test_tang_pipeline_lowers_scalar_atomic_builtins():
@@ -225,7 +247,10 @@ def test_tang_pipeline_preserves_extended_scalar_atomic_contract():
         "atomicDec(",
     ):
         assert name in source
-    assert source.count("(unsigned int*)") >= 6
+    assert source.count("(unsigned int*)") >= 5
+    # The neutral OR builtin receives an already-unsigned pointer.
+    assert "uint* __restrict__ U" in source
+    assert "atomicOr(&(U[0]), 1)" in source
 
 
 def test_tang_pipeline_lowers_extended_tile_atomics():

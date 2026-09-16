@@ -89,9 +89,16 @@ def get_parallel_select_kernel():
     return main
 
 
-def test_parallel_select_vectorized_condition():
+def test_parallel_select_uniform_condition():
     device = get_current_device()
     kernel = get_parallel_select_kernel()
+    source = kernel.get_kernel_source()
+
+    assert "if (" not in source
+    assert ") ? " in source
+    if device.type == "cuda":
+        assert "*(float4*)" in source or "load_global_256" in source
+
     A = torch.randn((1024,), dtype=torch.float32, device=device)
     B = torch.empty_like(A)
 
@@ -102,6 +109,41 @@ def test_parallel_select_vectorized_condition():
     expected = torch.zeros_like(A)
     expected[:512] = A[:512]
     torch.testing.assert_close(B.cpu(), expected.cpu())
+
+
+@tilelang.jit
+def get_parallel_data_dependent_select_kernel():
+    @T.prim_func
+    def main(
+        A: T.Tensor[(256,), T.float32],
+        B: T.Tensor[(256,), T.float32],
+    ):
+        with T.Kernel(1, threads=32):
+            for i in T.Parallel(256):
+                B[i] = T.Select(A[i] > T.float32(0), A[i], T.float32(0))
+
+    return main
+
+
+def test_parallel_data_dependent_select_disables_auto_vectorization():
+    device = get_current_device()
+    kernel = get_parallel_data_dependent_select_kernel()
+    source = kernel.get_kernel_source()
+
+    assert "if (" not in source
+    assert ") ? " in source
+    assert "*(float4*)" not in source
+    assert "load_global_256" not in source
+
+    A = torch.randn((256,), dtype=torch.float32, device=device)
+    B = torch.empty_like(A)
+    kernel(A, B)
+
+    if device.type == "ptpu":
+        torch.ptpu.synchronize(device)
+    A_cpu = A.cpu()
+    expected = torch.where(A_cpu > 0, A_cpu, torch.zeros_like(A_cpu))
+    torch.testing.assert_close(B.cpu(), expected)
 
 
 if __name__ == "__main__":

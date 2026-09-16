@@ -4,18 +4,21 @@ import tilelang.language as T
 from tilelang.profiler import do_bench
 import argparse
 
-try:
-    from fla.ops.linear_attn import fused_chunk_linear_attn  # We compare with FLA
+from tilelang.utils.target import determine_target
 
-    _HAS_FLA = True
-except ImportError:
-    _HAS_FLA = False
+_HAS_FLA = False
+if determine_target(return_object=True).kind.name == "cuda":
+    try:
+        from fla.ops.linear_attn import fused_chunk_linear_attn
+
+        _HAS_FLA = True
+    except ImportError:
+        pass
 
 from einops import rearrange
-from typing import Optional, Tuple
 
 
-def l2norm_fwd(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def l2norm_fwd(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Pure PyTorch L2 normalization along the last dimension (replaces FLA's l2norm_fwd)."""
     norm = (x * x).sum(dim=-1, keepdim=True).sqrt()
     return x / norm, norm
@@ -103,7 +106,7 @@ def tl_fused_chunk_fwd(q, k, v):
     return o, h
 
 
-def ref_program(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: Optional[float] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+def ref_program(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float | None = None) -> tuple[torch.Tensor, torch.Tensor]:
     q, k, v = q.float(), k.float(), v.float()
     if scale is None:
         scale = q.shape[-1] ** -0.5

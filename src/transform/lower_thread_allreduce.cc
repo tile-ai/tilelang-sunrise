@@ -1,26 +1,8 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
-
 /*!
  *  Lower allreduce to device implementable ir.
  * \file lower_thread_allreduce.cc
  */
+#include "op/builtin.h"
 #include "support/check.h"
 #include <tvm/arith/analyzer.h>
 #include <tvm/ir/cast.h>
@@ -752,8 +734,11 @@ private:
     }
 
     // normal synchronization
+    // TANG's shared-memory fallback must not require CUDA active-mask/ballot
+    // intrinsics. Keep each combine guarded and synchronize the whole block.
     bool warp_align =
-        group_extent == 1 || contiguous_reduce_extent % warp_size_ == 0;
+        target_->kind->name != "tang" &&
+        (group_extent == 1 || contiguous_reduce_extent % warp_size_ == 0);
     while (reduce_align > contiguous_reduce_extent ||
            reduce_align > warp_size_ || !warp_align) {
       if (reduce_align == 1) {
@@ -767,6 +752,9 @@ private:
     // in warp synchronization.
     if (reduce_align > 1) {
       PrimExpr in_warp_cond = reduce_index < (reduce_align >> 1);
+
+      Var active_mask("allreduce_active_mask", DataType::UInt(32));
+      Var participant_mask("allreduce_participant_mask", DataType::UInt(32));
 
       std::vector<Stmt> in_warp_seq;
 
@@ -792,10 +780,10 @@ private:
         }
 
         std::vector<Stmt> in_let_statement;
-        in_let_statement.emplace_back(SyncThread("warp"));
+        in_let_statement.emplace_back(SyncWarp(participant_mask));
         in_let_statement.emplace_back(
             fstore({in_warp_local_vars.begin(), in_warp_local_vars.end()}));
-        in_let_statement.emplace_back(SyncThread("warp"));
+        in_let_statement.emplace_back(SyncWarp(participant_mask));
 
         Stmt body = SeqStmt::Flatten(in_let_statement);
         for (size_t i = 0; i < size; i++) {
@@ -806,6 +794,15 @@ private:
 
       Stmt warp_body = SeqStmt::Flatten(in_warp_seq);
 
+      PrimExpr active_mask_value =
+          Call(DataType::UInt(64), tl::activemask(), {});
+      PrimExpr participant_mask_value = Call(
+          DataType::UInt(64), tl::ballot_sync(), {active_mask, in_warp_cond});
+
+      seq.emplace_back(
+          tirx::Bind(active_mask, Cast(DataType::UInt(32), active_mask_value)));
+      seq.emplace_back(tirx::Bind(
+          participant_mask, Cast(DataType::UInt(32), participant_mask_value)));
       seq.emplace_back(IfThenElse(in_warp_cond, warp_body));
       seq.emplace_back(SyncThread(shared_scope));
     }
@@ -842,10 +839,16 @@ private:
       return reduce_index;
     }
   }
+
   // sync thread op.
   static Stmt SyncThread(const std::string &sync) {
     return Evaluate(Call(DataType::Int(32), builtin::tvm_storage_sync(),
                          {StringImm(sync)}));
+  }
+
+  // sync warp op.
+  static Stmt SyncWarp(PrimExpr mask) {
+    return Evaluate(Call(DataType::Void(), tl::sync_warp(), {std::move(mask)}));
   }
 
   // Emit warp shuffle  calls.

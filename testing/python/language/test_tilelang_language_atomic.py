@@ -1,4 +1,5 @@
 import os
+import re
 
 import pytest
 import tilelang.testing
@@ -40,13 +41,6 @@ from tilelang import tvm
 
 
 # ======================= Thread-level atomic add =======================
-
-
-def _check_hopper():
-    if not torch.cuda.is_available() or torch.version.hip is not None:
-        return False
-    props = torch.cuda.get_device_properties(torch.cuda.current_device())
-    return (props.major, props.minor) == (9, 0)
 
 
 @tilelang.jit
@@ -341,23 +335,59 @@ def tma_atomic_add_program(out, explicit_swizzle=False):
             T.atomic_add(out, out_shared, use_tma=True)
 
 
-def tma_atomic_add_compile_program(dtype):
+@tilelang.jit
+def tma_atomic_add_uint64_program(out):
+    out: T.Tensor[(16, 16), T.uint64]
+
+    with T.Kernel(1):
+        out_shared = T.alloc_shared((16, 16), dtype=T.uint64)
+        T.fill(out_shared, 1)
+        for _ in range(4):
+            T.atomic_add(out, out_shared, use_tma=True)
+
+
+@tilelang.jit
+def tma_atomic_add_32b_swizzle_program(out):
+    out: T.Tensor[(16, 24), T.float32]
+
+    with T.Kernel(1):
+        out_shared = T.alloc_shared((16, 24), dtype=T.float32)
+        T.fill(out_shared, 1)
+        T.atomic_add(out, out_shared, use_tma=True)
+
+
+def tma_atomic_add_compile_program(dtype, shape=(16, 16), explicit_layout=False):
     @T.prim_func
-    def main(out: T.Tensor((16, 16), dtype)):
+    def main(out: T.Tensor(shape, dtype)):
         with T.Kernel(1):
-            out_shared = T.alloc_shared((16, 16), dtype=dtype)
+            out_shared = T.alloc_shared(shape, dtype=dtype)
+            if explicit_layout:
+                T.annotate_layout({out_shared: tilelang.layout.make_wgmma_swizzled_layout(out_shared)})
             T.atomic_add(out, out_shared, use_tma=True)
 
     return main
 
 
-def lower_tma_atomic_add(dtype):
-    target = tvm.target.Target({"kind": "cuda", "arch": "sm_90"})
+def lower_tma_atomic_add(dtype, arch="sm_90", shape=(16, 16), explicit_layout=False):
+    target = tvm.target.Target({"kind": "cuda", "arch": arch})
     with target:
-        return tilelang.lower(tma_atomic_add_compile_program(dtype), target=target)
+        return tilelang.lower(
+            tma_atomic_add_compile_program(dtype, shape=shape, explicit_layout=explicit_layout),
+            target=target,
+        )
 
 
-@pytest.mark.skipif(not _check_hopper(), reason="Requires Hopper GPU (sm_90)")
+def get_tma_atomic_add_descriptor_args(artifact):
+    for func in artifact.host_mod.functions.values():
+        if func.attrs is None or "tma_descriptor_args" not in func.attrs:
+            continue
+        descriptors = list(func.attrs["tma_descriptor_args"].values())
+        assert len(descriptors) == 1
+        return list(descriptors[0])
+    raise AssertionError("TMA descriptor metadata not found")
+
+
+@tilelang.testing.requires_cuda_compute_version_ge(9, 0)
 def test_tma_atomic_add():
     out = torch.zeros((16, 16), dtype=torch.float32, device="cuda")
     tma_atomic_add_program(out)
@@ -372,20 +402,137 @@ def test_tma_atomic_add():
     assert kernel.get_kernel_source() == kernel_with_explicit_swizzle.get_kernel_source()
 
 
+@tilelang.testing.requires_cuda_compute_version_ge(9, 0)
+def test_tma_atomic_add_uint64_runtime():
+    out = torch.zeros((16, 16), dtype=torch.uint64, device="cuda")
+    tma_atomic_add_uint64_program(out)
+    torch.testing.assert_close(out, torch.full_like(out, 4), rtol=0, atol=0)
+
+
+@tilelang.testing.requires_cuda_compute_version_ge(9, 0)
+def test_tma_atomic_add_wide_linear_layout_runtime():
+    rows, global_width, tile_width, col_offset = 8, 520, 512, 8
+
+    @tilelang.jit
+    def kernel(out):
+        out: T.Tensor[(rows, global_width), T.uint64]
+
+        with T.Kernel(1):
+            out_shared = T.alloc_shared((rows, tile_width), dtype=T.uint64)
+            T.fill(out_shared, 1)
+            T.atomic_add(
+                out[:, col_offset : col_offset + tile_width],
+                out_shared,
+                use_tma=True,
+            )
+
+    compiled = kernel.compile(out=T.Tensor[(rows, global_width), T.uint64])
+    source = compiled.get_kernel_source()
+    assert re.search(
+        r"for \(int \w+ = 0; \w+ < 2; \+\+\w+\) \{\n\s*tl::tma_store_add\(",
+        source,
+    )
+
+    out = torch.zeros((rows, global_width), dtype=torch.uint64, device="cuda")
+    compiled(out)
+    torch.cuda.synchronize()
+    assert torch.all(out[:, :col_offset] == 0)
+    assert torch.all(out[:, col_offset:] == 1)
+
+
+@tilelang.testing.requires_cuda_compute_version_ge(9, 0)
+def test_tma_atomic_add_versioned_smem_slice_runtime():
+    """A version slice of a wide linear buffer must stay contiguous under the
+    inferred layout, or the second TMA box silently reads the other version."""
+    rows, width = 8, 512
+
+    @tilelang.jit
+    def kernel(out):
+        out: T.Tensor[(rows, width), T.uint64]
+
+        with T.Kernel(1):
+            smem = T.alloc_shared((2, rows, width), dtype=T.uint64)
+            T.fill(smem, 7)  # decoy in version 0
+            for i, j in T.Parallel(rows, width):
+                smem[1, i, j] = 1
+            T.atomic_add(out, smem[1, :, :], use_tma=True)
+
+    compiled = kernel.compile(out=T.Tensor[(rows, width), T.uint64])
+    source = compiled.get_kernel_source()
+    assert re.search(
+        r"for \(int \w+ = 0; \w+ < 2; \+\+\w+\) \{\n\s*tl::tma_store_add\(",
+        source,
+    )
+
+    out = torch.zeros((rows, width), dtype=torch.uint64, device="cuda")
+    compiled(out)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, torch.ones_like(out), rtol=0, atol=0)
+
+
+@tilelang.testing.requires_cuda_compute_version_ge(9, 0)
+def test_tma_atomic_add_32b_swizzle_runtime():
+    out = torch.zeros((16, 24), dtype=torch.float32, device="cuda")
+    tma_atomic_add_32b_swizzle_program(out)
+    torch.testing.assert_close(out, torch.ones_like(out), rtol=0, atol=0)
+
+
 @tilelang.testing.requires_cuda
 @tilelang.testing.requires_cuda_compute_version_ge(9, 0)
-@pytest.mark.parametrize("dtype", [T.int16, T.float64, T.uint64, T.float32x2])
+@pytest.mark.parametrize("dtype", [T.int16, T.int64, T.float64, T.float32x2])
 def test_tma_atomic_add_rejects_unsupported_dtype(dtype):
-    with pytest.raises(Exception, match=rf"TMA atomic add does not support dtype {dtype}.*supported scalar dtypes"):
+    with pytest.raises(
+        tvm.error.InternalError,
+        match=rf"TMA atomic add does not support dtype {dtype}.*supported scalar dtypes",
+    ):
         lower_tma_atomic_add(dtype)
 
 
 @tilelang.testing.requires_cuda
 @tilelang.testing.requires_cuda_compute_version_ge(9, 0)
-@pytest.mark.parametrize("dtype", [T.float16, T.bfloat16, T.float32, T.int32, T.uint32])
-def test_tma_atomic_add_accepts_supported_dtype(dtype):
+@pytest.mark.parametrize("dtype", [T.float16, T.bfloat16, T.float32, T.int32, T.uint32, T.uint64])
+def test_tma_atomic_add_accepts_ptx_dtype(dtype):
     artifact = lower_tma_atomic_add(dtype)
     assert "tma_store_add" in artifact.kernel_source
+
+
+@tilelang.testing.requires_cuda
+def test_tma_atomic_add_uint64_uses_linear_layout():
+    artifact = lower_tma_atomic_add(T.uint64)
+    descriptor_args = get_tma_atomic_add_descriptor_args(artifact)
+    # The final four descriptor arguments are interleave, swizzle, L2
+    # promotion, and OOB fill. uint64 intentionally uses no swizzle because
+    # its GEMM K-inner layout is not representable by TensorMap.
+    assert descriptor_args[-3].value == 0
+
+
+@tilelang.testing.requires_cuda
+def test_tma_atomic_add_splits_32b_swizzle_box():
+    artifact = lower_tma_atomic_add(T.float32, shape=(16, 24))
+    descriptor_args = get_tma_atomic_add_descriptor_args(artifact)
+    assert descriptor_args[-3].value == 1
+    assert re.search(
+        r"for \(int \w+ = 0; \w+ < 3; \+\+\w+\) \{\n\s*tl::tma_store_add",
+        artifact.kernel_source,
+    )
+
+
+@tilelang.testing.requires_cuda
+def test_tma_atomic_add_rejects_pre_hopper_target():
+    with pytest.raises(
+        tvm.error.InternalError,
+        match=r"TMA atomic add requires a CUDA target with TMA support \(SM90\+\)",
+    ):
+        lower_tma_atomic_add(T.float32, arch="sm_80")
+
+
+@tilelang.testing.requires_cuda
+def test_tma_atomic_add_rejects_unencodable_explicit_layout():
+    with pytest.raises(
+        tvm.error.InternalError,
+        match=r"TMA atomic add cannot encode the shared layout.*not representable by a TensorMap descriptor",
+    ):
+        lower_tma_atomic_add(T.uint64, explicit_layout=True)
 
 
 def run_atomic_add_auto_vectorized(K, M, N, block_M, block_N, dtype=T.float32):
@@ -413,6 +560,41 @@ def run_atomic_add_auto_vectorized_unit_test(vec_size: int, dtype=T.float32):
     source = kernel.get_kernel_source()
     expected_intrinsic = "atomicAdd" if target_is_tang(_test_target()) else f"AtomicAddx{vec_size}"
     assert expected_intrinsic in source
+
+
+@tilelang.jit
+def atomic_add_vectorized_memory_order_program(N, threads, memory_order, dtype=T.float16):
+    @T.prim_func
+    def atomic_add(X: T.Tensor((N,), dtype), Out: T.Tensor((N,), dtype)):
+        with T.Kernel(1, threads=threads):
+            T.atomic_add(Out[0:N], X[0:N], memory_order=memory_order)
+
+    return atomic_add
+
+
+def run_atomic_add_vectorized_memory_order(N, threads, memory_order, memory_order_id, dtype=T.float16):
+    # A vectorized atomic add must carry the requested memory order, just like
+    # the scalar lowering of the same call does. Cache disabled because the key
+    # does not cover the native library by default, so a stale pre-fix kernel
+    # source would otherwise be served here.
+    tilelang.disable_cache()
+    try:
+        kernel = atomic_add_vectorized_memory_order_program(N, threads, memory_order, dtype=dtype)
+
+        wide_calls = re.findall(r"AtomicAddx\d\([^;]*\);", kernel.get_kernel_source())
+        assert wide_calls, f"expected a vectorized atomic add, got:\n{kernel.get_kernel_source()}"
+        for call in wide_calls:
+            assert call.endswith(f", {memory_order_id});"), f"{memory_order} dropped from vectorized atomic add: {call}"
+
+        # Each order takes a separately spelled asm string in the device helpers,
+        # so run the kernel to check this one actually computes the sum.
+        torch_dtype = getattr(torch, dtype)
+        X = torch.randn(N, dtype=torch_dtype).cuda()
+        Out = torch.zeros(N, dtype=torch_dtype).cuda()
+        kernel(X, Out)
+        torch.testing.assert_close(Out, X, atol=1e-2, rtol=1e-2)
+    finally:
+        tilelang.enable_cache()
 
 
 @tilelang.jit
@@ -468,7 +650,7 @@ def test_atomic_add_mixed_dtype_fp16():
 
 
 @tilelang.testing.requires_cuda
-@tilelang.testing.requires_cuda_compute_version_ge(8, 0)
+@tilelang.testing.requires_cuda_compute_version_ge(7, 0)
 def test_atomic_add_mixed_dtype_bf16():
     run_atomic_add_mixed_dtype(8, T.float32, T.bfloat16)
     run_atomic_addx2_mixed_dtype(32, 64, 8, 16, T.float32, T.bfloat16)
@@ -481,6 +663,28 @@ def test_atomic_different_memory_orders():
     run_atomic_different_memory_orders(32, 32, 8, 8, dtype=T.bfloat16)
 
 
+# ids match cuda::memory_order. Each one is a separately spelled asm string in
+# the device helpers, so all three ordered spellings need exercising.
+_ORDERED_MEMORY_ORDERS = [("acquire", 2), ("release", 3), ("acq_rel", 4)]
+
+
+@tilelang.testing.requires_cuda
+@pytest.mark.parametrize("memory_order, memory_order_id", _ORDERED_MEMORY_ORDERS)
+def test_atomic_add_vectorized_preserves_memory_order(memory_order, memory_order_id):
+    run_atomic_add_vectorized_memory_order(64, 32, memory_order, memory_order_id, dtype=T.float16)
+
+
+@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version_ge(8, 0)
+@pytest.mark.parametrize("memory_order, memory_order_id", _ORDERED_MEMORY_ORDERS)
+def test_atomic_add_vectorized_preserves_memory_order_bf16(memory_order, memory_order_id):
+    # bf16 takes a different device path depending on the target: below sm_90
+    # there is no ordered bf16 atomic in any width, so AtomicAddx2 falls back to
+    # fences around a relaxed add, while sm_90 uses the ordered instruction. A
+    # given run covers whichever side the test GPU selects.
+    run_atomic_add_vectorized_memory_order(64, 32, memory_order, memory_order_id, dtype=T.bfloat16)
+
+
 def test_atomic_addx4():
     run_atomic_addx4(16, 64, 4, 4)
 
@@ -490,7 +694,7 @@ def test_atomic_addx4_sliced_dst_compile():
 
 
 @tilelang.testing.requires_cuda
-@tilelang.testing.requires_cuda_compute_version_ge(8, 0)
+@tilelang.testing.requires_cuda_compute_version_ge(7, 0)
 def test_atomic_addx4_16bit():
     for dtype in (T.float16, T.bfloat16):
         for offset in (0, 4):
@@ -499,6 +703,13 @@ def test_atomic_addx4_16bit():
 
 def test_atomic_return_prev():
     run_atomic_return_prev(32, 32, 8, 8)
+
+
+@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version_ge(7, 0)
+@pytest.mark.parametrize("dtype", [T.float16, T.bfloat16])
+def test_atomic_return_prev_16bit(dtype):
+    run_atomic_return_prev(32, 32, 8, 8, dtype=dtype)
 
 
 def test_atomic_add():
@@ -1176,6 +1387,80 @@ def test_atomic_add_return_prev_materialized_once():
     assert counter.item() == n, f"atomic executed {counter.item()} times, expected {n}"
     assert (out < 0).sum().item() == 0, "unwritten slots: atomic return value was re-evaluated"
     assert torch.equal(out.cpu().sort().values.long(), torch.arange(n))
+
+
+# ======================= Contended scalar atomic add =======================
+
+
+@tilelang.jit
+def atomic_add_contended_program(N, threads, dtype):
+    @T.prim_func
+    def atomic_add_contended(A: T.Tensor((N,), dtype), Out: T.Tensor((1,), dtype)):
+        with T.Kernel(1, threads=threads) as _:
+            for i in T.Parallel(N):
+                T.atomic_add(Out[0], A[i])
+
+    return atomic_add_contended
+
+
+def run_atomic_add_contended(N, threads, dtype):
+    kernel = atomic_add_contended_program(N, threads, dtype)
+
+    # Every thread targets the same cell, so a non-atomic read-modify-write
+    # loses updates. Ones keep every partial sum exactly representable.
+    a = torch.ones(N, dtype=getattr(torch, dtype)).cuda()
+    out = torch.zeros(1, dtype=getattr(torch, dtype)).cuda()
+
+    kernel(a, out)
+
+    assert float(out[0]) == float(N), f"lost updates: got {float(out[0])}, expected {N}"
+
+
+@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version_ge(7, 0)
+def test_atomic_add_contended_bf16():
+    # bf16 is the dtype whose pre-SM80 add is a CAS loop; float32 contention is
+    # already covered by the multi-block test_atomic_add above.
+    run_atomic_add_contended(128, 128, T.bfloat16)
+
+
+@tilelang.jit(target={"kind": "cuda", "arch": "sm_75"})
+def atomic_add_bf16_sm75_program(N):
+    @T.prim_func
+    def atomic_add_bf16_sm75(A: T.Tensor((N,), T.bfloat16), B: T.Tensor((N,), T.bfloat16), Prev: T.Tensor((N,), T.bfloat16)):
+        with T.Kernel(1, threads=32) as _:
+            # Outside a parallel loop, so it stays scalar instead of packed.
+            T.atomic_add(B[1], A[1])
+            for i in T.Parallel(N // 2):
+                T.atomic_addx2(B[i * 2], A[i * 2])
+            for i in T.Parallel(N // 4):
+                T.atomic_addx4(B[i * 4], A[i * 4])
+            Prev[0] = T.atomic_add(B[0], A[0], return_prev=True)
+            Prev[0:2] = T.atomic_addx2(B[0:2], A[0:2], return_prev=True)
+            Prev[0:4] = T.atomic_addx4(B[0:4], A[0:4], return_prev=True)
+
+    return atomic_add_bf16_sm75
+
+
+@tilelang.testing.requires_cuda
+def test_atomic_add_bf16_compiles_for_sm75():
+    """The native __nv_bfloat16 atomicAdd and `atom.*.v2.bf16` are SM80+, and
+    atomic.h reaches every generated kernel, so the pre-SM80 fallbacks must keep
+    compiling. Pinned with an explicit sm_75 target because the tests above use
+    the runner's native target and would miss this fallback on a modern GPU."""
+    source = atomic_add_bf16_sm75_program(64).get_kernel_source()
+
+    # Auto-vectorization rewrites scalar adds into packed ones, so check the
+    # kernel above still reaches each fallback.
+    for helper in (
+        "AtomicAdd(",
+        "AtomicAddx2(",
+        "AtomicAddx4(",
+        "AtomicAddRet(",
+        "AtomicAddx2Ret(",
+        "AtomicAddx4Ret(",
+    ):
+        assert helper in source, f"{helper} not exercised by the sm_75 kernel"
 
 
 if __name__ == "__main__":

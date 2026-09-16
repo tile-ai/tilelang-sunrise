@@ -1,10 +1,11 @@
-# Exhaustive TileLang test inventory.
+# Exhaustive TileLang v0.1.14 test inventory.
 # A bare Python path runs in pytest mode with marker, skip, nodeid, and pytest
 # argument handling. A "python path.py" entry runs directly in command mode.
 # Commented Python entries remain inventoried but are quarantined CI failures.
 
 examples/analyze/test_example_analyze.py
 examples/attention_sink/test_example_attention_sink.py
+examples/aws/test_example_aws.py
 examples/block_causal_attention/test_block_causal_attention.py
 examples/blocksparse_attention/test_example_blocksparse_attention.py
 examples/blocksparse_gemm/test_example_blocksparse_gemm.py
@@ -49,10 +50,14 @@ testing/python/amd/test_tilelang_gfx950_copy_async.py
 testing/python/amd/test_tilelang_hip_atomic_load_store.py
 testing/python/amd/test_tilelang_hip_atomic_return_prev.py
 testing/python/amd/test_tilelang_hip_codegen.py
+testing/python/amd/test_tilelang_hip_gemm_block_size.py
+testing/python/amd/test_tilelang_hip_vector_not_codegen.py
+testing/python/amd/test_tilelang_hip_vector_select_codegen.py
 testing/python/amd/test_tilelang_mxfp4_gfx950.py
 testing/python/amd/test_tilelang_test_amd.py
 testing/python/analysis/test_tilelang_fragment_loop_checker.py
 testing/python/analysis/test_tilelang_nested_loop_checker.py
+testing/python/analysis/test_tilelang_parallel_local_index_checker.py
 testing/python/arith/test_arith_hard.py
 testing/python/arith/test_arith_intset.py
 testing/python/arith/test_arith_iter_affine_map.py
@@ -65,15 +70,19 @@ testing/python/autotune/test_tilelang_autotune_cutedsl_cache.py
 testing/python/autotune/test_tilelang_autotune_do_not_specialize.py
 testing/python/autotune/test_tilelang_autotune_eager_mode.py
 testing/python/autotune/test_tilelang_autotune_scalar_inputs.py
+testing/python/autotune/test_tilelang_autotune_timeout.py
 testing/python/autotune/test_tilelang_autotune_with_inputs.py
+testing/python/backend/test_tilelang_backend_module.py
 # CUDA binary-cache coverage requires CUDA/CUTLASS, which are not part of the TANG-only distribution.
 # testing/python/cache/test_tilelang_cuda_binary_cache.py
 testing/python/cache/test_tilelang_kernel_cache.py
 testing/python/cache/test_tilelang_kernel_cache_atomic_save.py
+testing/python/cache/test_tilelang_kernel_cache_integrity.py
 testing/python/carver/test_tilelang_carver_cuda_driver_properties.py
 testing/python/carver/test_tilelang_carver_generate_hints.py
 testing/python/carver/test_tilelang_carver_hint.py
 testing/python/carver/test_tilelang_carver_recommend_hints.py
+testing/python/carver/test_tilelang_carver_sm_version.py
 testing/python/components/test_cuda_restrict_codegen.py
 testing/python/components/test_cuda_shared_memory_alias_codegen.py
 # testing/python/components/test_storage_rewrite_detect_inplace.py
@@ -81,27 +90,35 @@ testing/python/components/test_tang_restrict_codegen.py
 testing/python/components/test_tilelang_env.py
 testing/python/components/test_tilelang_pass_config_disable_tma_lower.py
 testing/python/components/test_tilelang_pass_config_disable_warp_specialized.py
+testing/python/components/test_tilelang_pass_config_fast_math.py
 testing/python/components/test_tilelang_pass_config_new_options.py
 testing/python/components/test_tilelang_threadblock_swizzle_bijection.py
 testing/python/contrib/test_tilelang_contrib_cc.py
+testing/python/cpu/test_tilelang_cpu_atomic.py
+testing/python/cpu/test_tilelang_cpu_fp16_const.py
 testing/python/cpu/test_tilelang_cpu_gemm.py
+testing/python/cpu/test_tilelang_cpu_reduce.py
 testing/python/cpu/test_tilelang_cpu_tgemm.py
 testing/python/cpu/test_tilelang_cpu_transpose.py
+testing/python/cpu/test_tilelang_cpu_vec_type.py
 testing/python/cpu/test_tilelang_cpu_while_repro.py
 testing/python/cuda/test_cuda_bfloat16_math_intrinsics.py
 testing/python/cuda/test_cuda_f32x2_intrinsics.py
 testing/python/cuda/test_cuda_mma_sm75_dispatch.py
+testing/python/cuda/test_cuda_vector_bool_not_codegen.py
 testing/python/cuda/test_tilelang_cuda_tcgen05_operand_layout.py
 testing/python/cuda/test_tma_dsmem.py
 testing/python/cuda/test_tma_multicast_demo.py
 testing/python/debug/test_device_assert.py
 testing/python/debug/test_lower_trace.py
 testing/python/debug/test_pass_diff.py
+testing/python/debug/test_pass_events.py
 testing/python/debug/test_pass_timing.py
 testing/python/debug/test_pass_visualizer.py
 testing/python/debug/test_tilelang_debug_print.py
 testing/python/fastmath/test_mathops_fastmath.py
 testing/python/issue/test_tilelang_bf16x2_pack_special_values.py
+testing/python/issue/test_tilelang_int8x32_shift_ub.py
 testing/python/issue/test_tilelang_issue_1001.py
 testing/python/issue/test_tilelang_issue_1008.py
 testing/python/issue/test_tilelang_issue_1026.py
@@ -140,7 +157,19 @@ testing/python/issue/test_tilelang_issue_2537.py
 testing/python/issue/test_tilelang_issue_2554.py
 testing/python/issue/test_tilelang_issue_2600.py
 testing/python/issue/test_tilelang_issue_2615.py
+testing/python/issue/test_tilelang_issue_2624.py
+testing/python/issue/test_tilelang_issue_2628.py
 testing/python/issue/test_tilelang_issue_2632.py
+testing/python/issue/test_tilelang_issue_2635.py
+testing/python/issue/test_tilelang_issue_2682.py
+testing/python/issue/test_tilelang_issue_2883.py
+testing/python/issue/test_tilelang_issue_2928.py
+testing/python/issue/test_tilelang_issue_2947.py
+testing/python/issue/test_tilelang_issue_2994.py
+testing/python/issue/test_tilelang_issue_3010.py
+testing/python/issue/test_tilelang_issue_3021.py
+testing/python/issue/test_tilelang_issue_3025.py
+testing/python/issue/test_tilelang_issue_3035.py
 testing/python/issue/test_tilelang_issue_814.py
 testing/python/issue/test_tilelang_issue_830.py
 testing/python/issue/test_tilelang_issue_96.py
@@ -150,6 +179,7 @@ testing/python/issue/test_tilelang_issue_sm120_tma_smem_alignment.py
 testing/python/issue/test_tilelang_issue_tma_no_ws.py
 testing/python/issue/test_tilelang_issue_ws_simt_copy_full_producer_extent.py
 testing/python/issue/test_tilelang_u32_signed_decode.py
+testing/python/jit/test_tilelang_jit_adapter_wrapper.py
 testing/python/jit/test_tilelang_jit_argument_binding.py
 testing/python/jit/test_tilelang_jit_callback.py
 testing/python/jit/test_tilelang_jit_cutedsl.py
@@ -163,6 +193,7 @@ testing/python/jit/test_tilelang_jit_non_contiguous.py
 testing/python/jit/test_tilelang_jit_nullptr.py
 testing/python/jit/test_tilelang_jit_nvrtc.py
 testing/python/jit/test_tilelang_jit_nvrtc_host.py
+testing/python/jit/test_tilelang_jit_nvrtc_include_paths.py
 testing/python/jit/test_tilelang_jit_output_independence.py
 testing/python/jit/test_tilelang_jit_parcompile.py
 testing/python/jit/test_tilelang_jit_ptpu_device.py
@@ -235,6 +266,7 @@ testing/python/language/test_tilelang_language_ptr.py
 testing/python/language/test_tilelang_language_rand.py
 testing/python/language/test_tilelang_language_reduce.py
 testing/python/language/test_tilelang_language_reduce_maxmin_nan.py
+testing/python/language/test_tilelang_language_reducer_v2.py
 # testing/python/language/test_tilelang_language_reshape.py
 testing/python/language/test_tilelang_language_scan.py
 testing/python/language/test_tilelang_language_select.py
@@ -243,6 +275,7 @@ testing/python/language/test_tilelang_language_span.py
 testing/python/language/test_tilelang_language_stcu_pipeline.py
 testing/python/language/test_tilelang_language_subtype.py
 testing/python/language/test_tilelang_language_sync_threads.py
+testing/python/language/test_tilelang_language_tcgen05_cutedsl.py
 testing/python/language/test_tilelang_language_tcgen05_gemm.py
 testing/python/language/test_tilelang_language_tcgen05_sliced_operands.py
 testing/python/language/test_tilelang_language_ternary.py
@@ -270,16 +303,22 @@ testing/python/layout/test_tilelang_layout_equal.py
 testing/python/layout/test_tilelang_layout_expand.py
 testing/python/layout/test_tilelang_layout_fused_replicate.py
 testing/python/layout/test_tilelang_layout_inference.py
+testing/python/layout/test_tilelang_layout_inference_z3_context.py
+testing/python/layout/test_tilelang_layout_inverse.py
 testing/python/layout/test_tilelang_layout_linearized_index.py
 testing/python/layout/test_tilelang_layout_repeat.py
 testing/python/layout/test_tilelang_tcgen05_expand.py
+testing/python/llvm/test_tilelang_llvm_atomic.py
 testing/python/llvm/test_tilelang_llvm_gemm.py
+testing/python/llvm/test_tilelang_llvm_reduce.py
 testing/python/llvm/test_tilelang_llvm_tgemm.py
 testing/python/llvm/test_tilelang_llvm_while_repro.py
 testing/python/math/test_math_bitwise_reduce.py
 testing/python/math/test_math_fast_math.py
 testing/python/math/test_math_ieee_math.py
+testing/python/metal/test_metal_address_space.py
 testing/python/metal/test_metal_bf16_codegen.py
+testing/python/metal/test_metal_cache.py
 testing/python/metal/test_metal_codegen.py
 testing/python/metal/test_metal_codegen_linux.py
 testing/python/metal/test_metal_gemm_v2.py
@@ -306,16 +345,18 @@ testing/python/target/test_tilelang_tang_pipeline.py
 testing/python/target/test_tilelang_tang_target.py
 testing/python/target/test_tilelang_target.py
 testing/python/test_sunrise_ci_config.py
+testing/python/test_sunrise_ci_reporting.py
 testing/python/test_sunrise_packaging.py
 testing/python/test_version_provider.py
 testing/python/tilelibrary/test_tilelang_tilelibrary_gemm_sp.py
 testing/python/tools/test_tilelang_tools_analyzer.py
 testing/python/tools/test_tilelang_tools_autodd.py
+testing/python/tools/test_tilelang_tools_compile_only.py
 testing/python/tools/test_tilelang_tools_cuda_iket.py
 testing/python/transform/test_nullable_buffer_params.py
 testing/python/transform/test_readonly_param_const_codegen.py
+testing/python/transform/test_tilelang_codegen_line_directives.py
 testing/python/transform/test_tilelang_transform_Inject_software_pipeline.py
-testing/python/transform/test_tilelang_transform_cluster_planning.py
 testing/python/transform/test_tilelang_transform_config_index_bitwidth.py
 testing/python/transform/test_tilelang_transform_decouple_type_cast.py
 testing/python/transform/test_tilelang_transform_disable_memory_reuse.py
@@ -336,6 +377,7 @@ testing/python/transform/test_tilelang_transform_let_inline.py
 testing/python/transform/test_tilelang_transform_lexical_alloc_scope.py
 testing/python/transform/test_tilelang_transform_loop_peeling.py
 testing/python/transform/test_tilelang_transform_loop_unswitching.py
+testing/python/transform/test_tilelang_transform_loop_vectorize.py
 testing/python/transform/test_tilelang_transform_lower_device_kernel_launch.py
 testing/python/transform/test_tilelang_transform_lower_hopper_intrin.py
 testing/python/transform/test_tilelang_transform_lower_ldgstg.py
@@ -343,6 +385,7 @@ testing/python/transform/test_tilelang_transform_lower_shared_barrier.py
 testing/python/transform/test_tilelang_transform_lower_shared_tmem.py
 testing/python/transform/test_tilelang_transform_lower_tile_op.py
 testing/python/transform/test_tilelang_transform_make_packed_api.py
+testing/python/transform/test_tilelang_transform_materialize_ws_schedule.py
 testing/python/transform/test_tilelang_transform_merge_loop.py
 testing/python/transform/test_tilelang_transform_pad_gemm_tail.py
 testing/python/transform/test_tilelang_transform_pipeline_barrier_ownership.py
@@ -353,10 +396,13 @@ testing/python/transform/test_tilelang_transform_producer_consumer_ws.py
 testing/python/transform/test_tilelang_transform_producer_consumer_ws_persistent.py
 testing/python/transform/test_tilelang_transform_simplify.py
 testing/python/transform/test_tilelang_transform_smem_swizzle_alignment.py
+testing/python/transform/test_tilelang_transform_span_preservation.py
 testing/python/transform/test_tilelang_transform_split_host_device.py
 testing/python/transform/test_tilelang_transform_thread_sync.py
+testing/python/transform/test_tilelang_transform_tmem_arena_packing.py
 testing/python/transform/test_tilelang_transform_tmem_physical_shape.py
 testing/python/transform/test_tilelang_transform_unroll_loop.py
+testing/python/transform/test_tilelang_transform_verify_buffer_init.py
 testing/python/transform/test_tilelang_transform_verify_parallel_loop.py
 testing/python/utils/test_compress_utils.py
 testing/python/webgpu/test_webgpu_codegen.py

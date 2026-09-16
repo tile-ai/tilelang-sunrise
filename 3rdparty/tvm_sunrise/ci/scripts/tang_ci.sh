@@ -78,7 +78,7 @@ cmake_args=(
 if [[ "$mode" == "on" ]]; then
   tangrt_path="${TANGRT_PATH:-/usr/local/tangrt}"
   tang_prefix="${tangrt_path%/}/targets/linux-x86_64"
-  export LD_LIBRARY_PATH="${tangrt_path%/}/lib/linux-x86_64:/usr/lib64:$env_prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  export LD_LIBRARY_PATH="${TANGRT_LIB_PATH:-${tang_prefix}/lib:${tangrt_path%/}/lib/linux-x86_64:/usr/lib64}:$env_prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
   cmake_args+=(
     -DUSE_TANG=ON
     -DCMAKE_TANG_COMPILER="${PTCC_PATH:-${tangrt_path%/}/toolchains/llvm/prebuilt/linux-x86_64/bin/ptcc}"

@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "arith/pattern_match.h"
+#include "cuda/op/builtin.h"
 #include "op/builtin.h"
 #include "transform/common/attr.h"
 
@@ -228,6 +229,27 @@ static std::string GetFP6Type(DataType type) {
 static std::string GetFP4Type(DataType type) {
   std::stringstream stream;
   int32_t lanes = type.lanes();
+
+  // The unpacked variant is a different physical layout, not a different
+  // encoding: one e2m1 code in the low nibble of its own byte (hence bits() ==
+  // 8), which is what the mxf8f6f4 tensorcore reads for an fp4 operand mixed
+  // with fp8/fp6 -- EleType eFP4_E2M1_MIX, as opposed to the 2-per-byte packing
+  // mxf4/nvfp4 want. So it maps one element per byte, and the packed halving in
+  // GetBufferRef/GetVecLoad/GetVecStore -- all gated on is_float4_e2m1fn() --
+  // correctly leaves it alone.
+  if (type.is_float4_e2m1_unpacked()) {
+    if (type.is_scalar()) {
+      return "uchar";
+    }
+    if (lanes == 2 || lanes == 4 || lanes == 8 || lanes == 16) {
+      stream << "uchar" << lanes;
+      return stream.str();
+    }
+    LOG(FATAL) << "TANG codegen: unpacked fp4 supports a scalar or a 2/4/8/16 "
+                  "lane vector, got "
+               << type;
+  }
+
   std::string vec;
   if (type.is_scalar()) {
     vec = "";
@@ -585,11 +607,37 @@ std::string CodeGenTileLangTANG::Finish() {
   if (need___clang_tang_builtin_vars_h) {
     decl_stream << "#include <__clang_tang_builtin_vars.h>\n";
   }
-  if (need___clang_tang_fp16_h) {
+  if (enable_fp16_) {
     decl_stream << "#include <__clang_tang_fp16.h>\n";
   }
-  if (need___clang_tang_bf16_h) {
+  if (enable_bf16_) {
+    // Provides __bf16 helpers and the TANGRT_INF_BF16 / TANGRT_NAN_BF16 macros
+    // emitted by PrintConst for bfloat16 inf/nan.
     decl_stream << "#include <__clang_tang_bf16.h>\n";
+  }
+  // enable_fp4_ means the kernel emits __tang_cvt_* conversions, declared in
+  // the stcuv2-only <__clang_tang_fp4.h>. Without this check an stcu build
+  // fails inside ptcc with a bare "file not found" naming neither fp4 nor the
+  // arch. Note the fp8 counterpart is deliberately not rejected here: fp8
+  // buffers do reach codegen on stcu in transform-level tests that never invoke
+  // ptcc.
+  if (enable_fp4_) {
+    Target cur_target = Target::Current(/*allow_not_defined=*/true);
+    if (cur_target.defined() && !tl::TargetTangIsSTCUV2(cur_target)) {
+      auto arch = cur_target->GetAttr<ffi::String>("arch");
+      LOG(FATAL)
+          << "TANG codegen: this kernel converts fp4 values, which requires "
+             "arch=stcuv2, but the target arch is "
+          << (arch.has_value() ? std::string(arch.value()) : "<unset>")
+          << ". Declaring fp4 buffers is fine on stcu (they lower to packed "
+             "uchar bytes); converting them is not.";
+    }
+  }
+  if (enable_fp4_) {
+    decl_stream << "#include <__clang_tang_fp4.h>\n";
+  }
+  if (enable_fp8_) {
+    decl_stream << "#include <__clang_tang_fp8.h>\n";
   }
 
   decl_stream << "#include <tl_templates/tang/reduce.h>\n";
@@ -607,7 +655,15 @@ std::string CodeGenTileLangTANG::Finish() {
   }
 
   if (need_cp_async_bulk_h_) {
-    decl_stream << "#include <tl_templates/tang/copy_fcp_g_s.h>\n";
+    decl_stream << "#include <tl_templates/tang/copy_global_shm.h>\n";
+  }
+
+  if (need_cp_tmem_smem_h_) {
+    decl_stream << "#include <tl_templates/tang/copy_tmem_shm.h>\n";
+  }
+
+  if (need_barrier_h_) {
+    decl_stream << "#include <tl_templates/tang/barrier.h>\n";
   }
 
   if (need_global_barrier_) {
@@ -646,12 +702,23 @@ void CodeGenTileLangTANG::VisitStmt_(const tirx::ForNode *op) {
   std::string vid = AllocVarID(op->loop_var.get());
   std::string start = PrintExpr(op->min);
 
+  bool full_unroll =
+      op->body.as<BufferStoreNode>() || op->body.as<BufferLoadNode>();
+  if (const auto *seq = op->body.as<SeqStmtNode>(); seq && !seq->seq.empty()) {
+    const auto *store = seq->seq.back().as<BufferStoreNode>();
+    if (store && store->buffer.scope() == "local") {
+      // Vectorization can bind broadcast values before a register store.
+      // Preserve full unrolling; PTCC can miscompile partial register loops.
+      full_unroll = std::all_of(
+          seq->seq.begin(), seq->seq.end() - 1,
+          [](const Stmt &stmt) { return stmt.as<BindNode>() != nullptr; });
+    }
+  }
   if (op->kind == tirx::ForKind::kUnrolled) {
     if (unroll_factor.count(op->loop_var.get())) {
       stream << "#pragma unroll "
              << PrintExpr(unroll_factor[op->loop_var.get()]) << "\n";
-    } else if (op->body.as<BufferStoreNode>() ||
-               op->body.as<BufferLoadNode>()) {
+    } else if (full_unroll) {
       stream << "#pragma unroll \n";
     } else {
       // Uniform or non-uniform index: use partial unroll to limit register
@@ -784,7 +851,12 @@ void CodeGenTileLangTANG::PrintType(DataType t, std::ostream &os) { // NOLINT(*)
     }
     return;
   } else if (t.is_float4()) {
-    enable_fp4_ = true;
+    // No enable_fp4_ here: GetFP4Type maps fp4 onto a plain uchar container, so
+    // nothing emitted for the type itself refers to <__clang_tang_fp4.h>. The
+    // flag means "this kernel needs the fp4 intrinsics", which only the
+    // __tang_cvt_* cast paths do -- and they set it themselves. Raising it for
+    // a mere fp4 buffer declaration would drag that stcuv2-only header into
+    // stcu kernels that just move packed nibbles around.
     if (t.lanes() <= 4) {
       os << GetFP4Type(t);
     }
@@ -991,7 +1063,11 @@ void CodeGenTileLangTANG::PrintVecBinaryOp(const std::string &op, DataType t,
     for (int i = 0, lanes = t.lanes(); i < lanes; ++i) {
       std::ostringstream value_temp;
       if (isalpha(op[0])) {
-        value_temp << op << "(";
+        if ((t.is_float() || t.is_bfloat16()) && (op == "min" || op == "max")) {
+          value_temp << (op == "min" ? "tl::MinOp{}(" : "tl::MaxOp{}(");
+        } else {
+          value_temp << op << "(";
+        }
         PrintVecElemLoad(vlhs, lhs.dtype(), i, value_temp);
         value_temp << ", ";
         PrintVecElemLoad(vrhs, rhs.dtype(), i, value_temp);
@@ -1046,7 +1122,7 @@ void CodeGenTileLangTANG::PrintVecElemLoad(const std::string &vec, DataType t,
          << (i / 2 % 2) << ")->" << access[i % 2];
     }
   } else if (t.is_bfloat16()) {
-    need___clang_tang_bf16_h = true;
+    enable_bf16_ = true;
     if (t.lanes() <= 8) {
       os << "((__tang_bfloat162*)(&(" << vec << "." << access[i / 2] << ")))->"
          << access[i % 2];
@@ -1067,6 +1143,10 @@ void CodeGenTileLangTANG::PrintVecElemLoad(const std::string &vec, DataType t,
       os << "." << access[(i % 8) / 4];
     // fp8_e5_4_t or fp8_e5_2_t
     os << "." << access[i % 4];
+  } else if (t.is_float4_e2m1fn()) {
+    // FP4 is packed 2-per-byte. Extract the i-th nibble.
+    int shift = 4 * (i % t.lanes());
+    os << "((int)(" << vec << " >> " << shift << ") & 0xF)";
   } else if (t.lanes() > 4 && t.lanes() <= 8) {
     std::string type_name;
     if (t.bits() == 16) {
@@ -1129,7 +1209,7 @@ void CodeGenTileLangTANG::PrintVecElemStore(const std::string &vec, DataType t,
              << ";\n";
     }
   } else if (t.is_bfloat16()) {
-    need___clang_tang_bf16_h = true;
+    enable_bf16_ = true;
     if (t.lanes() <= 8) {
       stream << "((__tang_bfloat162*)(&(" << vec << "." << access[i / 2]
              << ")))->" << access[i % 2] << " = " << value << ";\n";
@@ -1151,6 +1231,14 @@ void CodeGenTileLangTANG::PrintVecElemStore(const std::string &vec, DataType t,
       stream << "." << access[(i % 8) / 4];
     // fp8_e5_4_t or fp8_e5_2_t
     stream << "." << access[i % 4] << " = " << value << ";\n";
+  } else if (t.is_float4_e2m1fn()) {
+    // FP4 packed 2-per-byte. Write the i-th nibble into the container.
+    int shift = 4 * (i % t.lanes());
+    stream << vec << " = ";
+    if (i != 0) {
+      stream << "(" << vec << " & ~(0xF << " << shift << ")) | ";
+    }
+    stream << "((" << value << " & 0xF) << " << shift << ");\n";
   } else if (t.lanes() > 4 && t.lanes() <= 8) {
     std::string type_name;
     if (t.bits() == 16) {
@@ -1186,9 +1274,13 @@ void CodeGenTileLangTANG::PrintStorageSync(const CallNode *op) {
     if (args.size() == 1) {
       this->stream << "__syncthreads();\n";
     } else {
-      // For partial sync (barrier_id, thread_count), fallback to full
-      // __syncthreads() since TANG does not support partial barriers.
-      this->stream << "__syncthreads();\n";
+      // TANG (stcuv2) has no named/partial barriers. ThreadSyncPlanner only
+      // emits a partial sync (scope, barrier_id, thread_count) inside a
+      // divergent thread guard, where a full __syncthreads() would deadlock:
+      // the unguarded threads never reach the barrier. TANG's guarded regions
+      // are always a single warp, so __syncwarp() has the same semantics and
+      // every thread in the guard can reach it.
+      this->stream << "__syncwarp();\n";
     }
   } else if (sync == "global") {
     if (!need_global_barrier_) {
@@ -1282,11 +1374,187 @@ void CodeGenTileLangTANG::VisitExpr_(const CastNode *op, std::ostream &os) {
   DataType target_ty = op->dtype;
   ICHECK_EQ(target_ty.lanes(), from_ty.lanes());
 
+  // Unpacked fp4 is a storage tag for a tensorcore operand, not an arithmetic
+  // type -- CUDA does not even give it a register type. It reaches codegen as a
+  // uchar holding a raw e2m1 code in the low nibble, so every conversion below
+  // would miss it (they all test is_float4_e2m1fn(), which is the packed code)
+  // and the generic CodeGenC fallback would emit a plain C cast: an integer
+  // reinterpretation of the code, not a dequantization. That is silently wrong
+  // in the same way the packed path documents, so refuse instead. Convert
+  // through the packed type if a value is actually needed.
+  if (from_ty.is_float4_e2m1_unpacked() ||
+      target_ty.is_float4_e2m1_unpacked()) {
+    LOG(FATAL)
+        << "TANG codegen: cannot convert " << from_ty << " -> " << target_ty
+        << ". float4_e2m1_unpacked is a shared-memory storage layout for "
+           "an mxf8f6f4 tensorcore operand (one e2m1 code per byte), not "
+           "a value type; it has no numeric conversion. Use "
+           "float4_e2m1fn for values.";
+  }
+
+  // Scalar fp4 <-> {half, float, double, bf16} conversions.
+  //
+  // The generic scalar path below delegates to CodeGenC, which emits a plain C
+  // cast. For the uchar fp4 container that is an *integer truncation*, NOT an
+  // fp4 (e2m1) quantization (e.g. 4.0f -> (uchar)4 -> 4.0f, or -3.0f -> 0),
+  // silently producing wrong numbers. Route scalars through the TANG scalar
+  // intrinsics from <__clang_tang_fp4.h> (fp4 pivots through half on device) so
+  // the value is actually quantized/dequantized. Vector fp4 is handled further
+  // below. Only when exactly one side is fp4 and the other is a supported float
+  // type; anything else falls through to the generic path.
+  if (from_ty.is_scalar() &&
+      (from_ty.is_float4_e2m1fn() != target_ty.is_float4_e2m1fn())) {
+    const bool to_fp4 = target_ty.is_float4_e2m1fn();
+    const DataType other = to_fp4 ? from_ty : target_ty;
+    const bool other_ok =
+        other.is_float16() || other.is_bfloat16() ||
+        (other.is_float() && (other.bits() == 32 || other.bits() == 64));
+    if (other_ok) {
+      enable_fp4_ = true;
+      std::string s = name_supply_->FreshName("_");
+      PrintIndent();
+      PrintType(target_ty, stream);
+      stream << ' ' << s << ";\n";
+      std::string v = SSAGetID(PrintExpr(op->value), from_ty);
+      if (to_fp4) {
+        // {half,float,double,bf16} -> fp4 (direct scalar intrinsics)
+        PrintIndent();
+        stream << "*reinterpret_cast<__tang_fp4_storage_t*>(&(" << s << ")) = ";
+        if (other.is_float16()) {
+          stream << "__tang_cvt_halfraw_to_fp4("
+                 << "*reinterpret_cast<const __half_raw*>(&(" << v
+                 << ")), __TANG_E2M1, tangRoundNearest);\n";
+        } else if (other.is_bfloat16()) {
+          stream << "__tang_cvt_bfloat16raw_to_fp4("
+                 << "*reinterpret_cast<const __tang_bfloat16_raw*>(&(" << v
+                 << ")), __TANG_E2M1, tangRoundNearest);\n";
+        } else {
+          // float and double both go through float_to_fp4. The ISS's
+          // __tang_cvt_double_to_fp4 is a no-op (returns 0); routing double via
+          // float is numerically identical anyway -- fp4 (e2m1) carries only a
+          // single mantissa bit, far below float32 precision.
+          stream << "__tang_cvt_float_to_fp4((float)(" << v
+                 << "), __TANG_E2M1, tangRoundNearest);\n";
+        }
+      } else if (other.is_float16()) {
+        // fp4 -> half (direct)
+        PrintIndent();
+        stream << "*reinterpret_cast<__half_raw*>(&(" << s
+               << ")) = __tang_cvt_fp4_to_halfraw("
+               << "*reinterpret_cast<const __tang_fp4_storage_t*>(&(" << v
+               << ")), __TANG_E2M1);\n";
+      } else {
+        // fp4 -> {float,double,bf16} via half then a native scalar cast.
+        // Mirrors the half-pivot used by the fp6 C++ operators, but uses the
+        // __fp16 type to allow the implicit (float) conversion.
+        std::string h = name_supply_->FreshName("_h");
+        PrintIndent();
+        stream << "__fp16 " << h << "; *reinterpret_cast<__half_raw*>(&" << h
+               << ") = __tang_cvt_fp4_to_halfraw("
+               << "*reinterpret_cast<const __tang_fp4_storage_t*>(&(" << v
+               << ")), __TANG_E2M1);\n";
+        PrintIndent();
+        if (other.is_bfloat16()) {
+          stream << s << " = (__bf16)(float)" << h << ";\n";
+        } else if (other.bits() == 64) {
+          stream << s << " = (double)(float)" << h << ";\n";
+        } else {
+          stream << s << " = (float)" << h << ";\n";
+        }
+      }
+      os << s;
+      return;
+    }
+  }
+
+  // Scalar fp8 (e4m3/e5m2) <-> {half, bfloat16, float, double} conversions.
+  //
+  // Like the fp4 path above, the generic C-cast fallback would treat the fp8
+  // container as an integer/opaque value, silently producing wrong numbers (the
+  // fp8_eN_t POD has no float conversion operator, so the cast does not even
+  // compile on ptcc). Route scalars through the TANG scalar intrinsics from
+  // <__clang_tang_fp8.h> so the value is actually quantized/dequantized.
+  // double<->fp8 goes via float: TANG has no direct double<->fp8 intrinsic, but
+  // fp8 precision is far below float32 so the intermediate cast is lossless.
+  // Vector fp8 is handled further below.
+  {
+    auto is_fp8 = [](DataType t) {
+      return t.is_float8_e4m3() || t.is_float8_e4m3fn() || t.is_float8_e5m2();
+    };
+    if (from_ty.is_scalar() && (is_fp8(from_ty) != is_fp8(target_ty))) {
+      const bool to_fp8 = is_fp8(target_ty);
+      const DataType other = to_fp8 ? from_ty : target_ty;
+      const bool other_ok =
+          other.is_float16() || other.is_bfloat16() ||
+          (other.is_float() && (other.bits() == 32 || other.bits() == 64));
+      if (other_ok) {
+        enable_fp8_ = true;
+        const DataType fp8_ty = to_fp8 ? target_ty : from_ty;
+        std::string interp =
+            (fp8_ty.is_float8_e4m3() || fp8_ty.is_float8_e4m3fn())
+                ? "__TANG_E4M3"
+                : "__TANG_E5M2";
+        std::string s = name_supply_->FreshName("_");
+        PrintIndent();
+        PrintType(target_ty, stream);
+        stream << ' ' << s << ";\n";
+        std::string v = SSAGetID(PrintExpr(op->value), from_ty);
+        if (to_fp8) {
+          // {half, bfloat16, float, double} -> fp8. double is cast to float
+          // first (no direct double->fp8 intrinsic on TANG; fp8 precision <<
+          // float32).
+          PrintIndent();
+          stream << "*reinterpret_cast<__tang_fp8_storage_t*>(&(" << s
+                 << ")) = ";
+          if (other.is_float16()) {
+            stream << "__tang_cvt_halfraw_to_fp8("
+                   << "*reinterpret_cast<const __half_raw*>(&(" << v
+                   << ")), __TANG_SATFINITE, " << interp << ");\n";
+          } else if (other.is_bfloat16()) {
+            stream << "__tang_cvt_bfloat16raw_to_fp8("
+                   << "*reinterpret_cast<const __tang_bfloat16_raw*>(&(" << v
+                   << ")), __TANG_SATFINITE, " << interp << ");\n";
+          } else {
+            stream << "__tang_cvt_float_to_fp8(((float)(" << v
+                   << ")), __TANG_SATFINITE, " << interp << ");\n";
+          }
+        } else if (other.is_bfloat16()) {
+          // fp8 -> bfloat16: direct LLVM intrinsic.
+          const char *fmt =
+              (fp8_ty.is_float8_e4m3() || fp8_ty.is_float8_e4m3fn()) ? "e4m3"
+                                                                     : "e5m2";
+          PrintIndent();
+          stream << s << " = __stvm_cvt_fp8_" << fmt << "_to_bfloat16("
+                 << "*reinterpret_cast<const __tang_fp8_storage_t*>(&(" << v
+                 << ")));\n";
+        } else {
+          // fp8 -> half (direct) or fp8 -> {float, double} (via half + cast).
+          std::string h = name_supply_->FreshName("_h");
+          PrintIndent();
+          stream << "__fp16 " << h << "; *reinterpret_cast<__half_raw*>(&" << h
+                 << ") = __tang_cvt_fp8_to_halfraw("
+                 << "*reinterpret_cast<const __tang_fp8_storage_t*>(&(" << v
+                 << ")), " << interp << ");\n";
+          PrintIndent();
+          if (other.is_float16()) {
+            stream << s << " = " << h << ";\n";
+          } else if (other.bits() == 64) {
+            stream << s << " = (double)(float)" << h << ";\n";
+          } else {
+            stream << s << " = (float)" << h << ";\n";
+          }
+        }
+        os << s;
+        return;
+      }
+    }
+  }
+
   if (from_ty.is_float16() || target_ty.is_float16()) {
-    need___clang_tang_fp16_h = true;
+    enable_fp16_ = true;
   }
   if (from_ty.is_bfloat16() || target_ty.is_bfloat16()) {
-    need___clang_tang_bf16_h = true;
+    enable_bf16_ = true;
   }
 
   // Emit simple C-style type conversion.
@@ -1388,7 +1656,7 @@ void CodeGenTileLangTANG::VisitExpr_(const CastNode *op, std::ostream &os) {
   // Handle conversion between bfloat16 and float32
   if (from_ty.is_bfloat16() && target_ty.is_float() && target_ty.bits() == 32) {
     // Use __bfloat1622float2 for vectorized conversion (bfloat162 -> float2)
-    need___clang_tang_bf16_h = true;
+    enable_bf16_ = true;
     if (from_ty.lanes() == 2 && target_ty.lanes() == 2) {
       // bfloat162 -> float2
       PrintIndent();
@@ -1433,7 +1701,7 @@ void CodeGenTileLangTANG::VisitExpr_(const CastNode *op, std::ostream &os) {
   } else if (from_ty.is_float() && from_ty.bits() == 32 &&
              target_ty.is_bfloat16()) {
     // Use __float22bfloat162_rn for vectorized conversion (float2 -> bfloat162)
-    need___clang_tang_bf16_h = true;
+    enable_bf16_ = true;
     if (from_ty.lanes() == 2 && target_ty.lanes() == 2) {
       // float2 -> bfloat162
       PrintIndent();
@@ -1494,63 +1762,348 @@ void CodeGenTileLangTANG::VisitExpr_(const CastNode *op, std::ostream &os) {
     }
   }
 
+  // Handle conversion from float16 to float8 (E4M3/E5M2)
+  if (from_ty.is_float16() &&
+      (target_ty.is_float8_e4m3() || target_ty.is_float8_e5m2())) {
+    enable_fp8_ = true;
+    std::string interp =
+        (target_ty.is_float8_e4m3() || target_ty.is_float8_e4m3fn())
+            ? "__TANG_E4M3"
+            : "__TANG_E5M2";
+    // half2 -> fp8x2: __tang_cvt_halfraw2_to_fp8x2 (direct HW)
+    if (from_ty.lanes() == 2 && target_ty.lanes() == 2) {
+      PrintIndent();
+      stream << "*reinterpret_cast<__tang_fp8x2_storage_t*>(&(" << sret
+             << ")) = __tang_cvt_halfraw2_to_fp8x2("
+             << "*reinterpret_cast<const __half2_raw*>(&(" << src
+             << ")), __TANG_SATFINITE, " << interp << ");\n";
+      os << sret;
+      return;
+    }
+  }
+
   // Handle conversion from float32 to float8 (E4M3/E5M2)
   if (from_ty.is_float() && from_ty.bits() == 32 &&
       (target_ty.is_float8_e4m3() || target_ty.is_float8_e5m2())) {
-    // FP32 -> FP8: Use __nv_cvt_float2_to_fp8x2 for vectorized conversion
-    // (float2 -> fp8x2)
+    enable_fp8_ = true;
+    std::string interp =
+        (target_ty.is_float8_e4m3() || target_ty.is_float8_e4m3fn())
+            ? "__TANG_E4M3"
+            : "__TANG_E5M2";
+    // float2 -> fp8x2: __tang_cvt_float2_to_fp8x2 (STCUv2 direct HW)
     if (from_ty.lanes() == 2 && target_ty.lanes() == 2) {
-      // float2 -> fp8x2
       PrintIndent();
-      stream << "*reinterpret_cast<__nv_fp8x2_storage_t*>(&(" << sret
-             << ")) = __nv_cvt_float2_to_fp8x2(*reinterpret_cast<float2*>(&("
-             << src << ")), __NV_SATFINITE, "
-             << (target_ty.is_float8_e4m3() ? "__NV_E4M3" : "__NV_E5M2")
-             << ");\n";
+      stream << "*reinterpret_cast<__tang_fp8x2_storage_t*>(&(" << sret
+             << ")) = __tang_cvt_float2_to_fp8x2("
+             << "*reinterpret_cast<const float2*>(&(" << src
+             << ")), __TANG_SATFINITE, " << interp << ");\n";
       os << sret;
       return;
     } else if (from_ty.lanes() == 4 && target_ty.lanes() == 4) {
-      // float4 -> fp8x4
       PrintIndent();
-      stream << "((__nv_fp8x2_storage_t*)(&" << sret << "))[0] = "
-             << "__nv_cvt_float2_to_fp8x2(*(float2*)(&(" << src
-             << ")), __NV_SATFINITE, "
-             << (target_ty.is_float8_e4m3() ? "__NV_E4M3" : "__NV_E5M2")
-             << ");\n";
+      stream << "((__tang_fp8x2_storage_t*)(&" << sret << "))[0] = "
+             << "__tang_cvt_float2_to_fp8x2(*(float2*)(&(" << src
+             << ")), __TANG_SATFINITE, " << interp << ");\n";
       PrintIndent();
-      stream << "((__nv_fp8x2_storage_t*)(&" << sret << "))[1] = "
-             << "__nv_cvt_float2_to_fp8x2(*((float2*)(&(" << src
-             << "))+1), __NV_SATFINITE, "
-             << (target_ty.is_float8_e4m3() ? "__NV_E4M3" : "__NV_E5M2")
-             << ");\n";
+      stream << "((__tang_fp8x2_storage_t*)(&" << sret << "))[1] = "
+             << "__tang_cvt_float2_to_fp8x2(*((float2*)(&(" << src
+             << "))+1), __TANG_SATFINITE, " << interp << ");\n";
       os << sret;
       return;
     } else if (from_ty.lanes() == 8 && target_ty.lanes() == 8) {
-      // float8 -> fp8x8
       PrintIndent();
-      stream << "((__nv_fp8x2_storage_t*)(&" << sret << "))[0] = "
-             << "__nv_cvt_float2_to_fp8x2(*(float2*)(&(" << src
-             << ")), __NV_SATFINITE, "
-             << (target_ty.is_float8_e4m3() ? "__NV_E4M3" : "__NV_E5M2")
-             << ");\n";
+      stream << "((__tang_fp8x2_storage_t*)(&" << sret << "))[0] = "
+             << "__tang_cvt_float2_to_fp8x2(*(float2*)(&(" << src
+             << ")), __TANG_SATFINITE, " << interp << ");\n";
       PrintIndent();
-      stream << "((__nv_fp8x2_storage_t*)(&" << sret << "))[1] = "
-             << "__nv_cvt_float2_to_fp8x2(*((float2*)(&(" << src
-             << "))+1), __NV_SATFINITE, "
-             << (target_ty.is_float8_e4m3() ? "__NV_E4M3" : "__NV_E5M2")
-             << ");\n";
+      stream << "((__tang_fp8x2_storage_t*)(&" << sret << "))[1] = "
+             << "__tang_cvt_float2_to_fp8x2(*((float2*)(&(" << src
+             << "))+1), __TANG_SATFINITE, " << interp << ");\n";
       PrintIndent();
-      stream << "((__nv_fp8x2_storage_t*)(&" << sret << "))[2] = "
-             << "__nv_cvt_float2_to_fp8x2(*((float2*)(&(" << src
-             << "))+2), __NV_SATFINITE, "
-             << (target_ty.is_float8_e4m3() ? "__NV_E4M3" : "__NV_E5M2")
-             << ");\n";
+      stream << "((__tang_fp8x2_storage_t*)(&" << sret << "))[2] = "
+             << "__tang_cvt_float2_to_fp8x2(*((float2*)(&(" << src
+             << "))+2), __TANG_SATFINITE, " << interp << ");\n";
       PrintIndent();
-      stream << "((__nv_fp8x2_storage_t*)(&" << sret << "))[3] = "
-             << "__nv_cvt_float2_to_fp8x2(*((float2*)(&(" << src
-             << "))+3), __NV_SATFINITE, "
-             << (target_ty.is_float8_e4m3() ? "__NV_E4M3" : "__NV_E5M2")
-             << ");\n";
+      stream << "((__tang_fp8x2_storage_t*)(&" << sret << "))[3] = "
+             << "__tang_cvt_float2_to_fp8x2(*((float2*)(&(" << src
+             << "))+3), __TANG_SATFINITE, " << interp << ");\n";
+      os << sret;
+      return;
+    }
+  }
+
+  // Handle conversion between fp8 (e4m3/e5m2) and bfloat16.
+  // fp8->bfloat16: scalar LLVM intrinsic __stvm_cvt_fp8_{fmt}_to_bfloat16
+  //   called per-element (no packed x2 TANG C API exists).
+  // bfloat16->fp8: __tl_cvt_bfloat162_to_fp8x2 wrapper (tang_fp8.h), which
+  //   forwards to __tang_cvt_bfloat16raw2_to_fp8x2 (direct HW).
+  {
+    auto is_fp8 = [](DataType t) {
+      return t.is_float8_e4m3() || t.is_float8_e4m3fn() || t.is_float8_e5m2();
+    };
+    if (is_fp8(from_ty) && target_ty.is_bfloat16()) {
+      enable_fp8_ = true;
+      enable_bf16_ = true;
+      const char *fmt = (from_ty.is_float8_e4m3() || from_ty.is_float8_e4m3fn())
+                            ? "e4m3"
+                            : "e5m2";
+      if (from_ty.lanes() == 2 && target_ty.lanes() == 2) {
+        PrintIndent();
+        stream << "{\n";
+        PrintIndent();
+        stream << "  const __tang_fp8_storage_t* _src = "
+               << "reinterpret_cast<const __tang_fp8_storage_t*>(&(" << src
+               << "));\n";
+        PrintIndent();
+        stream << "  __tang_bfloat162 _tmp;\n";
+        PrintIndent();
+        stream << "  ((__tang_bfloat16*)&_tmp)[0] = "
+               << "__stvm_cvt_fp8_" << fmt << "_to_bfloat16(_src[0]);\n";
+        PrintIndent();
+        stream << "  ((__tang_bfloat16*)&_tmp)[1] = "
+               << "__stvm_cvt_fp8_" << fmt << "_to_bfloat16(_src[1]);\n";
+        PrintIndent();
+        stream << "  *reinterpret_cast<__tang_bfloat162*>(&(" << sret
+               << ")) = _tmp;\n";
+        PrintIndent();
+        stream << "}\n";
+        os << sret;
+        return;
+      }
+    } else if (from_ty.is_bfloat16() && is_fp8(target_ty)) {
+      enable_fp8_ = true;
+      enable_bf16_ = true;
+      std::string interp =
+          (target_ty.is_float8_e4m3() || target_ty.is_float8_e4m3fn())
+              ? "__TANG_E4M3"
+              : "__TANG_E5M2";
+      if (from_ty.lanes() == 2 && target_ty.lanes() == 2) {
+        PrintIndent();
+        stream << "*reinterpret_cast<__tl_fp8x2_storage_t*>(&(" << sret
+               << ")) = __tl_cvt_bfloat162_to_fp8x2("
+               << "*reinterpret_cast<const __tang_bfloat162*>(&(" << src
+               << ")), " << interp << ");\n";
+        os << sret;
+        return;
+      }
+    }
+  }
+
+  // Handle conversion between float4_e2m1fn (fp4) and other float types.
+  // Uses __tang_cvt_* intrinsics from __clang_tang_fp4.h (STPU hardware).
+  //
+  // The fp4 operand travels as a uchar/ushort container, so PrintType's fp4
+  // branch never fires and Finish() would not request <__clang_tang_fp4.h>.
+  // Flag the include here whenever either side of the cast is fp4, so the
+  // __tang_cvt_* / __tang_fp4x2_storage_t / __TANG_E2M1 symbols resolve.
+  if (from_ty.is_float4_e2m1fn() || target_ty.is_float4_e2m1fn()) {
+    enable_fp4_ = true;
+  }
+
+  // fp4 -> half
+  if (from_ty.is_float4_e2m1fn() && target_ty.is_float16()) {
+    if (from_ty.lanes() == 2 && target_ty.lanes() == 2) {
+      PrintIndent();
+      stream << "*(half2*)(&(" << sret << ")) = "
+             << "__tang_cvt_fp4x2_to_halfraw2("
+             << "*reinterpret_cast<__tang_fp4x2_storage_t*>(&(" << src
+             << ")), __TANG_E2M1);\n";
+      os << sret;
+      return;
+    } else if (from_ty.lanes() == 4 && target_ty.lanes() == 4) {
+      PrintIndent();
+      stream << "((half2*)(&" << sret << "))[0] = "
+             << "__tang_cvt_fp4x2_to_halfraw2("
+             << "*reinterpret_cast<__tang_fp4x2_storage_t*>(&(" << src
+             << ")), __TANG_E2M1);\n";
+      PrintIndent();
+      stream << "((half2*)(&" << sret << "))[1] = "
+             << "__tang_cvt_fp4x2_to_halfraw2("
+             << "*(reinterpret_cast<__tang_fp4x2_storage_t*>(&(" << src
+             << "))+1), __TANG_E2M1);\n";
+      os << sret;
+      return;
+    }
+  }
+
+  // half -> fp4
+  if (from_ty.is_float16() && target_ty.is_float4_e2m1fn()) {
+    if (from_ty.lanes() == 2 && target_ty.lanes() == 2) {
+      PrintIndent();
+      stream << "*reinterpret_cast<__tang_fp4x2_storage_t*>(&(" << sret
+             << ")) = __tang_cvt_halfraw2_to_fp4x2("
+             << "*reinterpret_cast<__half2_raw*>(&(" << src
+             << ")), __TANG_E2M1, tangRoundNearest);\n";
+      os << sret;
+      return;
+    } else if (from_ty.lanes() == 4 && target_ty.lanes() == 4) {
+      PrintIndent();
+      stream << "(reinterpret_cast<__tang_fp4x2_storage_t*>(&" << sret
+             << "))[0] = __tang_cvt_halfraw2_to_fp4x2("
+             << "*reinterpret_cast<__half2_raw*>(&(" << src
+             << ")), __TANG_E2M1, tangRoundNearest);\n";
+      PrintIndent();
+      stream << "(reinterpret_cast<__tang_fp4x2_storage_t*>(&" << sret
+             << "))[1] = __tang_cvt_halfraw2_to_fp4x2("
+             << "*((__half2_raw*)(&(" << src << "))+1)"
+             << ", __TANG_E2M1, tangRoundNearest);\n";
+      os << sret;
+      return;
+    }
+  }
+
+  // fp4 -> float (composed: fp4->half->float)
+  if (from_ty.is_float4_e2m1fn() && target_ty.is_float()) {
+    if (from_ty.lanes() == 2 && target_ty.lanes() == 2) {
+      PrintIndent();
+      stream << "half2 _tmp = __tang_cvt_fp4x2_to_halfraw2("
+             << "*reinterpret_cast<__tang_fp4x2_storage_t*>(&(" << src
+             << ")), __TANG_E2M1);\n";
+      PrintIndent();
+      stream << sret << " = __half22float2(_tmp);\n";
+      os << sret;
+      return;
+    } else if (from_ty.lanes() == 4 && target_ty.lanes() == 4) {
+      PrintIndent();
+      stream << "half2 _tmp0 = __tang_cvt_fp4x2_to_halfraw2("
+             << "*reinterpret_cast<__tang_fp4x2_storage_t*>(&(" << src
+             << ")), __TANG_E2M1);\n";
+      PrintIndent();
+      stream << "half2 _tmp1 = __tang_cvt_fp4x2_to_halfraw2("
+             << "*(reinterpret_cast<__tang_fp4x2_storage_t*>(&(" << src
+             << "))+1), __TANG_E2M1);\n";
+      PrintIndent();
+      stream << "((float2*)(&" << sret << "))[0] = __half22float2(_tmp0);\n";
+      PrintIndent();
+      stream << "((float2*)(&" << sret << "))[1] = __half22float2(_tmp1);\n";
+      os << sret;
+      return;
+    }
+  }
+
+  // float -> fp4
+  if (from_ty.is_float() && target_ty.is_float4_e2m1fn()) {
+    if (from_ty.lanes() == 2 && target_ty.lanes() == 2) {
+      PrintIndent();
+      stream << "*reinterpret_cast<__tang_fp4x2_storage_t*>(&(" << sret
+             << ")) = __tang_cvt_float2_to_fp4x2("
+             << "*reinterpret_cast<float2*>(&(" << src
+             << ")), __TANG_E2M1, tangRoundNearest);\n";
+      os << sret;
+      return;
+    } else if (from_ty.lanes() == 4 && target_ty.lanes() == 4) {
+      PrintIndent();
+      stream << "(reinterpret_cast<__tang_fp4x2_storage_t*>(&" << sret
+             << "))[0] = __tang_cvt_float2_to_fp4x2("
+             << "*(float2*)(&(" << src
+             << ")), __TANG_E2M1, tangRoundNearest);\n";
+      PrintIndent();
+      stream << "(reinterpret_cast<__tang_fp4x2_storage_t*>(&" << sret
+             << "))[1] = __tang_cvt_float2_to_fp4x2("
+             << "*((float2*)(&(" << src << "))+1)"
+             << ", __TANG_E2M1, tangRoundNearest);\n";
+      os << sret;
+      return;
+    }
+  }
+
+  // fp4 -> double (composed: fp4->half->float->double)
+  if (from_ty.is_float4_e2m1fn() && target_ty.is_float() &&
+      target_ty.bits() == 64) {
+    if (from_ty.lanes() == 2 && target_ty.lanes() == 2) {
+      PrintIndent();
+      stream << "half2 _tmp = __tang_cvt_fp4x2_to_halfraw2("
+             << "*reinterpret_cast<__tang_fp4x2_storage_t*>(&(" << src
+             << ")), __TANG_E2M1);\n";
+      PrintIndent();
+      stream << "float2 _ftmp = __half22float2(_tmp);\n";
+      PrintIndent();
+      stream << sret << ".x = static_cast<double>(_ftmp.x);\n";
+      PrintIndent();
+      stream << sret << ".y = static_cast<double>(_ftmp.y);\n";
+      os << sret;
+      return;
+    }
+  }
+
+  // double -> fp4 (per-lane: TANG has no double2_to_fp4x2, use the scalar API)
+  if (from_ty.is_float() && from_ty.bits() == 64 &&
+      target_ty.is_float4_e2m1fn()) {
+    if (from_ty.lanes() == 2 && target_ty.lanes() == 2) {
+      PrintIndent();
+      stream << "*reinterpret_cast<__tang_fp4_storage_t*>(&(" << sret
+             << ".x)) = "
+             << "__tang_cvt_double_to_fp4(" << src
+             << ".x, __TANG_E2M1, tangRoundNearest);\n";
+      PrintIndent();
+      stream << "*reinterpret_cast<__tang_fp4_storage_t*>(&(" << sret
+             << ".y)) = "
+             << "__tang_cvt_double_to_fp4(" << src
+             << ".y, __TANG_E2M1, tangRoundNearest);\n";
+      os << sret;
+      return;
+    }
+  }
+
+  // fp4 -> bfloat16 (composed: fp4->half->float->bf16)
+  if (from_ty.is_float4_e2m1fn() && target_ty.is_bfloat16()) {
+    if (from_ty.lanes() == 2 && target_ty.lanes() == 2) {
+      PrintIndent();
+      stream << "half2 _tmp = __tang_cvt_fp4x2_to_halfraw2("
+             << "*reinterpret_cast<__tang_fp4x2_storage_t*>(&(" << src
+             << ")), __TANG_E2M1);\n";
+      PrintIndent();
+      stream << "float2 _ftmp = __half22float2(_tmp);\n";
+      PrintIndent();
+      stream << "*reinterpret_cast<__tang_bfloat162*>(&(" << sret
+             << ")) = __floats2bfloat162_rn(_ftmp.x, _ftmp.y);\n";
+      os << sret;
+      return;
+    } else if (from_ty.lanes() == 4 && target_ty.lanes() == 4) {
+      PrintIndent();
+      stream << "half2 _tmp0 = __tang_cvt_fp4x2_to_halfraw2("
+             << "*reinterpret_cast<__tang_fp4x2_storage_t*>(&(" << src
+             << ")), __TANG_E2M1);\n";
+      PrintIndent();
+      stream << "half2 _tmp1 = __tang_cvt_fp4x2_to_halfraw2("
+             << "*(reinterpret_cast<__tang_fp4x2_storage_t*>(&(" << src
+             << "))+1), __TANG_E2M1);\n";
+      PrintIndent();
+      stream << "float2 _ftmp0 = __half22float2(_tmp0);\n";
+      PrintIndent();
+      stream << "float2 _ftmp1 = __half22float2(_tmp1);\n";
+      PrintIndent();
+      stream << "(reinterpret_cast<__tang_bfloat162*>(&" << sret
+             << "))[0] = __floats2bfloat162_rn(_ftmp0.x, _ftmp0.y);\n";
+      PrintIndent();
+      stream << "(reinterpret_cast<__tang_bfloat162*>(&" << sret
+             << "))[1] = __floats2bfloat162_rn(_ftmp1.x, _ftmp1.y);\n";
+      os << sret;
+      return;
+    }
+  }
+
+  // bfloat16 -> fp4
+  if (from_ty.is_bfloat16() && target_ty.is_float4_e2m1fn()) {
+    if (from_ty.lanes() == 2 && target_ty.lanes() == 2) {
+      PrintIndent();
+      stream << "*reinterpret_cast<__tang_fp4x2_storage_t*>(&(" << sret
+             << ")) = __tang_cvt_bfloat16raw2_to_fp4x2("
+             << "*reinterpret_cast<__tang_bfloat162_raw*>(&(" << src
+             << ")), __TANG_E2M1, tangRoundNearest);\n";
+      os << sret;
+      return;
+    } else if (from_ty.lanes() == 4 && target_ty.lanes() == 4) {
+      PrintIndent();
+      stream << "(reinterpret_cast<__tang_fp4x2_storage_t*>(&" << sret
+             << "))[0] = __tang_cvt_bfloat16raw2_to_fp4x2("
+             << "*reinterpret_cast<__tang_bfloat162_raw*>(&(" << src
+             << ")), __TANG_E2M1, tangRoundNearest);\n";
+      PrintIndent();
+      stream << "(reinterpret_cast<__tang_fp4x2_storage_t*>(&" << sret
+             << "))[1] = __tang_cvt_bfloat16raw2_to_fp4x2("
+             << "*(reinterpret_cast<__tang_bfloat162_raw*>(&(" << src
+             << "))+1), __TANG_E2M1, tangRoundNearest);\n";
       os << sret;
       return;
     }
@@ -1598,6 +2151,30 @@ void CodeGenTileLangTANG::VisitExpr_(const MaxNode *op, std::ostream &os) {
 
   // For all other scalar types (int, uint), use default implementation
   CodeGenC::VisitExpr_(op, os);
+}
+
+void CodeGenTileLangTANG::VisitExpr_(const NotNode *op, std::ostream &os) {
+  if (!op->dtype.is_fixed_length_vector()) {
+    CodeGenC::VisitExpr_(op, os);
+    return;
+  }
+  std::string result = name_supply_->FreshName("_");
+  PrintIndent();
+  PrintType(op->dtype, stream);
+  stream << ' ' << result << ";\n";
+  int ssa_scope = BeginScope();
+  {
+    std::string value = SSAGetID(PrintExpr(op->a), op->a.dtype());
+    for (int i = 0; i < op->dtype.lanes(); ++i) {
+      std::ostringstream lane;
+      lane << "!bool(";
+      PrintVecElemLoad(value, op->a.dtype(), i, lane);
+      lane << ')';
+      PrintVecElemStore(result, op->dtype, i, lane.str());
+    }
+  }
+  EndScope(ssa_scope);
+  os << result;
 }
 
 void CodeGenTileLangTANG::PrintCallExtern(Type ret_type, String global_symbol,
@@ -1868,6 +2445,17 @@ void CodeGenTileLangTANG::VisitExpr_(const CallNode *op, std::ostream &os) {
     }
     return PrintExpr(expr);
   };
+  // Barriers reach codegen in two shapes: T.tcgen05_mma_arrive runs its
+  // argument through retrieve_ptr and hands over a pointer, while the
+  // barrier-id spelling names an element of the shared array. Normalize both
+  // to a Barrier*.
+  auto print_mbarrier_ptr = [&](const PrimExpr &barrier) {
+    if (barrier.as<IntImmNode>()) {
+      return "&(" + mbarrier_name_ + "[" + PrintExpr(barrier) + "])";
+    }
+    return "reinterpret_cast<" + mbarrier_dtype_ + " *>(" +
+           print_pointer(barrier) + ")";
+  };
   auto print_atomic_binary = [&](const char *name, bool returns_value) {
     ICHECK(op->args.size() == 2 || op->args.size() == 3)
         << name << " expects address, value, and an optional memory order";
@@ -1903,7 +2491,30 @@ void CodeGenTileLangTANG::VisitExpr_(const CallNode *op, std::ostream &os) {
       stream << call.str() << ";\n";
     }
   };
-  if (op->op.same_as(builtin::ptx_cp_async())) {
+  if (op->op.same_as(tl::ldg32())) {
+    ICHECK(op->args.size() == 1 || op->args.size() == 2);
+    std::string pointer = print_pointer(op->args[0]);
+    os << "(";
+    if (op->args.size() == 2) {
+      os << PrintExpr(op->args[1]) << " ? ";
+    }
+    os << "*reinterpret_cast<const unsigned int*>(" << pointer << ")";
+    if (op->args.size() == 2) {
+      os << " : 0u";
+    }
+    os << ")";
+  } else if (op->op.same_as(tl::stg32())) {
+    ICHECK(op->args.size() == 2 || op->args.size() == 3);
+    std::string pointer = print_pointer(op->args[0]);
+    std::string value = PrintExpr(op->args[1]);
+    std::string predicate = op->args.size() == 3 ? PrintExpr(op->args[2]) : "";
+    PrintIndent();
+    if (!predicate.empty()) {
+      stream << "if (" << predicate << ") ";
+    }
+    stream << "*reinterpret_cast<unsigned int*>(" << pointer << ") = " << value
+           << ";\n";
+  } else if (op->op.same_as(builtin::ptx_cp_async())) {
     // NOT used, will be deleted in the future.
     std::string dst = this->PrintExpr(op->args[0]);
     std::string dst_offset = this->PrintExpr(op->args[1]);
@@ -2504,6 +3115,7 @@ void CodeGenTileLangTANG::VisitExpr_(const CallNode *op, std::ostream &os) {
     }
     return;
   } else if (op->op.same_as(builtin::create_barriers())) {
+    need_barrier_h_ = true;
     this->PrintIndent();
     int barrier_count = Downcast<IntImm>(op->args[0])->value;
     auto mbarrier_storage_name = mbarrier_name_ + "_mem";
@@ -2518,54 +3130,78 @@ void CodeGenTileLangTANG::VisitExpr_(const CallNode *op, std::ostream &os) {
     os << mbarrier_name_ + "[" + barrier_id + "]";
   } else if (op->op.same_as(builtin::ptx_arrive_barrier())) {
     if (op->args.size() == 1) {
+      need_barrier_h_ = true;
       this->PrintIndent();
       auto mbarrier_obj = print_mbarrier_obj(op->args[0]);
       this->stream << mbarrier_obj << ".arrive();\n";
     } else if (op->args.size() == 3) {
-      this->PrintIndent();
-      auto mbarrier_obj = print_mbarrier_obj(op->args[0]);
-      auto cta_id = this->PrintExpr(op->args[1]);
-      auto pred = this->PrintExpr(op->args[2]);
-      this->stream << mbarrier_obj << ".arrive(" << cta_id << ", " << pred
-                   << ");\n";
+      // The three-argument form is mbarrier.arrive.cluster with a cta_id and a
+      // predicate. TANG has no cluster level and no cta_id operand on arrive,
+      // so there is nothing to lower this to.
+      LOG(FATAL) << "TANG codegen: T.mbarrier_arrive(mbar, cta_id, pred) is a "
+                    "cluster-scoped arrive, which TANG does not have (no "
+                    "cluster level, and mbarrier.arrive takes no cta_id "
+                    "operand). Use the single-argument T.mbarrier_arrive(mbar) "
+                    "for block-scoped synchronisation.";
     } else {
       LOG(FATAL) << "Invalid parameter  for tl::arrive_barrier "
                  << op->args.size();
     }
   } else if (op->op.same_as(builtin::ptx_init_barrier_thread_count())) {
     ICHECK_EQ(op->args.size(), 2);
+    need_barrier_h_ = true;
     this->PrintIndent();
     auto mbarrier_obj = print_mbarrier_obj(op->args[0]);
     auto arrive_count = this->PrintExpr(op->args[1]);
     this->stream << mbarrier_obj << ".init(" << arrive_count << ");\n";
   } else if (op->op.same_as(builtin::ptx_arrive_barrier_expect_tx())) {
-    if (op->args.size() == 2) {
-      this->PrintIndent();
-      auto mbarrier_obj = print_mbarrier_obj(op->args[0]);
-      auto transaction_bytes = this->PrintExpr(op->args[1]);
-      this->stream << mbarrier_obj << ".arrive_and_expect_tx("
-                   << transaction_bytes << ");\n";
-    } else if (op->args.size() == 4) {
-      this->PrintIndent();
-      auto mbarrier_obj = print_mbarrier_obj(op->args[0]);
-      auto transaction_bytes = this->PrintExpr(op->args[1]);
-      auto cta_id = this->PrintExpr(op->args[2]);
-      auto pred = this->PrintExpr(op->args[3]);
-      this->stream << mbarrier_obj << ".arrive_and_expect_tx("
-                   << transaction_bytes << ", " << cta_id << ", " << pred
-                   << ");\n";
-    } else {
-      LOG(FATAL) << "Invalid parameter  for tl::arrive_barrier_expect_tx "
-                 << op->args.size();
-    }
-  } else if (op->op.same_as(builtin::ptx_cp_async_barrier())) {
-    print_extern_call_stmt("tl::mbarrier_cp_async_arrive");
+    // TANG has no fused arrive.expect_tx: expect_tx and arrive are separate
+    // instructions. Splitting the fused builtin here would silently drop its
+    // atomicity, and the fused form only exists to serve the expect_tx /
+    // complete_tx transaction protocol, whose hardware counter is documented as
+    // unreliable on this silicon. See docs/tang_mbarrier.md.
+    LOG(FATAL) << "TANG codegen: T.mbarrier_arrive_expect_tx is not supported. "
+                  "TANG has no fused arrive.expect_tx instruction, and the "
+                  "transaction-count protocol it belongs to is unreliable on "
+                  "current hardware. Publish async-copy completion with a "
+                  "fence group bound to the barrier instead; see "
+                  "docs/tang_mbarrier.md.";
+  } else if (op->op.same_as(builtin::ptx_cp_async_barrier()) ||
+             op->op.same_as(tl::ptx_cp_async_barrier_noinc())) {
+    // cp.async.mbarrier.arrive makes a non-bulk cp.async group signal an
+    // mbarrier on completion. TANG's PTX layer leaves that instruction
+    // unwired (cp_async_mbarrier_arrive.h is commented out of the umbrella
+    // header), so there is no instruction to emit.
+    LOG(FATAL) << "TANG codegen: cp.async.mbarrier.arrive is not available on "
+                  "TANG, so a cp.async group cannot signal an mbarrier "
+                  "directly. Drain the copy with its fence group instead; see "
+                  "docs/tang_mbarrier.md.";
+  } else if (op->op.same_as(tl::tcgen05_mma_arrive())) {
+    // Blackwell's tcgen05.commit.*.mbarrier makes the MMA publish its own
+    // completion into an mbarrier. TANG's counterpart is a fence that arrives:
+    // binding the tensor-core fence group to the barrier makes hardware post
+    // one arrive when the group's MMA work retires.
+    //
+    // The arrive is per WARP, not per thread, and covers only the calling
+    // warp's own fence group. So the caller must have elected the issuing warp
+    // (CUDA requires the same), and a barrier fed by N issuing warps needs an
+    // arrive count of N. T.gemm(..., mbar=) handles both for you; this bare
+    // builtin does not.
+    ICHECK_EQ(op->args.size(), 1U)
+        << "T.tcgen05_mma_arrive expects 1 argument (the barrier)";
+    need_barrier_h_ = true;
+    this->PrintIndent();
+    this->stream << "(" << print_mbarrier_ptr(op->args[0])
+                 << ")->arrive_on_tc_fence();\n";
   } else if (op->op.same_as(tl::ptx_fence_barrier_init())) {
+    need_barrier_h_ = true;
     print_extern_call_stmt("tl::fence_barrier_init");
-  } else if (op->op.same_as(tl::ptx_cp_async_barrier_noinc())) {
-    print_extern_call_stmt("tl::mbarrier_cp_async_arrive_noinc");
   } else if (op->op.same_as(tl::mbarrier_expect_tx())) {
     ICHECK_EQ(op->args.size(), 2);
+    // The instruction exists and is emitted, but the transaction counter it
+    // feeds is unreliable on current hardware, so this must not be relied on to
+    // detect async-copy completion. See docs/tang_mbarrier.md.
+    need_barrier_h_ = true;
     this->PrintIndent();
     auto mbarrier_obj = print_mbarrier_obj(op->args[0]);
     auto transaction_bytes = this->PrintExpr(op->args[1]);
@@ -2573,6 +3209,7 @@ void CodeGenTileLangTANG::VisitExpr_(const CallNode *op, std::ostream &os) {
                  << ");\n";
   } else if (op->op.same_as(tl::mbarrier_wait_parity())) {
     ICHECK_EQ(op->args.size(), 2);
+    need_barrier_h_ = true;
     this->PrintIndent();
     auto mbarrier_obj = print_mbarrier_obj(op->args[0]);
     auto phase = this->PrintExpr(op->args[1]);
@@ -2831,17 +3468,32 @@ void CodeGenTileLangTANG::VisitExpr_(const CallNode *op, std::ostream &os) {
                           op_instance->value, op->args, true, os);
   } else if (op->op.same_as(tl::tl_tang_gemm())) {
     // 4 args for most TANG GEMM variants <op_instance, A_ptr, B_ptr, C_ptr>;
-    // the TC-Gen5 variant appends an optional 5th runtime arg (clear_accum);
+    // the TC-Gen5 variant appends an optional 5th runtime arg (clear_accum),
+    // and the asynchronous form a 6th (the completion barrier);
     // the block-scaled TC-Gen5 variant passes 8 args
     // <op_instance, A_ptr, B_ptr, C_ptr, SFA_ptr, SFB_ptr, SF_tmem,
     // clear_accum>.
-    ICHECK(op->args.size() == 4 || op->args.size() == 5 || op->args.size() == 8)
-        << "tl_tang_gemm expects 4, 5 or 8 arguments <op_instance, A_ptr, "
-           "B_ptr, C_ptr[, clear_accum | SFA_ptr, SFB_ptr, SF_tmem, "
+    ICHECK(op->args.size() == 4 || op->args.size() == 5 ||
+           op->args.size() == 6 || op->args.size() == 8)
+        << "tl_tang_gemm expects 4, 5, 6 or 8 arguments <op_instance, A_ptr, "
+           "B_ptr, C_ptr[, clear_accum[, mbar] | SFA_ptr, SFB_ptr, SF_tmem, "
            "clear_accum]>, but got "
         << op->args.size();
     auto op_instance = Downcast<StringImm>(op->args[0]);
     enable_sparse_gemm_ = false;
+    if (op->args.size() == 6) {
+      // The barrier argument is a Barrier lvalue (the shared array element),
+      // but the template takes a pointer, so it needs the address-of that the
+      // generic extern-call printer would not add.
+      need_barrier_h_ = true;
+      this->PrintIndent();
+      this->stream << op_instance->value << "(" << this->PrintExpr(op->args[1])
+                   << ", " << this->PrintExpr(op->args[2]) << ", "
+                   << this->PrintExpr(op->args[3]) << ", "
+                   << this->PrintExpr(op->args[4]) << ", &("
+                   << print_mbarrier_obj(op->args[5]) << "));\n";
+      return;
+    }
     this->PrintCallExtern(GetType(tvm::ffi::GetRef<PrimExpr>(op)),
                           op_instance->value, op->args, true, os);
   } else if (op->op.same_as(tl::tl_gemm_sp())) {
@@ -2854,84 +3506,35 @@ void CodeGenTileLangTANG::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->PrintCallExtern(GetType(tvm::ffi::GetRef<PrimExpr>(op)),
                           op_instance->value, op->args, true, os);
   } else if (op->op.same_as(tl::tang_tcgen05_mma_ss())) {
-    // TANG stcuv2 TC-Gen5 MMA (A/B from shared descriptors, C in TMEM)
-    // Maps to tang::ptx::mma<enable_input_d>(d_addr, a_desc, b_desc, i_desc)
-    ICHECK_EQ(op->args.size(), 14U)
-        << "tang_tcgen05_mma_ss expects 14 arguments";
-    std::string kind_dtype = Downcast<StringImm>(op->args[0])->value;
-    std::string a_desc = this->PrintExpr(op->args[1]);
-    std::string a_off = this->PrintExpr(op->args[2]);
-    std::string b_desc = this->PrintExpr(op->args[3]);
-    std::string b_off = this->PrintExpr(op->args[4]);
-    std::string c_ref = this->PrintExpr(op->args[5]);
-    std::string c_off = this->PrintExpr(op->args[6]);
-    std::string desc_val = this->PrintExpr(op->args[7]);
-    std::string scale_out = this->PrintExpr(op->args[8]);
-    std::string mask0 = this->PrintExpr(op->args[9]);
-    std::string mask1 = this->PrintExpr(op->args[10]);
-    std::string mask2 = this->PrintExpr(op->args[11]);
-    std::string mask3 = this->PrintExpr(op->args[12]);
-    bool enable_ws = Downcast<Bool>(op->args[13])->value;
-
-    need_tcgen05_common_h_ = true;
-    this->PrintIndent();
-    // i_desc: use pre-computed MMA descriptor
-    std::string i_desc = desc_val;
-    // d_addr: TMEM address for C
-    this->stream << "tang::ptx::mma<false>("
-                 << "static_cast<tang::ptx::tmem_ptr>(" << c_ref << ") + "
-                 << c_off << ", "
-                 << "static_cast<uint64_t>(" << a_desc << ") + " << a_off
-                 << ", "
-                 << "static_cast<uint64_t>(" << b_desc << ") + " << b_off
-                 << ", "
-                 << "static_cast<uint32_t>(" << i_desc << ")"
-                 << ");\n";
+    LOG(FATAL) << "STCUV2 GEMM is not supported";
   } else if (op->op.same_as(tl::tang_tcgen05_mma_ts())) {
-    // TANG stcuv2 TC-Gen5 MMA (A from TMEM, B from shared, C in TMEM)
-    // Maps to tang::ptx::mma_atmem<enable_input_d>(d_addr, a_tmem, b_desc,
-    // i_desc)
-    ICHECK_EQ(op->args.size(), 13U)
-        << "tang_tcgen05_mma_ts expects 13 arguments";
-    std::string kind_dtype = Downcast<StringImm>(op->args[0])->value;
-    std::string a_ref = this->PrintExpr(op->args[1]);
-    std::string a_off = this->PrintExpr(op->args[2]);
-    std::string b_desc = this->PrintExpr(op->args[3]);
-    std::string b_off = this->PrintExpr(op->args[4]);
-    std::string c_ref = this->PrintExpr(op->args[5]);
-    std::string c_off = this->PrintExpr(op->args[6]);
-    std::string desc_val = this->PrintExpr(op->args[7]);
-    std::string scale_out = this->PrintExpr(op->args[8]);
-    std::string mask0 = this->PrintExpr(op->args[9]);
-    std::string mask1 = this->PrintExpr(op->args[10]);
-    std::string mask2 = this->PrintExpr(op->args[11]);
-    std::string mask3 = this->PrintExpr(op->args[12]);
-
-    need_tcgen05_common_h_ = true;
-    this->PrintIndent();
-    this->stream << "tang::ptx::mma_atmem<false>("
-                 << "static_cast<tang::ptx::tmem_ptr>(" << c_ref << ") + "
-                 << c_off << ", "
-                 << "static_cast<uint32_t>(" << a_ref << ") + " << a_off << ", "
-                 << "static_cast<uint64_t>(" << b_desc << ") + " << b_off
-                 << ", "
-                 << "static_cast<uint32_t>(" << desc_val << ")"
-                 << ");\n";
-  } else if (op->op.same_as(tl::tang_init_tensor_memory())) {
-    // TANG stcuv2 TMEM allocation
-    // Maps to tang::ptx::tc_alloc<N>(ptr) where N is compile-time constant
+    LOG(FATAL) << "STCUV2 GEMM is not supported";
+  } else if (op->op.same_as(tl::tang_scale_stage())) {
+    LOG(FATAL) << "STCUV2 GEMM is not supported";
+  } else if (op->op.same_as(tl::tang_tcgen05_mma_scale())) {
+    LOG(FATAL) << "STCUV2 GEMM is not supported";
+  } else if (op->op.same_as(tl::tang_init_tensor_memory()) ||
+             op->op.same_as(tl::ptx_init_tensor_memory())) {
+    // TANG stcuv2 TMEM allocation.
+    // Maps to tang::ptx::tc_alloc<N>(ptr) where N is compile-time constant.
+    // The portable `ptx_init_tensor_memory` builtin is accepted as an alias so
+    // that user/upstream kernels written against the CUDA-style primitive
+    // compile unchanged on stcuv2 -- the compiler simply routes them to the
+    // corresponding TANG interface.
     ICHECK_EQ(op->args.size(), 2U)
-        << "tang_init_tensor_memory expects 2 arguments";
+        << "ptx_init_tensor_memory expects 2 arguments";
     std::string ptr = this->PrintExpr(op->args[0]);
     std::string num_cols = this->PrintExpr(op->args[1]);
     need_tcgen05_common_h_ = true;
     this->PrintIndent();
     this->stream << "tang::ptx::tc_alloc<" << num_cols << ">(" << ptr << ");\n";
-  } else if (op->op.same_as(tl::tang_deallocate_tensor_memory())) {
-    // TANG stcuv2 TMEM deallocation
-    // Maps to tang::ptx::tc_dealloc<N>(ptr) where N is compile-time constant
+  } else if (op->op.same_as(tl::tang_deallocate_tensor_memory()) ||
+             op->op.same_as(tl::ptx_deallocate_tensor_memory())) {
+    // TANG stcuv2 TMEM deallocation.
+    // Maps to tang::ptx::tc_dealloc<N>(ptr) where N is compile-time constant.
+    // `ptx_deallocate_tensor_memory` is accepted as an alias (see above).
     ICHECK_EQ(op->args.size(), 2U)
-        << "tang_deallocate_tensor_memory expects 2 arguments";
+        << "ptx_deallocate_tensor_memory expects 2 arguments";
     std::string ptr = this->PrintExpr(op->args[0]);
     std::string num_cols = this->PrintExpr(op->args[1]);
     need_tcgen05_common_h_ = true;
@@ -2939,12 +3542,13 @@ void CodeGenTileLangTANG::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->stream << "tang::ptx::tc_dealloc<" << num_cols << ">(" << ptr
                  << ");\n";
   } else if (op->op.same_as(tl::tang_tcgen05_mma_arrive())) {
+    // TANG-dialect spelling of tl::tcgen05_mma_arrive above; same lowering.
     ICHECK_EQ(op->args.size(), 1U)
-        << "tang_tcgen05_mma_arrive expects 1 argument";
-    need_tcgen05_common_h_ = true;
+        << "tang_tcgen05_mma_arrive expects 1 argument (the barrier)";
+    need_barrier_h_ = true;
     this->PrintIndent();
-    this->stream << "// tcgen05_mma_arrive(" << this->PrintExpr(op->args[0])
-                 << ");\n";
+    this->stream << "(" << print_mbarrier_ptr(op->args[0])
+                 << ")->arrive_on_tc_fence();\n";
   } else if (op->op.same_as(tl::tang_tmem_ld())) {
     // TANG stcuv2 TMEM load: ldt_32x32b_xN(out, taddr)
     // args: [out_ref, taddr, num_elements]
@@ -2960,19 +3564,66 @@ void CodeGenTileLangTANG::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->PrintIndent();
     this->stream << "tang::ptx::fence_ldt();\n";
   } else if (op->op.same_as(tl::tang_tmem_ld_16x256b())) {
-    // TANG stcuv2 warp-collective TMEM load: ldt_16x256b_x8_pack(out, taddr)
-    // args: [out_ref, taddr, num_elems] — num_elems ignored, always x8
+    // TANG stcuv2 warp-collective TMEM->register load (fp32, non-pack):
+    //   ldt_16x256b_x{N}(out[4N], taddr)
+    // One warp loads 16 rows x (8*N) fp32 columns; each lane holds 4*N regs.
+    // args: [out_ref, taddr, num_chunks (N)].
     ICHECK_EQ(op->args.size(), 3U)
         << "tang_tmem_ld_16x256b expects 3 arguments";
     std::string out_ref = this->PrintExpr(op->args[0]);
     std::string taddr = this->PrintExpr(op->args[1]);
+    int num_chunks = Downcast<IntImm>(op->args[2])->value;
+    int num_regs = 4 * num_chunks;
     need_tcgen05_common_h_ = true;
     this->PrintIndent();
-    this->stream << "ldt_16x256b_x8_pack("
-                 << "*reinterpret_cast<uint32_t (*)[32]>(" << out_ref << "), "
-                 << taddr << ");\n";
+    this->stream << "ldt_16x256b_x" << num_chunks << "("
+                 << "*reinterpret_cast<uint32_t (*)[" << num_regs << "]>("
+                 << out_ref << "), " << taddr << ");\n";
     this->PrintIndent();
     this->stream << "tang::ptx::fence_ldt();\n";
+  } else if (op->op.same_as(tl::tang_cp_tmem_to_shared())) {
+    // TANG stcuv2 tensor memory -> shared memory copy via the cpt2s engine.
+    //   tl::tang_cp_tmem_to_shared_sw128a8(smem, taddr, rows)
+    // args: [smem_ptr, tmem_addr, rows].
+    ICHECK_EQ(op->args.size(), 3U)
+        << "tang_cp_tmem_to_shared expects 3 arguments";
+    std::string smem = this->PrintExpr(op->args[0]);
+    std::string taddr = this->PrintExpr(op->args[1]);
+    std::string rows = this->PrintExpr(op->args[2]);
+    need_cp_tmem_smem_h_ = true;
+    this->PrintIndent();
+    this->stream << "tl::tang_cp_tmem_to_shared_sw128a8("
+                 << "reinterpret_cast<void *>(" << smem << "), "
+                 << "(uint32_t)(" << taddr << "), "
+                 << "(uint32_t)(" << rows << ")"
+                 << ");\n";
+  } else if (op->op.same_as(tl::tang_cp_shared_to_tmem())) {
+    LOG(FATAL) << "STCUV2 GEMM operand staging is not supported";
+    // TANG stcuv2 shared memory -> tensor memory copy via the cps2t engine.
+    //   tl::tang_cp_shared_to_tmem_{linear,sw128a32}(smem, taddr, rows, cols,
+    //                                                row_words)
+    // args: [smem_ptr, tmem_addr, rows, cols, row_words, swizzled_source];
+    // rows/cols/row_words count 32-bit words. `swizzled_source` selects how the
+    // shared tile was filled: 0 = unswizzled 1D staging copy (the default for a
+    // plain T.copy(global, shared)), 1 = sw128a32 bulk copy.
+    ICHECK_EQ(op->args.size(), 6U)
+        << "tang_cp_shared_to_tmem expects 6 arguments";
+    std::string smem = this->PrintExpr(op->args[0]);
+    std::string taddr = this->PrintExpr(op->args[1]);
+    std::string rows = this->PrintExpr(op->args[2]);
+    std::string cols = this->PrintExpr(op->args[3]);
+    std::string row_words = this->PrintExpr(op->args[4]);
+    int swizzled_source = Downcast<IntImm>(op->args[5])->value;
+    need_cp_tmem_smem_h_ = true;
+    this->PrintIndent();
+    this->stream << (swizzled_source ? "tl::tang_cp_shared_to_tmem_sw128a32("
+                                     : "tl::tang_cp_shared_to_tmem_linear(")
+                 << "reinterpret_cast<void *>(" << smem << "), "
+                 << "(uint32_t)(" << taddr << "), "
+                 << "(uint32_t)(" << rows << "), "
+                 << "(uint32_t)(" << cols << "), "
+                 << "(uint32_t)(" << row_words << ")"
+                 << ");\n";
   } else if (op->op.same_as(tl::tang_tmem_ld_16x256b_x16())) {
     // TANG stcuv2 warp-collective TMEM load (fp32): ldt_16x256b_x16(out, taddr)
     // args: [out_ref, taddr, num_elems] — num_elems determines _out[64]
@@ -2990,66 +3641,143 @@ void CodeGenTileLangTANG::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->stream << "tang::ptx::fence_ldt();\n";
   } else if (op->op.same_as(tl::tang_tmem_drain_16x256b_to_global())) {
     // TANG stcuv2 TMEM→global drain.
-    // args: [tmem_base_val, global_access_ptr, BM, BN, out_dtype_zero]
-    ICHECK_EQ(op->args.size(), 5U)
-        << "tang_tmem_drain_16x256b_to_global expects 5 arguments";
+    // args: [tmem_base_val, global_access_ptr, BM, BN, out_dtype_zero, nwarps,
+    //        N_tile]. N_tile (optional, default 128) is the per-block
+    //        accumulator column count; a tile wider than the 128-column ldt
+    //        chunk (e.g. a single block with N=256) is drained in 128-column
+    //        blocks. BN remains the GLOBAL row stride.
+    ICHECK(op->args.size() == 6U || op->args.size() == 7U)
+        << "tang_tmem_drain_16x256b_to_global expects 6 or 7 arguments";
     std::string tmem_base = this->PrintExpr(op->args[0]);
     std::string global_ref = this->PrintExpr(op->args[1]);
     int BM = Downcast<IntImm>(op->args[2])->value;
     int BN = Downcast<IntImm>(op->args[3])->value;
-    // The 32-bit accumulator in TMEM is fp32 for a float MMA and int32 for an
-    // integer MMA. Reinterpret each lane as that accumulator type, then the
-    // store narrows/converts to whatever the C buffer holds (fp16/bf16/int32).
-    // An integer C buffer ⇒ integer accumulator; otherwise it is fp32.
-    std::string acc_ty = op->args[4].dtype().is_int() ? "int32_t" : "float";
+    int nwarps = Downcast<IntImm>(op->args[5])->value;
+    int N_tile =
+        op->args.size() == 7U ? Downcast<IntImm>(op->args[6])->value : 128;
+    if (N_tile < 128)
+      N_tile = 128;
+    if (nwarps < 1)
+      nwarps = 1;
+    // arg[4] is a typed zero carrying the TMEM accumulator's element type.
+    // Reinterpret each word ldt returns as that type; the store then
+    // narrows/converts to whatever the C buffer holds.
+    //
+    // A 16-bit accumulator (tFP16/tBF16) keeps one element per 32-bit word, in
+    // the word's low half, so reinterpreting the word's first two bytes reads
+    // it -- no unpacking needed. Reading such a word as `float` instead gives a
+    // denormal, which then flushes to zero on the way into a 16-bit C: the
+    // whole tile silently comes out empty.
+    const DataType acc_dt = op->args[4].dtype();
+    std::string acc_ty;
+    if (acc_dt.is_int() || acc_dt.is_uint()) {
+      acc_ty = "int32_t";
+    } else if (acc_dt.is_float16()) {
+      acc_ty = "__fp16";
+    } else if (acc_dt.is_bfloat16()) {
+      acc_ty = "__bf16";
+    } else {
+      acc_ty = "float";
+    }
     need_tcgen05_common_h_ = true;
-    // Generate step-16 warp-collective drain loop matching the reference:
+    // The drain covers the standard 128-column TMEM accumulator tile: 16 chunks
+    // of 8 columns each (ldt_16x256b_x16), 4 registers per chunk. (Per-block
+    // tiles narrower than 128 columns are a separate unsupported
+    // configuration.) Generate step-16 warp-collective drain loop. The BM/16
+    // row-strips are round-robin distributed across the block's `nwarps` warps
+    // so every warp participates in the writeback (multi-warp drain, matching
+    // the golden reference's multi-drain-warp epilogue). Each ldt_16x256b_x16
+    // is a warp-collective load of one 16-row strip; warp `_w` handles strips
+    // _w, _w+nwarps, _w+2*nwarps, ... :
     //   uint32_t _out[64];
-    //   if ((int)threadIdx.x < 32) {
-    //     for (int i = 0; i < BM; i += 16) {
-    //       ldt_16x256b_x16(_out, C_tmem[0] + ((i << 16) | 0));
+    //   int _w = ((int)threadIdx.x) / 32;
+    //   if (_w < nwarps) {
+    //     uint32_t _tid = __laneid();
+    //     for (int _r = _w*16; _r < BM; _r += nwarps*16) {
+    //       ldt_16x256b_x16(_out, C_tmem[0] + ((_r << 16) | 0));
     //       fence_ldt();
     //       for (int _c = 0; _c < 16; ++_c) {
-    //         4 stores per _c: C[(i+tid/4)*BN+...] =
+    //         4 stores per _c: C[(_r+tid/4)*BN+...] =
     //         reinterpret_cast<float>(_out[...])
     //       }
     //     }
     //   }
+    // The names above are illustrative: every temporary is drawn from the
+    // codegen's name supply. A drain nested in a user loop shares that loop's
+    // scope, so a hard-coded name would shadow the loop variable -- and the
+    // drain's own base offset is an expression in exactly that variable (the
+    // batch index of a per-batch GEMM), so it would silently re-bind to the
+    // drain's row counter and every trip would address the wrong tile.
+    // Multi-warp drain requires a block barrier first: the async tcgen05 MMA is
+    // issued (and fenced with fence_tc) by warp 0 ONLY, so only warp 0 observes
+    // the accumulator completion. Warps 1..nwarps-1 never synchronized with the
+    // MMA and would read stale/garbage TMEM. A __syncthreads() after warp 0's
+    // fence_tc publishes the finished accumulator to every draining warp
+    // (mirrors the golden reference's sync_arrive/sync_wait producer->consumer
+    // handshake). Single-warp drain (nwarps==1, warp 0) needs no extra barrier.
+    if (nwarps > 1) {
+      this->PrintIndent();
+      this->stream << "__syncthreads();\n";
+    }
+    const std::string v_out = name_supply_->FreshName("_out");
+    const std::string v_w = name_supply_->FreshName("_w");
+    const std::string v_tid = name_supply_->FreshName("_tid");
+    const std::string v_r = name_supply_->FreshName("_r");
+    const std::string v_cb = name_supply_->FreshName("_cb");
+    const std::string v_c = name_supply_->FreshName("_c");
     this->PrintIndent();
-    this->stream << "uint32_t _out[64];\n";
+    this->stream << "uint32_t " << v_out << "[64];\n";
     this->PrintIndent();
-    this->stream << "if ((int)threadIdx.x < 32) {\n";
+    this->stream << "int " << v_w << " = ((int)threadIdx.x) / 32;\n";
+    this->PrintIndent();
+    this->stream << "if (" << v_w << " < " << nwarps << ") {\n";
     int scope1 = BeginScope();
     this->PrintIndent();
-    this->stream << "uint32_t _tid = __laneid();\n";
+    this->stream << "uint32_t " << v_tid << " = __laneid();\n";
     this->PrintIndent();
-    this->stream << "for (int i = 0; i < " << BM << "; i += 16) {\n";
+    this->stream << "for (int " << v_r << " = " << v_w << "*16; " << v_r
+                 << " < " << BM << "; " << v_r << " += " << (nwarps * 16)
+                 << ") {\n";
     int scope2 = BeginScope();
+    // Column-block loop: each ldt_16x256b_x16 drains 128 fp32 columns; a wider
+    // per-block tile (N_tile > 128) is written 128 columns at a time. This is
+    // the TMEM/global column base; for N_tile == 128 the loop runs once at 0
+    // and is byte-identical to the single-chunk drain.
     this->PrintIndent();
-    this->stream << "ldt_16x256b_x16(_out, " << tmem_base
-                 << " + ((i << 16) | 0));\n";
+    this->stream << "for (int " << v_cb << " = 0; " << v_cb << " < " << N_tile
+                 << "; " << v_cb << " += 128) {\n";
+    int scope_cb = BeginScope();
+    this->PrintIndent();
+    this->stream << "ldt_16x256b_x16(" << v_out << ", " << tmem_base << " + (("
+                 << v_r << " << 16) | " << v_cb << "));\n";
     this->PrintIndent();
     this->stream << "tang::ptx::fence_ldt();\n";
     this->PrintIndent();
-    this->stream << "for (int _c = 0; _c < 16; ++_c) {\n";
+    this->stream << "for (int " << v_c << " = 0; " << v_c << " < 16; ++" << v_c
+                 << ") {\n";
     int scope3 = BeginScope();
+    const std::string row = "(" + v_r + "+" + v_tid + "/4)*";
+    const std::string row8 = "(" + v_r + "+" + v_tid + "/4+8)*";
+    const std::string col = v_cb + "+8*" + v_c + "+(" + v_tid + "%4)*2";
     this->PrintIndent();
-    this->stream << global_ref << "[(i+_tid/4)*" << BN
-                 << " + 8*_c+(_tid%4)*2] = "
-                 << "reinterpret_cast<" << acc_ty << "&>(_out[4*_c]);\n";
+    this->stream << global_ref << "[" << row << BN << " + " << col << "] = "
+                 << "reinterpret_cast<" << acc_ty << "&>(" << v_out << "[4*"
+                 << v_c << "]);\n";
     this->PrintIndent();
-    this->stream << global_ref << "[(i+_tid/4)*" << BN
-                 << " + 8*_c+(_tid%4)*2+1] = "
-                 << "reinterpret_cast<" << acc_ty << "&>(_out[4*_c+1]);\n";
+    this->stream << global_ref << "[" << row << BN << " + " << col << "+1] = "
+                 << "reinterpret_cast<" << acc_ty << "&>(" << v_out << "[4*"
+                 << v_c << "+1]);\n";
     this->PrintIndent();
-    this->stream << global_ref << "[(i+_tid/4+8)*" << BN
-                 << " + 8*_c+(_tid%4)*2] = "
-                 << "reinterpret_cast<" << acc_ty << "&>(_out[4*_c+2]);\n";
+    this->stream << global_ref << "[" << row8 << BN << " + " << col << "] = "
+                 << "reinterpret_cast<" << acc_ty << "&>(" << v_out << "[4*"
+                 << v_c << "+2]);\n";
     this->PrintIndent();
-    this->stream << global_ref << "[(i+_tid/4+8)*" << BN
-                 << " + 8*_c+(_tid%4)*2+1] = "
-                 << "reinterpret_cast<" << acc_ty << "&>(_out[4*_c+3]);\n";
+    this->stream << global_ref << "[" << row8 << BN << " + " << col << "+1] = "
+                 << "reinterpret_cast<" << acc_ty << "&>(" << v_out << "[4*"
+                 << v_c << "+3]);\n";
     this->EndScope(scope3);
+    this->stream << "}\n";
+    this->EndScope(scope_cb);
     this->stream << "}\n";
     this->EndScope(scope2);
     this->stream << "}\n";
@@ -3064,8 +3792,34 @@ void CodeGenTileLangTANG::VisitExpr_(const CallNode *op, std::ostream &os) {
     int num_elems = Downcast<IntImm>(op->args[2])->value;
     need_tcgen05_common_h_ = true;
     this->PrintIndent();
-    this->stream << "stt_32x32b_x" << num_elems << "(" << in_ref << ", "
-                 << taddr << ");\n";
+    // stt_32x32b_xN takes a uint32_t (&)[N]; reinterpret the register pointer
+    // to that array reference (mirrors the ldt_32x32b_xN_pack load path).
+    this->stream << "stt_32x32b_x" << num_elems << "("
+                 << "*reinterpret_cast<uint32_t (*)[" << num_elems << "]>("
+                 << in_ref << "), " << taddr << ");\n";
+    this->PrintIndent();
+    // Order the store before subsequent TMEM readers (LDT / MMA).
+    this->stream << "tang::ptx::fence_stt();\n";
+  } else if (op->op.same_as(tl::tang_tmem_st_16x256b())) {
+    // TANG stcuv2 warp-collective register->TMEM store (fp32, non-pack):
+    //   stt_16x256b_x{N}(in[4N], taddr)
+    // Store counterpart of tang_tmem_ld_16x256b (same 16x256b layout).
+    // args: [in_ref, taddr, num_chunks (N)].
+    ICHECK_EQ(op->args.size(), 3U)
+        << "tang_tmem_st_16x256b expects 3 arguments";
+    std::string in_ref = this->PrintExpr(op->args[0]);
+    std::string taddr = this->PrintExpr(op->args[1]);
+    int num_chunks = Downcast<IntImm>(op->args[2])->value;
+    int num_regs = 4 * num_chunks;
+    need_tcgen05_common_h_ = true;
+    this->PrintIndent();
+    this->stream << "stt_16x256b_x" << num_chunks << "("
+                 << "*reinterpret_cast<uint32_t (*)[" << num_regs << "]>("
+                 << in_ref << "), " << taddr << ");\n";
+    this->PrintIndent();
+    this->stream << "tang::ptx::fence_stt();\n";
+  } else if (op->op.same_as(tl::tang_tmem_st_a_operand())) {
+    LOG(FATAL) << "STCUV2 GEMM is not supported";
   } else if (op->op.same_as(tl::tang_tmem_fence())) {
     // TANG stcuv2 TMEM fence
     // args: [fence_group] (optional, default fg_ldt_default)
@@ -3077,112 +3831,168 @@ void CodeGenTileLangTANG::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->PrintIndent();
     this->stream << "tang::ptx::fence_tmem<" << fg << ">();\n";
   } else if (op->op.same_as(tl::tang_cp_async_bulk())) {
+    LOG(FATAL) << "STCUV2 bulk copy is not supported";
     // TANG stcuv2 swizzled async bulk copy (global ↔ shared).
     // args: [direction, dst, src, rows, col_bytes]
     // direction: 0 = g2s (global → shared), 1 = s2g (shared → global)
     // Emits the self-contained, mbarrier-synchronized helper from
-    // tl_templates/tang/copy_fcp_g_s.h, which wraps tang::ptx::fcpg2s / fcps2g
-    // (sw128bytes_atom32bytes) with a separate global row pitch so K-subtiles
-    // of a wider matrix copy correctly.
-    // args: [direction, dst, src, rows, smem_col_bytes, gmem_row_bytes]
-    ICHECK_EQ(op->args.size(), 6U) << "tang_cp_async_bulk expects 6 arguments";
+    // tl_templates/tang/copy_global_shm.h, which wraps tang::ptx::fcpg2s /
+    // fcps2g (sw128bytes_atom32bytes) with a separate global row pitch so
+    // K-subtiles of a wider matrix copy correctly. args: [direction, dst, src,
+    // rows, smem_col_bytes, gmem_row_bytes,
+    //        num_threads]
+    ICHECK_EQ(op->args.size(), 7U) << "tang_cp_async_bulk expects 7 arguments";
     int direction = Downcast<IntImm>(op->args[0])->value;
     std::string dst = this->PrintExpr(op->args[1]);
     std::string src = this->PrintExpr(op->args[2]);
     std::string rows = this->PrintExpr(op->args[3]);
     std::string col_bytes = this->PrintExpr(op->args[4]);
     std::string gmem_row_bytes = this->PrintExpr(op->args[5]);
+    // Warp count is a codegen-time constant (blockDim is unreliable on the
+    // stcuv2 ISS); the helper partitions the tile across this many warps.
+    int num_threads = Downcast<IntImm>(op->args[6])->value;
+    int nwarps = num_threads / 32;
     need_cp_async_bulk_h_ = true;
     this->PrintIndent();
     if (direction == 0) {
       // g2s: dst = shared, src = global
-      this->stream << "tl::tang_bulk_g2s_sw128a32("
+      this->stream << "tl::tang_bulk_g2s<tang::ptx::sw128a32>("
                    << "reinterpret_cast<void *>(" << dst << "), "
                    << "reinterpret_cast<const void *>(" << src << "), "
                    << "(uint32_t)(" << rows << "), "
                    << "(uint32_t)(" << col_bytes << "), "
-                   << "(uint32_t)(" << gmem_row_bytes << ")"
+                   << "(uint32_t)(" << gmem_row_bytes << "), "
+                   << "(uint32_t)(" << nwarps << ")"
                    << ");\n";
     } else {
       // s2g: dst = global, src = shared
-      this->stream << "tl::tang_bulk_s2g_sw128a32("
+      this->stream << "tl::tang_bulk_s2g<tang::ptx::sw128a32>("
                    << "reinterpret_cast<void *>(" << dst << "), "
                    << "reinterpret_cast<const void *>(" << src << "), "
                    << "(uint32_t)(" << rows << "), "
                    << "(uint32_t)(" << col_bytes << "), "
-                   << "(uint32_t)(" << gmem_row_bytes << ")"
+                   << "(uint32_t)(" << gmem_row_bytes << "), "
+                   << "(uint32_t)(" << nwarps << ")"
                    << ");\n";
     }
-  } else if (op->op.same_as(tl::tang_cp_async_bulk_sw())) {
-    // TANG stcuv2 swizzled async bulk copy with explicit swizzle mode.
-    // args: [direction, dst, src, rows, col_bytes, gmem_row_bytes,
-    //        mbarrier, swizzle_mode]
-    ICHECK_EQ(op->args.size(), 8U)
-        << "tang_cp_async_bulk_sw expects 8 arguments";
+  } else if (op->op.same_as(tl::tang_cp_async_bulk_1d())) {
+    LOG(FATAL) << "STCUV2 bulk copy is not supported";
+    // TANG stcuv2 unswizzled 1D bulk copy (global <-> shared). Same argument
+    // shape as tang_cp_async_bulk; the helper picks a flat or per-row transfer
+    // from the two pitches at runtime.
+    // args: [direction, dst, src, rows, smem_row_bytes, gmem_row_bytes,
+    //        num_threads]
+    ICHECK_EQ(op->args.size(), 7U)
+        << "tang_cp_async_bulk_1d expects 7 arguments";
     int direction = Downcast<IntImm>(op->args[0])->value;
     std::string dst = this->PrintExpr(op->args[1]);
     std::string src = this->PrintExpr(op->args[2]);
     std::string rows = this->PrintExpr(op->args[3]);
     std::string col_bytes = this->PrintExpr(op->args[4]);
     std::string gmem_row_bytes = this->PrintExpr(op->args[5]);
-    std::string mbarrier = this->PrintExpr(op->args[6]);
-    int swizzle_mode = Downcast<IntImm>(op->args[7])->value;
+    int num_threads = Downcast<IntImm>(op->args[6])->value;
+    int nwarps = num_threads / 32;
     need_cp_async_bulk_h_ = true;
     this->PrintIndent();
-    // Map swizzle mode to the template function suffix
-    const char *sw_suffix = "sw128a32"; // default
+    this->stream << (direction == 0 ? "tl::tang_bulk_g2s_1d("
+                                    : "tl::tang_bulk_s2g_1d(")
+                 << "reinterpret_cast<void *>(" << dst << "), "
+                 << "reinterpret_cast<const void *>(" << src << "), "
+                 << "(uint32_t)(" << rows << "), "
+                 << "(uint32_t)(" << col_bytes << "), "
+                 << "(uint32_t)(" << gmem_row_bytes << "), "
+                 << "(uint32_t)(" << nwarps << ")"
+                 << ");\n";
+  } else if (op->op.same_as(tl::tang_cp_async_bulk_sw())) {
+    LOG(FATAL) << "STCUV2 bulk copy is not supported";
+    // TANG stcuv2 swizzled async bulk copy with explicit swizzle and pack mode.
+    // args: [direction, dst, src, rows, col_bytes, gmem_row_bytes,
+    //        num_threads, swizzle_mode, pack_mode]
+    ICHECK_EQ(op->args.size(), 9U)
+        << "tang_cp_async_bulk_sw expects 9 arguments";
+    int direction = Downcast<IntImm>(op->args[0])->value;
+    std::string dst = this->PrintExpr(op->args[1]);
+    std::string src = this->PrintExpr(op->args[2]);
+    std::string rows = this->PrintExpr(op->args[3]);
+    std::string col_bytes = this->PrintExpr(op->args[4]);
+    std::string gmem_row_bytes = this->PrintExpr(op->args[5]);
+    // Warp count is a codegen-time constant (blockDim is unreliable on the
+    // stcuv2 ISS); the helper partitions the tile across this many warps.
+    int num_threads = Downcast<IntImm>(op->args[6])->value;
+    int nwarps = num_threads / 32;
+    int swizzle_mode = Downcast<IntImm>(op->args[7])->value;
+    int pack_mode = Downcast<IntImm>(op->args[8])->value;
+    need_cp_async_bulk_h_ = true;
+    this->PrintIndent();
+    // Allow-list of tang::ptx::SwizzleMode enumerators the lowering can emit.
+    // The device side is a single templated core (tl::tang_bulk_{g2s,s2g}<SW>)
+    // whose stripe geometry (512 / atom_bytes) is the ISA's own general
+    // formula, so widening this list is a one-line change plus an ISS test --
+    // but a mode must not become reachable before it has one, hence the hard
+    // failure below rather than a silent fallback to sw128a32.
+    const char *sw_enum = nullptr;
     switch (swizzle_mode) {
+    // The swizzle a cpt2s-staged tile is written with: an 8-byte atom keeps
+    // one tensor memory row per atom (wider atoms interleave atom/8 rows).
     case 4:
-      sw_suffix = "sw128a8";
+      sw_enum = "sw128a8";
       break;
-    case 5:
-      sw_suffix = "sw128a16";
-      break;
+    // fp16/bf16 (any major) + tf32/int8 K-major (TN). Default path.
     case 6:
-      sw_suffix = "sw128a32";
+      sw_enum = "sw128a32";
       break;
+    // tf32/int8 N-major (MN_major), i.e. the NN GEMM B operand.
     case 7:
-      sw_suffix = "sw128a64";
-      break;
-    case 8:
-      sw_suffix = "sw64a8";
-      break;
-    case 9:
-      sw_suffix = "sw64a16";
-      break;
-    case 10:
-      sw_suffix = "sw64a32";
-      break;
-    case 1:
-      sw_suffix = "sw32a8";
-      break;
-    case 2:
-      sw_suffix = "sw32a16";
+      sw_enum = "sw128a64";
       break;
     default:
-      sw_suffix = "sw128a32";
+      LOG(FATAL) << "tang_cp_async_bulk_sw: swizzle mode " << swizzle_mode
+                 << " has no validated device path (only sw128a8=4, "
+                    "sw128a32=6, sw128a64=7 are exercised). Add an ISS test "
+                    "before enabling it here.";
+    }
+    // Same allow-list discipline for the pack mode. b4p4x16 (packed fp4 ->
+    // unpacked shared) is the only one wired up, and only on the load side:
+    // the s2g repack has no validated pairing.
+    std::string pp_targ;
+    switch (pack_mode) {
+    case 0:
       break;
+    case 1:
+      ICHECK_EQ(direction, 0)
+          << "tang_cp_async_bulk_sw: pack mode b4p4x16 is load-only, got a "
+             "shared->global store";
+      pp_targ = ", tang::ptx::b4p4x16";
+      break;
+    default:
+      LOG(FATAL) << "tang_cp_async_bulk_sw: pack mode " << pack_mode
+                 << " has no validated device path (only no_pack=0 and "
+                    "b4p4x16=1 are exercised). Add an ISS test before "
+                    "enabling it here.";
     }
     if (direction == 0) {
-      this->stream << "tl::tang_bulk_g2s_" << sw_suffix << "("
+      this->stream << "tl::tang_bulk_g2s<tang::ptx::" << sw_enum << pp_targ
+                   << ">("
                    << "reinterpret_cast<void *>(" << dst << "), "
                    << "reinterpret_cast<const void *>(" << src << "), "
                    << "(uint32_t)(" << rows << "), "
                    << "(uint32_t)(" << col_bytes << "), "
-                   << "(uint32_t)(" << gmem_row_bytes << ")"
+                   << "(uint32_t)(" << gmem_row_bytes << "), "
+                   << "(uint32_t)(" << nwarps << ")"
                    << ");\n";
     } else {
-      this->stream << "tl::tang_bulk_s2g_" << sw_suffix << "("
+      this->stream << "tl::tang_bulk_s2g<tang::ptx::" << sw_enum << ">("
                    << "reinterpret_cast<void *>(" << dst << "), "
                    << "reinterpret_cast<const void *>(" << src << "), "
                    << "(uint32_t)(" << rows << "), "
                    << "(uint32_t)(" << col_bytes << "), "
-                   << "(uint32_t)(" << gmem_row_bytes << ")"
+                   << "(uint32_t)(" << gmem_row_bytes << "), "
+                   << "(uint32_t)(" << nwarps << ")"
                    << ");\n";
     }
   } else if (op->op.same_as(tl::tang_fence_tc())) {
     // TANG stcuv2 TC fence: fence_tc<fg>()
-    need_cp_async_bulk_h_ = true;
+    need_tcgen05_common_h_ = true;
     int fg = 0; // default fg_tc_default
     if (op->args.size() >= 1) {
       fg = Downcast<IntImm>(op->args[0])->value;
@@ -3193,7 +4003,7 @@ void CodeGenTileLangTANG::VisitExpr_(const CallNode *op, std::ostream &os) {
     // TANG stcuv2 TC fence arrive: fence_tc_arrive(bar)
     ICHECK_EQ(op->args.size(), 1U) << "tang_fence_tc_arrive expects 1 argument";
     std::string bar = this->PrintExpr(op->args[0]);
-    need_cp_async_bulk_h_ = true;
+    need_tcgen05_common_h_ = true;
     this->PrintIndent();
     this->stream << "tang::ptx::fence_tc_arrive(" << bar << ");\n";
   } else if (op->op.same_as(tl::tang_fence_g2s_arrive())) {
@@ -3201,7 +4011,7 @@ void CodeGenTileLangTANG::VisitExpr_(const CallNode *op, std::ostream &os) {
     ICHECK_EQ(op->args.size(), 1U)
         << "tang_fence_g2s_arrive expects 1 argument";
     std::string bar = this->PrintExpr(op->args[0]);
-    need_cp_async_bulk_h_ = true;
+    need_tcgen05_common_h_ = true;
     this->PrintIndent();
     this->stream << "tang::ptx::fence_g2s_arrive(" << bar << ");\n";
   } else if (op->op.same_as(tl::tang_sync_wait())) {
@@ -3594,6 +4404,7 @@ void CodeGenTileLangTANG::VisitStmt_(const AllocBufferNode *op) {
         scope == "shared.tmem_addr") {
       stream << ' ' << vid << '[' << constant_size << "];\n";
     } else if (scope == "shared.barrier") {
+      need_barrier_h_ = true;
       auto v_id_mem = vid + "_mem";
       stream << ' ' << v_id_mem << "[" << constant_size << "];\n";
       PrintIndent();
@@ -3737,44 +4548,32 @@ void CodeGenTileLangTANG::VisitExpr_(const BufferLoadNode *op,
 void CodeGenTileLangTANG::VisitExpr_(const BroadcastNode *op,
                                      std::ostream &os) { // NOLINT(*)
   int lanes = static_cast<int>(Downcast<IntImm>(op->lanes)->value);
-  if ((op->dtype.is_int() || op->dtype.is_uint()) && op->dtype.bits() == 8) {
-    if (lanes == 32) {
-      std::string v = PrintExpr(op->value);
-      std::string packed_byte = "((unsigned long long)((unsigned char)(" + v +
-                                ")) * 0x0101010101010101ULL)";
-      if (op->dtype.is_uint()) {
-        os << "make_ulonglong4(";
-      } else {
-        os << "make_longlong4(";
-      }
-      for (int i = 0; i < 4; ++i) {
+  if ((op->dtype.is_int() || op->dtype.is_uint()) && op->dtype.bits() == 8 &&
+      (lanes == 4 || lanes == 8 || lanes == 16 || lanes == 32)) {
+    std::string value = PrintExpr(op->value);
+    bool wide = lanes == 32;
+    const char *word_type =
+        wide ? (op->dtype.is_uint() ? "unsigned long long" : "long long")
+             : (op->dtype.is_uint() ? "unsigned int" : "int");
+    std::string packed =
+        wide ? "((unsigned long long)(unsigned char)(" + value +
+                   ") * 0x0101010101010101ULL)"
+             : "((unsigned int)(unsigned char)(" + value + ") * 0x01010101U)";
+    // Each constructor argument represents four or eight packed byte lanes.
+    if (lanes == 4) {
+      os << "((" << word_type << ")" << packed << ")";
+    } else {
+      os << "make_";
+      PrintType(op->dtype, os);
+      os << '(';
+      for (int i = 0; i < lanes / (wide ? 8 : 4); ++i) {
         if (i != 0)
           os << ", ";
-        if (op->dtype.is_uint()) {
-          os << packed_byte;
-        } else {
-          os << "((long long)" << packed_byte << ")";
-        }
+        os << "((" << word_type << ")" << packed << ")";
       }
-      os << ")";
-      return;
+      os << ')';
     }
-
-    const int64_t *p = as_const_int(op->value);
-    if (p) {
-      if (lanes == 4) {
-        // make_int8x4
-        ICHECK(p);
-        int64_t v = *p & 0xFF;
-        v = (v << 24) | (v << 16) | (v << 8) | v;
-        if (op->dtype.is_uint()) {
-          os << "(uint)" << v;
-        } else {
-          os << "(int)" << v;
-        }
-        return;
-      }
-    }
+    return;
   }
 
   if (op->dtype.is_float16()) {
@@ -3944,10 +4743,10 @@ inline void PrintConst(const FloatImmNode *op, std::ostream &os,
       p->PrintType(op->dtype, temp);
       temp << ")";
       temp << "TANGRT_INF_FP16";
-      p->need___clang_tang_fp16_h = true;
+      p->enable_fp16_ = true;
     } else if (std::isnan(op->value)) {
       temp << "TANGRT_NAN_FP16";
-      p->need___clang_tang_fp16_h = true;
+      p->enable_fp16_ = true;
     } else {
       p->PrintType(op->dtype, temp);
       temp << '(' << std::hexfloat << op->value << 'f';
@@ -3968,10 +4767,10 @@ inline void PrintConst(const FloatImmNode *op, std::ostream &os,
       p->PrintType(op->dtype, temp);
       temp << ")";
       temp << "TANGRT_INF_BF16";
-      p->need___clang_tang_bf16_h = true;
+      p->enable_bf16_ = true;
     } else if (std::isnan(op->value)) {
       temp << "TANGRT_NAN_BF16";
-      p->need___clang_tang_bf16_h = true;
+      p->enable_bf16_ = true;
     } else {
       p->PrintType(op->dtype, temp);
       temp << '(' << std::hexfloat << op->value << 'f';

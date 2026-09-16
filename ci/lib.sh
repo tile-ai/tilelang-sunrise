@@ -1,5 +1,3 @@
-#!/bin/bash
-
 # Shared CI library for TileLang and downstream operator repos.
 # Source this file; it only defines variables + functions, never exits on its own.
 # Public defaults are provided where portable. Vendor packages and host toolchain
@@ -15,27 +13,40 @@ export TARGET_TORCH_VERSION TARGET_TRITON_VERSION TARGET_TORCH_PKG_URL
 export TARGET_TORCH_PTPU_PKG TARGET_TRITON_PKG
 TARGET_TVM_FFI_VERSION="${TARGET_TVM_FFI_VERSION:-0.1.11+sunrise.1}"
 
-# GitLab keeps the existing password-backed reset path.  The public GitHub
-# runner selects sudo-n and only receives one exact NOPASSWD pt_smi command.
+# Keep GitLab defaults; restricted public runners opt into sudo-n and redacted logs.
 TILELANG_CI_RESET_MODE="${TILELANG_CI_RESET_MODE:-password}"
 TILELANG_CI_PUBLIC_LOGS="${TILELANG_CI_PUBLIC_LOGS:-0}"
 export TILELANG_CI_RESET_MODE TILELANG_CI_PUBLIC_LOGS
+declare -A CI_CASE_TIMEOUTS=()
 
 # -------------------- Host toolchain paths (machine-specific) --------------------
+# LLVM_HOME has no built-in default (a personal absolute path was removed); it must
+# come from the environment (CI runner or local shell). Empty here simply means
+# "unset unless the environment provides it".
 LLVM_HOME="${LLVM_HOME:-}"
 LLVM_VERSION_MAJOR="${LLVM_VERSION_MAJOR:-20}"
 LLVM_VERSION_MINOR="${LLVM_VERSION_MINOR:-0}"
 TANGRT_PATH="${TANGRT_PATH:-/usr/local/tangrt/}"
 STPU_TANGRT_PATH="${STPU_TANGRT_PATH:-/usr/local/tangrt}"
-TANGRT_LIB_PATH="${TANGRT_LIB_PATH:-/usr/local/tangrt/lib/linux-x86_64:/usr/lib64}"
+TANGRT_LIB_PATH="${TANGRT_LIB_PATH:-${TANGRT_PATH%/}/targets/linux-x86_64/lib:${TANGRT_PATH%/}/lib/linux-x86_64:/usr/lib64}"
 VENDOR_INCLUDE_DIRS="${VENDOR_INCLUDE_DIRS:-/usr/local/tangrt/include}"
-PTCC_PATH="${PTCC_PATH:-/usr/local/tangrt/toolchains/llvm/prebuilt/linux-x86_64/bin/ptcc}"
+PTCC_PATH="${PTCC_PATH:-}"
+CI_PTCC_RESOLVER="$(cd "${BASH_SOURCE[0]%/*}" && pwd)/../tilelang/_ptcc.py"
 CMAKE_PATH="${CMAKE_PATH:-/usr/local/tangrt/cmake}"
 CMAKE_ROOT="${CMAKE_ROOT:-/usr/local/bin/cmake}"
 TANG_CMAKE_PACKAGE_DIR="${TANG_CMAKE_PACKAGE_DIR:-${TANGRT_PATH}/targets/linux-x86_64/lib/cmake/TANG}"
 TANGRT_CMAKE_PACKAGE_DIR="${TANGRT_CMAKE_PACKAGE_DIR:-${TANGRT_PATH}/targets/linux-x86_64/lib/cmake/TANGRT}"
 
 # -------------------- Helpers --------------------
+ci_configure_ptcc () {
+    PTCC_PATH=$(PTCC_PATH="$PTCC_PATH" python3 "$CI_PTCC_RESOLVER" "$TANGRT_PATH") || return 1
+    export PTCC_PATH
+    echo "PTCC: $(readlink -f "$PTCC_PATH")"
+    "$PTCC_PATH" --version || return 1
+    echo "PTCC JIT profile: ${PTCC_JIT_PROFILE:-llvm20}"
+    echo "TANG toolkit: $TANGRT_PATH; S2 build arch: stcu"
+}
+
 # GitLab job cancel (SIGTERM): child pid of the in-flight test, and shutdown latch.
 CI_TEST_PID=""
 CI_SHUTTING_DOWN=0
@@ -107,6 +118,10 @@ ci_card_has_ctx () {
 # Print device client dirs under /proc/pt/ptpu{N}/ named like 0@779457 (ctx@pid).
 ci_list_card_clients () {
     local state_dir=$1
+    if [[ "${TILELANG_CI_PUBLIC_LOGS:-0}" == "1" ]]; then
+        echo "ci_check_card_state: client details redacted for public CI"
+        return 0
+    fi
     local clients c pid cmd
     clients=$(ci_card_ctx_clients "${state_dir}")
     if [[ -z ${clients} ]]; then
@@ -157,6 +172,10 @@ ci_card_clients_are_benign_only () {
 }
 
 ci_dump_device_status () {
+    if [[ "${TILELANG_CI_PUBLIC_LOGS:-0}" == "1" ]]; then
+        ci_save_device_logs
+        return $?
+    fi
     echo "========== device status dump =========="
     echo "---- cat /proc/pt/ptpu*/state ----"
     if compgen -G "/proc/pt/ptpu*/state" >/dev/null 2>&1; then
@@ -219,7 +238,7 @@ ci_check_card_state () {
         if [[ $state_val != "READY" || $fatal_val != "0" ]]; then
             echo "ERROR: 设备异常 — ptpu${card} (expect state=READY fatal_error=0; got state=${state_val} usage=${usage_val} fatal_error=${fatal_val})"
             echo "---- ${state_file} ----"
-            echo "${content}"
+            [[ "${TILELANG_CI_PUBLIC_LOGS:-0}" == "1" ]] || echo "${content}"
             ci_list_card_clients "${state_dir}"
             ci_dump_device_status
             exit 1
@@ -251,7 +270,7 @@ ci_check_card_state () {
         # Busy card: print state + holders once per retry, keep the happy path quiet.
         echo "ci_check_card_state: ptpu${card} busy (ctx held, usage=${usage_val}, attempt ${attempt}/${limit})"
         echo "---- ${state_file} ----"
-        echo "${content}"
+        [[ "${TILELANG_CI_PUBLIC_LOGS:-0}" == "1" ]] || echo "${content}"
         ci_list_card_clients "${state_dir}"
         if [[ $benign_seen -eq 1 ]]; then
             echo "ci_check_card_state: holders are ${holders:-heartbeat/pt_smi} only, wait up to ${limit} attempts (${this_wait}s each)"
@@ -283,33 +302,79 @@ ci_failure_report_dir () {
 #       [attempt max_attempts will_retry]
 ci_record_case_result () {
     local suite="$1" case_id="$2" command="$3" status="$4" exit_code="$5" elapsed="$6" reason="$7" logfile="$8"
-    local timeout_seconds="$9" attempt="${10:-}" max_attempts="${11:-}" will_retry="${12:-0}"
+    local timeout_seconds="${9:-}"
     local report_dir; report_dir="$(ci_failure_report_dir)"
-    mkdir -p "$report_dir"
+    if ! mkdir -p "$report_dir"; then
+        echo "ERROR: failed to create case-report directory: $report_dir" >&2
+        return 1
+    fi
     local tail_chars="${CI_CASE_LOG_TAIL_CHARS:-6000}"
     local tail=""
-    [[ -n "$logfile" && -f "$logfile" ]] && tail="$(tail -c "$tail_chars" "$logfile")"
+    if [[ -n "$logfile" && -f "$logfile" ]] && ! tail="$(tail -c "$tail_chars" "$logfile")"; then
+        echo "ERROR: failed to read case log tail: $logfile" >&2
+        return 1
+    fi
     python3 - "$report_dir/${suite}.jsonl" "$suite" "$case_id" "$command" "$status" \
-              "$exit_code" "$elapsed" "$reason" "$tail" "$timeout_seconds" "$attempt" "$max_attempts" "$will_retry" <<'PY'
+              "$exit_code" "$elapsed" "$reason" "$tail" "$timeout_seconds" <<'PY'
 import json, os, sys
-out, suite, case_id, command, status, exit_code, elapsed, reason, tail, timeout_seconds, attempt, max_attempts, will_retry = sys.argv[1:14]
+out, suite, case_id, command, status, exit_code, elapsed, reason, tail = sys.argv[1:10]
+timeout_seconds = sys.argv[10]
 rec = {
-    "schema_version": 2, "record_kind": "case_attempt" if attempt else "case_result",
+    "schema_version": 2, "record_kind": "case_result",
     "suite": suite, "job": os.getenv("CI_JOB_NAME", ""), "case": case_id,
     "command": command, "cwd": os.getcwd(), "status": status,
     "exit_code": int(exit_code), "elapsed_seconds": int(elapsed),
-    "timeout_seconds": int(timeout_seconds),
     "failure_reason": reason, "log_tail": tail,
     "pipeline_id": os.getenv("CI_PIPELINE_ID", ""), "job_id": os.getenv("CI_JOB_ID", ""),
     "job_name": os.getenv("CI_JOB_NAME", ""), "commit_sha": os.getenv("CI_COMMIT_SHA", ""),
     "project_id": os.getenv("CI_PROJECT_ID", ""), "mr_iid": os.getenv("CI_MERGE_REQUEST_IID", ""),
 }
-if attempt:
-    rec.update({
-        "attempt": int(attempt),
-        "max_attempts": int(max_attempts),
-        "will_retry": will_retry == "1",
-    })
+if timeout_seconds:
+    rec["timeout_seconds"] = int(timeout_seconds)
+with open(out, "a", encoding="utf-8") as fh:
+    fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+PY
+}
+
+# Append one JSONL record per ATTEMPT (additive; the final attempt is still also
+# recorded via ci_record_case_result). record_kind:"case_attempt" carries attempt
+# / total_attempts so per-retry history is inspectable; downstream case_result
+# consumers ignore it (they filter on record_kind). FAIL/TIMEOUT attempts carry a
+# bounded log tail; PASS/SKIPPED pass an empty logfile to omit it.
+# Args: suite case command status exit_code elapsed attempt total_attempts reason logfile
+ci_record_case_attempt () {
+    local suite="$1" case_id="$2" command="$3" status="$4" exit_code="$5" elapsed="$6"
+    local attempt="$7" total="$8" reason="$9" logfile="${10}"
+    local timeout_seconds="${11:-}"
+    local report_dir; report_dir="$(ci_failure_report_dir)"
+    if ! mkdir -p "$report_dir"; then
+        echo "ERROR: failed to create case-report directory: $report_dir" >&2
+        return 1
+    fi
+    local tail_chars="${CI_CASE_LOG_TAIL_CHARS:-6000}"
+    local tail=""
+    if [[ -n "$logfile" && -f "$logfile" ]] && ! tail="$(tail -c "$tail_chars" "$logfile")"; then
+        echo "ERROR: failed to read case log tail: $logfile" >&2
+        return 1
+    fi
+    python3 - "$report_dir/${suite}.jsonl" "$suite" "$case_id" "$command" "$status" \
+              "$exit_code" "$elapsed" "$attempt" "$total" "$reason" "$tail" "$timeout_seconds" <<'PY'
+import json, os, sys
+out, suite, case_id, command, status, exit_code, elapsed, attempt, total, reason, tail = sys.argv[1:12]
+timeout_seconds = sys.argv[12]
+rec = {
+    "schema_version": 2, "record_kind": "case_attempt",
+    "suite": suite, "job": os.getenv("CI_JOB_NAME", ""), "case": case_id,
+    "command": command, "cwd": os.getcwd(), "status": status,
+    "exit_code": int(exit_code), "elapsed_seconds": int(elapsed),
+    "attempt": int(attempt), "total_attempts": int(total),
+    "failure_reason": reason, "log_tail": tail,
+    "pipeline_id": os.getenv("CI_PIPELINE_ID", ""), "job_id": os.getenv("CI_JOB_ID", ""),
+    "job_name": os.getenv("CI_JOB_NAME", ""), "commit_sha": os.getenv("CI_COMMIT_SHA", ""),
+    "project_id": os.getenv("CI_PROJECT_ID", ""), "mr_iid": os.getenv("CI_MERGE_REQUEST_IID", ""),
+}
+if timeout_seconds:
+    rec["timeout_seconds"] = int(timeout_seconds)
 with open(out, "a", encoding="utf-8") as fh:
     fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
 PY
@@ -318,7 +383,7 @@ PY
 ci_record_device_recovery () {
     local suite="$1" case_id="$2" attempt="$3" device="$4" status="$5" exit_code="$6" reason="$7"
     local report_dir; report_dir="$(ci_failure_report_dir)"
-    mkdir -p "$report_dir"
+    mkdir -p "$report_dir" || return 1
     python3 - "$report_dir/${suite}.jsonl" "$suite" "$case_id" "$attempt" "$device" \
               "$status" "$exit_code" "$reason" <<'PY'
 import json, os, sys
@@ -347,7 +412,7 @@ ci_reset_gpu_on_timeout () {
     local ret=0
     if [[ ${CI_SHUTTING_DOWN:-0} -eq 1 ]]; then
         echo "ci_reset_gpu_on_timeout: skip (job cancelling)"
-        ci_record_device_recovery "$suite" "$case_id" "$attempt" "$dev" SKIPPED 0 "job cancelling" || true
+        ci_record_device_recovery "$suite" "$case_id" "$attempt" "$dev" SKIPPED 0 "job cancelling" || return $?
         return 0
     fi
     echo "Resetting Tang device $dev after timeout ..."
@@ -356,7 +421,7 @@ ci_reset_gpu_on_timeout () {
             if [[ "$dev" != "0" ]]; then
                 echo "WARNING: public runner reset is restricted to Tang device 0 (got $dev)"
                 ci_record_device_recovery "$suite" "$case_id" "$attempt" "$dev" SKIPPED 0 \
-                    "public reset is restricted to device 0" || true
+                    "public reset is restricted to device 0" || return $?
                 return 0
             fi
             /usr/bin/timeout --foreground --kill-after=10s 60 \
@@ -366,13 +431,13 @@ ci_reset_gpu_on_timeout () {
             if ! command -v pt_smi >/dev/null 2>&1; then
                 echo "WARNING: pt_smi is unavailable; cannot reset timed-out Tang device"
                 ci_record_device_recovery "$suite" "$case_id" "$attempt" "$dev" SKIPPED 0 \
-                    "pt_smi is unavailable" || true
+                    "pt_smi is unavailable" || return $?
                 return 0
             fi
             if [[ -z "${SUDO_MAGICWORD:-}" ]]; then
                 echo "WARNING: SUDO_MAGICWORD is unavailable; cannot reset timed-out Tang device"
                 ci_record_device_recovery "$suite" "$case_id" "$attempt" "$dev" SKIPPED 0 \
-                    "reset credential is unavailable" || true
+                    "reset credential is unavailable" || return $?
                 return 0
             fi
             printf '%s\n' "$SUDO_MAGICWORD" | sudo -S -p '' \
@@ -381,25 +446,25 @@ ci_reset_gpu_on_timeout () {
         disabled)
             echo "WARNING: Tang reset is disabled; runner operator intervention may be required"
             ci_record_device_recovery "$suite" "$case_id" "$attempt" "$dev" SKIPPED 0 \
-                "reset mode is disabled" || true
+                "reset mode is disabled" || return $?
             return 0
             ;;
         *)
             echo "WARNING: unsupported TILELANG_CI_RESET_MODE=$mode; Tang device was not reset"
             ci_record_device_recovery "$suite" "$case_id" "$attempt" "$dev" SKIPPED 0 \
-                "unsupported reset mode" || true
+                "unsupported reset mode" || return $?
             return 0
             ;;
     esac
     if [[ $ret -ne 0 ]]; then
         echo "WARNING: Tang reset failed (exit=${ret}); runner operator intervention may be required"
         ci_record_device_recovery "$suite" "$case_id" "$attempt" "$dev" FAIL "$ret" \
-            "pt_smi reset failed" || true
+            "pt_smi reset failed" || return $?
         ci_dump_device_status
         return 0
     fi
     echo "ci_reset_gpu_on_timeout: pt_smi -r -i ${dev} OK"
-    ci_record_device_recovery "$suite" "$case_id" "$attempt" "$dev" PASS 0 "" || true
+    ci_record_device_recovery "$suite" "$case_id" "$attempt" "$dev" PASS 0 "" || return $?
 }
 
 # Best-effort pytest skip detection from one case's output. Used by the caller only
@@ -414,6 +479,160 @@ ci_pytest_is_skipped () {
         return 0
     fi
     return 1
+}
+
+# Load conda's shell integration without reading the user's interactive shell
+# startup files.  This keeps local callers' selected environment and aliases out
+# of CI setup while still making conda activate available in a plain shell.
+ci_ensure_conda_shell () {
+    if [[ "$(type -t conda 2>/dev/null)" == "function" ]]; then
+        return 0
+    fi
+
+    local conda_exe="${CONDA_EXE:-}" candidate
+    if [[ -z "$conda_exe" ]]; then
+        conda_exe="$(command -v conda 2>/dev/null || true)"
+    fi
+    if [[ -z "$conda_exe" ]]; then
+        for candidate in \
+            "$HOME/miniconda3/bin/conda" \
+            "$HOME/miniconda3/condabin/conda" \
+            "$HOME/anaconda3/bin/conda" \
+            /opt/conda/bin/conda; do
+            if [[ -x "$candidate" ]]; then
+                conda_exe="$candidate"
+                break
+            fi
+        done
+    fi
+    if [[ -z "$conda_exe" ]]; then
+        echo "ERROR: conda is unavailable; put conda on PATH, set CONDA_EXE, or install it under a standard prefix" >&2
+        return 1
+    fi
+
+    local conda_base conda_sh
+    conda_base="$("$conda_exe" info --base)" || {
+        echo "ERROR: failed to query the conda base directory" >&2
+        return 1
+    }
+    conda_sh="$conda_base/etc/profile.d/conda.sh"
+    if [[ ! -r "$conda_sh" ]]; then
+        echo "ERROR: conda shell integration is unreadable: $conda_sh" >&2
+        return 1
+    fi
+    source "$conda_sh"
+}
+
+# Prefer the configured CMake executable, but reject wrappers that cannot run in
+# the isolated environment and fall back to another installed CMake binary.
+ci_resolve_cmake () {
+    local candidate resolved
+    for candidate in "${CMAKE_ROOT:-}" cmake cmake3; do
+        [[ -z "$candidate" ]] && continue
+        if [[ "$candidate" == */* ]]; then
+            resolved="$candidate"
+        else
+            resolved="$(command -v "$candidate" 2>/dev/null || true)"
+        fi
+        if [[ -n "$resolved" && -x "$resolved" ]] && "$resolved" --version >/dev/null 2>&1; then
+            echo "$resolved"
+            return 0
+        fi
+    done
+    echo "ERROR: no working CMake executable found" >&2
+    return 1
+}
+
+# Remove source-checkout overrides before installing or testing a wheel.  Keep
+# only an explicitly requested PYTHONPATH entry (the pytest audit plugin in CI).
+ci_prepare_installed_wheel_env () {
+    local pythonpath="${1:-}"
+    export -n TILELANG_HOME 2>/dev/null || true
+    unset TVM_HOME TVM_PREBUILD_PATH TVM_SOURCE_DIR TVM_LIBRARY_PATH TL_TEMPLATE_PATH
+    unset TVM_IMPORT_PYTHON_PATH TVM_USE_RUNTIME_LIB SKIP_LOADING_TILELANG_SO PYTHONHOME
+    unset TILELANG_TEST_INSTALLED_WHEEL TILELANG_WHEEL_PREFIX
+    export PYTHONNOUSERSITE=1
+    if [[ -n "$pythonpath" ]]; then
+        export PYTHONPATH="$pythonpath"
+    else
+        unset PYTHONPATH
+    fi
+}
+
+# Import TileLang outside the checkout and prove that both Python and the loaded
+# package come from the isolated environment populated by ci_install_tilelang_whl.
+ci_assert_installed_tilelang_wheel () {
+    local expected_prefix="${CONDA_ENV_PREFIX:-${CONDA_PREFIX:-}}"
+    if [[ -z "$expected_prefix" || -z "${CI_TMP_DIR:-}" ]]; then
+        echo "ERROR: isolated conda prefix or temp directory is unavailable" >&2
+        return 1
+    fi
+    export TILELANG_WHEEL_PREFIX="$expected_prefix"
+    (
+        cd "$CI_TMP_DIR" || exit 1
+        ci_prepare_installed_wheel_env
+        TILELANG_EXPECTED_PREFIX="$expected_prefix" python -I - <<'PY'
+import importlib.metadata
+import os
+from pathlib import Path
+import sys
+
+import tilelang
+import tvm
+import tvm.base
+import tvm_ffi
+import tvm_ffi.core
+
+expected_prefix = Path(os.environ["TILELANG_EXPECTED_PREFIX"]).resolve()
+active_prefix = Path(sys.prefix).resolve()
+package_file = Path(tilelang.__file__).resolve()
+distribution_root = Path(
+    importlib.metadata.distribution("tilelang-sunrise").locate_file("")
+).resolve()
+
+if active_prefix != expected_prefix:
+    raise SystemExit(
+        f"Python prefix mismatch: expected {expected_prefix}, got {active_prefix}"
+    )
+if expected_prefix not in package_file.parents:
+    raise SystemExit(
+        f"tilelang.__file__ is outside the isolated environment: {package_file}"
+    )
+if distribution_root not in package_file.parents:
+    raise SystemExit(
+        "tilelang.__file__ is outside the installed tilelang-sunrise distribution: "
+        f"{package_file} (distribution root: {distribution_root})"
+    )
+def installed_files(name):
+    dist = importlib.metadata.distribution(name)
+    if not dist.files:
+        raise SystemExit(f"{name}: installed file manifest is missing")
+    return {Path(dist.locate_file(entry)).resolve() for entry in dist.files}
+
+
+def verify_path(label, value, files):
+    path = Path(value).resolve(strict=True)
+    if path not in files or expected_prefix not in path.parents:
+        raise SystemExit(f"{label}: resolved outside installed wheel files: {path}")
+    print(f"{label}: {path}")
+
+
+tilelang_files = installed_files("tilelang-sunrise")
+ffi_files = installed_files("apache-tvm-ffi")
+verify_path("installed tilelang", tilelang.__file__, tilelang_files)
+verify_path("installed tvm", tvm.__file__, tilelang_files)
+verify_path("installed tvm-ffi", tvm_ffi.__file__, ffi_files)
+verify_path("tvm-ffi extension", tvm_ffi.core.__file__, ffi_files)
+verify_path("tilelang native library", tilelang._LIB._name, tilelang_files)
+verify_path("tvm compiler library", tvm.base._LIB._name, tilelang_files)
+verify_path("tvm runtime library", tvm.base._LIB_RUNTIME._name, tilelang_files)
+verify_path("tvm-ffi native library", tvm_ffi.LIB._name, ffi_files)
+if tvm.get_global_func("target.build.tilelang_tang", allow_missing=True) is None:
+    raise SystemExit("target.build.tilelang_tang is not registered")
+print("target.build.tilelang_tang: registered")
+print(f"installed wheel: python={sys.executable} tilelang={package_file}")
+PY
+    )
 }
 
 # Init job-isolated state under $1 (default: CI project dir / PWD) and arm cleanup.
@@ -440,7 +659,8 @@ ci_init_state () {
 }
 
 ci_cleanup_state () {
-    local exit_code=$?
+    local trapped_exit_code=$?
+    local exit_code="${1:-$trapped_exit_code}"
     trap - EXIT TERM INT
     set +e
     # Abnormal exit: stage device logs for GitLab artifacts before tearing down state.
@@ -471,8 +691,8 @@ ci_save_device_logs () {
             usage_val=$(awk -F: '/^[[:space:]]*usage:/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$state_file")
             fatal_val=$(awk -F: '/^[[:space:]]*fatal_error:/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$state_file")
         fi
-        mkdir -p "$dest"
-        python3 - "$dest/sunrise_device_summary.json" "$dev" "$state_val" "$usage_val" "$fatal_val" <<'PY'
+        mkdir -p "$dest" || return 1
+        python3 - "$dest/sunrise_device_summary.json" "$dev" "$state_val" "$usage_val" "$fatal_val" <<'PY' || return $?
 import json
 import os
 import sys
@@ -493,7 +713,7 @@ with open(path, "w", encoding="utf-8") as output:
     output.write("\n")
 PY
         echo "ci_save_device_logs: wrote sanitized public summary ${dest}/sunrise_device_summary.json"
-        return 0
+        return $?
     fi
     local dmesg_log="${dest}/dmesg.log"
     local pt_log_src="/var/log/pt200/pt.log"
@@ -513,6 +733,7 @@ PY
 
 # Create + activate the isolated conda env with base deps, torch and torch_ptpu.
 ci_create_conda_env () {
+    check_exec ci_ensure_conda_shell
     : "${TARGET_TORCH_PTPU_PKG:?Set TARGET_TORCH_PTPU_PKG to an accessible torch_ptpu wheel}"
     : "${TARGET_TRITON_PKG:?Set TARGET_TRITON_PKG to an accessible Triton wheel}"
     local conda_exe=""
@@ -614,6 +835,9 @@ ci_build_tvm () {
         echo "ERROR: ci_build_tvm requires an explicit wheel output directory"
         return 1
     fi
+    local cmake_cmd
+    cmake_cmd="$(ci_resolve_cmake)" || return 1
+    echo "Using CMake: $cmake_cmd"
     mkdir -p "$dist_dir"
     local tvm_home="$tilelang_home/3rdparty/tvm_sunrise"
     local tvm_ffi_home="$tvm_home/3rdparty/tvm-ffi"
@@ -645,17 +869,15 @@ ci_build_tvm () {
         rm -rf build
         mkdir build
         pushd build
-            check_exec cmake .. -DUSE_TANG=1 -DUSE_TADNN=0 \
-                -DUSE_CUDA=OFF \
-                -DUSE_OPENCL=OFF \
-                -DUSE_CUTLASS=OFF \
-                -DCMAKE_TANG_COMPILER=${PTCC_PATH} \
-                -DTANG_TOOLKIT_ROOT_DIR=${TANGRT_PATH} \
-                -DTANG_DIR=${TANG_CMAKE_PACKAGE_DIR} \
-                -DTANGRT_DIR=${TANGRT_CMAKE_PACKAGE_DIR} \
+            check_exec "$cmake_cmd" .. -DUSE_TANG=1 -DUSE_TADNN=0 -DUSE_CUDA=OFF -DUSE_OPENCL=OFF -DUSE_CUTLASS=OFF \
+                "-DCMAKE_TANG_COMPILER=${PTCC_PATH}" \
+                "-DCMAKE_TANG_FLAGS=--tang-gpu-arch=stcu" \
+                "-DTANG_TOOLKIT_ROOT_DIR=${TANGRT_PATH}" \
+                "-DTANG_DIR=${TANG_CMAKE_PACKAGE_DIR}" \
+                "-DTANGRT_DIR=${TANGRT_CMAKE_PACKAGE_DIR}" \
                 -DCMAKE_MODULE_PATH=${CMAKE_PATH} \
                 -DUSE_HEXAGON=0
-            check_exec cmake --build . --parallel "$(nproc)"
+            check_exec "$cmake_cmd" --build . --parallel "$(nproc)"
         popd
     popd
 }
@@ -667,6 +889,12 @@ ci_set_tilelang_build_env () {
     export TVM_PREBUILD_PATH=$TVM_HOME/build
     export TVM_SOURCE_DIR=$TVM_HOME
     export PYTHONPATH=$TVM_HOME/python:$TVM_HOME/ffi/python:$PYTHONPATH
+    # scikit-build-core starts a separate CMake configure for the TileLang
+    # wheel (including its embedded TVM); it does not inherit TVM's cache.
+    # Its environment list uses semicolons, preserving spaces inside paths.
+    local ptcc_cmake_args="-DCMAKE_TANG_COMPILER=${PTCC_PATH};-DCMAKE_TANG_FLAGS=--tang-gpu-arch=stcu"
+    ptcc_cmake_args+=";-DTANG_TOOLKIT_ROOT_DIR=${TANGRT_PATH};-DTANG_DIR=${TANG_CMAKE_PACKAGE_DIR};-DTANGRT_DIR=${TANGRT_CMAKE_PACKAGE_DIR}"
+    export SKBUILD_CMAKE_ARGS="${SKBUILD_CMAKE_ARGS:+${SKBUILD_CMAKE_ARGS};}${ptcc_cmake_args}"
 }
 
 # Install tilelang + tvm-ffi from prebuilt whls in $1 (dist dir).
@@ -723,26 +951,33 @@ ci_puzzle_postcheck () {
 # Optional $4 = launch cwd (e.g. PYTEST_LAUNCH_CWD). Returns the timeout/cmd exit.
 ci_run_timed () {
     local case_timeout="$1" logfile="$2" cmd="$3" launch_cwd="${4:-}"
+    local timeout_log
+    timeout_log=$(mktemp) || return 125
+    : > "$logfile" || { rm -f "$timeout_log"; return 125; }
+    CI_LAST_RUN_TIMED_OUT=0
     if [[ ${CI_SHUTTING_DOWN:-0} -eq 1 ]]; then
+        rm -f "$timeout_log"
         exit 143
     fi
     echo "Execute timeout --foreground --kill-after=${CI_TIMEOUT_KILL_AFTER}s ${case_timeout} ${cmd}"
-    if [[ -n "$launch_cwd" ]]; then
-        # exec so CI_TEST_PID is timeout itself (not a wrapping subshell).
-        (cd "$launch_cwd" && eval "exec timeout --foreground --kill-after=${CI_TIMEOUT_KILL_AFTER}s ${case_timeout} ${cmd}") \
-            </dev/null >"$logfile" 2>&1 &
-    else
-        eval "timeout --foreground --kill-after=${CI_TIMEOUT_KILL_AFTER}s ${case_timeout} ${cmd}" \
-            </dev/null >"$logfile" 2>&1 &
-    fi
+    (
+        [[ -z "$launch_cwd" ]] || cd "$launch_cwd" || exit 125
+        # Separate timeout's own diagnostic from child output. A child exiting
+        # 124/137/143 is not proof that the wall-clock deadline was reached.
+        exec env LC_ALL=C timeout --foreground --verbose --kill-after="${CI_TIMEOUT_KILL_AFTER}s" \
+            "$case_timeout" bash -c 'exec >"$2" 2>&1; eval "exec $1"' _ "$cmd" "$logfile"
+    ) </dev/null 2>"$timeout_log" &
     CI_TEST_PID=$!
-    # Live-stream while the test runs; --pid makes tail exit when the child dies.
     tail -n +1 -f "$logfile" --pid="$CI_TEST_PID" 2>/dev/null &
-    local tail_pid=$!
-    wait "${CI_TEST_PID}"
-    local ret=$?
+    local tail_pid=$! ret=0
+    wait "${CI_TEST_PID}" || ret=$?
     CI_TEST_PID=""
     wait "${tail_pid}" 2>/dev/null || true
+    if grep -qE '^timeout: sending signal (TERM|KILL) to command' "$timeout_log"; then
+        CI_LAST_RUN_TIMED_OUT=1
+    fi
+    cat "$timeout_log" | tee -a "$logfile"
+    rm -f "$timeout_log"
     if [[ ${CI_SHUTTING_DOWN:-0} -eq 1 ]]; then
         exit 143
     fi
@@ -769,82 +1004,160 @@ ci_prepare_failure_reports () {
         return 0
     fi
     local report_dir; report_dir="$(ci_failure_report_dir)"
-    rm -rf "$report_dir"
-    mkdir -p "$report_dir"
+    if ! rm -rf "$report_dir" || ! mkdir -p "$report_dir"; then
+        echo "ERROR: failed to initialize case-report directory: $report_dir" >&2
+        return 1
+    fi
     CI_FAILURE_REPORTS_INITIALIZED=1
     export CI_FAILURE_REPORTS_INITIALIZED
 }
 
-# Run a test-case list. $1=list file, $2=mode (command|pytest|puzzle).
-# In pytest mode, bare Python paths use pytest while "python path.py" entries
-# run as direct commands.
-# Honors TEST_MARKER, CASE_TIMEOUT, CASE_REPEAT, TILELANG_CACHE_DIR. An optional
-# sibling <list-name>_timeouts.tsv maps an exact case label to a larger/smaller
-# timeout in seconds. Unknown, duplicate, or malformed mappings fail closed.
-# CASE_REPEAT (default 3): per-case attempts until PASS/SKIPPED. Every attempt
-# is reported; only the final case outcome is tallied (no batching).
-# Returns 1 if any case fails.
-ci_run_test_list () {
-    local list_file="$1" mode="${2:-pytest}" suite="${3:-}"
-    local case_timeout="${CASE_TIMEOUT:-900}"
-    local case_repeat="${CASE_REPEAT:-3}"
-    local cache_dir="${TILELANG_CACHE_DIR:-$HOME/.tilelang/cache}"
-    local list_root; list_root="$(cd "$(dirname "$list_file")" && pwd)"
-    local timeout_file="${CASE_TIMEOUT_FILE:-${list_file%.txt}_timeouts.tsv}"
+# Warn (stderr) that a non-comment, non-blank list line matched no accepted form
+# and was dropped, and record it in the caller-visible CI_DROPPED_LINES array so a
+# preview (ci/run.sh --dry-run) can surface it. Additive: which lines RUN is
+# unchanged; existing callers just see extra warnings.
+_ci_warn_unparsable () {
+    local line="$1" list_file="$2"
+    echo "WARNING: ci_parse_list_into: skipping unparsable line in ${list_file}: ${line}" >&2
+    CI_DROPPED_LINES+=("$line")
+}
 
-    if ! [[ $case_repeat =~ ^[1-9][0-9]*$ ]]; then
-        echo "ERROR: Invalid CASE_REPEAT=$case_repeat (need positive integer)"
-        return 1
-    fi
-
-    # Operator repos call with 2 args; derive the suite from the list filename:
-    #   ci_test_case_list_tileops.txt -> tileops ; ..._tilelang_puzzles.txt -> tilelang_puzzles
-    if [[ -z "$suite" ]]; then
-        suite="$(basename "$list_file")"; suite="${suite#ci_test_case_list_}"; suite="${suite%.txt}"
-    fi
-
+# Parse a test-case list file into the caller-visible arrays CI_CMDS / CI_LABELS
+# / CI_CASE_MODES (APPENDS; caller resets first). $1=list file, $2=mode
+# (command|pytest|puzzle), optional $3=list_root used to resolve relative paths
+# (defaults to the list file's directory).
+# In pytest mode: bare Python paths run under pytest, "python path.py" entries run
+# as direct commands, and a pytest nodeid (path.py::Class::test) is passed through
+# to pytest as-is (its file part is resolved against list_root).
+# Honors TEST_MARKER and PYTEST_AUDIT_PLUGIN_ARGS.
+ci_parse_list_into () {
+    local list_file="$1" mode="${2:-pytest}"
+    local list_root="${3:-}"
     if [[ ! -f "$list_file" ]]; then
         echo "Error: test list file not found: $list_file"; return 1
     fi
-
-    ci_assert_runtime_stack
-
-    local -a cmds=() labels=() case_modes=()
-    local -A case_timeouts=()
+    [[ -z "$list_root" ]] && list_root="$(cd "$(dirname "$list_file")" && pwd)"
     local line
     while IFS= read -r line; do
         [[ $line =~ ^#.*$ ]] && continue
         [[ -z $line ]] && continue
         case "$mode" in
             command)
-                [[ $line =~ ^(python|pytest)[[:space:]]+ ]] || continue
-                cmds+=("$line"); labels+=("$(echo "$line" | awk '{print $2}')")
-                case_modes+=("command") ;;
+                [[ $line =~ ^(python|pytest)[[:space:]]+ ]] || { _ci_warn_unparsable "$line" "$list_file"; continue; }
+                CI_CMDS+=("$line"); CI_LABELS+=("$(echo "$line" | awk '{print $2}')")
+                CI_CASE_MODES+=("command") ;;
             pytest)
                 if [[ $line =~ ^python[[:space:]]+.+\.py$ ]]; then
-                    cmds+=("$line")
-                    labels+=("$(echo "$line" | awk '{print $2}')")
-                    case_modes+=("command")
+                    CI_CMDS+=("$line")
+                    CI_LABELS+=("$(echo "$line" | awk '{print $2}')")
+                    CI_CASE_MODES+=("command")
                 else
-                    [[ $line =~ \.py$ ]] || continue
-                    local case_path="$line"
-                    [[ "$case_path" != /* ]] && case_path="$list_root/$case_path"
-                    if [ -n "${TEST_MARKER}" ]; then
-                        cmds+=("python -m pytest -v -ra --instafail --import-mode=importlib ${PYTEST_AUDIT_PLUGIN_ARGS:-} -m ${TEST_MARKER} $case_path")
+                    # Accept a bare .py path or a pytest nodeid (path.py::...).
+                    [[ $line =~ \.py(::|$) ]] || { _ci_warn_unparsable "$line" "$list_file"; continue; }
+                    local file_part="${line%%::*}" node_suffix=""
+                    [[ "$line" == *::* ]] && node_suffix="::${line#*::}"
+                    [[ "$file_part" != /* ]] && file_part="$list_root/$file_part"
+                    local case_path="${file_part}${node_suffix}"
+                    if [ -n "${TEST_MARKER:-}" ]; then
+                        CI_CMDS+=("python -m pytest -v -ra --instafail --import-mode=importlib ${PYTEST_AUDIT_PLUGIN_ARGS:-} -m ${TEST_MARKER} $case_path")
                     elif [ "$line" = "tests/test_base.py" ]; then
-                        cmds+=("python $case_path")
+                        CI_CMDS+=("python $case_path")
                     else
-                        cmds+=("python -m pytest -v -ra --instafail --import-mode=importlib ${PYTEST_AUDIT_PLUGIN_ARGS:-} $case_path")
+                        CI_CMDS+=("python -m pytest -v -ra --instafail --import-mode=importlib ${PYTEST_AUDIT_PLUGIN_ARGS:-} $case_path")
                     fi
-                    labels+=("$line")
-                    case_modes+=("pytest")
+                    CI_LABELS+=("$line")
+                    CI_CASE_MODES+=("pytest")
                 fi
                 ;;
             puzzle)
-                [[ $line =~ \.py$ ]] || continue
-                cmds+=("python $line"); labels+=("$line"); case_modes+=("puzzle") ;;
+                [[ $line =~ \.py$ ]] || { _ci_warn_unparsable "$line" "$list_file"; continue; }
+                CI_CMDS+=("python $line"); CI_LABELS+=("$line"); CI_CASE_MODES+=("puzzle") ;;
         esac
     done < "$list_file"
+}
+
+# Canonical selector identity shared by list overrides and run.sh's merged plan.
+ci_timeout_key () {
+    local label="$1" root="$2" file_part="${1%%::*}" suffix=""
+    [[ "$label" == *::* ]] && suffix="::${label#*::}"
+    [[ "$file_part" == /* ]] || file_part="$root/$file_part"
+    local resolved
+    resolved=$(realpath -m -- "$file_part") || return 1
+    printf '%s%s\n' "$resolved" "$suffix"
+}
+
+# Load an optional sibling TSV into the caller's associative CI_CASE_TIMEOUTS.
+# Reject duplicate entries, stale selectors, and conflicting merged-list values.
+ci_load_test_timeouts () {
+    local list_file="$1" mode="${2:-pytest}" timeout_file="${1%.txt}_timeouts.tsv"
+    [[ -e "$timeout_file" ]] || return 0
+    if [[ ! -f "$timeout_file" || ! -r "$timeout_file" ]]; then
+        echo "ERROR: unreadable timeout mapping: $timeout_file" >&2
+        return 1
+    fi
+    local list_root
+    list_root=$(cd "$(dirname "$list_file")" && pwd) || return 1
+    local -a CI_CMDS=() CI_LABELS=() CI_CASE_MODES=()
+    ci_parse_list_into "$list_file" "$mode" "$list_root" || return 1
+    local -A available=() seen=()
+    local label key line value
+    for label in "${CI_LABELS[@]}"; do
+        key=$(ci_timeout_key "$label" "$list_root") || return 1
+        available["$key"]=1
+    done
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*# || -z "$line" ]] && continue
+        label="${line%%$'\t'*}"
+        value="${line#*$'\t'}"
+        if [[ "$label" == "$line" || -z "$label" || "$label" =~ [[:space:]] ||
+              ! "$value" =~ ^[1-9][0-9]*$ || ${#value} -gt 9 ]]; then
+            echo "ERROR: Invalid timeout mapping in $timeout_file: $line" >&2
+            return 1
+        fi
+        key=$(ci_timeout_key "$label" "$list_root") || return 1
+        if [[ -n "${seen[$key]:-}" ]]; then
+            echo "ERROR: Duplicate timeout mapping for $label in $timeout_file" >&2
+            return 1
+        fi
+        seen["$key"]=1
+        if [[ -z "${available[$key]:-}" ]]; then
+            echo "ERROR: Timeout mapping does not match a case in $list_file: $label" >&2
+            return 1
+        fi
+        if [[ -n "${CI_CASE_TIMEOUTS[$key]:-}" && "${CI_CASE_TIMEOUTS[$key]}" != "$value" ]]; then
+            echo "ERROR: Conflicting timeout mappings for $label in $timeout_file" >&2
+            return 1
+        fi
+        CI_CASE_TIMEOUTS["$key"]="$value"
+    done < "$timeout_file"
+    return 0
+}
+
+# Run/retry/tally the cases already parsed into CI_CMDS / CI_LABELS / CI_CASE_MODES.
+# $1=suite (report bucket). Honors CASE_TIMEOUT, CASE_REPEAT, TILELANG_CACHE_DIR,
+# PYTEST_LAUNCH_CWD.
+# CASE_REPEAT (default 3): per-case attempts until PASS/SKIPPED; the final attempt
+# is tallied/reported as case_result, and every attempt is additionally recorded as
+# case_attempt. Returns 1 if any case fails.
+ci_run_prepared_cases () {
+    local suite="$1"
+    local list_root="${2:-$PWD}"
+    local case_timeout="${CASE_TIMEOUT:-900}"
+    local case_repeat="${CASE_REPEAT:-3}"
+    local cache_dir="${TILELANG_CACHE_DIR:-$HOME/.tilelang/cache}"
+
+    if ! [[ "$case_timeout" =~ ^[1-9][0-9]*$ ]] || [[ ${#case_timeout} -gt 9 ]]; then
+        echo "ERROR: Invalid CASE_TIMEOUT=$case_timeout (need positive integer seconds)" >&2
+        return 1
+    fi
+    if ! [[ $case_repeat =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: Invalid CASE_REPEAT=$case_repeat (need positive integer)"
+        return 1
+    fi
+
+    local -n cmds=CI_CMDS
+    local -n labels=CI_LABELS
+    local -n case_modes=CI_CASE_MODES
 
     if [[ -f "$timeout_file" ]]; then
         local timeout_case timeout_value
@@ -867,9 +1180,9 @@ ci_run_test_list () {
     fi
 
     local num=${#cmds[@]}
-    echo "Total test cases: $num   (mode: $mode, marker: ${TEST_MARKER:-all}, repeat: ${case_repeat})"
+    echo "Total test cases: $num   (marker: ${TEST_MARKER:-all}, repeat: ${case_repeat})"
     if [[ $num -eq 0 ]]; then
-        echo "Error: no valid test cases found in $list_file"; return 1
+        echo "Error: no valid test cases found"; return 1
     fi
 
     if (( ${#case_timeouts[@]} > 0 )); then
@@ -892,15 +1205,18 @@ ci_run_test_list () {
 
     # Clear stale reports only before this job's first list.  Subsequent lists
     # append separate suite JSONL files into the same artifact directory.
-    ci_prepare_failure_reports
+    if ! ci_prepare_failure_reports; then
+        return 2
+    fi
 
     local -a results=()
     local success=0 fail=0 skipped=0 i ret start end elapsed line_result
-    local attempt case_status reason rec_log current_mode launch_cwd logfile current_timeout
-    local needs_timeout_reset will_retry
+    local attempt case_status reason rec_log current_mode launch_cwd logfile attempt_log current_timeout key
+    local recording_failed=0 record_ret
     for ((i=0; i<num; i++)); do
         echo ">>>>>>> running case $((i+1))/$num: ${labels[$i]} <<<<<<<<"
-        current_timeout="${case_timeouts[${labels[$i]}]:-$case_timeout}"
+        key=$(ci_timeout_key "${labels[$i]}" "$list_root") || return 1
+        current_timeout="${CI_CASE_TIMEOUTS[$key]:-$case_timeout}"
         echo "Case timeout: ${current_timeout}s"
         current_mode="${case_modes[$i]}"
         launch_cwd=""
@@ -923,33 +1239,42 @@ ci_run_test_list () {
             start=$(date +%s)
             # `|| ret=$?` keeps set -e callers from aborting before we classify the result.
             ret=0
+            CI_LAST_RUN_TIMED_OUT=0
             ci_run_timed "$current_timeout" "$logfile" "${cmds[$i]}" "$launch_cwd" || ret=$?
             if [[ "$current_mode" == "puzzle" ]]; then
                 ci_puzzle_postcheck "$logfile" "$ret" || ret=$?
             fi
             end=$(date +%s); elapsed=$((end - start))
 
-            if [[ "$current_mode" == "pytest" ]] && ci_pytest_is_skipped "$logfile" "$ret"; then
+            if [[ ${CI_LAST_RUN_TIMED_OUT:-0} -eq 1 ]]; then
+                case_status="TIMEOUT"; reason="timed out after ${current_timeout}s (exit $ret)"; rec_log="$logfile"
+            elif [[ "$current_mode" == "pytest" ]] && ci_pytest_is_skipped "$logfile" "$ret"; then
                 case_status="SKIPPED"; reason="no tests ran / all skipped"; rec_log=""
             elif [[ $ret -eq 0 ]]; then
                 case_status="PASS"; reason=""; rec_log=""
-            elif ci_result_is_timeout "$ret" "$elapsed" "$current_timeout"; then
-                case_status="TIMEOUT"; reason="timed out after ${current_timeout}s (exit ${ret})"; rec_log="$logfile"
-                needs_timeout_reset=1
             elif [[ $ret -eq 137 ]]; then
-                case_status="FAIL"; reason="terminated by SIGKILL (exit 137)"; rec_log="$logfile"
+                case_status="FAIL"; reason="SIGKILL (exit 137; possible OOM)"; rec_log="$logfile"
+            elif [[ $ret -eq 143 ]]; then
+                case_status="FAIL"; reason="SIGTERM (exit 143)"; rec_log="$logfile"
             else
                 case_status="FAIL"; reason="exit code $ret"; rec_log="$logfile"
             fi
 
-            will_retry=0
-            if [[ $case_status != "PASS" && $case_status != "SKIPPED" && $attempt -lt $case_repeat ]]; then
-                will_retry=1
-            fi
-            ci_record_case_result "$suite" "${labels[$i]}" "${cmds[$i]}" "$case_status" \
-                "$ret" "$elapsed" "$reason" "$rec_log" "$current_timeout" "$attempt" "$case_repeat" "$will_retry"
-            if [[ $needs_timeout_reset -eq 1 ]]; then
-                ci_reset_gpu_on_timeout "$suite" "${labels[$i]}" "$attempt"
+            # Record this attempt (additive). FAIL/TIMEOUT carry a bounded log tail.
+            attempt_log=""
+            [[ "$case_status" != "PASS" && "$case_status" != "SKIPPED" ]] && attempt_log="$logfile"
+            ci_record_case_attempt "$suite" "${labels[$i]}" "${cmds[$i]}" "$case_status" \
+                "$ret" "$elapsed" "$attempt" "$case_repeat" "$reason" "$attempt_log" "$current_timeout" || {
+                record_ret=$?
+                echo "ERROR: failed to record attempt ${attempt} for ${labels[$i]} (exit $record_ret)" >&2
+                recording_failed=1
+            }
+
+            if [[ "$case_status" == "TIMEOUT" ]]; then
+                ci_reset_gpu_on_timeout "$suite" "${labels[$i]}" "$attempt" || {
+                    echo "ERROR: failed to record device recovery for ${labels[$i]}" >&2
+                    recording_failed=1
+                }
             fi
 
             if [[ $case_status == "PASS" || $case_status == "SKIPPED" ]]; then
@@ -978,8 +1303,11 @@ ci_run_test_list () {
                 line_result="FAILURE: ${labels[$i]} (exit $ret, ${elapsed}s)"; fail=$((fail+1)) ;;
         esac
         # Record every case (PASS/SKIPPED carry no log_tail to bound artifact size).
-        ci_record_case_result "$suite" "${labels[$i]}" "${cmds[$i]}" "$case_status" \
-            "$ret" "$elapsed" "$reason" "$rec_log" "$current_timeout"
+        ci_record_case_result "$suite" "${labels[$i]}" "${cmds[$i]}" "$case_status" "$ret" "$elapsed" "$reason" "$rec_log" "$current_timeout" || {
+            record_ret=$?
+            echo "ERROR: failed to record final result for ${labels[$i]} (exit $record_ret)" >&2
+            recording_failed=1
+        }
         [[ -n $rec_log ]] && rm -f "$rec_log"
         results+=("$line_result")
         echo "  -> $line_result"
@@ -991,5 +1319,46 @@ ci_run_test_list () {
     echo "============================= Statistics =============================="
     echo "Total: $num   Success: $success   Failed: $fail   Skipped: $skipped"
     awk "BEGIN {printf \"Success rate: %.1f%%\n\", $success/$num*100}"
-    [[ $fail -gt 0 ]] && return 1 || return 0
+    if [[ $fail -gt 0 ]]; then
+        return 1
+    fi
+    [[ $recording_failed -gt 0 ]] && return 2
+    return 0
+}
+
+# Run a test-case list. $1=list file, $2=mode (command|pytest|puzzle), $3=suite.
+# Thin wrapper preserved for downstream callers: reset the arrays, parse the list,
+# then run the prepared cases. Net behavior identical to before the parse/run split.
+# In pytest mode, bare Python paths use pytest while "python path.py" entries run
+# as direct commands.
+# Honors TEST_MARKER, CASE_TIMEOUT, CASE_REPEAT, TILELANG_CACHE_DIR.
+# CASE_REPEAT (default 3): per-case attempts until PASS/SKIPPED; only the final
+# attempt is tallied/reported (no batching).
+# Returns 1 if any case fails.
+ci_run_test_list () {
+    local list_file="$1" mode="${2:-pytest}" suite="${3:-}"
+    local case_repeat="${CASE_REPEAT:-3}"
+    local -A CI_CASE_TIMEOUTS=()
+
+    if ! [[ $case_repeat =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: Invalid CASE_REPEAT=$case_repeat (need positive integer)"
+        return 1
+    fi
+
+    # Operator repos call with 2 args; derive the suite from the list filename:
+    #   ci_test_case_list_tileops.txt -> tileops ; ..._tilelang_puzzles.txt -> tilelang_puzzles
+    if [[ -z "$suite" ]]; then
+        suite="$(basename "$list_file")"; suite="${suite#ci_test_case_list_}"; suite="${suite%.txt}"
+    fi
+
+    if [[ ! -f "$list_file" ]]; then
+        echo "Error: test list file not found: $list_file"; return 1
+    fi
+
+    ci_assert_runtime_stack
+
+    CI_CMDS=(); CI_LABELS=(); CI_CASE_MODES=()
+    ci_parse_list_into "$list_file" "$mode" || return 1
+    ci_load_test_timeouts "$list_file" "$mode" || return 1
+    ci_run_prepared_cases "$suite" "$(cd "$(dirname "$list_file")" && pwd)"
 }

@@ -66,26 +66,9 @@ def test_issue_2123_atomic_load_lower_access_ptr_pipeline():
         target = tvm.target.Target("tang")
         func = issue_2123_atomic_load_repro(4).with_attr("global_symbol", "main")
         mod = tvm.IRModule.from_expr(func)
-        with target:
-            mod = tirx.transform.BindTarget(target)(mod)
-            mod = tilelang.transform.MaterializeKernelLaunch()(mod)
-            mod = tilelang.transform.AddWrapperForSingleBufStore()(mod)
-            mod = tilelang.transform.LegalizeNegativeIndex()(mod)
-            mod = tilelang.transform.InjectAssumes()(mod)
-            mod = tilelang.transform.Simplify()(mod)
-            mod = tilelang.transform.LayoutReducer()(mod)
-            mod = tilelang.transform.IfStmtBinding()(mod)
-            mod = tilelang.transform.PipelinePlanning()(mod)
-            mod = tilelang.transform.InjectSoftwarePipeline()(mod)
-            mod = tilelang.transform.Simplify()(mod)
-            mod = tilelang.transform.LayoutInference()(mod)
-            mod = tilelang.transform.LowerTileOp()(mod)
-            mod = tilelang.transform.DecoupleTypeCast()(mod)
-            mod = tilelang.transform.LegalizeVectorizedLoop()(mod)
-            mod = tilelang.transform.LegalizeSafeMemoryAccess()(mod)
-            mod = tilelang.transform.LowerAccessPtr()(mod)
-            mod = tilelang.transform.Simplify()(mod)
-        lowered = mod
+        from tilelang.tang.pipeline import TANGPassPipelineBodyPrologue
+
+        lowered = TANGPassPipelineBodyPrologue(mod, target)
     else:
         target = tvm.target.Target("cuda", host="llvm")
         func = issue_2123_atomic_load_repro(4).with_attr("global_symbol", "main")

@@ -16,7 +16,7 @@ def test_sunrise_distribution_metadata():
     metadata = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     project = metadata["project"]
 
-    assert (REPO_ROOT / "VERSION").read_text(encoding="utf-8").strip() == "0.1.13+sunrise.1.0.0"
+    assert (REPO_ROOT / "VERSION").read_text(encoding="utf-8").strip() == "0.1.14+sunrise.1.1.0"
     assert project["name"] == "tilelang-sunrise"
     assert project["requires-python"] == ">=3.10"
     assert "apache-tvm-ffi==0.1.11+sunrise.1" in project["dependencies"]
@@ -41,7 +41,7 @@ def test_vendored_downstream_packages_build_without_nested_git_metadata():
     tileops = tomllib.loads((REPO_ROOT / "downstream" / "tileops_sunrise" / "pyproject.toml").read_text(encoding="utf-8"))
     tilekernels = tomllib.loads((REPO_ROOT / "downstream" / "tilekernels_sunrise" / "pyproject.toml").read_text(encoding="utf-8"))
 
-    version_range = "tilelang-sunrise>=0.1.13,<0.1.14"
+    version_range = "tilelang-sunrise>=0.1.13,<0.2.0"
     assert version_range in tileops["project"]["dependencies"]
     assert version_range in tilekernels["project"]["dependencies"]
     assert tilekernels["tool"]["setuptools_scm"]["fallback_version"] == "0.1.0"
@@ -57,4 +57,4 @@ def test_upstream_version_marker():
         if isinstance(target, ast.Name) and target.id == "__upstream_version__"
     }
 
-    assert assignments["__upstream_version__"] == "0.1.13"
+    assert assignments["__upstream_version__"] == "0.1.14"

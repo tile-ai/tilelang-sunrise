@@ -1,2 +1,40 @@
 
 # ===================== S3 tests ======================
+python testing/python/s3/test_tang_language_dialect.py
+python testing/python/s3/test_tang_tcgen5_gemm_atmem.py
+python testing/python/s3/test_tang_tcgen05_ldst.py
+python testing/python/s3/test_tang_tcgen05_cpt2s.py
+python testing/python/s3/test_tang_tcgen05_fence.py
+python testing/python/s3/test_tang_mbarrier.py
+python testing/python/s3/test_tang_tcgen05_warp_specialize.py
+python testing/python/s3/test_tang_tmem_alloc.py
+python testing/python/s3/test_tang_ldst_matrix.py
+python testing/python/s3/test_tang_tcgen05_multiwarp_copy.py
+python testing/python/s3/test_tang_tcgen05_multiwarp_drain.py
+python testing/python/s3/test_tang_gs_copy.py
+python testing/python/s3/test_tang_vectorized_cast.py
+
+
+# =====================  TODO: tilelang CI test cases on S3
+# testing/python/cuda/test_tma_dsmem.py
+# testing/python/cuda/test_tma_multicast_demo.py
+# testing/python/issue/test_tilelang_issue_sm120_tma_smem_alignment.py
+# testing/python/issue/test_tilelang_issue_tma_no_ws.py
+# testing/python/kernel/test_tilelang_kernel_bf16_gemm_tcgen5_ts.py
+# testing/python/kernel/test_tilelang_kernel_int8_gemm_tcgen5.py
+# testing/python/language/test_tilelang_language_float4_e2m1_unpacked_dtype.py
+# testing/python/language/test_tilelang_language_pdl.py
+# testing/python/language/test_tilelang_language_tcgen05_gemm.py
+# testing/python/language/test_tilelang_language_tma_1d.py
+# testing/python/language/test_tilelang_language_tma_copy.py
+# testing/python/language/test_tilelang_language_tma_gather_scatter.py
+# testing/python/language/test_tilelang_language_tma_store.py
+# testing/python/language/test_tilelang_language_wgmma_gemm.py
+# testing/python/runtime/test_tilelang_runtime_tma_validation.py
+# testing/python/target/test_tilelang_alloc_barrier_target_guard.py
+# testing/python/transform/test_tilelang_transform_fuse_mbarrier_arrive_expect_tx.py
+# testing/python/transform/test_tilelang_transform_inject_tcgen05_fence.py
+# testing/python/transform/test_tilelang_transform_lower_hopper_intrin.py
+# testing/python/transform/test_tilelang_transform_lower_shared_barrier.py
+# testing/python/transform/test_tilelang_transform_lower_shared_tmem.py
+# testing/python/transform/test_tilelang_transform_pipeline_barrier_ownership.py

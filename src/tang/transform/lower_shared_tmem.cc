@@ -41,6 +41,7 @@
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
 
+#include <algorithm>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -224,6 +225,20 @@ private:
         Evaluate(Call(DataType::Handle(), builtin::tvm_storage_sync(),
                       {StringImm("shared")})));
     new_body.push_back(block->body);
+    // Barrier before the collective tc_dealloc (correctness). On stcuv2
+    // tc_dealloc is issued unconditionally by ALL threads (single-reservation
+    // requirement) and is a plain per-thread instruction with no built-in
+    // synchronization, but the TMEM drain epilogue (ldt/stt into the fragment)
+    // runs on a single warp -- the other warps skip it. Without this sync the
+    // non-draining warps could race ahead to tc_dealloc and release the
+    // CTA-wide TMEM reservation while the draining warp is still reading it.
+    // The golden reference (gver) synchronizes the same way -- it issues a
+    // sync_wait(...) on all warps before tc_dealloc. The CUDA path instead
+    // gates dealloc to warp 0 (the same warp that drains); on stcuv2 dealloc
+    // must be collective, so a barrier is required instead.
+    new_body.push_back(
+        Evaluate(Call(DataType::Handle(), builtin::tvm_storage_sync(),
+                      {StringImm("shared")})));
     new_body.push_back(
         Evaluate(Call(DataType::Handle(), tl::tang_deallocate_tensor_memory(),
                       {region0_base, PrimExpr(num_cols_allocated)})));
@@ -245,10 +260,12 @@ private:
     auto layout = layout_map_[buffer];
     ICHECK(layout.defined());
     Array<PrimExpr> tmem_phy_coords = layout->Forward(indices);
-    PrimExpr result =
-        tmem_phy_coords[0] << 16 |
-        tmem_phy_coords
-            [1]; // https://docs.nvidia.com/cuda/parallel-thread-execution/#tensor-memory-addressing
+    // Row in the high 16 bits, column in the low 16. This is TANG's own tensor
+    // memory address format, not one inherited from CUDA: the cpt2s dim
+    // descriptors in cccl/tang/__ptx/instructions/tc_cp.h use TMEM strides
+    // 0x100000 for dim1 and 0x400000 for dim2, i.e. 16 << 16 and 64 << 16 --
+    // stepping whole rows through the high half.
+    PrimExpr result = tmem_phy_coords[0] << 16 | tmem_phy_coords[1];
     return result;
   }
 
@@ -358,27 +375,128 @@ PrimFunc LowerSharedTmem(PrimFunc f) {
 //     }
 // ===========================================================================
 
+// Does this subtree store to global from a shared.tmem load, i.e. hold an
+// un-rewritten TMEM->global drain?
+static bool ContainsTmemToGlobalStore(const Stmt &stmt) {
+  bool found = false;
+  PostOrderVisit(stmt, [&](const ObjectRef &node) {
+    if (found)
+      return;
+    const auto *store = node.as<BufferStoreNode>();
+    if (store == nullptr || store->buffer.scope() != "global")
+      return;
+    PostOrderVisit(store->value, [&](const ObjectRef &v) {
+      if (const auto *bl = v.as<BufferLoadNode>()) {
+        if (GetPtrStorageScope(bl->buffer->data).find("shared.tmem") == 0)
+          found = true;
+      }
+    });
+  });
+  return found;
+}
+
 class TangTmemDrainRewriter : public StmtExprMutator {
 public:
   static Stmt Rewrite(Stmt body) {
     TangTmemDrainRewriter rewriter;
-    return rewriter(body);
+    Stmt out = rewriter(body);
+    // The rewrite is now keyed off the "tmem_drain" marker that copy lowering
+    // attaches. If a drain ever reaches this pass without one, the elementwise
+    // loop would survive and read the shrunk (1,)-uint32 address holder as if
+    // it were the accumulator -- wrong, and quiet. Fail instead.
+    ICHECK(!ContainsTmemToGlobalStore(out))
+        << "LowerTangTmemDrain: a TMEM->global store survived the rewrite. It "
+           "was not wrapped in a \"tmem_drain\" marker, so it did not come "
+           "from the TMEM->global branch of the TANG copy lowering.";
+    return out;
   }
 
 private:
+  // Whether we are inside the "tmem_drain" marker that copy lowering wraps
+  // around a TMEM->global drain. Only loops under it are drain candidates.
+  bool in_tmem_drain_ = false;
+  // Element type of the TMEM accumulator being drained, carried on that same
+  // marker (LowerSharedTmem has already erased it from the buffer by now).
+  DataType accum_dtype_ = DataType::Float(32);
   // Cache to avoid re-visiting already-processed nodes
   std::unordered_map<const StmtNode *, Stmt> processed_;
   // threadIdx.* iteration vars seen on the way down (intra-tile coordinates).
   // blockIdx.* are deliberately NOT tracked: they parameterize *which* tile a
   // block writes and must survive into the per-block base offset.
   std::unordered_set<const VarNode *> thread_vars_;
+  // Per-thread-var iteration extent (threadIdx.{x,y,z}), for bounding the drain
+  // store's row index over the full thread range when recovering BM.
+  std::unordered_map<const VarNode *, PrimExpr> thread_extents_;
+  // Block threadIdx.x extent (total threads). Used to derive how many warps
+  // cooperatively drain the TMEM accumulator. 0 => not yet seen.
+  int block_threads_x_ = 0;
+  // Nesting depth of `warp_specialize` (T.ws) attr regions. A fused
+  // TMEM->global drain (`T.copy(C_tmem, C)`) reconstructs its warp-collective
+  // ldt geometry (rows-per-strip, per-lane store pattern) from the loop shape
+  // of a *128-thread* copy. Inside a T.ws(...,32) region the copy is instead
+  // laid out over 32 threads, so the loop collapses (e.g. 128x128 -> extent
+  // 512) and that geometry no longer holds -- the drain cannot be reconstructed
+  // there. We detect it and fail loudly (see the For handler), pointing at the
+  // tcgen05_ld idiom which drains correctly under warp specialization.
+  int in_warp_specialize_ = 0;
+  // User `T.copy(..., drain_warps=N)` cap for the enclosing drain (0 => unset,
+  // meaning drain across all block warps). Carried via a "tmem_drain_warps"
+  // AttrStmt wrapping the drain.
+  int drain_warps_attr_ = 0;
 
   Stmt VisitStmt_(const AttrStmtNode *op) final {
     if (op->attr_key == tirx::attr::thread_extent) {
       auto iv = Downcast<IterVar>(op->node);
       if (std::string(iv->thread_tag).compare(0, 9, "threadIdx") == 0) {
         thread_vars_.insert(iv->var.get());
+        // Remember each thread var's extent so the drain can bound the store
+        // row index over the full [0, extent) thread range when recovering BM.
+        thread_extents_[iv->var.get()] = op->value;
       }
+      // Record the block's threadIdx.x extent so the drain can be spread across
+      // all warps of the block (multi-warp writeback). Blocks are launched with
+      // a static thread count on stcuv2, so this is a compile-time constant.
+      if (iv->thread_tag == "threadIdx.x") {
+        if (const auto *ext = op->value.as<IntImmNode>()) {
+          block_threads_x_ = static_cast<int>(ext->value);
+        }
+      }
+    }
+    if (op->attr_key == "warp_specialize") {
+      in_warp_specialize_++;
+      Stmt body = StmtExprMutator::VisitStmt_(op);
+      in_warp_specialize_--;
+      return body;
+    }
+    // A user `T.copy(..., drain_warps=N)` cap is carried on a durable AttrStmt
+    // wrapping the drain (loop annotations don't survive copy lowering). Scope
+    // it to the wrapped subtree.
+    if (op->attr_key == "tmem_drain") {
+      bool saved = in_tmem_drain_;
+      DataType saved_dtype = accum_dtype_;
+      in_tmem_drain_ = true;
+      accum_dtype_ = op->value.dtype();
+      Stmt body = StmtExprMutator::VisitStmt_(op);
+      in_tmem_drain_ = saved;
+      accum_dtype_ = saved_dtype;
+      // The marker has done its job; drop it so it doesn't reach codegen.
+      if (const auto *attr = body.as<AttrStmtNode>();
+          attr && attr->attr_key == "tmem_drain")
+        return attr->body;
+      return body;
+    }
+    if (op->attr_key == "tmem_drain_warps") {
+      int saved = drain_warps_attr_;
+      if (const auto *imm = op->value.as<IntImmNode>())
+        drain_warps_attr_ = static_cast<int>(imm->value);
+      Stmt body = StmtExprMutator::VisitStmt_(op);
+      drain_warps_attr_ = saved;
+      // The attr has done its job (carrying the hint); drop the wrapper so it
+      // doesn't leak into codegen.
+      if (const auto *attr = body.as<AttrStmtNode>();
+          attr && attr->attr_key == "tmem_drain_warps")
+        return attr->body;
+      return body;
     }
     return StmtExprMutator::VisitStmt_(op);
   }
@@ -388,6 +506,16 @@ private:
     auto it = processed_.find(op);
     if (it != processed_.end())
       return it->second;
+
+    // Only loops under the "tmem_drain" marker are candidates. Without this
+    // gate any enclosing user loop also matches the store pattern below, and
+    // replacing it would discard its other statements -- see the marker's
+    // rationale in the TMEM->global branch of tang/op/copy.cc.
+    if (!in_tmem_drain_) {
+      Stmt result = StmtExprMutator::VisitStmt_(op);
+      processed_[op] = result;
+      return result;
+    }
 
     // Look for a for-loop whose body stores from a shared.tmem buffer
     // to a global buffer (the TMEM->global drain pattern).
@@ -422,11 +550,125 @@ private:
       return result;
     }
 
-    // Get dimensions from the loop extent (BM = rows) and global buffer
-    int BM = Downcast<IntImm>(op->extent)->value;
+    // The fused drain's ldt geometry is derived from a 128-thread copy loop;
+    // inside a T.ws(...,32) region the copy collapses to 32 threads and this
+    // reconstruction breaks (wrong BM / base offset). Fail loudly instead of
+    // emitting a garbage drain, and steer to the warp-specialization-safe
+    // idiom.
+    ICHECK_EQ(in_warp_specialize_, 0)
+        << "A fused TMEM->global drain (`T.copy(C_tmem, C_global)`) cannot be "
+           "placed inside a warp-specialized region (`T.ws(...)`): under T.ws "
+           "the "
+           "epilogue copy is laid out over a single 32-thread warp, so the "
+           "fused "
+           "ldt drain (whose row-strip / lane geometry assumes a 128-thread "
+           "copy) "
+           "cannot be reconstructed. For a single/specific-warp writeback use "
+           "the "
+           "explicit warp-specialized idiom instead:\n"
+           "    with T.ws(0, warp_group_size=32):\n"
+           "        T.tcgen05_sync_arrive(bid)\n"
+           "    with T.ws(drain_warp, warp_group_size=32):\n"
+           "        T.tcgen05_sync_wait(bid, 1, 1)\n"
+           "        T.tcgen05_ld(C_frag, C_tmem)\n"
+           "        T.copy(C_frag, C_global)\n"
+           "For an all-warp writeback keep `T.copy(C_tmem, C_global)` at the "
+           "top "
+           "level (outside any T.ws region).";
+
+    // User cap on the number of writeback warps (`T.copy(..., drain_warps=N)`),
+    // carried on the enclosing "tmem_drain_warps" AttrStmt. 0 => unset (drain
+    // across all block warps).
+    int drain_warps_hint = drain_warps_attr_;
+
+    // Get dimensions from the loop extent (BM = rows) and global buffer.
+    // NOTE: BN here is the global row STRIDE (the full output N), used for the
+    // per-row address arithmetic in the drain; it may exceed the per-block tile
+    // width for a grid that splits N. The number of accumulator columns
+    // actually drained per row is fixed by the codegen (the 128-wide TMEM
+    // tile), not by BN. (A per-block tile narrower than 128 columns -- e.g.
+    // N=64 in a single block -- is a separate, currently-unsupported drain
+    // configuration.) Neither the tile row count (BM) nor the per-block tile
+    // column count (N_tile) may be read from op->extent: the pre-drain copy is
+    // a SIMT elementwise loop whose trip count depends on the block thread
+    // count (128 rows over 128 threads -> extent 128; over 256 threads the copy
+    // packs 2 rows per step -> extent 64), so op->extent under-counts the rows
+    // for any block wider than 128 threads. Instead recover each tile extent
+    // from the span of the store index: bind the copy's loop / nested-loop /
+    // thread vars to their iteration extents, zero the spatial (block) vars,
+    // and take the resulting [0, extent) span of that index coordinate.
+    std::vector<std::pair<Var, PrimExpr>> loop_vars;
+    loop_vars.emplace_back(op->loop_var, op->extent);
+    PostOrderVisit(op->body, [&](const ObjectRef &node) {
+      if (const auto *f = node.as<ForNode>())
+        loop_vars.emplace_back(f->loop_var, f->extent);
+    });
+    std::unordered_set<const VarNode *> keep;
+    for (const auto &lv : loop_vars)
+      keep.insert(lv.first.get());
+    for (const auto *tv : thread_vars_)
+      keep.insert(tv);
+    auto intra_extent = [&](const PrimExpr &index) -> int {
+      Map<Var, PrimExpr> zero_spatial;
+      PostOrderVisit(index, [&](const ObjectRef &node) {
+        if (const auto *v = node.as<VarNode>())
+          if (!keep.count(v))
+            zero_spatial.Set(tvm::ffi::GetRef<Var>(v), make_zero(v->dtype));
+      });
+      PrimExpr intra = Substitute(index, zero_spatial);
+      arith::Analyzer a;
+      for (const auto &lv : loop_vars)
+        a.Bind(lv.first,
+               Range::FromMinExtent(make_zero(lv.first->dtype), lv.second));
+      for (const auto *tv : thread_vars_) {
+        auto it = thread_extents_.find(tv);
+        if (it != thread_extents_.end())
+          a.Bind(tvm::ffi::GetRef<Var>(tv),
+                 Range::FromMinExtent(make_zero(tv->dtype), it->second));
+      }
+      auto bound = a.const_int_bound(intra);
+      if (bound->max_value != arith::ConstIntBound::kPosInf &&
+          bound->max_value >= 0)
+        return static_cast<int>(bound->max_value) + 1;
+      return 0;
+    };
+
+    // The drain writes a 2D (rows x cols) tile, so its row and column
+    // coordinates are the LAST two store indices. A destination of rank > 2 (a
+    // batched output indexed as D[b, i, j]) carries leading slice-origin
+    // indices; reading indices[0] there picks up the batch index, whose span is
+    // 1, which would collapse the drain to a single row and leave the rest of
+    // the tile unwritten.
+    const size_t nidx = tmem_store->indices.size();
+    ICHECK_GE(nidx, 1u) << "LowerTangTmemDrain: global store has no indices";
+    const size_t row_pos = nidx >= 2 ? nidx - 2 : 0;
+
+    int BM = intra_extent(tmem_store->indices[row_pos]);
+    if (BM <= 0) {
+      const auto *ext = op->extent.as<IntImmNode>();
+      BM = ext ? static_cast<int>(ext->value) : 128;
+      LOG(WARNING)
+          << "LowerTangTmemDrain: could not bound the store row index; "
+             "falling back to (thread-count-dependent) loop extent BM="
+          << BM;
+    }
+    // Per-block accumulator column count. The drain writes ldt_16x256b chunks
+    // of 128 fp32 columns each; a tile wider than 128 (e.g. a single block with
+    // N=256) needs the codegen to loop over 128-column blocks, so pass N_tile
+    // separately from BN (the global row stride). Defaults to 128 when it
+    // cannot be bounded (the historical single-chunk assumption).
+    int N_tile = 128;
+    if (nidx >= 2) {
+      int cols = intra_extent(tmem_store->indices[nidx - 1]);
+      if (cols > 0)
+        N_tile = cols;
+    }
     int BN = 128; // fallback
-    if (global_buf->shape.size() == 2) {
-      BN = Downcast<IntImm>(global_buf->shape[1])->value;
+    if (global_buf->shape.size() >= 2) {
+      // Innermost dimension: the flat distance between two tile rows. Reading
+      // shape[1] instead would be the batch stride at rank 3.
+      BN = Downcast<IntImm>(global_buf->shape[global_buf->shape.size() - 1])
+               ->value;
     } else if (global_buf->shape.size() == 1) {
       // Flattened buffer: shape[0] = BM * BN
       BN = Downcast<IntImm>(global_buf->shape[0])->value / BM;
@@ -472,18 +714,38 @@ private:
     // -- Replace with the tang_tmem_drain_16x256b_to_global intrinsic --
     // Pass C_tmem[0] (value, not pointer) as the TMEM base address
     PrimExpr tmem_base = BufferLoad(tmem_buf, {IntImm(DataType::Int(32), 0)});
-    // The 5th arg carries the output element dtype (via a typed zero) so
-    // codegen can pick the right accumulator reinterpret: a float MMA
-    // accumulates in fp32 (reinterpret <float&> then narrow to fp16/bf16/fp32
-    // C), an integer MMA accumulates in int32 (reinterpret <int32_t&> into the
-    // int32 C). Without it the drain hard-cast every result to float and
-    // silently mangled int32 C.
+    // The 5th arg carries the ACCUMULATOR's element type (via a typed zero) so
+    // codegen knows how to read back each 32-bit word ldt returns: fp32 and
+    // int32 accumulators fill the word, while a 16-bit accumulator occupies its
+    // low half. Narrowing to the C buffer's own type then happens in the store.
+    // This used to pass the C buffer's type as a stand-in, which is only the
+    // same thing when the accumulator is 32-bit: a 16-bit accumulator read as
+    // fp32 yields a denormal, and the store flushes the whole tile to zero.
+    // The BM/16 row-strips are round-robin distributed across `nwarps` warps
+    // (matches the golden reference's multi-drain-warp epilogue). The intrinsic
+    // emits its own block-wide __syncthreads (all threads reach it -- the drain
+    // is at block scope, not inside a T.ws) to publish warp0's async MMA, then
+    // only the first `nwarps` warps run the ldt writeback. By default every
+    // warp of the block drains; a user `drain_warps=N` caps it (e.g. 1 => a
+    // single warp writes back while the others still hit the barrier),
+    // decoupling the writeback from the copy/MMA warps. Fall back to 4 warps
+    // (standard 128-thread stcuv2 GEMM block) if the extent could not be read.
+    int block_warps = (block_threads_x_ > 0) ? (block_threads_x_ / 32) : 4;
+    if (block_warps < 1)
+      block_warps = 1;
+    int nwarps = block_warps;
+    if (drain_warps_hint > 0) {
+      nwarps = std::min(drain_warps_hint, block_warps);
+    }
+    if (nwarps < 1)
+      nwarps = 1;
     Stmt drain_call = Evaluate(
         Call(DataType::Handle(), tang_tmem_drain_16x256b_to_global(),
              {tmem_base,
               global_buf.access_ptr(2, DataType::Handle(), 1, base_offset),
               IntImm(DataType::Int(32), BM), IntImm(DataType::Int(32), BN),
-              make_zero(global_buf->dtype)}));
+              make_zero(accum_dtype_), IntImm(DataType::Int(32), nwarps),
+              IntImm(DataType::Int(32), N_tile)}));
 
     processed_[op] = drain_call;
     return drain_call;

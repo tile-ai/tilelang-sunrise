@@ -319,6 +319,94 @@ def create_tma_descriptor(*args):
     return tirx.call_intrin("handle", tirx.op.Op.get("tl.create_tma_descriptor"), *args)
 
 
+# ---------------------------------------------------------------------------
+# STMatrix / LDMatrix frontend primitives (TANG stcuv2)
+#
+# ``tang_stmatrix`` / ``tang_ldmatrix`` expose warp-level 8x8 b16 matrix
+# store/load between shared memory and registers (fragment) for the TANG
+# stcuv2 subtarget. They are re-exported by :mod:`tilelang.tang.language`.
+#
+# .. note::
+#     **stcuv2 backend is still under development.** The LLVM-level matrix
+#     load/store intrinsics that these lower to are not ready yet, so on S3
+#     the codegen path is intentionally *not* finalized. The agreed direction
+#     is a **direct shared <-> fragment** load/store (ordinary shared-memory
+#     access, *not* routed through TMEM / the tensor-core ``ldt``/``stt``
+#     family): a single ``ldt``/``stt`` addresses TMEM only, and shared<->TMEM
+#     needs ``cps2t``/``cpt2s``, which we deliberately avoid here. For now these
+#     wrappers only expose the frontend API and emit the existing
+#     ``tl.ptx_stmatrix`` / ``tl.ptx_ldmatrix`` builtins; the stcuv2 lowering
+#     will be wired up once the LLVM intrinsics land.
+#
+# ``ptx_ldmatrix`` is intentionally *not* defined here: the name already
+# resolves to the upstream TVM 8-arg intrinsic (see ``language/tir/op.py``),
+# which the CUDA mma path (``intrinsics/mma_macro_generator.py``) depends on.
+# Redefining it would shadow that. Use :func:`tang_ldmatrix` for the clean
+# tilelang-style load interface.
+# ---------------------------------------------------------------------------
+
+
+def _stmatrix_call(shared_addr: PrimExpr, values, trans: bool):
+    vals = list(values)
+    num = len(vals)
+    assert num in (1, 2, 4), f"stmatrix stores 1, 2 or 4 8x8 matrices, but got {num} values"
+    return tirx.call_intrin(
+        "handle", tirx.op.Op.get("tl.ptx_stmatrix"), tirx.const(1 if trans else 0, "int32"), tirx.const(num, "int32"), shared_addr, *vals
+    )
+
+
+def _ldmatrix_call(shared_addr: PrimExpr, local_ptr: PrimExpr, num: int, trans: bool):
+    assert num in (1, 2, 4), f"ldmatrix loads 1, 2 or 4 8x8 matrices, but got num={num}"
+    return tirx.call_intrin(
+        "handle",
+        tirx.op.Op.get("tl.ptx_ldmatrix"),
+        tirx.const(1 if trans else 0, "int32"),
+        tirx.const(num, "int32"),
+        shared_addr,
+        local_ptr,
+    )
+
+
+def tang_stmatrix(shared_addr: PrimExpr, values, trans: bool = False):
+    """Store 1/2/4 8x8 register matrices to shared memory (STMatrix) on TANG.
+
+    Emits the ``tl.ptx_stmatrix`` builtin. This is a TANG **stcuv2** subtarget
+    feature (only meaningful on ``tang -arch=stcuv2``). See the module note
+    above for the stcuv2 (direct shared<->fragment) lowering status.
+
+    Args:
+        shared_addr: destination shared-memory address (an access pointer, e.g.
+            ``buf.access_ptr("w", offset=...)``).
+        values: sequence of 1/2/4 ``int32`` register values to store.
+        trans: if True, store each 8x8 matrix transposed.
+    """
+    return _stmatrix_call(shared_addr, values, trans)
+
+
+def tang_ldmatrix(shared_addr: PrimExpr, local_ptr: PrimExpr, num: int, trans: bool = False):
+    """Load 1/2/4 8x8 b16 matrices from shared memory into registers (LDMatrix).
+
+    S3-explicit, clean tilelang-style load interface (counterpart of the
+    upstream TVM ``ptx_ldmatrix``). Emits the ``tl.ptx_ldmatrix`` builtin. This
+    is a TANG **stcuv2** subtarget feature (only meaningful on
+    ``tang -arch=stcuv2``). See the module note above for the stcuv2 (direct
+    shared<->fragment) lowering status.
+
+    Args:
+        shared_addr: source shared-memory address (an access pointer, e.g.
+            ``buf.access_ptr("r", offset=...)``).
+        local_ptr: destination register/fragment pointer (e.g.
+            ``frag.access_ptr("w", offset=...)``).
+        num: number of 8x8 matrices to load (1, 2 or 4).
+        trans: if True, load each 8x8 matrix transposed.
+    """
+    return _ldmatrix_call(shared_addr, local_ptr, num, trans)
+
+
+# NOTE(wt): T.create_list_of_mbarrier and T.get_mbarrier is now only an intermediate intrinsic
+# during transforms, and won't be exposed to frontend. For creating mbarriers, please use T.alloc_barrier instead.
+
+
 def tma_load(*args):
     """Perform a Tensor Memory Access (TMA) load operation.
 

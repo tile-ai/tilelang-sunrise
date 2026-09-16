@@ -3,12 +3,13 @@
 import functools
 import math
 
-import tilelang
 import tilelang.language as T
 import torch
 
+import tilelang
 from tileops.kernels.gemm import GemmKernel
 from tileops.kernels.kernel_base import Kernel
+from tileops.utils import get_sm_version
 
 __all__ = ["SharedExpertMLPKernel"]
 
@@ -84,13 +85,20 @@ class SharedExpertMLPKernel(Kernel):
         self.dtype = dtype
         self.init_config(config, tune)
 
+        # On TANG, GemmKernel picks its own tuned block_k/k_step. The CUDA-oriented
+        # _DEFAULT_CONFIG (block_k=64) would override that block_k while GemmKernel's
+        # default k_step survives, yielding block_k=64 + k_step=16 and failing the
+        # TANG gemm static_assert (inner_k % kStep == 0). Let GemmKernel self-select.
+        use_tang = get_sm_version() is None and hasattr(torch, "ptpu")
+        gemm_config = None if use_tang else self.config
+
         self._gemm_gate_up = GemmKernel(
             m=num_tokens, n=ffn_size * 2, k=hidden_size,
-            dtype=dtype, trans_b=True, config=self.config,
+            dtype=dtype, trans_b=True, config=gemm_config,
         )
         self._gemm_down = GemmKernel(
             m=num_tokens, n=hidden_size, k=ffn_size,
-            dtype=dtype, trans_b=True, config=self.config,
+            dtype=dtype, trans_b=True, config=gemm_config,
         )
 
     @property

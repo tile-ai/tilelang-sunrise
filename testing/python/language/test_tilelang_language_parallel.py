@@ -83,20 +83,30 @@ def test_parallel_dynamic_extent(valid_len):
     _assert_close_on_host(out, reference)
 
 
-@tilelang.jit
-def _parallel_vectorize_local_and_var():
-    with T.Kernel(1) as _:
-        x = T.alloc_fragment([256], T.float32)
-        y = T.alloc_fragment([256], T.float32)
-        z = T.alloc_var(T.float32)
-        for i in T.parallel(256):
-            y[i] = x[i] * z
-
-
 def test_parallel_vectorize_var():
-    source = _parallel_vectorize_local_and_var.get_kernel_source()
-    # do not vectorize if the loop only contains local/fragment and var buffer access
-    assert "float2" not in source
+    @tilelang.jit(out_idx=[1])
+    def kernel():
+        @T.prim_func
+        def main(A: T.Tensor((256,), T.float32), B: T.Tensor((256,), T.float32)):
+            with T.Kernel(1, threads=128):
+                x = T.alloc_fragment((256,), T.float32)
+                y = T.alloc_fragment((256,), T.float32)
+                scale = T.alloc_var(T.float32, init=3.0)
+                T.copy(A, x)
+                for i in T.Parallel(256):
+                    y[i] = x[i] * scale
+                T.copy(y, B)
+
+        return main
+
+    compiled = kernel.compile()
+    # Register-register loops vectorize while the scalar operand broadcasts.
+    assert "float2" in compiled.get_kernel_source()
+    data = _require_accelerator_tensor((256,), torch.float32)
+    output = compiled(data)
+    if data.device.type == "ptpu":
+        torch.ptpu.synchronize()
+    _assert_close_on_host(output, data.cpu() * 3.0)
 
 
 if __name__ == "__main__":

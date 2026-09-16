@@ -3,6 +3,8 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib.sh"
+ci_configure_ptcc
 TILELANG_HOME="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 : "${OP:?OP must be set by the CI matrix}"

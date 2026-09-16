@@ -31,6 +31,7 @@
 #include <tvm/tirx/transform.h>
 
 #include "backend/common/target_utils.h"
+#include "cuda/op/builtin.h"
 #include "op/builtin.h"
 #include "op/utils.h"
 #include "tir/ir/buffer_common.h"
@@ -51,7 +52,7 @@ public:
 
   Stmt VisitStmt_(const AttrStmtNode *attr) final {
     if (attr->attr_key == s_tir::attr::async_scope) {
-      return GetRef<Stmt>(attr);
+      return ffi::GetRef<Stmt>(attr);
     }
     return StmtExprMutator::VisitStmt_(attr);
   }
@@ -318,7 +319,7 @@ private:
 
   bool CanEvaluateStoreValueOutsidePredicate(const PrimExpr &value) {
     bool safe = true;
-    PostOrderVisit(value, [&](const ObjectRef &node) {
+    PostOrderVisit(value, [&](const ffi::ObjectRef &node) {
       if (!safe) {
         return;
       }

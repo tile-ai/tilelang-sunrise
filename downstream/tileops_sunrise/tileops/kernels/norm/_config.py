@@ -33,12 +33,8 @@ _CANDIDATE_BLOCK_M = (1, 2, 4, 8)
 _DEFAULT_THREADS = 128  # default for small rows; see the module docstring
 
 # Cap the per-thread element count for performance, not correctness. On
-# TANG/PTPU, large rows with few threads can spill fragments to local memory
-# and under-parallelise the reduction, so increase ``threads`` until the
-# per-thread element count is under this cap. The kernel fence preserves the
-# required ordering for spilled-fragment accesses, so this cap affects
-# performance rather than correctness.
-_MAX_ELEMS_PER_THREAD = 24
+# Bound per-thread work to avoid costly spilled-fragment layouts.
+_MAX_ELEMS_PER_THREAD = 16
 
 
 def _feasible_threads(n_padded: int, dtype: torch.dtype = torch.float16) -> list[int]:

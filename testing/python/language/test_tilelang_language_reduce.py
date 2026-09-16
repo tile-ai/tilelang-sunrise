@@ -11,6 +11,14 @@ from tilelang import tvm
 
 tilelang.testing.set_random_seed()
 
+
+def _assert_close(actual, expected, **kwargs):
+    if actual.device.type == "ptpu":
+        torch.ptpu.synchronize(actual.device)
+        actual, expected = actual.cpu(), expected.cpu()
+    torch.testing.assert_close(actual, expected, **kwargs)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -338,7 +346,7 @@ def _make_sm80_batch_reduce_kernel():
 @tilelang.testing.requires_cuda_compute_version_ge(8, 0)
 def test_reduce_partial_thread_barrier_correctness():
     torch.manual_seed(0)
-    x = torch.rand((4, 512), dtype=torch.float32, device="cuda")
+    x = torch.rand((4, 512), dtype=torch.float32, device=get_current_device())
     out = _make_partial_reduce_kernel()(x)
     torch.cuda.synchronize()
     torch.testing.assert_close(
@@ -352,7 +360,7 @@ def test_reduce_partial_thread_barrier_correctness():
 @tilelang.testing.requires_cuda_compute_version_ge(8, 0)
 def test_reduce_partial_thread_barrier_full_block_groups():
     torch.manual_seed(1)
-    x = torch.rand((2, 512), dtype=torch.float32, device="cuda")
+    x = torch.rand((2, 512), dtype=torch.float32, device=get_current_device())
     out = _make_two_group_reduce_kernel()(x)
     torch.cuda.synchronize()
     torch.testing.assert_close(out, x.sum(dim=1), rtol=1e-5, atol=1e-5)
@@ -362,7 +370,7 @@ def test_reduce_partial_thread_barrier_full_block_groups():
 def test_reduce_partial_thread_barrier_multiple_groups_in_partial_cta():
     """Two adjacent 64-thread groups form [0, 128) in a 256-thread CTA."""
     torch.manual_seed(2)
-    x = torch.rand((2, 512), dtype=torch.float32, device="cuda")
+    x = torch.rand((2, 512), dtype=torch.float32, device=get_current_device())
     out = _make_two_group_reduce_kernel(block_threads=256)(x)
     torch.cuda.synchronize()
     torch.testing.assert_close(out, x.sum(dim=1), rtol=1e-5, atol=1e-5)
@@ -371,7 +379,7 @@ def test_reduce_partial_thread_barrier_multiple_groups_in_partial_cta():
 @tilelang.testing.requires_cuda_compute_version_ge(8, 0)
 def test_reduce_partial_thread_barrier_offset_thread_range():
     torch.manual_seed(3)
-    x = torch.rand((2, 512), dtype=torch.float32, device="cuda")
+    x = torch.rand((2, 512), dtype=torch.float32, device=get_current_device())
     out = _make_offset_thread_reduce_kernel()(x)
     torch.cuda.synchronize()
     torch.testing.assert_close(
@@ -522,6 +530,7 @@ def test_reduce(op, dtype, M, N, src_scope, dst_scope, threads, batch):
     torch.testing.assert_close(B.cpu(), _ref(A.cpu(), op), atol=tol, rtol=tol)
 
 
+@tilelang.testing.requires_cuda
 @pytest.mark.parametrize(
     ("op", "packed_op"),
     [("sum", "add2"), ("max", "max2"), ("min", "min2")],
@@ -544,6 +553,7 @@ def test_reduce_local_packed_codegen(op, packed_op):
     assert f"tl::{packed_op}" in artifact.kernel_source
 
 
+@tilelang.testing.requires_cuda
 @pytest.mark.parametrize(
     ("op", "packed_op"),
     [("sum", "add2"), ("max", "max2"), ("min", "min2")],
@@ -568,6 +578,7 @@ def test_reduce_local_noncontiguous_dim_packed_codegen(op, packed_op):
     assert f"tl::{packed_op}" in artifact.kernel_source
 
 
+@tilelang.testing.requires_cuda
 @pytest.mark.parametrize(
     ("op", "packed_op"),
     [("sum", "add2"), ("max", "max2"), ("min", "min2")],
@@ -608,7 +619,7 @@ def test_reduce_local_packed_correctness(op):
         return main
 
     jit_kernel = kernel()
-    A = torch.randn((8,), dtype=torch.float16, device="cuda")
+    A = torch.randn((8,), dtype=torch.float16, device=get_current_device())
     B = jit_kernel(A)
     torch.testing.assert_close(B[0], _ref(A.reshape(1, 8), op)[0], atol=1e-1, rtol=1e-1)
 
@@ -732,12 +743,19 @@ def _make_finalize_reducer_kernel(block_M, block_N, dtype, op, batch):
     ids=[f"{op}-{dtype}-{bM}x{bN}-b{batch}" for op, dtype, bM, bN, batch in FINALIZE_REDUCER_CASES],
 )
 def test_finalize_reducer_codegen(op, dtype, block_M, block_N, batch):
-    """batch=1 → scalar run; batch>1 → run_batch with correct template arg."""
+    """batch=1 → scalar run; batch>1 → run_batch with correct template arg.
+
+    Forces the FullParticipant baseline: this test verifies the batched
+    AllReduce plumbing of the wide plan. Under automatic plan selection
+    these kernels take a narrow plan whose collective fits in a warp, where
+    batching (which amortizes block-wide barriers) has nothing to amortize
+    and run_batch is legitimately absent.
+    """
 
     src = tl.compile(
         _make_finalize_reducer_kernel(block_M, block_N, dtype, op, batch),
         out_idx=-1,
-        pass_configs=_COMPILE_FLAGS,
+        pass_configs={**_COMPILE_FLAGS, "tl.reducer_force_baseline": True},
     ).get_kernel_source()
 
     if batch == 1:
@@ -775,6 +793,173 @@ def test_finalize_reducer_correctness(op, dtype, block_M, block_N, batch):
         pass_configs=_COMPILE_FLAGS,
     )(A)
     torch.testing.assert_close(B.cpu(), _ref(A.cpu(), op), atol=1e-2, rtol=1e-2)
+
+
+def test_finalize_reducer_short_parallel_extent():
+    extent = 8
+    threads = 128
+
+    @T.prim_func
+    def kernel(A: T.Tensor((extent,), T.float32), B: T.Tensor((1,), T.float32)):
+        with T.Kernel(1, threads=threads):
+            src = T.alloc_fragment((extent,), T.float32)
+            T.copy(A, src)
+            total = T.alloc_reducer((1,), T.float32, replication="all")
+            T.clear(total)
+            for i in T.Parallel(extent):
+                total[0] += src[i]
+            T.finalize_reducer(total)
+            if T.get_thread_binding() == 0:
+                B[0] = total[0]
+
+    A = torch.arange(1, extent + 1, dtype=torch.float32, device=get_current_device())
+    B = tl.compile(kernel, out_idx=-1, pass_configs=_COMPILE_FLAGS)(A)
+    _assert_close(B, A.sum().reshape(1), atol=0, rtol=0)
+
+
+def test_finalize_reducer_mixed_parallel_extents():
+    extent = 8
+    threads = 128
+
+    @T.prim_func
+    def kernel(
+        A: T.Tensor((extent,), T.float32),
+        B: T.Tensor((2 * extent,), T.float32),
+        C: T.Tensor((1,), T.float32),
+    ):
+        with T.Kernel(1, threads=threads):
+            a_frag = T.alloc_fragment((extent,), T.float32)
+            b_frag = T.alloc_fragment((2 * extent,), T.float32)
+            T.copy(A, a_frag)
+            T.copy(B, b_frag)
+            total = T.alloc_reducer((1,), T.float32, replication="all")
+            T.clear(total)
+            for i in T.Parallel(extent):
+                total[0] += a_frag[i]
+            for j in T.Parallel(2 * extent):
+                total[0] += b_frag[j]
+            T.finalize_reducer(total)
+            if T.get_thread_binding() == 0:
+                C[0] = total[0]
+
+    A = torch.arange(1, extent + 1, dtype=torch.float32, device=get_current_device())
+    B = torch.arange(1, 2 * extent + 1, dtype=torch.float32, device=get_current_device())
+    C = tl.compile(kernel, out_idx=-1, pass_configs=_COMPILE_FLAGS)(A, B)
+    _assert_close(C, (A.sum() + B.sum()).reshape(1), atol=0, rtol=0)
+
+
+def test_finalize_reducer_epoch_inside_pipelined_loop():
+    """Legacy online-softmax: a full v1 epoch (fill / RMW updates / in-place
+    finalize / direct reads) reopens once per iteration of a T.Pipelined
+    tile loop, seeding the max from the running maximum."""
+    K, BLOCK_K, threads = 512, 128, 128
+
+    @T.prim_func
+    def kernel(A: T.Tensor((K,), T.float32), B: T.Tensor((1,), T.float32)):
+        with T.Kernel(1, threads=threads):
+            a_shared = T.alloc_shared((BLOCK_K,), T.float32)
+            a_frag = T.alloc_fragment((BLOCK_K,), T.float32)
+            running_max = T.alloc_fragment((1,), T.float32)
+            running_sum = T.alloc_fragment((1,), T.float32)
+            running_max[0] = -T.infinity(T.float32)
+            running_sum[0] = 0.0
+            for k_tile in T.Pipelined(T.ceildiv(K, BLOCK_K), num_stages=2):
+                T.copy(A[k_tile * BLOCK_K], a_shared)
+                T.copy(a_shared, a_frag)
+
+                new_max = T.alloc_reducer((1,), T.float32, op="max", replication="all")
+                T.fill(new_max, running_max[0])
+                for i in T.Parallel(BLOCK_K):
+                    new_max[0] = T.max(new_max[0], a_frag[i])
+                T.finalize_reducer(new_max)
+
+                new_sum = T.alloc_reducer((1,), T.float32, replication="all")
+                T.fill(new_sum, 0.0)
+                for i in T.Parallel(BLOCK_K):
+                    new_sum[0] += T.exp(a_frag[i] - new_max[0])
+                T.finalize_reducer(new_sum)
+
+                running_sum[0] = T.exp(running_max[0] - new_max[0]) * running_sum[0] + new_sum[0]
+                running_max[0] = new_max[0]
+            if T.get_thread_binding() == 0:
+                B[0] = T.log(running_sum[0]) + running_max[0]
+
+    A = torch.randn(K, dtype=torch.float32, device=get_current_device())
+    B = tl.compile(kernel, out_idx=-1, pass_configs=_COMPILE_FLAGS)(A)
+    if A.device.type == "ptpu":
+        torch.ptpu.synchronize(A.device)
+        A = A.cpu()
+    _assert_close(B, torch.logsumexp(A, dim=0).reshape(1), atol=1e-4, rtol=1e-4)
+
+
+def test_finalize_reducer_default_alloc_v1_syntax():
+    """Pre-v2 default: T.alloc_reducer without `replication` used with v1
+    syntax (T.clear / `acc[i] +=` / in-place finalize / direct reads) must
+    keep compiling — the buffer is v2-allocated but never touched by a v2
+    op, so the legacy shim canonicalizes it."""
+    BLOCK, K, threads = 64, 8, 128
+
+    @T.prim_func
+    def kernel(
+        G: T.Tensor((BLOCK, K), T.float32),
+        Y: T.Tensor((BLOCK, K), T.float32),
+        O: T.Tensor((BLOCK, K), T.float32),
+    ):
+        with T.Kernel(1, threads=threads):
+            g_frag = T.alloc_fragment((BLOCK, K), T.float32)
+            y_frag = T.alloc_fragment((BLOCK, K), T.float32)
+            out_frag = T.alloc_fragment((BLOCK, K), T.float32)
+            reducer = T.alloc_reducer((BLOCK,), T.float32)
+            T.copy(G, g_frag)
+            T.copy(Y, y_frag)
+            T.clear(reducer)
+            for i, j in T.Parallel(BLOCK, K):
+                reducer[i] += g_frag[i, j] * y_frag[i, j]
+            T.finalize_reducer(reducer)
+            for i, j in T.Parallel(BLOCK, K):
+                out_frag[i, j] = g_frag[i, j] - reducer[i]
+            T.copy(out_frag, O)
+
+    G = torch.randn(BLOCK, K, dtype=torch.float32, device=get_current_device())
+    Y = torch.randn(BLOCK, K, dtype=torch.float32, device=get_current_device())
+    O = tl.compile(kernel, out_idx=-1, pass_configs=_COMPILE_FLAGS)(G, Y)
+    ref = G - (G * Y).sum(dim=1, keepdim=True)
+    _assert_close(O, ref, atol=1e-4, rtol=1e-4)
+
+
+def test_finalize_reducer_conditional_finalize():
+    """Legacy epoch opened at block scope, updated and finalized inside one
+    arm of a block-uniform conditional (the vllm sum_smaller_probs pattern):
+    the finalize runs 0 or 1 times per init, and skipped blocks never read
+    the reducer."""
+    extent, threads = 8, 128
+
+    @T.prim_func
+    def kernel(
+        A: T.Tensor((extent,), T.float32),
+        S: T.Tensor((2,), T.int32),
+        B: T.Tensor((2,), T.float32),
+    ):
+        with T.Kernel(2, threads=threads) as bx:
+            src = T.alloc_fragment((extent,), T.float32)
+            T.copy(A, src)
+            total = T.alloc_reducer((1,), T.float32, replication="all")
+            T.fill(total, 0.0)
+            if S[bx] < 0:
+                if T.get_thread_binding() == 0:
+                    B[bx] = 0.0
+            else:
+                for i in T.Parallel(extent):
+                    total[0] += src[i]
+                T.finalize_reducer(total)
+                if T.get_thread_binding() == 0:
+                    B[bx] = total[0]
+
+    A = torch.arange(1, extent + 1, dtype=torch.float32, device=get_current_device())
+    S = torch.tensor([-1, 1], dtype=torch.int32, device=get_current_device())
+    B = tl.compile(kernel, out_idx=-1, pass_configs=_COMPILE_FLAGS)(A, S)
+    expected = torch.stack([torch.zeros((), device=get_current_device()), A.sum()])
+    _assert_close(B, expected, atol=0, rtol=0)
 
 
 # (batch, exc_type, match)
@@ -876,10 +1061,10 @@ def test_reduce_sum_reshape_straddle_layout_regression():
             for i, g in T.Parallel(tile_m, group):
                 B[i, g] = dst[i, g]
 
-    A = torch.arange(1, tile_m * hidden + 1, dtype=torch.float32, device="cuda").reshape(tile_m, hidden)
+    A = torch.arange(1, tile_m * hidden + 1, dtype=torch.float32, device=get_current_device()).reshape(tile_m, hidden)
     B = _compile(kernel)(A)
     ref = A.reshape(tile_m, group, group_k).sum(dim=2)
-    torch.testing.assert_close(B, ref, atol=1e-3, rtol=1e-3)
+    _assert_close(B, ref, atol=1e-3, rtol=1e-3)
 
 
 # ---------------------------------------------------------------------------
@@ -934,19 +1119,19 @@ def test_allreduce_rejects_non_power_of_two_logical_width(reduce_fn, width):
 def test_allreduce_power_of_two_width_runtime(reduce_fn, width):
     M = 4
     k = _compile(_make_allreduce_width_kernel(reduce_fn, M, width, width))
-    A = torch.randn(M, width, dtype=torch.float32, device="cuda")
+    A = torch.randn(M, width, dtype=torch.float32, device=get_current_device())
     B = k(A)
     ref = A.sum(dim=1) if reduce_fn is T.reduce_sum else A.max(dim=1).values
-    torch.testing.assert_close(B, ref, atol=1e-2, rtol=1e-2)
+    _assert_close(B, ref, atol=1e-2, rtol=1e-2)
 
 
 @tilelang.testing.requires_cuda
 @pytest.mark.parametrize(("logical_width", "scale"), [(32, 2), (64, 2)])
 def test_allreduce_scale_greater_than_one_valid_runtime(logical_width, scale):
     k = _compile(_make_allreduce_dim0_scale_kernel(T.reduce_sum, logical_width, scale))
-    A = torch.randn(logical_width, scale, dtype=torch.float32, device="cuda")
+    A = torch.randn(logical_width, scale, dtype=torch.float32, device=get_current_device())
     B = k(A)
-    torch.testing.assert_close(B, A.sum(dim=0), atol=1e-2, rtol=1e-2)
+    _assert_close(B, A.sum(dim=0), atol=1e-2, rtol=1e-2)
 
 
 @tilelang.testing.requires_cuda
@@ -988,7 +1173,7 @@ def test_reduce_packed_fp8_to_float16_absmax_runtime():
     source = k.get_kernel_source()
     assert "from_uint1<__half2>(*(fp8" not in source
 
-    base = torch.linspace(-2.0, 2.0, 128, device="cuda", dtype=torch.float16).reshape(4, 32)
+    base = torch.linspace(-2.0, 2.0, 128, device=get_current_device(), dtype=torch.float16).reshape(4, 32)
     base[0, 3] = -7.0
     base[1, 17] = 5.5
     base[2, 31] = -3.25
@@ -996,7 +1181,7 @@ def test_reduce_packed_fp8_to_float16_absmax_runtime():
     A = base.to(torch.float8_e4m3fn)
     B = k(A)
     ref = A.to(torch.float16).abs().amax(dim=1)
-    torch.testing.assert_close(B, ref, atol=0, rtol=0)
+    _assert_close(B, ref, atol=0, rtol=0)
 
 
 def test_reduce_packed_max_nan_propagate_uses_nan_intrinsics():

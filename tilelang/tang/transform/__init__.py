@@ -3,6 +3,16 @@
 from .. import _ffi_api
 
 
+def LowerSharedBarrier():
+    """Turn shared.barrier allocations into an mbarrier init prologue.
+
+    TANG has its own rewrite rather than the CUDA one: that file is only
+    compiled when USE_CUDA is on, and its cluster-barrier branch has no TANG
+    counterpart.
+    """
+    return _ffi_api.LowerSharedBarrier()  # type: ignore
+
+
 def LowerSharedTmem():
     """Lower TANG shared.tmem buffers to address holders."""
     return _ffi_api.LowerSharedTmem()  # type: ignore
@@ -23,4 +33,4 @@ def LowerLDGSTG():
     return _ffi_api.LowerLDGSTG()  # type: ignore
 
 
-__all__ = ["InjectPTSAsyncCopy", "LowerLDGSTG", "LowerSharedTmem", "LowerTangTmemDrain"]
+__all__ = ["InjectPTSAsyncCopy", "LowerLDGSTG", "LowerSharedBarrier", "LowerSharedTmem", "LowerTangTmemDrain"]

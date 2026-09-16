@@ -2,10 +2,10 @@ import functools
 import itertools
 from typing import Optional, Tuple
 
-import tilelang
 import tilelang.language as T
 import torch
 
+import tilelang
 from tileops.kernels.kernel_base import Kernel
 from tileops.utils import get_sm_version
 
@@ -28,6 +28,16 @@ def get_shared_memory_limit_bytes() -> int:
     props = torch.ptpu.get_device_properties(torch.ptpu.current_device())
     if hasattr(props, "shared_memory_per_block_optin"):
         return props.shared_memory_per_block_optin
+    if hasattr(props, "shared_memory_per_block"):
+        return props.shared_memory_per_block
+    # TANG 及无 per-block shared memory 属性的后端:torch.ptpu 的 DeviceProp 只暴露
+    # total_memory(HBM 容量),用它估算会得到远超真实上限的值,导致 autotune 过滤失效。
+    # 改用 tilelang 的 arch driver 读取运行时的 sharedMemPerBlock。
+    from tilelang.carver.arch.driver import get_shared_memory_per_block
+
+    limit = get_shared_memory_per_block()
+    if limit:
+        return limit
     return int(props.total_memory // 16)
 
 
@@ -1152,14 +1162,17 @@ def _conv2d_1x1_kernel(
             out: T.Tensor((n, c_out, h, w), dtype),  # type: ignore
             bias: T.Tensor((c_out,), dtype),  # type: ignore
         ):
-            x_flat = T.Tensor((n, c_in, hw), dtype, x.data)
-            out_flat = T.Tensor((n, c_out, hw), dtype, out.data)
             with T.Kernel(
                 T.ceildiv(hw, block_n),
                 T.ceildiv(c_out, block_m),
                 n,
                 threads=threads,
             ) as (bx, by, bz):
+                # 2D 视图(替代 3D reshape 别名):用 elem_offset 切出 batch 维度的切片,
+                # 让 copy 的 src/dst 都是 2D,避开 3D->2D extent mismatch 导致的
+                # swizzle 布局 apply 错误。
+                x_2d = T.Buffer((c_in, hw), dtype, data=x.data, elem_offset=bz * (c_in * hw))
+                out_2d = T.Buffer((c_out, hw), dtype, data=out.data, elem_offset=bz * (c_out * hw))
                 weight_shared = T.alloc_shared((block_m, block_k), dtype)
                 data_shared = T.alloc_shared((block_k, block_n), dtype)
                 out_shared = T.alloc_shared((block_m, block_n), dtype)
@@ -1170,8 +1183,10 @@ def _conv2d_1x1_kernel(
 
                 for k_iter in T.Pipelined(T.ceildiv(c_in, block_k), num_stages=num_stages):
                     T.copy(weight[by * block_m, k_iter * block_k], weight_shared)
-                    T.copy(x_flat[bz, k_iter * block_k, bx * block_n], data_shared)
+                    T.copy(x_2d[k_iter * block_k, bx * block_n], data_shared)
                     T.gemm(weight_shared, data_shared, out_local)
+
+                T.copy(out_local, out_shared)
 
                 for i, j in T.Parallel(block_m, block_n):
                     oc = by * block_m + i
@@ -1179,17 +1194,17 @@ def _conv2d_1x1_kernel(
                     if has_bias:
                         out_shared[i, j] = T.if_then_else(
                             (oc < c_out) & (hw_idx < hw),
-                            T.cast(out_local[i, j] + T.cast(bias[oc], accum_dtype), dtype),
+                            T.cast(T.cast(out_shared[i, j], accum_dtype) + T.cast(bias[oc], accum_dtype), dtype),
                             T.cast(0.0, dtype),
                         )
                     else:
                         out_shared[i, j] = T.if_then_else(
                             (oc < c_out) & (hw_idx < hw),
-                            T.cast(out_local[i, j], dtype),
+                            out_shared[i, j],
                             T.cast(0.0, dtype),
                         )
 
-                T.copy(out_shared, out_flat[bz, by * block_m, bx * block_n])
+                T.copy(out_shared, out_2d[by * block_m, bx * block_n])
 
         return _conv2d_1x1_main
 
@@ -2447,10 +2462,14 @@ class Conv2d1x1Kernel(Kernel):
     @property
     def autotune_configs(self) -> list[dict]:
         shared_memory_limit_bytes = get_shared_memory_limit_bytes()
+        # block_m/block_k 超过 M(c_out)/K(c_in) 维度只会引入越界 padding,
+        # 白白增加编译时间;按 shape 收窄候选。
+        block_m_choices = [m for m in (64, 128, 256) if m <= self.c_out] or [64]
+        block_k_choices = [k for k in (32, 64, 128) if k <= self.c_in] or [32]
         configs = itertools.product(
+            block_m_choices,
             [64, 128, 256],
-            [64, 128, 256],
-            [32, 64, 128],
+            block_k_choices,
             [2, 3],
             [128, 256],
             [True],

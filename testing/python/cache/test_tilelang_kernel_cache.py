@@ -41,6 +41,35 @@ PTPU_BACKENDS = ["tvm_ffi", "cython"]
 BACKENDS = PTPU_BACKENDS if is_ptpu_available() else CUDA_BACKENDS
 
 
+def test_tang_cache_key_tracks_compiler_without_probing_other_targets(monkeypatch):
+    from types import SimpleNamespace
+    from tilelang import _ptcc
+    from tilelang.cache.kernel_cache import KernelCache
+    from tilelang.contrib import ptcc
+
+    cache = KernelCache()
+    func = SimpleNamespace(script=lambda **kwargs: "same kernel")
+    monkeypatch.setattr(cache, "_get_base_key", lambda: {})
+    monkeypatch.setattr(ptcc, "get_ptcc_compiler", lambda: "ptcc")
+    identity = ("ptcc", "version-one")
+    monkeypatch.setattr(_ptcc, "compiler_identity", lambda _: identity)
+    defaults = ["-O3"]
+    monkeypatch.setattr(_ptcc, "default_jit_options", lambda: defaults)
+    first = cache._generate_key(func, [0], args=(), target="tang")
+    assert cache._generate_key(func, [0], args=(), target="tang") == first
+    identity = ("ptcc", "version-two")
+    second = cache._generate_key(func, [0], args=(), target="tang")
+    assert second != first
+    defaults = ["-O1"]
+    assert cache._generate_key(func, [0], args=(), target="tang") != second
+
+    def unexpected_probe():
+        raise AssertionError("non-TANG cache must not require PTCC")
+
+    monkeypatch.setattr(ptcc, "get_ptcc_compiler", unexpected_probe)
+    cache._generate_key(func, [0], args=(), target="llvm")
+
+
 def _get_target_from_backend(backend: str):
     """Map backend to target string."""
     if get_current_device().type == "ptpu":
@@ -88,7 +117,6 @@ def setup_module_env():
     """Setup and restore module-level environment and cache state."""
     # Save original env values
     original_cache_dir = env.TILELANG_CACHE_DIR
-    original_tmp_dir = env.TILELANG_TMP_DIR
 
     # Enable cache once for entire module
     tilelang.enable_cache()
@@ -97,7 +125,6 @@ def setup_module_env():
 
     # Restore env at module end
     env.TILELANG_CACHE_DIR = original_cache_dir
-    env.TILELANG_TMP_DIR = original_tmp_dir
 
     # Restore default postproc callbacks
     tvm_ffi.register_global_func("tilelang_callback_cuda_postproc", f=lambda code, _: code, override=True)
@@ -109,15 +136,10 @@ def setup_module_env():
 def clean_cache_env(tmp_path, request):
     """Provide isolated cache environment for each test.
 
-    Creates isolated cache/tmp directories to ensure:
+    Creates an isolated cache directory to ensure:
     - No interference from previous test runs
     - No interference between parallel tests
     - Clean slate for testing cache miss/hit behavior
-    - No "Invalid cross-device link" errors (os.replace requires same filesystem)
-
-    Technical notes:
-    - TILELANG_TMP_DIR MUST be on same filesystem as TILELANG_CACHE_DIR because
-      cache implementation uses os.replace() for atomic writes
     - Env restoration is handled by setup_module_env at module scope
     """
     # This fixture should ONLY be used with @pytest.mark.parametrize("backend", ...)
@@ -127,12 +149,8 @@ def clean_cache_env(tmp_path, request):
     cache_dir = tmp_path / "tilelang_cache"
     cache_dir.mkdir()
 
-    tmp_dir = tmp_path / "tilelang_tmp"
-    tmp_dir.mkdir()
-
-    # Patch env variables to point to isolated directories
+    # Patch the cache root to point to an isolated directory.
     env.TILELANG_CACHE_DIR = str(cache_dir)
-    env.TILELANG_TMP_DIR = str(tmp_dir)
 
     # Clear memory caches to force disk I/O
     _dispatch_map[backend]._memory_cache.clear()
@@ -199,6 +217,8 @@ def test_disk_cache_with_postproc(clean_cache_env, backend):
     )
 
     assert counter.count == 1, f"Cache hit: postproc should not be called again, got {counter.count} calls"
+    if backend == "nvrtc":
+        assert kernel1.adapter.kernels is not kernel2.adapter.kernels
 
     source2 = kernel2.get_kernel_source()
     assert counter.marker in source2, f"Expected cached marker '{counter.marker}' in source"
@@ -217,6 +237,38 @@ def test_disk_cache_with_postproc(clean_cache_env, backend):
     torch.testing.assert_close(c1, ref)
     torch.testing.assert_close(c2, ref)
     torch.testing.assert_close(c1, c2)
+
+
+def test_tvm_ffi_export_library_after_disk_cache_hit(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "tilelang_cache"
+    cache_dir.mkdir()
+    monkeypatch.setattr(env, "TILELANG_CACHE_DIR", str(cache_dir))
+
+    cache = _dispatch_map["tvm_ffi"]
+    cache._memory_cache.clear()
+
+    @T.prim_func
+    def vector_add(
+        A: T.Tensor((128,), T.float32),
+        B: T.Tensor((128,), T.float32),
+    ):
+        with T.Kernel(128, threads=128) as i:
+            B[i] = A[i] + 1.0
+
+    kernel_func = vector_add.with_attr("global_symbol", f"export_library_{uuid.uuid4().hex[:8]}")
+    cold_kernel = tilelang.compile(kernel_func, out_idx=[1], execution_backend="tvm_ffi")
+    cold_library = tmp_path / "cold.so"
+    cold_kernel.export_library(str(cold_library))
+
+    cache._memory_cache.clear()
+    cached_kernel = tilelang.compile(kernel_func, out_idx=[1], execution_backend="tvm_ffi")
+    cached_library = tmp_path / "cached.so"
+    cached_kernel.export_library(str(cached_library))
+
+    assert cold_library.is_file()
+    assert cached_kernel.artifact is None
+    assert cached_library.read_bytes() == Path(cached_kernel.adapter.libpath).read_bytes()
+    assert tilelang.tvm.runtime.load_module(str(cached_library)) is not None
 
 
 @pytest.mark.parametrize("backend", BACKENDS)

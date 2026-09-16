@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import tilelang.language as T
-from tvm import ir
-from tvm.tirx import PrimExpr, Buffer, BufferLoad, op
+from tvm import DataType, ir
+from tvm.tirx import PrimExpr, Buffer, BufferLoad, Var, op
 from tilelang._typing import BufferLikeType
-from tvm import DataType
-from tvm.tirx import Var
+from tilelang.language.utils import _normalize_annotations
 from tilelang.utils.language import to_buffer_region, legalize_pairwise_extents
 from tilelang.language.utils import get_extent
 
@@ -153,11 +152,12 @@ def atomic_max(
     memory_order: str | None = None,
     return_prev: bool = False,
     uint_atomic: bool = False,
+    annotations: dict | None = None,
 ) -> PrimExpr:
     """
     Perform an atomic maximum on the value stored at dst with an optional memory-order.
 
-    Supports scalar/addressed extern atomic max when neither argument exposes extents, or tile-region-based atomic max for Buffer/BufferRegion/BufferLoad inputs. If both arguments are plain Buffers their shapes must be structurally equal. If at least one side exposes extents, extents are aligned (missing dimensions are treated as size 1); an assertion is raised if extents cannot be deduced. The optional `memory_order` (one of "relaxed","consume","acquire","release","acq_rel","seq_cst") is used only for the direct extern `AtomicMax` path when no extents are available — otherwise the tile-region path ignores `memory_order`.
+    Supports scalar/addressed extern atomic max when neither argument exposes extents, or tile-region-based atomic max for Buffer/BufferRegion/BufferLoad inputs. If both arguments are plain Buffers their shapes must be structurally equal. If at least one side exposes extents, extents are aligned (missing dimensions are treated as size 1); an assertion is raised if extents cannot be deduced. The optional `memory_order` (one of "relaxed","consume","acquire","release","acq_rel","seq_cst") is honored on CUDA targets by both the direct extern `AtomicMax` path and the tile-region path. HIP and CuteDSL codegen currently ignore it.
 
     Parameters:
         dst (Buffer): Destination buffer/address to apply the atomic max.
@@ -195,6 +195,7 @@ def atomic_max(
 
     src_extent = get_extent(value)
     dst_extent = get_extent(dst)
+    ann = _normalize_annotations(annotations)
 
     if dst_extent is None and src_extent is None:
         if uint_atomic:
@@ -217,6 +218,7 @@ def atomic_max(
             T.access_ptr(dst, "rw"),
             value,
             memory_order_id,
+            annotations=ann,
         )
 
     # When both arguments are Buffer, we can check whether they are structural equal.
@@ -238,13 +240,12 @@ def atomic_max(
     if return_prev:
         raise NotImplementedError("return_prev is not supported for tile-region-based atomic operations")
 
-    ann = {}
     if uint_atomic:
         ann["uint_atomic"] = 1
     if memory_order is not None:
         ann["memory_order"] = _MEMORY_ORDER_ID_MAP[memory_order]
 
-    return T.call_intrin("handle", op.Op.get("tl.tileop.atomicmax"), value, dst, annotations=ann if ann else None)
+    return T.call_intrin("handle", op.Op.get("tl.tileop.atomicmax"), value, dst, annotations=ann)
 
 
 def atomic_min(
@@ -253,11 +254,12 @@ def atomic_min(
     memory_order: str | None = None,
     return_prev: bool = False,
     uint_atomic: bool = False,
+    annotations: dict | None = None,
 ) -> PrimExpr:
     """
     Atomically update the value at dst to the minimum of its current value and value.
 
-    Supports scalar/addressed extern atomic min when neither argument exposes extents, or tile-region-based atomic min for Buffer/BufferRegion/BufferLoad inputs. If both arguments are plain Buffers their shapes must be structurally equal. If at least one side exposes extents, extents are aligned (missing dimensions are treated as size 1); an assertion is raised if extents cannot be deduced. The optional `memory_order` (one of "relaxed","consume","acquire","release","acq_rel","seq_cst") is used only for the direct extern `AtomicMin` path when no extents are available — otherwise the tile-region path ignores `memory_order`.
+    Supports scalar/addressed extern atomic min when neither argument exposes extents, or tile-region-based atomic min for Buffer/BufferRegion/BufferLoad inputs. If both arguments are plain Buffers their shapes must be structurally equal. If at least one side exposes extents, extents are aligned (missing dimensions are treated as size 1); an assertion is raised if extents cannot be deduced. The optional `memory_order` (one of "relaxed","consume","acquire","release","acq_rel","seq_cst") is honored on CUDA targets by both the direct extern `AtomicMin` path and the tile-region path. HIP and CuteDSL codegen currently ignore it.
 
     Parameters:
         dst (Buffer): Destination buffer/address to apply the atomic min.
@@ -295,6 +297,7 @@ def atomic_min(
 
     src_extent = get_extent(value)
     dst_extent = get_extent(dst)
+    ann = _normalize_annotations(annotations)
 
     if dst_extent is None and src_extent is None:
         if uint_atomic:
@@ -317,6 +320,7 @@ def atomic_min(
             T.access_ptr(dst, "rw"),
             value,
             memory_order_id,
+            annotations=ann,
         )
 
     # When both arguments are Buffer, we can check whether they are structural equal.
@@ -338,13 +342,12 @@ def atomic_min(
     if return_prev:
         raise NotImplementedError("return_prev is not supported for tile-region-based atomic operations")
 
-    ann = {}
     if uint_atomic:
         ann["uint_atomic"] = 1
     if memory_order is not None:
         ann["memory_order"] = _MEMORY_ORDER_ID_MAP[memory_order]
 
-    return T.call_intrin("handle", op.Op.get("tl.tileop.atomicmin"), value, dst, annotations=ann if ann else None)
+    return T.call_intrin("handle", op.Op.get("tl.tileop.atomicmin"), value, dst, annotations=ann)
 
 
 def atomic_add(
@@ -354,11 +357,12 @@ def atomic_add(
     return_prev: bool = False,
     use_tma: bool = False,
     uint_atomic: bool = False,
+    annotations: dict | None = None,
 ) -> PrimExpr:
     """
     Atomically add `value` into `dst`, returning a handle to the operation.
 
-    Supports scalar/addressed extern atomic add when neither argument exposes extents, or tile-region-based atomic add for Buffer/BufferRegion/BufferLoad inputs. If both arguments are plain Buffers their shapes must be structurally equal. If at least one side exposes extents, extents are aligned (missing dimensions are treated as size 1); an assertion is raised if extents cannot be deduced. The optional `memory_order` (one of "relaxed","consume","acquire","release","acq_rel","seq_cst") is used only for the direct extern `AtomicAdd` path when no extents are available — otherwise the tile-region path ignores `memory_order`.
+    Supports scalar/addressed extern atomic add when neither argument exposes extents, or tile-region-based atomic add for Buffer/BufferRegion/BufferLoad inputs. If both arguments are plain Buffers their shapes must be structurally equal. If at least one side exposes extents, extents are aligned (missing dimensions are treated as size 1); an assertion is raised if extents cannot be deduced. The optional `memory_order` (one of "relaxed","consume","acquire","release","acq_rel","seq_cst") is honored on CUDA targets by both paths: the direct extern `AtomicAdd` path when no extents are available, and the tile-region path (including when it auto-vectorizes to `AtomicAddx2`/`AtomicAddx4`). HIP and CuteDSL codegen currently ignore it.
 
     Parameters:
         dst (Buffer): Destination buffer/address to apply the atomic add.
@@ -401,6 +405,7 @@ def atomic_add(
 
     src_extent = get_extent(value)
     dst_extent = get_extent(dst)
+    ann = _normalize_annotations(annotations)
 
     # Thread-level atomic add, where both extent can't be inferred
     if dst_extent is None and src_extent is None:
@@ -418,7 +423,7 @@ def atomic_add(
 
         # Pass destination by pointer to match device signature
         if memory_order is None:
-            return T.call_intrin(return_type, atomic_add_op, T.access_ptr(dst, "rw"), value)
+            return T.call_intrin(return_type, atomic_add_op, T.access_ptr(dst, "rw"), value, annotations=ann)
         else:
             return T.call_intrin(
                 return_type,
@@ -426,6 +431,7 @@ def atomic_add(
                 T.access_ptr(dst, "rw"),
                 value,
                 _MEMORY_ORDER_ID_MAP[memory_order],
+                annotations=ann,
             )
 
     # When both arguments are Buffer, we can check whether they are structural equal.
@@ -450,7 +456,6 @@ def atomic_add(
         raise NotImplementedError("return_prev is not supported for tile-region-based atomic operations")
 
     # Build annotations dict
-    ann = {}
     if use_tma:
         ann["use_tma"] = 1
     if uint_atomic:
@@ -458,7 +463,7 @@ def atomic_add(
     if memory_order is not None:
         ann["memory_order"] = _MEMORY_ORDER_ID_MAP[memory_order]
 
-    return T.call_intrin("handle", op.Op.get("tl.tileop.atomicadd"), value, dst, annotations=ann if ann else None)
+    return T.call_intrin("handle", op.Op.get("tl.tileop.atomicadd"), value, dst, annotations=ann)
 
 
 def atomic_sub(
@@ -894,7 +899,10 @@ def atomic_or(
 ) -> PrimExpr:
     """Atomically bitwise-or an integer scalar address."""
     _require_integer_atomic(dst, "atomic_or")
-    if uint_atomic or return_prev or get_extent(dst) is not None or get_extent(value) is not None:
+    # Signed and unsigned 32-bit OR have identical bitwise update semantics.
+    # Keep the neutral intrinsic so CPU lowering can handle the default API.
+    needs_uint_extern = uint_atomic and _atomic_dtype(dst) not in ("int32", "uint32")
+    if needs_uint_extern or return_prev or get_extent(dst) is not None or get_extent(value) is not None:
         return _extended_atomic(
             dst,
             (value,),

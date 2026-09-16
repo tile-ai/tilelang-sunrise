@@ -3,9 +3,29 @@
 
 cmake_minimum_required(VERSION 3.26)
 
+# Activate the build toolchain before project(): the MSVC environment has to be in
+# place when the compilers are probed, and the generator resolves CMAKE_MAKE_PROGRAM
+# there. CUDA detection lives in the same module but must run after project() instead
+# -- see the second include below.
+set(TILELANG_PRE_PROJECT_ONLY ON)
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/FindPipCUDAToolkit.cmake)
+unset(TILELANG_PRE_PROJECT_ONLY)
+
+# Capture this CMakeLists.txt's directory once so `function()` bodies below
+# can reference files shipped with the project. CMake 4.x resolves
+# CMAKE_CURRENT_LIST_DIR inside a function() to the caller's listfile, which
+# breaks resource paths when helpers are invoked from included Find modules
+# (e.g. cmake/pypi-z3/FindZ3.cmake).
+set(TILELANG_CMAKELISTS_DIR "${CMAKE_CURRENT_LIST_DIR}")
+
+project(TILE_LANG C CXX)
+
 # Detect CUDA toolkit: tries host installation first, then falls back to
-# pip-installed packages (env WITH_PIP_CUDA_TOOLCHAIN or auto-detect).
-# Must be included before project() so CMAKE_CUDA_COMPILER is set.
+# pip-installed packages (env WITH_PIP_CUDA_TOOLCHAIN or auto-detect). This has to
+# run after project() so that an enabled language is available -- FindCUDAToolkit's
+# imported-target setup calls find_package(Threads REQUIRED), which hard-errors
+# otherwise. CMAKE_CUDA_COMPILER is published as a cache entry, so subprojects
+# configured further down (add_subdirectory(${TVM_SOURCE}) below) still see it.
 set(_tilelang_probe_cuda ON)
 if(DEFINED USE_CUDA AND NOT USE_CUDA)
   set(_tilelang_probe_cuda OFF)
@@ -16,15 +36,6 @@ if(_tilelang_probe_cuda)
   include(${CMAKE_CURRENT_LIST_DIR}/cmake/FindPipCUDAToolkit.cmake)
 endif()
 unset(_tilelang_probe_cuda)
-
-# Capture this CMakeLists.txt's directory once so `function()` bodies below
-# can reference files shipped with the project. CMake 4.x resolves
-# CMAKE_CURRENT_LIST_DIR inside a function() to the caller's listfile, which
-# breaks resource paths when helpers are invoked from included Find modules
-# (e.g. cmake/pypi-z3/FindZ3.cmake).
-set(TILELANG_CMAKELISTS_DIR "${CMAKE_CURRENT_LIST_DIR}")
-
-project(TILE_LANG C CXX)
 
 # MSVC-specific build configuration. Must run after project() so MSVC is
 # defined, but before add_subdirectory(${TVM_SOURCE}) below so subprojects
@@ -353,6 +364,7 @@ file(GLOB TILE_LANG_SRCS
   src/layout/*.cc
   src/transform/*.cc
   src/transform/common/*.cc
+  src/transform/layout_inference/*.cc
   src/transform/pipeline/*.cc
   src/op/*.cc
   src/backend/common/target_utils.cc
