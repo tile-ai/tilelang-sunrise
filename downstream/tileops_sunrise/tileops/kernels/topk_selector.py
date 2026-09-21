@@ -268,7 +268,15 @@ class TopkSelectorKernel(Kernel):
         batch = self.batch
         seq_len_kv = self.seq_len_kv
 
-        dim_map = {"batch": batch, "seq_len_kv": seq_len_kv}
+        # Autotuning only needs a small, valid dummy input to benchmark each
+        # config; it does not need the real tensor sizes. `seq_len_kv` is a
+        # dynamic dim, so supplying a capped length keeps the dummy index_score
+        # small. Without this cap the supply_prog allocates a *second* full-size
+        # index_score (32 GiB for the large-batch shapes) on top of the real
+        # input the benchmark already holds, OOM-ing the 64 GiB device.
+        supply_seq_len_kv = min(seq_len_kv, max(self.topk, 4096))
+
+        dim_map = {"batch": batch, "seq_len_kv": supply_seq_len_kv}
 
         def symbol_name(value):
             name = getattr(value, "name", None)
@@ -301,9 +309,10 @@ class TopkSelectorKernel(Kernel):
                         int_tensors.append(i)
                     else:
                         inputs.append(_torch.rand(shape, dtype=dtype, device=device))
-            # last int tensor is 'ends' — fill with seq_len_kv so kernel processes all elements
+            # last int tensor is 'ends' — fill with the capped seq_len_kv so the
+            # kernel processes all elements of the (capped) dummy index_score.
             if int_tensors:
-                inputs[int_tensors[-1]].fill_(seq_len_kv)
+                inputs[int_tensors[-1]].fill_(supply_seq_len_kv)
             return inputs
 
         return supply_prog
@@ -316,8 +325,8 @@ class TopkSelectorKernel(Kernel):
     def default_config(self) -> dict:
         return {
             "RADIX": 1 << 8,
-            "BLOCK_SIZE": 1024,
-            "SMEM_INPUT_SIZE": 4096,
+            "BLOCK_SIZE": 512,
+            "SMEM_INPUT_SIZE": 3072,
             "block_m": 32,
         }
 
@@ -330,8 +339,8 @@ class TopkSelectorKernel(Kernel):
             list[dict]: A list of dictionaries containing 'block_i' and 'threads' combinations.
         """
         RADIX = [1 << 8]
-        BLOCK_SIZE = [1024]
-        SMEM_INPUT_SIZE = [4096]
+        BLOCK_SIZE = [512]
+        SMEM_INPUT_SIZE = [3072]
         block_m = [32]
         _configs = list(itertools.product(RADIX, BLOCK_SIZE, SMEM_INPUT_SIZE, block_m))
 

@@ -1,12 +1,36 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 #include <tvm/arith/analyzer.h>
+#include <tvm/ffi/extra/structural_equal.h>
+#include <tvm/ffi/extra/structural_hash.h>
 #include <tvm/runtime/logging.h>
-#include <tvm/tirx/expr.h>
-#include <tvm/tirx/op.h>
+#include <tvm/tirx/analysis.h>
 #include <tvm/tirx/builtin.h>
-#include "z3++.h"
+#include <tvm/tirx/expr.h>
+#include <tvm/tirx/expr_functor.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/op_attr_types.h>
 
 #include <algorithm>
 #include <map>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -17,13 +41,8 @@
 #include "tvm/ffi/object.h"
 #include "tvm/ffi/string.h"
 #include "tvm/ir/expr.h"
-#include <tvm/ffi/extra/structural_equal.h>
-#include <tvm/ffi/extra/structural_hash.h>
 #include "tvm/runtime/data_type.h"
-#include <tvm/tirx/analysis.h>
-#include <tvm/tirx/expr_functor.h>
-#include "tvm/arith/analyzer.h"
-#include <tvm/tirx/op_attr_types.h>
+#include "z3++.h"
 
 namespace tvm::arith {
 
@@ -64,7 +83,17 @@ struct Namespace {
   }
 };
 
-} // namespace
+}  // namespace
+
+// Deprecated no-ops, kept only for downstream callers of
+// arith.EnterZ3ContextScope / arith.ExitZ3ContextScope (Z3ContextScope in
+// Python). Shared per-compile z3 contexts are gone: every materialized
+// solver owns a private context (see Z3Prover::Impl::Materialize), which
+// subsumes the per-compile isolation these scopes provided. Remove together
+// with the remaining call sites.
+void EnterZ3ContextScope() {}
+
+void ExitZ3ContextScope() {}
 
 class Z3Prover::Impl : ExprFunctor<z3::expr(const PrimExpr &)> {
 public:
@@ -72,14 +101,14 @@ public:
   using Self = Z3Prover::Impl;
 
   Analyzer* analyzer;
-  /// @brief Z3 context, a shared ptr, because tilelang want to copy the Analyzer
-  // We use a thread_local static Z3 context so all analyzers within the same thread
-  // can share a common context, because Z3 initialization is slow on some CPUs
-  // (e.g., AMD EPYC 7502 32-Core). Using thread_local ensures thread safety.
-  inline static thread_local std::shared_ptr<z3::context> ctx { new z3::context() };
+  /// @brief Z3 context owning every handle of this prover.
+  // Null until the solver materializes; Materialize creates a context
+  // private to this prover, which clones of a materialized prover then
+  // share (shared_ptr) so their copied handles stay valid.
+  std::shared_ptr<z3::context> ctx;
 
   /// @brief Z3 solver instance
-  z3::solver solver {*ctx};
+  std::optional<z3::solver> solver;
 
   /// @brief Memoized PrimExpr -> slot in z3_pool_. Holds no z3 handles, so
   /// its pointer-hashed bucket order cannot affect z3 object lifetime.
@@ -131,17 +160,25 @@ public:
 
   /// @brief Create a z3 solver with custom options
   static z3::solver CreateSolver(z3::context & ctx) {
-    z3::solver solver(ctx);
+    z3::solver result(ctx);
     // here we disable model generation to speed up the solving process
-    solver.set("model", false);
+    result.set("model", false);
     // ensure determinstic behavior
-    solver.set("random_seed", (unsigned)42);
-    return solver;
+    result.set("random_seed", (unsigned)42);
+    return result;
   }
 
-  Impl(Analyzer * parent): analyzer(parent) {
+  Impl(Analyzer* parent)
+      : analyzer(parent) {
+    // The solver (and its context) is created lazily (see Materialize).
+    // Analyzers are constructed in large numbers as cheap scratch objects,
+    // and only a tiny fraction ever reaches the Z3 fallback of CanProve;
+    // creating the solver (and translating every Bind into z3 constraints)
+    // eagerly made every Analyzer pay Z3's initialization cost up front.
+    // Until the first operation that actually needs the solver,
+    // Bind/EnterConstraint only journal their arguments into scope_stack_.
     scope_stack_.push_back({});
-    solver = CreateSolver(*ctx);
+    scope_side_effects_.push_back({});
     // default timeout 5ms
     // Z3's implementation of timeout, when setting timeout T ms, it will stop at T - 1 ms
     // SetTimeoutMs(5);
@@ -149,8 +186,56 @@ public:
     SetRLimit(1e4);
   }
 
+  /// @brief Create the solver on first use and replay the recorded journal.
+  ///
+  /// The live scope_stack_ (which also feeds the SMTLIB2 debug output) holds
+  /// exactly the binds and constraints an eagerly-built solver would carry:
+  /// binds append to the innermost scope and scopes pop LIFO, so walking the
+  /// scopes front-to-back replays the surviving entries in the order they
+  /// were recorded. Entries from scopes that already exited were popped
+  /// together with their scope and are correctly absent. The replay performs
+  /// the same MemoPut/solver->add sequence the eager path would have done
+  /// for these entries, so CanProve answers are unchanged.
+  void Materialize() {
+    if (solver) return;
+    // The solver gets its own context: verdicts under the deterministic
+    // rlimit budget depend on the context's accumulated AST state (ids feed
+    // the search heuristics), so sharing a context couples every solver's
+    // borderline answers to whichever analyzers happened to be created
+    // before it. A private context makes each analyzer's answers a pure
+    // function of its own journal and query history. Unmaterialized provers
+    // hold no context (and no z3 state) at all.
+    ctx = std::make_shared<z3::context>();
+    solver.emplace(CreateSolver(*ctx));
+    if (timeout_ms != UINT_MAX) {
+      solver->set("timeout", timeout_ms);
+    }
+    if (rlimit != UINT_MAX) {
+      solver->set("rlimit", rlimit);
+    }
+    TVM_FFI_ICHECK_EQ(scope_side_effects_.size(), scope_stack_.size());
+    for (size_t si = 0; si < scope_stack_.size(); ++si) {
+      for (const Scope& s : scope_stack_[si]) {
+        switch (s.kind) {
+          case Scope::BindValue:
+            ApplyBindValue(s.var, s.value);
+            break;
+          case Scope::BindRange:
+            ApplyBindRange(s.var, s.min, s.extent);
+            break;
+          case Scope::Constraint:
+            ApplyConstraint(s.constraint, s.is_assume, si);
+            break;
+        }
+      }
+    }
+  }
+
   /// @brief Create a Free z3 expression from PrimExprNode
   z3::expr Create(const PrimExprNode *op) {
+    // Expression translation only happens with a live solver: every public
+    // entry point that can reach a visitor materializes first.
+    TVM_FFI_ICHECK(solver.has_value());
     auto ref = ffi::GetRef<PrimExpr>(op);
     auto dtype = op->dtype;
     std::string name = ns.GetNewName(ref);
@@ -161,11 +246,11 @@ public:
     else {
       z3::expr e = ctx->int_const(name.c_str());
       if(dtype.is_uint() && dtype.bits() == 64) {
-        solver.add(ctx->int_val(0) <= e && e <= ctx->int_val((uint64_t)UINT64_MAX));
+        solver->add(ctx->int_val(0) <= e && e <= ctx->int_val((uint64_t)UINT64_MAX));
       } else {
         auto min_val = Downcast<IntImm>(min_value(dtype))->value;
         auto max_val = Downcast<IntImm>(max_value(dtype))->value;
-        solver.add(ctx->int_val(min_val) <= e && e <= ctx->int_val(max_val));
+        solver->add(ctx->int_val(min_val) <= e && e <= ctx->int_val(max_val));
       }
       return e;
     }
@@ -182,39 +267,63 @@ public:
     PrimExpr min;
     PrimExpr extent;
     PrimExpr constraint;
+    /// Assume-mode constraints keep the free variables they introduce
+    /// memoized for the lifetime of their scope; recorded so a deferred
+    /// replay reproduces the same memo behavior.
+    bool is_assume = false;
   };
 
   /// @brief scope_stack memorizes existing constraint and bindings
   ///        to generate SMTLIB2 representation with comments
   std::vector<std::vector<Scope>> scope_stack_;
 
+  /// @brief Per-scope memoized side-effect exprs (parallel to scope_stack_).
+  /// An assume-mode constraint keeps the free variables it introduces in the
+  /// memo until its scope exits; the exit callback erases whatever this
+  /// stack's top holds, which stays correct whether the constraint was
+  /// translated when it was entered or later, during a deferred replay.
+  std::vector<std::vector<PrimExpr>> scope_side_effects_;
+
   /// @brief Enter a constraint scope
   std::function<void()> EnterConstraint(const PrimExpr& constraint, bool is_assume=false) {
     if (!IsValidDType(constraint->dtype)) return nullptr;
     scope_stack_.push_back({});
-    scope_stack_.back().push_back(Scope{Scope::Constraint, Var(), PrimExpr(), PrimExpr(), PrimExpr(), constraint});
-    solver.push();
+    scope_stack_.back().push_back(Scope{Scope::Constraint, Var(), PrimExpr(), PrimExpr(), PrimExpr(), constraint, is_assume});
+    scope_side_effects_.push_back({});
+    if (solver) {
+      ApplyConstraint(constraint, is_assume, scope_side_effects_.size() - 1);
+    }
+    // Exit callback: scopes leave LIFO, so the stack tops are this scope's.
+    // If the solver materialized while the scope was live, the replay pushed
+    // a frame for it (and recorded any assume-kept side effects), so the pop
+    // and the memo erasure below stay balanced either way.
+    return [this]() {
+      if (solver) solver->pop();
+      for (const auto& expr : scope_side_effects_.back()) {
+        MemoErase(expr);
+      }
+      scope_side_effects_.pop_back();
+      scope_stack_.pop_back();
+    };
+  }
+
+  /// @brief Translate a constraint into the solver (push + assert). Assume
+  /// mode keeps introduced free vars memoized for the scope's lifetime by
+  /// parking them in scope_side_effects_[scope_index].
+  void ApplyConstraint(const PrimExpr& constraint, bool is_assume, size_t scope_index) {
+    solver->push();
     this->is_assume = is_assume;
-    solver.add(VisitBool(constraint));
+    solver->add(VisitBool(constraint));
     this->is_assume = false;
     auto side_effect_exprs = std::move(side_effect_exprs_);
     side_effect_exprs_.clear();
     if(is_assume) {
-      return [this, side_effect_exprs]() {
-        solver.pop();
-        for (const auto& expr : side_effect_exprs) {
-          MemoErase(expr);
-        }
-        scope_stack_.pop_back();
-      };
+      auto& keep = scope_side_effects_[scope_index];
+      keep.insert(keep.end(), side_effect_exprs.begin(), side_effect_exprs.end());
     } else {
       for(const auto & expr: side_effect_exprs) {
         MemoErase(expr);
       }
-      return [this]() {
-        solver.pop();
-        scope_stack_.pop_back();
-      };
     }
   }
 
@@ -263,17 +372,26 @@ public:
 
   /// @brief Check if the expression can be proved
   bool CanProve(const PrimExpr &expr) {
-    if (CheckTrivilBadCases(expr)) return false;
     if (!IsValidDType(expr->dtype)) return false;
+    // The trivial-bad-case check below consults the memo (IsFreeNode), so
+    // the journal must be replayed first for it to see the bound vars.
+    Materialize();
+    if (CheckTrivilBadCases(expr)) return false;
     z3::expr_vector constr(*ctx);
     constr.push_back(!ConvertBool(expr));
-    auto result = solver.check(constr);
+    auto result = solver->check(constr);
     constr.pop_back();
     return result == z3::unsat;
   }
 
   /// @brief Binded
   /// @brief Bind a variable to a value or a range
+  /// A bind journaled inside a live constraint scope is dropped with that
+  /// scope. The eager path differed only cosmetically: it kept the var's
+  /// memo translation after the scope's solver frame (and with it the
+  /// var's range asserts) was popped, leaving an unconstrained placeholder
+  /// -- observably the same as translating the var as a fresh free
+  /// variable on demand, which is what a later query on the journal does.
   void Bind(const Var & var, const PrimExpr & value, bool allow_override = false) {
     if (!IsValidDType(var->dtype)) return;
     scope_stack_.back().push_back(Scope{
@@ -281,6 +399,11 @@ public:
       var,
       value
     });
+    if (!solver) return;  // journaled; translated when the solver materializes
+    ApplyBindValue(var, value);
+  }
+
+  void ApplyBindValue(const Var & var, const PrimExpr & value) {
     // we add the binding whenever the value is pure,
     // because non-pure parts are handling by creating free variables in VisitExpr
     MemoPut(var, ConvertInt(value));
@@ -296,6 +419,11 @@ public:
       range->min,
       range->extent
     });
+    if (!solver) return;  // journaled; translated when the solver materializes
+    ApplyBindRange(var, range->min, range->extent);
+  }
+
+  void ApplyBindRange(const Var & var, const PrimExpr & min, const PrimExpr & extent) {
     // 1. Create a placeholder for the var, and save it in the memo
     //    if the var is overrided later, we can just update the memo, and the old placeholder will be ignored
     auto var_expr = Create(var.as<PrimExprNode>());
@@ -304,27 +432,47 @@ public:
     // 2. Add constraint on the placeholder
     //    when min_expr >= max_expr, the range is empty, which is under undefined behavior
     //    instead of adding an unsat constraint, we just skip the range constraint to leave it a free var
-    if(tirx::is_const_int(range->min) && tirx::is_const_int(range->min + range->extent)) {
-      int64_t min_value = *tirx::as_const_int(range->min);
-      int64_t max_value = *tirx::as_const_int(range->min + range->extent);
+    if(tirx::is_const_int(min) && tirx::is_const_int(min + extent)) {
+      int64_t min_value = *tirx::as_const_int(min);
+      int64_t max_value = *tirx::as_const_int(min + extent);
       if(min_value < max_value) {
-        solver.add(ctx->int_val(min_value) <= var_expr);
-        solver.add(var_expr < ctx->int_val(max_value));
+        solver->add(ctx->int_val(min_value) <= var_expr);
+        solver->add(var_expr < ctx->int_val(max_value));
       }
     } else {
-      solver.add(ConvertBool(range->extent <= 0 || (range->min <= var && var < range->min + range->extent)));
+      solver->add(ConvertBool(extent <= 0 ||
+                              (min <= var && var < min + extent)));
     }
   }
 
   void CopyFrom(const Self & other_) {
-    // 1. create a new solver
-    //    because this->solver depends on this->ctx
-    //    we need to deconstruct the old solver, and create a new one depending on other_.ctx
-    solver = CreateSolver(*other_.ctx);
-    // 2. copy the context
-    //    the context is a shared_ptr, we can just copy the pointer
+    if (!other_.solver) {
+      // The source has not materialized: its entire Z3 state is the journal.
+      // Copy it and stay lazy; a later Materialize on this clone rebuilds
+      // the same solver state the source would have built.
+      solver.reset();
+      memo_.clear();
+      z3_pool_.clear();
+      free_slots_.clear();
+      ns = Namespace();
+      side_effect_exprs_.clear();
+      ctx = other_.ctx;
+      scope_stack_ = other_.scope_stack_;
+      scope_side_effects_.assign(scope_stack_.size(), {});
+      timeout_ms = other_.timeout_ms;
+      rlimit = other_.rlimit;
+      return;
+    }
+    // Z3 handles cannot move between contexts. Destroy every handle owned by
+    // this fresh clone before adopting the source Analyzer's context.
+    solver.reset();
+    memo_.clear();
+    z3_pool_.clear();
+    free_slots_.clear();
     ctx = other_.ctx;
-    // 3. copy other objects
+    solver.emplace(CreateSolver(*ctx));
+
+    // Copy other objects.
     ns = other_.ns;
     // Replay live memo entries in slot order: deterministic, unlike the
     // pointer-hashed iteration order of memo_ itself.
@@ -334,35 +482,38 @@ public:
     std::sort(live.begin(), live.end(),
               [](auto &a, auto &b) { return a.first < b.first; });
     for (auto &[idx, e] : live) MemoPut(*e, *other_.z3_pool_[idx]);
-    for(auto a: other_.solver.assertions()) {
-      solver.add(a);
+    for (auto a : other_.solver->assertions()) {
+      solver->add(a);
     }
-    // 4. copy timeout options
-    //    but other solver options are not copied
+    // Copy timeout options, but not other solver options.
     SetTimeoutMs(other_.timeout_ms);
     SetRLimit(other_.rlimit);
-    // 5. copy the scope stack, which containing comments for SMTLIB2 generation
+    // Copy the scope stack, which contains comments for SMTLIB2 generation.
     scope_stack_ = other_.scope_stack_;
+    scope_side_effects_ = other_.scope_side_effects_;
   }
 
   /// @brief Set timeout in milliseconds
   void SetTimeoutMs(unsigned timeout_ms) {
     this->timeout_ms = timeout_ms;
-    solver.set("timeout", timeout_ms);
+    if (!solver) return;  // stored; applied when the solver materializes
+    solver->set("timeout", timeout_ms);
   }
 
   /// @brief Set max steps
   void SetRLimit(unsigned rlimit) {
     this->rlimit = rlimit;
-    solver.set("rlimit", rlimit);
+    if (!solver) return;  // stored; applied when the solver materializes
+    solver->set("rlimit", rlimit);
   }
 
   /// @brief Get the SMTLIB2 representation of the current solver state
   ffi::String GetSMTLIB2() {
+    Materialize();
     std::stringstream ss;
     ss << "(set-option :timeout " << timeout_ms << ")\n";
     AddScopeDebugMsg(ss);
-    ss <<  solver.to_smt2();
+    ss << solver->to_smt2();
     return ss.str();
   }
 
@@ -387,32 +538,35 @@ public:
 
   /// @brief Get the SMTLIB2 representation of the current solver state with additional expr trying to prove
   ffi::String GetSMTLIB2(const PrimExpr & expr) {
+    Materialize();
     std::stringstream ss;
     ss << "(set-option :timeout " << timeout_ms << ")\n";
     AddScopeDebugMsg(ss);
     ss << "; Trying to prove: " << expr << "\n";
-    solver.push();
-    solver.add(!ConvertBool(expr));
-    ss << solver.to_smt2();
-    solver.pop();
+    solver->push();
+    solver->add(!ConvertBool(expr));
+    ss << solver->to_smt2();
+    solver->pop();
     return ss.str();
   }
 
   /// @brief Get the statistics of the solver
   ffi::String GetStats() {
+    Materialize();
     std::stringstream ss;
-    ss << solver.statistics();
+    ss << solver->statistics();
     return ss.str();
   }
 
   ffi::String GetModel(const PrimExpr & expr) {
-    solver.set("model", true);
-    solver.push();
-    solver.add(!ConvertBool(expr));
-    auto result = solver.check();
+    Materialize();
+    solver->set("model", true);
+    solver->push();
+    solver->add(!ConvertBool(expr));
+    auto result = solver->check();
     ffi::String model_str;
     if (result == z3::sat) {
-      z3::model m = solver.get_model();
+      z3::model m = solver->get_model();
       std::map<std::string, z3::expr> model_map;
       for(unsigned i = 0; i < m.size(); i++) {
         z3::func_decl d = m[i];
@@ -424,8 +578,8 @@ public:
       }
       model_str = ss.str();
     }
-    solver.pop();
-    solver.set("model", false);
+    solver->pop();
+    solver->set("model", false);
     return model_str;
   }
 
@@ -447,8 +601,9 @@ public:
       return -1;
     }
 
-    solver.set("model", true);
-    solver.push();
+    Materialize();
+    solver->set("model", true);
+    solver->push();
 
     // Convert the TVM variable to Z3 expression
     z3::expr z3_var = VisitInt(var);
@@ -457,12 +612,12 @@ public:
     std::vector<int64_t> found_values;
 
     while (count < max_count) {
-      auto result = solver.check();
+      auto result = solver->check();
       if (result != z3::sat) {
         break;  // No more solutions
       }
 
-      z3::model m = solver.get_model();
+      z3::model m = solver->get_model();
       z3::expr val_expr = m.eval(z3_var, true);
 
       // Extract the integer value from Z3 expression
@@ -478,11 +633,11 @@ public:
       count++;
 
       // Add blocking clause: var != val (exclude this solution)
-      solver.add(z3_var != ctx->int_val(val));
+      solver->add(z3_var != ctx->int_val(val));
     }
 
-    solver.pop();
-    solver.set("model", false);
+    solver->pop();
+    solver->set("model", false);
 
     // Clear any side effects from visiting the variable
     for (const auto& expr : side_effect_exprs_) {
@@ -743,11 +898,11 @@ private:
 
       // Add constraint that shift amount should be non-negative
       // This is a common assumption in many programming languages
-      solver.add(b_expr >= 0);
+      solver->add(b_expr >= 0);
 
       // Also limit shift amount to avoid unrealistic large shifts
       // We'll limit to 64 bits (reasonable for most use cases)
-      solver.add(b_expr < 64);
+      solver->add(b_expr < 64);
 
       unsigned bit_width = std::max(a.dtype().bits(), b.dtype().bits());
       z3::expr a_bv = z3::int2bv(bit_width, a_expr);

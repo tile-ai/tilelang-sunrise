@@ -51,6 +51,32 @@ def test_tilelang_copy():
     run_tilelang_copy(M=1024, N=576, block_M=32, block_N=576, dtype=T.float32)
 
 
+def test_scalar_copy_annotations_preserved():
+    @T.prim_func
+    def main(A: T.Tensor((1,), T.float32), B: T.Tensor((1,), T.float32)):
+        with T.Kernel(1, threads=32):
+            A_shared = T.alloc_shared((1,), T.float32)
+            T.copy(A[0], B[0], annotations={"test.copy": "sync"})
+            T.async_copy(A[0], A_shared[0], annotations={"test.copy": "async"})
+
+    lines = main.script().splitlines()
+    copy_line = next(line for line in lines if "T.copy(" in line)
+    async_line = next(line for line in lines if "T.async_copy(" in line)
+    assert 'test.copy="sync"' in copy_line
+    assert 'test.copy="async"' in async_line
+
+
+@pytest.mark.parametrize("annotation_warps", [None, 2])
+def test_scalar_copy_drain_warps_preserved(annotation_warps):
+    annotations = {} if annotation_warps is None else {"drain_warps": annotation_warps}
+    src = tvm.tirx.decl_buffer((1,), "float32", name="src")
+    dst = tvm.tirx.decl_buffer((1,), "float32", name="dst")
+    call = T.copy(src[0], dst[0], drain_warps=1, annotations=annotations)
+    assert isinstance(call, tvm.tirx.Call)
+    assert int(call.annotations["drain_warps"]) == (annotation_warps or 1)
+    assert annotations == ({} if annotation_warps is None else {"drain_warps": annotation_warps})
+
+
 def run_tilelang_copy_cross_dtype(M=256, N=256, block_M=128, block_N=128, src_dtype=T.float16, dst_dtype=T.bfloat16):
     program = tilelang_copy(M, N, block_M, block_N, src_dtype=src_dtype, dst_dtype=dst_dtype)
     kernel = tilelang.compile(program, out_idx=[1])

@@ -71,7 +71,7 @@ def _compute_build_sha() -> str:
     return "unknown"
 
 
-__upstream_version__ = "0.1.13"
+__upstream_version__ = "0.1.14"
 __build_sha__ = _compute_build_sha()
 del _compute_build_sha, _compute_version
 
@@ -247,6 +247,7 @@ if not env.is_light_import():
     from . import rocm as rocm  # noqa: F401
     from . import metal as metal  # noqa: F401
     from . import tang as tang  # noqa: F401
+    from . import webgpu as webgpu  # noqa: F401
 
     if env.get_lower_trace_mode() is not None:
         from .tools.lower_trace import enable as _lower_trace_enable

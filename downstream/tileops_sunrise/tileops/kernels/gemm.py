@@ -1,4 +1,5 @@
 import functools
+import math
 from typing import Callable, Optional
 
 import tilelang
@@ -509,9 +510,9 @@ def _gemm_tang_kernel(m: int,
     a_shape = (k, m) if trans_a else (m, k)
     b_shape = (n, k) if trans_b else (k, n)
 
-    # B-reuse is ineffective at M=1 and can regress wide prefill; keep it off the 128×128 tile.
+    # Preserve the source shape-specific configuration and reuse constraints.
     compile_flags = ["-O3", "-DENABLE_BF16"]
-    if m == 1 or n > m * 4:
+    if m == 1 or n > m * 4 or (m >= 8 and n <= m * 4 and not trans_a and not trans_b):
         compile_flags.append("-DTL_TANG_GEMM_B_REUSE_MIN_WARP_COLS=8")
 
     @tilelang.jit(
@@ -528,7 +529,9 @@ def _gemm_tang_kernel(m: int,
                    num_stages: int = 3,
                    k_step: int = 8,
                    threads: int = 128,
-                   policy: T.GemmWarpPolicy = T.GemmWarpPolicy.FullCol) -> Callable:
+                   policy: T.GemmWarpPolicy = T.GemmWarpPolicy.FullCol,
+                   panel_size: int = 16,
+                   order: str = "column") -> Callable:
         a_shared_shape = (block_k, block_m) if trans_a else (block_m, block_k)
         b_shared_shape = (block_n, block_k) if trans_b else (block_k, block_n)
         num_iters = T.ceildiv(k, block_k)
@@ -546,7 +549,7 @@ def _gemm_tang_kernel(m: int,
                 c_local = T.alloc_fragment((block_m, block_n), accum_dtype)
                 c_shared = T.alloc_shared((block_m, block_n), dtype)
 
-                T.use_swizzle(16, order="column", enable=True)
+                T.use_swizzle(panel_size, order=order, enable=True)
 
                 # Prefetch block 0, then overlap each copy with the previous MMA.
                 with T.attr("default", "async_scope", 1):
@@ -581,6 +584,118 @@ def _gemm_tang_kernel(m: int,
         return _gemm_main
 
     return _gemm_func
+
+
+@functools.lru_cache(maxsize=32)
+def _gemm_tang_splitk_kernel(m: int,
+                             n: int,
+                             k: int,
+                             trans_a: bool,
+                             trans_b: bool,
+                             split_k: int,
+                             dtype: str = "float16") -> tuple[Callable, Callable]:
+    """TANG split-K GEMM：k1 写 partial ``P[split_k, m, n]`` (fp32)，k2 归约到 ``C[m, n]``。
+
+    对 M=1 的 K-heavy decode（如 mlp.down 1×4096×12288），单 kernel 的 grid 只有
+    ``(N/block_n, 1)``（M 维恒 1），occupancy 被 shared/register 卡在 1-2 block/SM。
+    split-K 把 bz 维拉起来增加并行度，抵消归约开销。k1 用 fp32 中间输出保证精度。
+    """
+    accum_dtype = "float"
+    a_shape = (k, m) if trans_a else (m, k)
+    b_shape = (n, k) if trans_b else (k, n)
+    k_per_split = k // split_k
+
+    compile_flags = ["-O3", "-DENABLE_BF16"]
+    if m == 1 or n > m * 4:
+        compile_flags.append("-DTL_TANG_GEMM_B_REUSE_MIN_WARP_COLS=8")
+
+    @tilelang.jit(
+        out_idx=[-1],
+        pass_configs={
+            tilelang.PassConfigKey.TL_USE_ASYNC_COP4: True,
+            tilelang.PassConfigKey.TL_ENABLE_COPY_STAGING_PAD: True,
+        },
+        compile_flags=compile_flags,
+    )
+    def _partial_func(block_m: int,
+                      block_n: int,
+                      block_k: int,
+                      threads: int,
+                      k_step: int,
+                      policy: T.GemmWarpPolicy,
+                      panel_size: int) -> Callable:
+        a_shared_shape = (block_k, block_m) if trans_a else (block_m, block_k)
+        b_shared_shape = (block_n, block_k) if trans_b else (block_k, block_n)
+        num_iters = T.ceildiv(k_per_split, block_k)
+
+        @T.prim_func
+        def _partial_main(
+                a: T.Tensor(a_shape, dtype),  # type: ignore
+                b: T.Tensor(b_shape, dtype),  # type: ignore
+                p: T.Tensor((split_k, m, n), "float32"),  # type: ignore
+        ) -> None:
+            with T.Kernel(
+                    T.ceildiv(n, block_n), T.ceildiv(m, block_m), split_k,
+                    threads=threads) as (bx, by, bz):
+                a_shared = T.alloc_shared(a_shared_shape, dtype)
+                b_shared = T.alloc_shared(b_shared_shape, dtype)
+                c_local = T.alloc_fragment((block_m, block_n), accum_dtype)
+                c_shared = T.alloc_shared((block_m, block_n), "float32")
+
+                T.use_swizzle(panel_size, order="column", enable=True)
+
+                k_base = bz * k_per_split
+                with T.attr("default", "async_scope", 1):
+                    if not trans_a:
+                        T.copy(a[by * block_m, k_base], a_shared)
+                    else:
+                        T.copy(a[k_base, by * block_m], a_shared)
+                    if not trans_b:
+                        T.copy(b[k_base, bx * block_n], b_shared)
+                    else:
+                        T.copy(b[bx * block_n, k_base], b_shared)
+                T.gemm(a_shared, b_shared, c_local, trans_a, trans_b,
+                       k_step=k_step, policy=policy, clear_accum=True)
+
+                for ko in T.serial(1, num_iters):
+                    with T.attr("default", "async_scope", 1):
+                        if not trans_a:
+                            T.copy(a[by * block_m, k_base + ko * block_k], a_shared)
+                        else:
+                            T.copy(a[k_base + ko * block_k, by * block_m], a_shared)
+                        if not trans_b:
+                            T.copy(b[k_base + ko * block_k, bx * block_n], b_shared)
+                        else:
+                            T.copy(b[bx * block_n, k_base + ko * block_k], b_shared)
+                    T.gemm(a_shared, b_shared, c_local, trans_a, trans_b,
+                           k_step=k_step, policy=policy)
+
+                T.copy(c_local, c_shared)
+                T.copy(c_shared, p[bz, by * block_m, bx * block_n])
+
+        return _partial_main
+
+    @tilelang.jit(out_idx=[-1])
+    def _reduce_func(reduce_block_n: int, reduce_threads: int) -> Callable:
+        @T.prim_func
+        def _reduce_main(
+                p: T.Tensor((split_k, m, n), "float32"),  # type: ignore
+                c: T.Tensor((m, n), dtype),  # type: ignore
+        ) -> None:
+            with T.Kernel(
+                    T.ceildiv(n, reduce_block_n), T.ceildiv(m, 1),
+                    threads=reduce_threads) as (bx, by):
+                acc = T.alloc_fragment((1, reduce_block_n), "float32")
+                T.clear(acc)
+                for bz in range(split_k):
+                    for i, j in T.Parallel(1, reduce_block_n):
+                        acc[i, j] += p[bz, by, bx * reduce_block_n + j]
+                for i, j in T.Parallel(1, reduce_block_n):
+                    c[by, bx * reduce_block_n + j] = acc[i, j].astype(dtype)
+
+        return _reduce_main
+
+    return _partial_func, _reduce_func
 
 
 @torch.library.custom_op("top::gemm_wrapped_kernel", mutates_args=())
@@ -644,6 +759,39 @@ class GemmKernel(Kernel):
         self.trans_b = trans_b
 
         self._use_tang_kernel = get_sm_version() is None and hasattr(torch, "ptpu")
+        # split-K：小 M 大 K 时单 kernel 网格 M 维接近 1、occupancy 被卡死；split-K 拉高
+        # bz 维并行度。block_k 按 M 分档（M<8 decode 用 1024，8<=M<32 prefill 用 128），
+        # 须保证 k//split_k 能被 block_k 整除，否则 padding 破坏正确性。
+        self.split_k = 4
+        if self.m < 8:
+            _splitk_ok = self.k >= 12288 and self.k % (self.split_k * 1024) == 0
+        else:
+            _splitk_ok = self.k % (self.split_k * 128) == 0
+        self._use_split_k = (
+            self._use_tang_kernel and self.m < 32 and self.k >= 4096
+            and not self.trans_a and self.trans_b
+            and _splitk_ok
+        )
+
+        if self._use_split_k:
+            self._partial_factory, self._reduce_factory = _gemm_tang_splitk_kernel(
+                m, n, k, trans_a, trans_b, self.split_k, self.dtype_str)
+            self.init_config(config, tune)
+            self._compiled_partial = self._partial_factory(
+                block_m=self.config["block_m"],
+                block_n=self.config["block_n"],
+                block_k=self.config["block_k"],
+                threads=self.config["threads"],
+                k_step=self.config["k_step"],
+                policy=self.config.get("policy", T.GemmWarpPolicy.FullCol),
+                panel_size=self.config.get("panel_size", 16),
+            )
+            self._compiled_reduce = self._reduce_factory(
+                self.config["reduce_block_n"], self.config["reduce_threads"])
+            layout = f"{'T' if self.trans_a else 'N'}{'T' if self.trans_b else 'N'}"
+            self._stem = f"gemm_{self.m}x{self.n}x{self.k}_{layout}_{self.dtype_str}_splitk{self.split_k}"
+            return
+
         kernel_factory = _gemm_tang_kernel if self._use_tang_kernel else _gemm_kernel
         self.kernel = kernel_factory(m, n, k, trans_a, trans_b, self.dtype_str)
 
@@ -660,11 +808,18 @@ class GemmKernel(Kernel):
             # M < 8 is a GEMV-like decode shape; a small block_m avoids M-padding waste.
             # Config keyed on N/K: K>=12288 → 8/16/1024; N<6144 → 8/32/256;
             # 6144<=N<=16384 → 16/16/512; N>16384 → 8/32/512.
+            if self._use_split_k:
+                if self.m < 8:
+                    return {"split_k": 4, "block_m": 8, "block_n": 32, "block_k": 1024,
+                            "num_stages": 3, "k_step": 16, "threads": 128,
+                            "policy": T.GemmWarpPolicy.FullCol, "panel_size": 16,
+                            "reduce_block_n": 64, "reduce_threads": 64}
+                # 8<=M<32 prefill（如 M=16）：block_m 贴近 M、block_k=128。
+                return {"split_k": 4, "block_m": 16, "block_n": 32, "block_k": 128,
+                        "num_stages": 3, "k_step": 8, "threads": 128,
+                        "policy": T.GemmWarpPolicy.FullRow, "panel_size": 32,
+                        "reduce_block_n": 64, "reduce_threads": 64}
             if self.m < 8:
-                if self.k >= 12288:
-                    # K-heavy: block_n=16 doubles grid, block_k=1024 halves K-loop.
-                    return {"block_m": 8, "block_n": 16, "block_k": 1024,
-                            "num_stages": 3, "k_step": 16, "threads": 64}
                 if self.n < 6144:
                     return {"block_m": 8, "block_n": 32, "block_k": 256,
                             "num_stages": 3, "k_step": 8}
@@ -678,17 +833,50 @@ class GemmKernel(Kernel):
                 return {"block_m": 8, "block_n": 32, "block_k": 512,
                         "num_stages": 3, "k_step": 16}
             if self.n > self.m * 4:
-                # Wide prefill (M << N): 128×128/FullCol spills + compiles slowly;
-                # 128×64×256 + FullRow avoids that resource-pressure path.
-                return {"block_m": 128, "block_n": 64, "block_k": 256,
-                        "num_stages": 3, "k_step": 8, "threads": 256,
-                        "policy": T.GemmWarpPolicy.FullRow}
+                if math.ceil(self.m / 128) * math.ceil(self.n / 64) < 96:
+                    return {"block_m": 32, "block_n": 64, "block_k": 128,
+                            "num_stages": 3, "k_step": 8, "threads": 256,
+                            "policy": T.GemmWarpPolicy.FullRow, "panel_size": 32,
+                            "order": "column"}
+                return {"block_m": 128, "block_n": 64, "block_k": 128,
+                        "num_stages": 3, "k_step": 8,
+                        "threads": 128 if self.n >= 24576 else 256,
+                        "policy": T.GemmWarpPolicy.FullRow,
+                        "panel_size": 32, "order": "row"}
+            if math.ceil(self.m / 128) * math.ceil(self.n / 128) < 96:
+                if self.m & (self.m - 1):
+                    return {
+                        "block_m": 32,
+                        "block_n": 64,
+                        "block_k": 128,
+                        "num_stages": 2,
+                        "k_step": 16,
+                        "threads": 128,
+                        "policy": T.GemmWarpPolicy.FullRow,
+                        "panel_size": 4,
+                        "order": "column",
+                    }
+                return {
+                    "block_m": 64,
+                    "block_n": 64,
+                    "block_k": 128,
+                    "num_stages": 2,
+                    "k_step": 16,
+                    "threads": 128,
+                    "policy": T.GemmWarpPolicy.FullRow,
+                    "panel_size": 4,
+                    "order": "row",
+                }
             return {
                 "block_m": 128,
                 "block_n": 128,
-                "block_k": 64,
-                "num_stages": 3,
+                "block_k": 128,
+                "num_stages": 2,
                 "k_step": 8,
+                "threads": 256,
+                "policy": T.GemmWarpPolicy.FullRow,
+                "panel_size": 1 if (self.m >= 4096 and self.n >= 4096) else 2,
+                "order": "row",
             }
         return {
             "block_m": 128,
@@ -701,6 +889,9 @@ class GemmKernel(Kernel):
         # Call the compiled JIT directly (cf. GemvKernel); _gemm_wrapped_kernel is
         # kept only for torch.compile compatibility. trace.run dumps the timeline
         # when tracing is on and otherwise just returns C — so no branch here.
+        if self._use_split_k:
+            p = self._compiled_partial(a, b)
+            return self._compiled_reduce(p)
         if self._use_tang_kernel:
             return trace.run(self._compiled, (a, b), stem=self._stem)
         compiled = _gemm_kernel(

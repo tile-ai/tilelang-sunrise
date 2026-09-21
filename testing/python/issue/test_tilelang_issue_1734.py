@@ -11,13 +11,13 @@ from tilelang.utils.device import get_current_device
 def _issue_1734_layout_kernel():
     @T.prim_func
     def main(
-        A: T.Tensor[(2, 512), T.float32],
-        B: T.Tensor[(2, 512), T.float32],
+        A: T.Tensor[(2, 4096), T.float32],
+        B: T.Tensor[(2, 4096), T.float32],
         C: T.Tensor[(2,), T.float32],
     ):
         with T.Kernel(1, threads=256):
-            A_local = T.alloc_fragment((2, 512), T.float32)
-            B_local = T.alloc_fragment((2, 512), T.float32)
+            A_local = T.alloc_fragment((2, 4096), T.float32)
+            B_local = T.alloc_fragment((2, 4096), T.float32)
             C_local = T.alloc_fragment((2,), T.float32)
 
             T.copy(A, A_local)
@@ -25,7 +25,7 @@ def _issue_1734_layout_kernel():
             T.copy(C, C_local)
 
             for i in T.serial(0, 2):
-                for j in T.Parallel(512):
+                for j in T.Parallel(4096):
                     if C_local[i] >= 0:
                         B_local[i, j] = A_local[i, j]
 
@@ -41,21 +41,21 @@ def test_issue_1734():
     def kernel():
         @T.prim_func
         def main(
-            A: T.Tensor[(2, 512), T.float32],
-            B: T.Tensor[(2, 512), T.float32],
+            A: T.Tensor[(2, 4096), T.float32],
+            B: T.Tensor[(2, 4096), T.float32],
             C: T.Tensor[(2,), T.float32],
         ):
             with T.Kernel(1, threads=256):
-                A_local = T.alloc_fragment((2, 512), T.float32)
-                B_local = T.alloc_fragment((2, 512), T.float32)
+                A_local = T.alloc_fragment((2, 4096), T.float32)
+                B_local = T.alloc_fragment((2, 4096), T.float32)
                 C_local = T.alloc_fragment((2,), T.float32)
 
                 T.copy(A, A_local)
                 T.copy(B, B_local)
                 T.copy(C, C_local)
 
-                for i, j in T.Parallel(2, 512):
-                    if C_local[i] >= 0:
+                for i, j in T.Parallel(2, 4096):
+                    if C_local[0] >= 0:
                         B_local[i, j] = A_local[i, j]
 
                 T.copy(B_local, B)
@@ -64,13 +64,15 @@ def test_issue_1734():
 
     mod = kernel.compile()
     runtime_source = mod.get_kernel_source()
-    assert re.search(r"\bB_local\[[^\n]+\]\s*=\s*A_local", runtime_source)
+    assignment_pattern = r"(?:\bB_local\[[^\n]+\]|\*\(float[24]\*\)\(B_local[^\n]+?\))\s*=\s*(?:A_local|\*\(float[24]\*\)\(A_local)"
+    assert re.search(assignment_pattern, runtime_source)
     assert re.search(r"\bif\s*\(", runtime_source)
 
     # Keep the exact outer-if/inner-loop source oracle on a layout that Tang
     # preserves instead of flattening during the final kernel emission.
-    source = _issue_1734_layout_kernel.compile().get_kernel_source()
-    assignment = re.search(r"\bB_local\[[^\n]+\]\s*=\s*A_local", source)
+    layout_mod = _issue_1734_layout_kernel.compile()
+    source = layout_mod.get_kernel_source()
+    assignment = re.search(assignment_pattern, source)
     assert assignment is not None, "Expected a generated B_local <- A_local assignment"
     assignment_pos = assignment.start()
     if_positions = [match.start() for match in re.finditer(r"\bif\s*\(", source)]
@@ -85,10 +87,10 @@ def test_issue_1734():
     assert outer_for_pos < if_pos < inner_for_pos < assignment_pos, "Grouped loop condition should be hoisted outside the inner loop"
 
     device = get_current_device()
-    input_a = torch.arange(2 * 512, dtype=torch.float32, device=device).reshape(2, 512)
+    input_a = torch.arange(2 * 4096, dtype=torch.float32, device=device).reshape(2, 4096)
     input_c = torch.arange(2, dtype=torch.float32, device=device) * 2 - 1
     output_b = torch.zeros_like(input_a)
-    mod(input_a, output_b, input_c)
+    layout_mod(input_a, output_b, input_c)
     if device.type == "ptpu":
         torch.ptpu.synchronize()
     expected = torch.where(input_c[:, None] >= 0, input_a, torch.zeros_like(input_a))

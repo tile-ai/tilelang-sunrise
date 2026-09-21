@@ -297,6 +297,8 @@ def test_mathops_generate_no_fastmath(name, func):
     ids=["ties-to-even", "ties-away-from-zero"],
 )
 def test_round_modes(rounding_mode, func, cuda_mathop_name):
+    if rounding_mode == "ties-away-from-zero":
+        cuda_mathop_name = "RoundTiesAwayFromZero"
     run_single_arg_mathop_test(
         f"round[{rounding_mode}]",
         func,

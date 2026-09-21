@@ -23,11 +23,19 @@ macro(find_tang)
     message(FATAL_ERROR "The TANG package does not provide TANG::tang")
   endif()
 
-  get_target_property(_tang_include_dirs TANG::tang INTERFACE_INCLUDE_DIRECTORIES)
-  list(GET _tang_include_dirs 0 _tang_include_dir)
-  get_filename_component(TANG_TOOLKIT_ROOT_DIR "${_tang_include_dir}" DIRECTORY)
+  if(NOT TANG_TOOLKIT_ROOT_DIR)
+    get_target_property(_tang_include_dirs TANG::tang INTERFACE_INCLUDE_DIRECTORIES)
+    list(GET _tang_include_dirs 0 _tang_include_dir)
+    get_filename_component(TANG_TOOLKIT_ROOT_DIR "${_tang_include_dir}" DIRECTORY)
+    # Target-specific headers share the language modules at the toolkit root.
+    if(TANG_TOOLKIT_ROOT_DIR MATCHES "/targets/[^/]+$")
+      get_filename_component(TANG_TOOLKIT_ROOT_DIR "${TANG_TOOLKIT_ROOT_DIR}/../.." ABSOLUTE)
+    endif()
+  endif()
   if(NOT EXISTS "${TANG_TOOLKIT_ROOT_DIR}/cmake/CMakeDetermineTANGCompiler.cmake")
-    message(FATAL_ERROR "The TANG package does not provide TANG CMake language modules")
+    message(FATAL_ERROR
+      "TANG CMake language modules not found under ${TANG_TOOLKIT_ROOT_DIR}/cmake; "
+      "set TANG_TOOLKIT_ROOT_DIR to the toolkit installation root")
   endif()
   list(APPEND CMAKE_MODULE_PATH "${TANG_TOOLKIT_ROOT_DIR}/cmake")
 

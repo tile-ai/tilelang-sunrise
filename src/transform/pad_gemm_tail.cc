@@ -44,7 +44,7 @@
 
 #include "op/builtin.h"
 #include "op/operator.h"
-#include "op/region.h"
+#include "op/utils.h"
 
 namespace tvm {
 namespace tl {
@@ -104,16 +104,16 @@ class PadGemmTailMutator : public StmtExprMutator {
       return StmtExprMutator::VisitStmt_(op);
     const auto *src_call = call->args[0].as<CallNode>();
     const auto *dst_call = call->args[1].as<CallNode>();
-    if (src_call == nullptr || !src_call->op.same_as(RegionOp::Get()) ||
-        dst_call == nullptr || !dst_call->op.same_as(RegionOp::Get()))
+    if (src_call == nullptr || !src_call->op.same_as(Op::Get("tl.region")) ||
+        dst_call == nullptr || !dst_call->op.same_as(Op::Get("tl.region")))
       return StmtExprMutator::VisitStmt_(op);
 
-    RegionOp src_region(src_call->args);
-    RegionOp dst_region(dst_call->args);
-    const Buffer &src_buf = src_region->GetBuffer();
-    const Buffer &dst_buf = dst_region->GetBuffer();
-    const Array<Range> &src_ranges = src_region->GetRanges();
-    const Array<Range> &dst_ranges = dst_region->GetRanges();
+    BufferRegion src_region = NormalizeToBufferRegion(call->args[0]);
+    BufferRegion dst_region = NormalizeToBufferRegion(call->args[1]);
+    const Buffer &src_buf = src_region->buffer;
+    const Buffer &dst_buf = dst_region->buffer;
+    const Array<Range> &src_ranges = src_region->region;
+    const Array<Range> &dst_ranges = dst_region->region;
     if (src_ranges.size() != dst_ranges.size())
       return StmtExprMutator::VisitStmt_(op);
 

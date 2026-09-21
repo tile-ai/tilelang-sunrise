@@ -22,7 +22,7 @@ authors = [
     { name = "Chenggang Zhao", email = "chenggangz@deepseek.com"}
 ]
 dependencies = [
-    "tilelang-sunrise>=0.1.13,<0.1.14"
+    "tilelang-sunrise>=0.1.13,<0.2.0"
 ]
 requires-python = ">=3.10"
 classifiers = [

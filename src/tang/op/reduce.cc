@@ -30,7 +30,9 @@ struct Reduce : backend::ReduceLowerer<Reduce> {
     return TargetIsTang(target);
   }
 
-  static int GetPreferedVectorizedSize(DataType, Target) { return 1; }
+  static int GetPreferredVectorizedSize(const ReduceOpNode &, Target) {
+    return 1;
+  }
 
   static std::string MakeBatchAllReduce(std::string reducer,
                                         int reducing_threads, int scale,

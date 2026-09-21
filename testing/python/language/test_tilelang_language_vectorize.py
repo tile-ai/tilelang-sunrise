@@ -141,6 +141,59 @@ def test_vectorize_invariant_index():
 
 
 @tilelang.jit
+def vectorize_global_invariant_store_accumulate(M, K):
+    @T.prim_func
+    def main(
+        A: T.Tensor[(M, K), T.float32],  # noqa: F821
+        B: T.Tensor[(M,), T.float32],  # noqa: F821
+    ):
+        with T.Kernel(M // 128, threads=128) as bx:
+            row = bx * 128 + T.get_thread_binding(0)
+            B[row] = 0.0
+            for k in T.vectorized(K):
+                B[row] = B[row] + A[row, k]
+
+    return main
+
+
+@tilelang.jit
+def vectorize_local_invariant_store_accumulate(M, K):
+    @T.prim_func
+    def main(
+        A: T.Tensor[(M, K), T.float32],  # noqa: F821
+        B: T.Tensor[(M,), T.float32],  # noqa: F821
+    ):
+        with T.Kernel(M // 128, threads=128) as bx:
+            row = bx * 128 + T.get_thread_binding(0)
+            acc = T.alloc_local((1,), T.float32)
+            acc[0] = 0.0
+            for k in T.vectorized(K):
+                acc[0] = acc[0] + A[row, k]
+            B[row] = acc[0]
+
+    return main
+
+
+def run_vectorize_invariant_store_accumulate(kernel_factory):
+    M, K = 128, 4
+    kernel = kernel_factory(M, K)
+    a = torch.ones((M, K), device=get_current_device(), dtype=torch.float32)
+    b = torch.empty((M,), device=get_current_device(), dtype=torch.float32)
+
+    kernel(a, b)
+
+    torch.testing.assert_close(b.cpu(), torch.full((M,), float(K), dtype=torch.float32), rtol=0, atol=0)
+
+
+def test_vectorize_global_invariant_store_accumulate():
+    run_vectorize_invariant_store_accumulate(vectorize_global_invariant_store_accumulate)
+
+
+def test_vectorize_local_invariant_store_accumulate():
+    run_vectorize_invariant_store_accumulate(vectorize_local_invariant_store_accumulate)
+
+
+@tilelang.jit
 def vectorize_test_all_dtypes(dtype, vec_num):
     @T.prim_func
     def main(A: T.Tensor[(64,), dtype]):
@@ -191,6 +244,36 @@ def vectorize_broadcast_int8(vec_num):
 def test_vectorize_broadcast_int8(vec_num):
     """Test broadcasting a non-constant int8 value to a vectorized store."""
     vectorize_broadcast_int8.compile(vec_num=vec_num)
+
+
+@pytest.mark.parametrize("dtype", ["int8", "uint8"])
+@pytest.mark.parametrize("vec_num", [4, 8, 16, 32])
+def test_tang_register_byte_broadcast(dtype, vec_num):
+    device = get_current_device()
+    if device.type != "ptpu":
+        pytest.skip("TANG packed register broadcast")
+
+    @T.prim_func
+    def kernel(A: T.Tensor((1,), dtype), B: T.Tensor((vec_num,), dtype)):
+        with T.Kernel(1, threads=1):
+            values = T.alloc_local((vec_num,), dtype)
+            value = A[0]
+            for i in T.vectorized(vec_num):
+                values[i] = value
+            T.copy(values, B)
+
+    compiled = tilelang.compile(kernel)
+    if vec_num >= 16:
+        constructor = "make_uint4(" if dtype == "uint8" else "make_int4("
+        assert constructor in compiled.get_kernel_source()
+    torch_dtype = getattr(torch, dtype)
+    output = torch.empty((vec_num,), dtype=torch_dtype, device=device)
+    samples = [0, 3, 128, 255] if dtype == "uint8" else [-128, -3, 0, 127]
+    for value in samples:
+        scalar = torch.tensor([value], dtype=torch_dtype, device=device)
+        compiled(scalar, output)
+        torch.ptpu.synchronize()
+        torch.testing.assert_close(output.cpu(), torch.full((vec_num,), value, dtype=torch_dtype), rtol=0, atol=0)
 
 
 @tilelang.jit

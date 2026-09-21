@@ -16,8 +16,15 @@ if os.environ.get("TILELANG_TEST_INSTALLED_WHEEL") == "1":
     tilelang_spec = importlib.util.find_spec("tilelang")
     if tilelang_spec is None or tilelang_spec.origin is None:
         raise RuntimeError("Sunrise CI could not resolve the installed TileLang wheel")
-    if os.path.commonpath((SOURCE_PACKAGE_ROOT, os.path.abspath(tilelang_spec.origin))) == SOURCE_PACKAGE_ROOT:
+    tilelang_origin = os.path.realpath(tilelang_spec.origin)
+    if os.path.commonpath((SOURCE_PACKAGE_ROOT, tilelang_origin)) == SOURCE_PACKAGE_ROOT:
         raise RuntimeError(f"Sunrise CI resolved TileLang from the checkout: {tilelang_spec.origin}")
+    wheel_prefix = os.environ.get("TILELANG_WHEEL_PREFIX")
+    if not wheel_prefix:
+        raise RuntimeError("Sunrise CI did not provide the isolated TileLang wheel prefix")
+    wheel_prefix = os.path.realpath(wheel_prefix)
+    if os.path.commonpath((wheel_prefix, tilelang_origin)) != wheel_prefix:
+        raise RuntimeError(f"Sunrise CI resolved TileLang outside the isolated environment: {tilelang_spec.origin}")
 elif REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 

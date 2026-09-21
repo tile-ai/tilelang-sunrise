@@ -125,7 +125,7 @@ class LibraryGenerator:
         elif is_hip_target(target):
             from tilelang.rocm.target import target_get_mcpu
 
-            from tilelang.env import COMPOSABLE_KERNEL_INCLUDE_DIR, TILELANG_HIP_SAVE_TEMP_FILES
+            from tilelang.env import TILELANG_HIP_SAVE_TEMP_FILES
 
             src = tempfile.NamedTemporaryFile(mode="w", suffix=".cpp", delete=False)  # noqa: SIM115
             libpath = src.name.replace(".cpp", ".so")
@@ -139,9 +139,6 @@ class LibraryGenerator:
                 "--shared",
                 src.name,
                 "-Rpass-analysis=kernel-resource-usage",
-            ]
-            command += [
-                "-I" + COMPOSABLE_KERNEL_INCLUDE_DIR,
             ]
             if TILELANG_HIP_SAVE_TEMP_FILES != "0":
                 command += ["--save-temps", "-g"]
@@ -157,25 +154,14 @@ class LibraryGenerator:
             ]
         elif is_tang_target(target):
             from tilelang.contrib import ptcc
+            from tilelang._ptcc import default_jit_options
             from tilelang.env import TANG_HOME
 
             assert self.device_source is not None, "tang backend requires device source to be assigned via assign_device_source()"
 
             # 1. Compile the TANG device source into an ELF code object with ptcc.
             arch = str(target.attrs.get("arch", "stcu"))
-            options = [
-                "-xtang",
-                "-std=c++17",
-                "-DTANG",
-                "-fstpu-warp-alu",
-                "-stpu-loop",
-                "-use-load-const",
-                "-O3",
-                "-c",
-                "--tang-device-only",
-                f"--tang-gpu-arch={arch}",
-                f"-I{TILELANG_TEMPLATE_PATH}",
-            ]
+            options = default_jit_options(arch) + [f"-I{TILELANG_TEMPLATE_PATH}"]
             if TANG_HOME:
                 options.append(f"-I{os.path.join(TANG_HOME, 'include')}")
             if arch == "stcuv2":

@@ -2,13 +2,141 @@ import json
 import os
 import re
 import shlex
+import sys
 import subprocess
+import importlib.util
 from pathlib import Path
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
 CI_LIST = ROOT / "ci_test_case_list_tilelang.txt"
 S3_LIST = ROOT / "ci_test_case_list_tilelang_s3.txt"
+
+
+@pytest.fixture
+def ptcc_resolver(monkeypatch):
+    spec = importlib.util.spec_from_file_location("ptcc_resolver", ROOT / "tilelang" / "_ptcc.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    for name in ("PTCC_PATH", "PTCC_JIT_PROFILE", "TANG_HOME", "TANG_PATH", "TANGRT_PATH"):
+        monkeypatch.delenv(name, raising=False)
+    return module
+
+
+@pytest.mark.parametrize("profile", ["llvm20", "llvm22"])
+def test_ptcc_jit_profile_defaults(ptcc_resolver, monkeypatch, profile):
+    monkeypatch.setenv("PTCC_JIT_PROFILE", profile)
+    options = ptcc_resolver.default_jit_options()
+    assert "--tang-gpu-arch=stcu" in options
+    assert "--tang-gpu-arch=stcuv2" not in options
+    assert ("-fstpu-warp-alu" in options) == (profile == "llvm20")
+    assert ("-fno-stpu-warp-alu" in options) == (profile == "llvm22")
+    monkeypatch.setitem(ptcc_resolver._JIT_OPTIMIZATION_FLAGS, profile, ("-O1",))
+    changed = ptcc_resolver.default_jit_options()
+    assert "-O1" in changed and "-O3" not in changed
+    monkeypatch.setenv("PTCC_JIT_PROFILE", "invalid")
+    with pytest.raises(ValueError, match="PTCC_JIT_PROFILE"):
+        ptcc_resolver.default_jit_options()
+
+
+@pytest.mark.parametrize("layout", ["bin/ptcc", "toolchains/llvm/prebuilt/linux-x86_64/bin/ptcc"])
+def test_ptcc_precedence(ptcc_resolver, monkeypatch, tmp_path, layout):
+    toolkit = tmp_path / "tool kit"
+    fallback = toolkit / layout
+    fallback.parent.mkdir(parents=True)
+    fallback.write_text("#!/bin/sh\necho ptcc-test\n")
+    fallback.chmod(0o755)
+    monkeypatch.setenv("TANG_HOME", str(toolkit))
+    monkeypatch.setattr(ptcc_resolver.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(ptcc_resolver.shutil, "which", lambda _: None)
+    assert ptcc_resolver.resolve_ptcc(str(toolkit)) == str(fallback)
+    explicit = tmp_path / "custom ptcc"
+    explicit.write_text("#!/bin/sh\necho custom-ptcc\n")
+    explicit.chmod(0o755)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PTCC_PATH", "custom ptcc")
+    monkeypatch.setattr(ptcc_resolver.shutil, "which", lambda _: str(fallback))
+    assert ptcc_resolver.resolve_ptcc(str(toolkit)) == str(explicit)
+    monkeypatch.setenv("PTCC_PATH", "")
+    assert ptcc_resolver.resolve_ptcc(str(toolkit)) == str(fallback)
+    monkeypatch.setattr(ptcc_resolver.shutil, "which", lambda _: None)
+    with pytest.raises(RuntimeError):
+        ptcc_resolver.resolve_ptcc("")
+
+
+def test_selected_ptcc_is_shared_with_build(ptcc_resolver, monkeypatch, tmp_path):
+    compiler = tmp_path / "custom ptcc"
+    compiler.write_text("#!/bin/sh\necho test-version\n")
+    compiler.chmod(0o755)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PTCC_PATH", "custom ptcc")
+    monkeypatch.setenv("SKBUILD_CMAKE_ARGS", "-DEXISTING_OPTION=ON")
+    assert ptcc_resolver.resolve_ptcc("") == str(compiler)
+    shell = f"""source {shlex.quote(str(ROOT / "ci/lib.sh"))}
+ci_configure_ptcc || exit
+ci_set_tilelang_build_env "$PWD"
+cd /
+printf 'SELECTED=%s\\n' "$PTCC_PATH"
+printf 'WHEEL_ARGS=%s\\n' "$SKBUILD_CMAKE_ARGS"
+"""
+    result = subprocess.run(["bash", "-c", shell], check=True, text=True, capture_output=True)
+    assert f"SELECTED={compiler}" in result.stdout
+    wheel_args = next(line.removeprefix("WHEEL_ARGS=") for line in result.stdout.splitlines() if line.startswith("WHEEL_ARGS="))
+    assert {
+        "-DEXISTING_OPTION=ON",
+        f"-DCMAKE_TANG_COMPILER={compiler}",
+        "-DCMAKE_TANG_FLAGS=--tang-gpu-arch=stcu",
+    } <= set(wheel_args.split(";"))
+
+
+@pytest.mark.parametrize("invalid", ["missing", "directory", "non-executable"])
+def test_ptcc_invalid_override_never_falls_back(ptcc_resolver, monkeypatch, tmp_path, invalid):
+    candidate = tmp_path / invalid
+    if invalid == "directory":
+        candidate.mkdir()
+    elif invalid == "non-executable":
+        candidate.write_text("compiler")
+    monkeypatch.setenv("PTCC_PATH", str(candidate))
+    monkeypatch.setattr(ptcc_resolver.shutil, "which", lambda _: "/valid/system/ptcc")
+    with pytest.raises(RuntimeError, match="PTCC_PATH"):
+        ptcc_resolver.resolve_ptcc("")
+    if invalid == "missing":
+        result = subprocess.run(["bash", "-c", f"source {shlex.quote(str(ROOT / 'ci/lib.sh'))}; ci_configure_ptcc"], capture_output=True)
+        assert result.returncode != 0
+
+
+def test_ptcc_identity_changes_in_new_process(ptcc_resolver, tmp_path):
+    compiler = tmp_path / "ptcc"
+    compiler.write_bytes(b"version-one")
+    first = ptcc_resolver.compiler_identity(str(compiler))
+    assert ptcc_resolver.compiler_identity(str(compiler)) == first
+    alternate = tmp_path / "other-ptcc"
+    alternate.write_bytes(b"version-one")
+    assert ptcc_resolver.compiler_identity(str(alternate)) != first
+    compiler.write_bytes(b"version-two")
+    script = "import runpy,json,sys; m=runpy.run_path(sys.argv[1]); print(json.dumps(m['compiler_identity'](sys.argv[2])))"
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(ROOT / "tilelang/_ptcc.py"), str(compiler)],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    assert tuple(json.loads(result.stdout)) != first
+
+
+def test_ptcc_dry_run_does_not_require_compiler(monkeypatch, tmp_path):
+    monkeypatch.setenv("PTCC_PATH", str(tmp_path / "missing"))
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    result = subprocess.run(
+        ["bash", str(ROOT / "ci/run.sh"), "--dry-run", "--case", "examples/elementwise/test_example_elementwise.py"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "Dry-run plan" in result.stdout
 
 
 def _enabled_lines(path):
@@ -42,6 +170,7 @@ def test_ci_shell_scripts_have_valid_syntax():
         ROOT / "ci" / "github_runner" / "preflight.sh",
         ROOT / "ci" / "lib.sh",
         ROOT / "ci" / "lint.sh",
+        ROOT / "ci" / "run.sh",
         ROOT / "ci" / "test.sh",
         ROOT / "ci" / "s3" / "lib_s3.sh",
         ROOT / "ci" / "s3" / "test_s3.sh",
@@ -84,23 +213,33 @@ def test_direct_scripts_use_the_supported_python_command_mode():
 
 
 def test_ci_records_exact_pytest_nodeids_and_preserves_all_suite_reports():
-    test_script = (ROOT / "ci" / "test.sh").read_text(encoding="utf-8")
+    # The CI test path is now ci/run.sh --ci; ci/test.sh is a thin shim that
+    # delegates to it, so the audit-plugin env that used to live in ci/test.sh
+    # moved into ci/run.sh verbatim.
+    run_script = (ROOT / "ci" / "run.sh").read_text(encoding="utf-8")
+    test_shim = (ROOT / "ci" / "test.sh").read_text(encoding="utf-8")
     library = (ROOT / "ci" / "lib.sh").read_text(encoding="utf-8")
     preflight = (ROOT / "ci" / "github_runner" / "preflight.sh").read_text(encoding="utf-8")
     assert (ROOT / "ci" / "pytest_node_audit.py").is_file()
-    assert 'PYTEST_AUDIT_PLUGIN_ARGS="-p pytest_node_audit"' in test_script
-    assert 'PYTEST_NODE_AUDIT_PATH="$(ci_failure_report_dir)/tilelang_nodes.jsonl"' in test_script
-    assert 'PYTEST_LAUNCH_CWD="$CI_TMP_DIR"' in test_script
-    assert 'PYTEST_NODE_AUDIT_TEST_CWD="$TILELANG_HOME"' in test_script
-    assert 'PYTEST_NODE_AUDIT_SOURCE_ROOT="$TILELANG_HOME"' in test_script
-    assert "TILELANG_TEST_INSTALLED_WHEEL=1" in test_script
-    assert 'TILELANG_DEFAULT_TARGET="${TILELANG_DEFAULT_TARGET:-tang}"' in test_script
+    # ci/test.sh still routes to the CI run path (run.sh --ci on the tilelang list)
+    # so its existing callers keep the same behavior.
+    assert 'run.sh" --ci --list' in test_shim
+    assert "ci_test_case_list_tilelang.txt" in test_shim
+    # Exact pytest nodeids: the node-audit plugin + its output path are wired on
+    # the CI test path (moved from ci/test.sh to ci/run.sh --ci).
+    assert 'PYTEST_AUDIT_PLUGIN_ARGS="-p pytest_node_audit"' in run_script
+    assert 'PYTEST_NODE_AUDIT_PATH="$(ci_failure_report_dir)/tilelang_nodes.jsonl"' in run_script
+    assert 'PYTEST_LAUNCH_CWD="$CI_TMP_DIR"' in run_script
+    assert 'PYTEST_NODE_AUDIT_TEST_CWD="$TILELANG_HOME"' in run_script
+    assert 'PYTEST_NODE_AUDIT_SOURCE_ROOT="$TILELANG_HOME"' in run_script
+    assert "TILELANG_TEST_INSTALLED_WHEEL=1" in run_script
+    assert 'TILELANG_DEFAULT_TARGET="${TILELANG_DEFAULT_TARGET:-tang}"' in run_script
     assert "--import-mode=importlib" in library
     assert "case_modes" in library
     assert 'current_mode="${case_modes[$i]}"' in library
     assert "ci_prepare_failure_reports ()" in library
     assert "CI_FAILURE_REPORTS_INITIALIZED=1" in library
-    assert test_script.count("ci_run_test_list") == 1
+    assert run_script.count("ci_run_test_list") == 1
     assert 'CI_FAILURE_REPORT_ROOT="$evidence_dir/ci_failure_reports"' in preflight
     assert 'CI_FAILURE_REPORT_DIR="$CI_FAILURE_REPORT_ROOT/$name"' in preflight
 
@@ -111,6 +250,124 @@ def test_wheel_ci_disables_testing_conftest_source_shadowing():
     assert "sys.path[:]" in conftest
     assert 'SOURCE_PACKAGE_ROOT = os.path.join(REPO_ROOT, "tilelang")' in conftest
     assert "resolved TileLang from the checkout" in conftest
+    assert 'os.environ.get("TILELANG_WHEEL_PREFIX")' in conftest
+    assert "outside the isolated environment" in conftest
+
+
+def test_ci_entry_points_do_not_source_user_shell_startup():
+    for relative_path in ("ci/build.sh", "ci/install.sh", "ci/run.sh", "ci/test.sh"):
+        script = (ROOT / relative_path).read_text(encoding="utf-8")
+        assert "source ~/.bashrc" not in script
+
+
+def test_conda_shell_bootstraps_from_home_without_user_startup(tmp_path):
+    conda_base = tmp_path / "home" / "miniconda3"
+    conda_exe = conda_base / "bin" / "conda"
+    conda_sh = conda_base / "etc" / "profile.d" / "conda.sh"
+    conda_exe.parent.mkdir(parents=True)
+    conda_sh.parent.mkdir(parents=True)
+    conda_exe.write_text(
+        f'#!/bin/sh\nif [ "$1" = info ] && [ "$2" = --base ]; then\n  printf \'%s\\n\' {shlex.quote(str(conda_base))}\n  exit 0\nfi\nexit 2\n',
+        encoding="utf-8",
+    )
+    conda_sh.write_text("conda() { :; }\n", encoding="utf-8")
+    conda_exe.chmod(0o755)
+    (tmp_path / "home" / ".bashrc").write_text("exit 97\n", encoding="utf-8")
+
+    shell = f"""
+set -e
+source {shlex.quote(str(ROOT / "ci" / "lib.sh"))}
+ci_ensure_conda_shell
+type -t conda
+"""
+    environment = os.environ.copy()
+    environment.update(HOME=str(tmp_path / "home"), PATH="/usr/bin:/bin")
+    environment.pop("CONDA_EXE", None)
+    environment.pop("CONDA_PREFIX", None)
+
+    completed = subprocess.run(
+        ["/bin/bash", "-c", shell],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert completed.stdout.strip() == "function"
+
+
+def test_wheel_runtime_environment_drops_source_checkout_overrides(tmp_path):
+    shell = f"""
+set -e
+source {shlex.quote(str(ROOT / "ci" / "lib.sh"))}
+TILELANG_HOME=/current/checkout
+ci_prepare_installed_wheel_env /current/checkout/ci
+env
+"""
+    environment = os.environ.copy()
+    environment.update(
+        PYTHONPATH="/other/checkout",
+        TILELANG_HOME="/other/checkout",
+        TVM_HOME="/other/tvm",
+        TVM_PREBUILD_PATH="/other/tvm/build",
+        TVM_SOURCE_DIR="/other/tvm",
+        TVM_LIBRARY_PATH="/other/tvm/lib",
+        TL_TEMPLATE_PATH="/other/checkout/src/tl_templates",
+        TILELANG_TEST_INSTALLED_WHEEL="1",
+        TILELANG_WHEEL_PREFIX="/other/prefix",
+    )
+
+    completed = subprocess.run(
+        ["bash", "-c", shell],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    child_env = dict(line.split("=", 1) for line in completed.stdout.splitlines() if "=" in line)
+    assert child_env["PYTHONPATH"] == "/current/checkout/ci"
+    assert child_env["PYTHONNOUSERSITE"] == "1"
+    for name in (
+        "TILELANG_HOME",
+        "TVM_HOME",
+        "TVM_PREBUILD_PATH",
+        "TVM_SOURCE_DIR",
+        "TVM_LIBRARY_PATH",
+        "TL_TEMPLATE_PATH",
+        "TILELANG_TEST_INSTALLED_WHEEL",
+        "TILELANG_WHEEL_PREFIX",
+    ):
+        assert name not in child_env
+
+
+def test_cmake_resolver_skips_a_broken_configured_wrapper(tmp_path):
+    broken = tmp_path / "cmake"
+    fallback = tmp_path / "cmake3"
+    broken.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    fallback.write_text("#!/bin/sh\nprintf 'cmake version test\\n'\n", encoding="utf-8")
+    broken.chmod(0o755)
+    fallback.chmod(0o755)
+
+    shell = f"""
+set -e
+source {shlex.quote(str(ROOT / "ci" / "lib.sh"))}
+CMAKE_ROOT={shlex.quote(str(broken))}
+ci_resolve_cmake
+"""
+    environment = os.environ.copy()
+    environment["PATH"] = str(tmp_path)
+
+    completed = subprocess.run(
+        ["/bin/bash", "-c", shell],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert completed.stdout.strip() == str(fallback)
 
 
 def _require_snippets(path: Path, *snippets: str) -> None:
@@ -180,11 +437,11 @@ ci_run_test_list {shlex.quote(str(case_list))} command retry_suite
     assert [record["record_kind"] for record in records] == ["case_attempt", "case_attempt", "case_result"]
     assert records[0]["status"] == "FAIL"
     assert records[0]["attempt"] == 1
-    assert records[0]["will_retry"] is True
+    assert records[0]["total_attempts"] == 2
     assert "stub attempt 1" in records[0]["log_tail"]
     assert records[1]["status"] == "PASS"
     assert records[1]["attempt"] == 2
-    assert records[1]["will_retry"] is False
+    assert records[1]["total_attempts"] == 2
     assert records[2]["status"] == "PASS"
 
 
@@ -224,7 +481,7 @@ ci_run_test_list {shlex.quote(str(case_list))} command timeout_override_suite
     timeout_file.write_text("stale.py\t3600\n", encoding="utf-8")
     rejected = subprocess.run(["bash", "-c", script], cwd=ROOT, env=env, text=True, capture_output=True, check=False)
     assert rejected.returncode == 1
-    assert "Timeout mapping does not match a case" in rejected.stdout
+    assert "Timeout mapping does not match a case" in rejected.stderr
 
 
 def test_preflight_cleans_generated_device_summary_before_git_cleanliness_gate():
@@ -247,6 +504,7 @@ ci_assert_runtime_stack () {{ :; }}
 ci_check_card_state () {{ :; }}
 ci_run_timed () {{
     printf 'terminated at deadline\n' > "$2"
+    CI_LAST_RUN_TIMED_OUT=1
     return 143
 }}
 if ci_run_test_list {shlex.quote(str(case_list))} command timeout_suite; then
@@ -256,7 +514,7 @@ fi
     env = {
         **os.environ,
         "CASE_REPEAT": "1",
-        "CASE_TIMEOUT": "0",
+        "CASE_TIMEOUT": "900",
         "CI_FAILURE_REPORT_DIR": str(report_dir),
         "TILELANG_CACHE_DIR": str(tmp_path / "cache"),
         "TILELANG_CI_RESET_MODE": "disabled",
@@ -270,7 +528,7 @@ fi
     assert [record["record_kind"] for record in records] == ["case_attempt", "device_recovery", "case_result"]
     assert records[0]["status"] == "TIMEOUT"
     assert records[0]["exit_code"] == 143
-    assert records[0]["failure_reason"] == "timed out after 0s (exit 143)"
+    assert records[0]["failure_reason"] == "timed out after 900s (exit 143)"
     assert records[1]["action"] == "reset"
     assert records[1]["status"] == "SKIPPED"
     assert records[1]["reason"] == "reset mode is disabled"
@@ -279,12 +537,12 @@ fi
 
 def test_tang_ci_treats_llvm_home_as_optional_and_verifies_the_wheel():
     library = (ROOT / "ci" / "lib.sh").read_text(encoding="utf-8")
-    build = (ROOT / "ci" / "build.sh").read_text(encoding="utf-8")
+    build = (ROOT / "ci" / "install.sh").read_text(encoding="utf-8")
     assert "${LLVM_HOME:?" not in library
     assert 'if [[ -n "$LLVM_HOME" ]]' in library
     assert "ci_assert_tilelang_tang_registration ()" in library
     assert 'tvm.get_global_func("target.build.tilelang_tang", allow_missing=True)' in library
-    assert "ci_assert_tilelang_tang_registration" in build
+    assert "ci_assert_installed_tilelang_wheel" in build
 
 
 def test_ci_builds_only_from_vendored_dependencies():
@@ -326,8 +584,10 @@ def test_pipeline_preserves_project_jobs_and_manual_s3_entry():
     assert "- OP: tilekernels_sunrise" in config
     assert "tilelang-puzzles" not in config
     assert "\ntilelang_test_s3:" in config
-    assert "start tilelang S3 ISS simulator test (preserved, unverified)" in config
-    assert "when: manual" in config
+    s3_job = config.split("\ntilelang_test_s3:", 1)[1].split("\nvalidate:", 1)[0]
+    assert "allow_failure: true" in s3_job
+    assert "when: manual" in s3_job
+    assert "TANG_S3_PTCC_PATH" in s3_job
     assert "ci_save_device_logs" in config
     assert "- dmesg.log" in config
     assert "- pt.log" in config
@@ -379,10 +639,10 @@ def test_ci_conda_activation_is_initialized_for_nested_shells():
         assert "source ~/.bashrc" not in script
 
 
-def test_cython_version_matches_the_cp38_limited_api_contract():
+def test_cython_version_matches_the_cp39_limited_api_contract():
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     ci_lib = (ROOT / "ci" / "lib.sh").read_text(encoding="utf-8")
-    assert 'wheel.py-api = "cp38"' in pyproject
+    assert 'wheel.py-api = "cp39"' in pyproject
     assert '"cython>=3.1.0,<3.3"' in pyproject
     assert 'conda install numpy psutil "cython>=3.1.0,<3.3" pytest -y' in ci_lib
 

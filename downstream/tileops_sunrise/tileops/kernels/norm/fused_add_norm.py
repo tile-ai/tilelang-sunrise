@@ -13,7 +13,6 @@ memory instructions.
 """
 
 import functools
-import itertools
 from typing import List, Optional
 
 import tilelang
@@ -21,6 +20,8 @@ import tilelang.language as T
 import torch
 
 from tileops.kernels.kernel_base import Kernel
+
+from ._config import select_row_config, select_row_configs
 
 __all__ = ["FusedAddLayerNormKernel", "FusedAddRMSNormKernel"]
 
@@ -54,33 +55,29 @@ def _fused_add_layer_norm_kernel(M, N, eps, dtype):
                 shared_x = T.alloc_shared((block_m, N_padded), dtype)
                 shared_r = T.alloc_shared((block_m, N_padded), dtype)
                 x_local = T.alloc_fragment((block_m, N_padded), dtype)
-                r_local = T.alloc_fragment((block_m, N_padded), dtype)
-                add_f32 = T.alloc_fragment((block_m, N_padded), "float32")
                 norm_f32 = T.alloc_fragment((block_m, N_padded), "float32")
                 acc = T.alloc_fragment((block_m,), "float32")
                 mean_val = T.alloc_fragment((block_m,), "float32")
                 rstd = T.alloc_fragment((block_m,), "float32")
 
-                # Load x and residual via shared memory
+                # Load x and residual via shared memory. residual stays in
+                # shared (read directly during the add) so only x needs a
+                # full-row fragment — halving per-thread register pressure vs.
+                # holding both x and residual in fragments.
                 T.copy(x[pid_m * block_m, 0], shared_x)
                 T.copy(shared_x, x_local)
                 T.copy(residual[pid_m * block_m, 0], shared_r)
-                T.copy(shared_r, r_local)
 
-                # Fused add: compute (x + residual) in fp32
+                # Fused add: round (x + residual) directly into x_local so the
+                # native-dtype sum doubles as the residual_out output AND the
+                # normalization input. This matters for bf16, where using the
+                # pre-rounding fp32 sum for statistics can produce large
+                # outliers relative to the rounded normalization input.
                 for i, j in T.Parallel(block_m, N_padded):
-                    add_f32[i, j] = T.cast(x_local[i, j], "float32") + T.cast(
-                        r_local[i, j], "float32"
+                    x_local[i, j] = T.cast(x_local[i, j], "float32") + T.cast(
+                        shared_r[i, j], "float32"
                     )
 
-                # Store pre-norm sum back in x_local (native dtype) for output
-                for i, j in T.Parallel(block_m, N_padded):
-                    x_local[i, j] = add_f32[i, j]
-
-                # Normalize the same native-dtype residual value that is
-                # returned to the caller. This matters for bf16, where using
-                # the pre-rounding fp32 sum for statistics can produce large
-                # outliers relative to the rounded normalization input.
                 for i, j in T.Parallel(block_m, N_padded):
                     norm_f32[i, j] = T.cast(x_local[i, j], "float32")
 
@@ -103,10 +100,14 @@ def _fused_add_layer_norm_kernel(M, N, eps, dtype):
                         + eps
                     )
 
-                # --- Output y: (add - mean) * rstd * weight + bias ---
-                # Re-cast from x_local (which holds the pre-norm sum in native dtype)
+                # Write residual_out = x + residual first (x_local still holds
+                # the sum here), then reuse x_local to hold the normalized y.
+                T.copy(x_local, shared_r)
+                T.copy(shared_r, residual_out[pid_m * block_m, 0])
+
+                # --- Output y: (sum - mean) * rstd * weight + bias ---
                 for i, j in T.Parallel(block_m, N_padded):
-                    r_local[i, j] = (
+                    x_local[i, j] = (
                         (T.cast(x_local[i, j], "float32") - mean_val[i])
                         * rstd[i]
                         * T.cast(weight[j], "float32")
@@ -114,12 +115,8 @@ def _fused_add_layer_norm_kernel(M, N, eps, dtype):
                     )
 
                 # Write y
-                T.copy(r_local, shared_x)
+                T.copy(x_local, shared_x)
                 T.copy(shared_x, y[pid_m * block_m, 0])
-
-                # Write residual_out = x + residual
-                T.copy(x_local, shared_r)
-                T.copy(shared_r, residual_out[pid_m * block_m, 0])
 
         return main
 
@@ -187,25 +184,11 @@ class FusedAddLayerNormKernel(Kernel):
 
     @property
     def default_config(self) -> dict:
-        # Shared memory budget: 2 buffers * block_m * N_padded * dtype_size < 48KB
-        elem_bytes = torch.tensor([], dtype=self.dtype).element_size()
-        smem_per_row = self.N_padded * elem_bytes
-        max_block_m = (48 * 1024) // (2 * smem_per_row)
-        block_m = 1
-        for bm in [1, 2, 4, 8, 16]:
-            if bm <= max_block_m:
-                block_m = bm
-        return {"block_m": block_m, "threads": 256}
+        return select_row_config(self.N_padded, self.dtype)
 
     @property
     def autotune_configs(self) -> list[dict]:
-        elem_bytes = torch.tensor([], dtype=self.dtype).element_size()
-        smem_per_row = self.N_padded * elem_bytes
-        max_block_m = (48 * 1024) // (2 * smem_per_row)
-        block_ms = [bm for bm in [1, 2, 4, 8, 16] if bm <= max_block_m]
-        threads_list = [128, 256]
-        configs = list(itertools.product(block_ms, threads_list))
-        return [{"block_m": bm, "threads": t} for bm, t in configs]
+        return select_row_configs(self.N_padded, self.dtype, num_buffers=2)
 
     def forward(
         self,
@@ -249,21 +232,21 @@ def _fused_add_rms_norm_kernel(M, N, eps, dtype):
                 shared_x = T.alloc_shared((block_m, N_padded), dtype)
                 shared_r = T.alloc_shared((block_m, N_padded), dtype)
                 x_local = T.alloc_fragment((block_m, N_padded), dtype)
-                r_local = T.alloc_fragment((block_m, N_padded), dtype)
                 xsq_f32 = T.alloc_fragment((block_m, N_padded), "float32")
                 sumsq = T.alloc_fragment((block_m,), "float32")
                 rrms = T.alloc_fragment((block_m,), "float32")
 
-                # Load x and residual via shared memory
+                # Load x and residual via shared memory. residual stays in
+                # shared (read directly during the add) so only x needs a
+                # full-row fragment.
                 T.copy(x[pid_m * block_m, 0], shared_x)
                 T.copy(shared_x, x_local)
                 T.copy(residual[pid_m * block_m, 0], shared_r)
-                T.copy(shared_r, r_local)
 
-                # Fused add: x_local <- (x + residual) in native dtype
+                # Fused add: x_local <- round(x + residual) in native dtype
                 for i, j in T.Parallel(block_m, N_padded):
                     x_local[i, j] = T.cast(x_local[i, j], "float32") + T.cast(
-                        r_local[i, j], "float32"
+                        shared_r[i, j], "float32"
                     )
 
                 # Compute (x+residual)^2 in fp32
@@ -280,21 +263,22 @@ def _fused_add_rms_norm_kernel(M, N, eps, dtype):
                 for i in T.Parallel(block_m):
                     rrms[i] = T.rsqrt(sumsq[i] / float(N) + eps)
 
+                # Write residual_out = x + residual first (x_local still holds
+                # the sum here), then reuse x_local to hold the normalized y.
+                T.copy(x_local, shared_r)
+                T.copy(shared_r, residual_out[pid_m * block_m, 0])
+
                 # y = (x+residual) * rrms * weight
                 for i, j in T.Parallel(block_m, N_padded):
-                    r_local[i, j] = (
+                    x_local[i, j] = (
                         T.cast(x_local[i, j], "float32")
                         * rrms[i]
                         * T.cast(weight[j], "float32")
                     )
 
                 # Write y
-                T.copy(r_local, shared_x)
+                T.copy(x_local, shared_x)
                 T.copy(shared_x, y[pid_m * block_m, 0])
-
-                # Write residual_out = x + residual
-                T.copy(x_local, shared_r)
-                T.copy(shared_r, residual_out[pid_m * block_m, 0])
 
         return main
 
@@ -361,24 +345,11 @@ class FusedAddRMSNormKernel(Kernel):
 
     @property
     def default_config(self) -> dict:
-        elem_bytes = torch.tensor([], dtype=self.dtype).element_size()
-        smem_per_row = self.N_padded * elem_bytes
-        max_block_m = (48 * 1024) // (2 * smem_per_row)
-        block_m = 1
-        for bm in [1, 2, 4, 8]:
-            if bm <= max_block_m:
-                block_m = bm
-        return {"block_m": block_m, "threads": 128}
+        return select_row_config(self.N_padded, self.dtype)
 
     @property
     def autotune_configs(self) -> list[dict]:
-        elem_bytes = torch.tensor([], dtype=self.dtype).element_size()
-        smem_per_row = self.N_padded * elem_bytes
-        max_block_m = (48 * 1024) // (2 * smem_per_row)
-        block_ms = [bm for bm in [1, 2, 4, 8] if bm <= max_block_m]
-        threads_list = [128, 256]
-        configs = list(itertools.product(block_ms, threads_list))
-        return [{"block_m": bm, "threads": t} for bm, t in configs]
+        return select_row_configs(self.N_padded, self.dtype, num_buffers=2)
 
     def forward(
         self,

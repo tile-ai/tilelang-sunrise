@@ -6,7 +6,7 @@ readme = "README.md"
 authors = [{ name="Tile-AI"}]
 dependencies = [
     "torch>=2.1.0,<2.11.0",
-    "tilelang-sunrise>=0.1.13,<0.1.14",
+    "tilelang-sunrise>=0.1.13,<0.2.0",
     "apache-tvm-ffi>=0.1.11,<0.1.12",
     "einops",
     "pyyaml>=6.0",

@@ -4,11 +4,11 @@
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import tempfile
 
 from tilelang.env import TANG_HOME, env
+from tilelang._ptcc import resolve_ptcc
 from tvm.base import py_str
 
 
@@ -62,14 +62,17 @@ def compile_tang(code, options=None, path_target=None, verbose=False):
             out_file.write(code)
 
         file_target = path_target or temp_target
-        cmd = [get_ptcc_compiler()]
-        if options:
-            if isinstance(options, str):
-                cmd.append(options)
-            elif isinstance(options, list):
-                cmd.extend(options)
-            else:
-                raise ValueError("options must be str or list of str")
+        if options is None:
+            opt_list = []
+        elif isinstance(options, str):
+            opt_list = [options]
+        elif isinstance(options, list):
+            opt_list = list(options)
+        else:
+            raise ValueError("options must be str or list of str")
+
+        cmd = [get_ptcc_compiler(_target_arch(opt_list))]
+        cmd.extend(opt_list)
         cmd.extend(["-o", file_target, temp_code])
 
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -93,13 +96,33 @@ def find_tang_path() -> str:
     raise RuntimeError("Cannot find a TANG installation. Set TANG_HOME or TANG_PATH to the toolkit root.")
 
 
-def get_ptcc_compiler() -> str:
-    """Return the ``ptcc`` executable path."""
-    compiler = shutil.which("ptcc")
-    if compiler:
-        return compiler
-    if TANG_HOME:
-        candidate = os.path.join(TANG_HOME, "bin", "ptcc")
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            return candidate
-    raise RuntimeError("Cannot find ptcc. Add it to PATH or set TANG_HOME to a toolkit containing bin/ptcc.")
+_S3_ARCH = "stcuv2"
+_ENV_S3_PTCC_PATH = "TANG_S3_PTCC_PATH"
+
+
+def _target_arch(options: list[str]) -> str | None:
+    """Read the ``--tang-gpu-arch=`` value out of the compiler options."""
+    prefix = "--tang-gpu-arch="
+    for opt in options:
+        if opt.startswith(prefix):
+            return opt[len(prefix) :]
+    return None
+
+
+def get_ptcc_compiler(arch: str | None = None) -> str:
+    """Return the ``ptcc`` executable path.
+
+    stcuv2 (S3) is developed against a toolchain that ships separately from the
+    installed TANG runtime, so ``TANG_S3_PTCC_PATH`` takes precedence for that
+    arch -- the same variable the simulator execution backend uses. Falling back
+    to whichever ptcc happens to be on PATH would compile S3 kernels with a
+    toolchain that does not carry the S3 headers, which surfaces as a confusing
+    missing-include error rather than a wrong-compiler one.
+    """
+    if arch == _S3_ARCH:
+        override = os.environ.get(_ENV_S3_PTCC_PATH)
+        if override:
+            if not (os.path.isfile(override) and os.access(override, os.X_OK)):
+                raise RuntimeError(f"{_ENV_S3_PTCC_PATH} is set to '{override}', which is not an executable file.")
+            return override
+    return resolve_ptcc(TANG_HOME)

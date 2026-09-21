@@ -202,7 +202,7 @@ class SparseFlashAttn(torch.nn.Module):
             dim_v,
             block_N=block_size,
             block_H=self.block_H,
-            num_stages=2,
+            num_stages=0 if is_ptpu_available() else 2,
             threads=128,
         )(query, key, value, block_mask, cache_seqlens, glse, output_partial)
         return output
@@ -254,7 +254,7 @@ def sparse_gqa_decode_varlen_mask(query, key, value, block_mask, cache_seqlens, 
         dim_v,
         block_N=block_size,
         block_H=block_H,
-        num_stages=2,
+        num_stages=0 if is_ptpu_available() else 2,
         threads=128,
     )
 
@@ -466,7 +466,7 @@ def run_regression_perf(batch=8, heads=32, heads_kv=8, max_cache_seqlen=8192, di
         dim_v,
         block_N=block_size,
         block_H=sparse_kernel.block_H,
-        num_stages=2,
+        num_stages=0 if is_ptpu_available() else 2,
         threads=128,
     )
 

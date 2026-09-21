@@ -3,32 +3,20 @@ from __future__ import annotations
 import os
 import shlex
 
-import tvm_ffi
-
-from tilelang.backend.device_codegen import DeviceCodegen, global_func_device_codegen, register_device_codegen
+from tilelang.backend.device_codegen import DeviceCodegen, global_func_device_codegen
 from tilelang.contrib import ptcc
+from tilelang._ptcc import default_jit_options
 from tilelang.env import TANG_HOME, TILELANG_TEMPLATE_PATH
 from tilelang.transform import PassConfigKey
 
 
-@tvm_ffi.register_global_func("tilelang_callback_tang_compile", override=True)
 def tilelang_callback_tang_compile(code, target, pass_config=None):
     config = pass_config or {}
     arch = str(target.attrs.get("arch", "stcu"))
-    options = [
-        "-xtang",
+    options = default_jit_options(arch) + [
         "-Wall",
         "-Wno-parentheses-equality",
         "-Wno-deprecated-declarations",
-        "-std=c++17",
-        "-DTANG",
-        "-fstpu-warp-alu",
-        "-stpu-loop",
-        "-use-load-const",
-        "-O3",
-        "-c",
-        "--tang-device-only",
-        f"--tang-gpu-arch={arch}",
         f"-I{TILELANG_TEMPLATE_PATH}",
     ]
     if TANG_HOME:
@@ -38,7 +26,8 @@ def tilelang_callback_tang_compile(code, target, pass_config=None):
     if bool(config.get(PassConfigKey.TL_ENABLE_FAST_MATH, False)):
         options.append("-ffast-math")
     if bool(config.get(PassConfigKey.TL_TANG_DISABLE_WARP_ALU, False)):
-        options.remove("-fstpu-warp-alu")
+        options = [option for option in options if option not in ("-fstpu-warp-alu", "-fno-stpu-warp-alu")]
+        options.append("-fno-stpu-warp-alu")
 
     extra_flags = config.get(PassConfigKey.TL_DEVICE_COMPILE_FLAGS, None)
     if extra_flags:
@@ -50,12 +39,8 @@ def tilelang_callback_tang_compile(code, target, pass_config=None):
     return ptcc.compile_tang(code, options=options, verbose=True)
 
 
-register_device_codegen(
+DEVICE_CODEGEN = DeviceCodegen(
     "tang",
-    DeviceCodegen(
-        "tang",
-        build=global_func_device_codegen("target.build.tilelang_tang"),
-        build_without_compile=global_func_device_codegen("target.build.tilelang_tang_without_compile"),
-    ),
-    override=True,
+    build=global_func_device_codegen("target.build.tilelang_tang"),
+    build_without_compile=global_func_device_codegen("target.build.tilelang_tang_without_compile"),
 )

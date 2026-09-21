@@ -1,12 +1,14 @@
-"""TANG lowering pipeline built on the v0.1.12 backend registry."""
+"""TANG lowering pipeline for STCU and STCUV2."""
 
 from __future__ import annotations
 
 from tvm import IRModule, s_tir, tirx
 from tvm.target import Target
+from tvm.tirx import PrimFunc, SBlock
+from tvm.tirx.stmt_functor import post_order_visit
 
 import tilelang
-from tilelang.backend.pass_pipeline import PassPipeline, register_pipeline
+from tilelang.backend.pass_pipeline import PassPipeline
 from tilelang.backend.pass_pipeline.pipeline_utils import (
     LayoutVisual,
     allow_global_thread_synchronization,
@@ -23,10 +25,38 @@ from tilelang.backend.pass_pipeline.pipeline_utils import (
 )
 
 from .subtarget import TangSubtarget as S
-from .subtarget import pass_filter
+from .subtarget import pass_filter, subtarget_matches
 
 
-def TANGPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
+def _module_has_shared_barrier(
+    mod: IRModule,
+    scopes: tuple[str, ...] = ("shared.barrier", "shared.cluster_barrier"),
+) -> bool:
+    """Whether any function allocates a barrier buffer in one of ``scopes``
+    (i.e. uses ``T.alloc_barrier`` / ``T.alloc_cluster_barrier``).
+
+    TANG rejects barrier allocations an arch has no hardware for here so the
+    generated code fails fast with a clear message instead of deep inside ptcc.
+    Called twice with different ``scopes``: once narrowed to cluster barriers,
+    which TANG has no level for at all, and once for any barrier, which needs
+    stcuv2.
+    """
+    found = False
+
+    def visit(node):
+        nonlocal found
+        if isinstance(node, SBlock):
+            for buffer in node.alloc_buffers:
+                if buffer.scope() in scopes:
+                    found = True
+
+    for _, func in mod.functions.items():
+        if isinstance(func, PrimFunc):
+            post_order_visit(func.body, visit)
+    return found
+
+
+def TANGPassPipelineBodyPrologue(mod: IRModule, target: Target) -> IRModule:
     """Lower Tile IR for stcu/stcuv2 without entering CUDA-only passes."""
     mod = tirx.transform.BindTarget(target)(mod)
     mod = tilelang.transform.MaterializeKernelLaunch()(mod)
@@ -40,25 +70,30 @@ def TANGPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
         mod = tilelang.transform.VerifyParallelLoop()(mod)
     mod = tilelang.transform.InjectAssumes()(mod)
     mod = tilelang.transform.Simplify()(mod)
-    mod = tilelang.transform.LayoutReducer()(mod)
+    mod = tilelang.transform.CanonicalizeLegacyReducer()(mod)
+    mod = tilelang.transform.VerifyReducerEpoch()(mod)
+    mod = tilelang.transform.VerifyBufferInit()(mod)
 
     mod = tilelang.transform.IfStmtBinding()(mod)
     mod = tilelang.transform.PipelinePlanning()(mod)
     mod = tilelang.transform.InjectSoftwarePipeline()(mod)
     mod = tilelang.transform.Simplify()(mod)
 
-    mod = tilelang.transform.LayoutInference()(mod)
-    if not should_disable_loop_peeling(pass_ctx=pass_ctx):
-        mod = tilelang.transform.LoopPeeling()(mod)
-    if not should_disable_gemm_pad(pass_ctx=pass_ctx):
-        mod = tilelang.transform.PadGemmTail()(mod)
-    LayoutVisual(mod)
     # Shared tile lowering and vector planning consult Target::Current while
     # selecting target-dispatched operators and legal vector widths.  Keep the
     # same TANG target bound through LegalizeVectorizedLoop so vectorized tile
     # operators cannot accidentally observe no target.
     with target:
+        mod = tilelang.transform.LayoutInference()(mod)
+        mod = tilelang.transform.ReducerPlanAndMaterialize()(mod)
+        if subtarget_matches(target, S.STCU):
+            if not should_disable_loop_peeling(pass_ctx=pass_ctx):
+                mod = tilelang.transform.LoopPeeling()(mod)
+            if not should_disable_gemm_pad(pass_ctx=pass_ctx):
+                mod = tilelang.transform.PadGemmTail()(mod)
+        LayoutVisual(mod)
         mod = tilelang.transform.LowerTileOp()(mod)
+        mod = tilelang.transform.VerifyReducerConsumed()(mod)
         mod = tilelang.transform.DecoupleTypeCast()(mod)
         mod = tilelang.transform.LegalizeVectorizedLoop()(mod)
     mod = tilelang.transform.LegalizeSafeMemoryAccess()(mod)
@@ -66,8 +101,35 @@ def TANGPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.Simplify()(mod)
     mod = tilelang.transform.HoistNonRestrictParams()(mod)
 
+    return mod
+
+
+def TANGPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
+    mod = TANGPassPipelineBodyPrologue(mod, target)
+    pass_ctx = tilelang.transform.get_pass_context()
+
     mod = tilelang.tang.transform.LowerSharedTmem()(mod)
     mod = tilelang.transform.PlanAndUpdateBufferAllocationLocation()(mod)
+    # TANG has no cluster level, so a cluster-scoped barrier has no counterpart
+    # at any arch: mbarrier.arrive takes no cta_id operand and there is no
+    # cluster-wide storage sync to publish the init with.
+    if _module_has_shared_barrier(mod, ("shared.cluster_barrier",)):
+        raise ValueError(
+            "T.alloc_cluster_barrier() has no TANG equivalent: TANG has no cluster "
+            "level, and mbarrier.arrive takes no cta_id operand. Use "
+            "T.alloc_barrier() for block-scoped synchronisation."
+        )
+    # TANG mbarriers exist only on stcuv2: the whole __mbarrier_* family is
+    # gated on __Tang_ARCH__ >= 200. Reject T.alloc_barrier on stcu here rather
+    # than letting ptcc fail on the gated builtins with no mention of the arch.
+    if _module_has_shared_barrier(mod) and not subtarget_matches(target, S.STCUV2):
+        raise ValueError(
+            f"T.alloc_barrier() requires arch=stcuv2, but the current target is "
+            f"{target}. TANG mbarrier operations (the Barrier type, mbarrier_init, "
+            f"mbarrier_arrive, the parity waits) are only compiled for "
+            f"__Tang_ARCH__ >= 200. Use T.sync_threads() on stcu instead."
+        )
+    mod = pass_filter(tilelang.tang.transform.LowerSharedBarrier, S.STCUV2)()(mod)
     mod = pass_filter(tilelang.tang.transform.LowerTangTmemDrain, S.STCUV2)()(mod)
     mod = tilelang.transform.HoistGlobalBufferAllocations()(mod)
     mod = tilelang.transform.LowerOpaqueBlock()(mod)
@@ -128,5 +190,3 @@ def TANGPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
 
 
 tang_pipeline = PassPipeline("tang", TANGPassPipelineBody)
-
-register_pipeline(tang_pipeline)

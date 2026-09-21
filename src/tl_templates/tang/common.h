@@ -43,6 +43,11 @@
     }                                                                          \
   } while (0)
 
+// PTCC exposes half/BF16 math helpers but no htanh overloads.
+TL_DEVICE half htanh(half x) { return half(tanhf(float(x))); }
+
+TL_DEVICE __bf16 htanh(__bf16 x) { return __bf16(tanhf(float(x))); }
+
 // Pack two half values.
 TL_DEVICE unsigned __pack_half2(const half x, const half y) {
   unsigned v0 = *((unsigned short *)&x);
@@ -70,6 +75,16 @@ TL_DEVICE unsigned int make_uint(unsigned char x0, unsigned char x1,
 }
 
 namespace tl {
+TL_DEVICE float RoundTiesAwayFromZero(float x) { return roundf(x); }
+
+TL_DEVICE double RoundTiesAwayFromZero(double x) { return round(x); }
+
+TL_DEVICE half RoundTiesAwayFromZero(half x) { return half(roundf(float(x))); }
+
+TL_DEVICE __bf16 RoundTiesAwayFromZero(__bf16 x) {
+  return __bf16(roundf(float(x)));
+}
+
 // Any
 template <typename T> TL_DEVICE bool Any(T *a, int size) {
   for (int i = 0; i < size; i++) {

@@ -72,6 +72,8 @@ def _mha_fwd_kernel(batch: int,
         out_idx=[3, 4],
         pass_configs={
             tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+            # Avoid PTCC warp-ALU stalls in vectorized online softmax on TANG.
+            tilelang.PassConfigKey.TL_TANG_DISABLE_WARP_ALU: True,
         },
         compile_flags=["-O3", "-DENABLE_BF16"])
     def _mha_fwd_func(block_m: int, block_n: int, num_stages: int, threads: int) -> Callable:

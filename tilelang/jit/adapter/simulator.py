@@ -283,35 +283,6 @@ def _extract_launch_dims(
     return tuple(thread), tuple(block)
 
 
-def _estimate_tcgen5_shared_mem(kernel_source: str) -> int:
-    """Parse tcgen5 GEMM template parameters from source and estimate shared mem.
-
-    The generated kernel contains a call like:
-      tl::gemm_tang_tcgen5<BM, BN, BK, ...>(...)
-
-    Estimated shared memory = A_shared(BM*BK*2) + B_shared(BK*BN*2) +
-                              C_shared(BM*BN*2) + alignment(~4KB).
-    """
-    import re
-
-    m = re.search(r"gemm_tang_tcgen5<(\d+),\s*(\d+),\s*(\d+)", kernel_source)
-    if not m:
-        return 0
-    BM, BN, BK = int(m.group(1)), int(m.group(2)), int(m.group(3))
-
-    def _shared(rows, cols, elem_bytes):
-        # Align each allocation to 128 bytes
-        sz = rows * cols * elem_bytes
-        return (sz + 127) // 128 * 128
-
-    total = (
-        _shared(BM, BK, 2)  # A_shared: float16
-        + _shared(BK, BN, 2)  # B_shared: float16
-        + _shared(BM, BN, 2)
-    )  # C_shared: float16
-    return total
-
-
 def _compute_device_param_order(func_or_mod, device_mod, n_params: int) -> list[int]:
     """Map GM argument slots to host parameter indices.
 
@@ -492,7 +463,7 @@ class SimulatorKernelAdapter(BaseKernelAdapter):
         self.result_idx = self._legalize_result_idx(result_idx)
         self.kernel_source = device_kernel_source or ""
         self.pass_configs = pass_configs or {}
-        self.target = Target.canon_target(determine_target(target))
+        self.target = determine_target(target, return_object=True)
         # The ISS simulator backend is only supported on the STCUV2 subtarget.
         # Guard here (in addition to backend resolution) so that any direct
         # construction with an unsupported target fails fast with a clear error.
@@ -617,13 +588,9 @@ class SimulatorKernelAdapter(BaseKernelAdapter):
                     in_file_idx += 1
 
                 # ── 6. Build & write user_config.json ───────────────
-                # Estimate dynamic shared memory from kernel source
-                _shm = _estimate_tcgen5_shared_mem(kernel_source)
-                if _shm > 0:
-                    # Write captured_kernel.json for STCU_loader
-                    _cap = {"selected_launch": {"shared": _shm}}
-                    (work_dir / "captured_kernel.json").write_text(json.dumps(_cap))
-
+                # The tcgen5 device templates that used to report shared-memory
+                # needs are gone (MMA is emitted by the Python emitter now);
+                # the loader sizes shared memory from the kernel ELF, so pass 0.
                 cfg = _build_user_config(
                     params,
                     result_idx,
@@ -631,7 +598,7 @@ class SimulatorKernelAdapter(BaseKernelAdapter):
                     thread_dims=thread_dims,
                     block_dims=block_dims,
                     blk_split_mode=0,
-                    shared_mem_size=_shm,
+                    shared_mem_size=0,
                     slot_to_host=slot_to_host,
                 )
                 cfg_path = work_dir / "user_config.json"
@@ -664,7 +631,7 @@ class SimulatorKernelAdapter(BaseKernelAdapter):
                         # The simulator writes a flat HBM word stream; restore
                         # the parameter's N-D shape so callers don't need a
                         # manual reshape.
-                        # numel mismatch: leave flat
+                        # numel mismatch: leave flat.
                         with contextlib.suppress(RuntimeError):
                             tensor = tensor.reshape(param_shapes[host_idx])
                         outputs_by_host[host_idx] = tensor

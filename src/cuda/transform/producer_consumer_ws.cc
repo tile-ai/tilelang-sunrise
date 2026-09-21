@@ -35,15 +35,14 @@
 #include <utility>
 
 #include "backend/common/target_utils.h"
+#include "cuda/op/builtin.h"
 #include "cuda/op/copy.h"
 #include "layout/cute_layout.h"
 #include "multi_version_buffer_rewriter.h"
-#include "op/builtin.h"
 #include "op/copy.h"
 #include "op/fill.h"
 #include "op/gemm.h"
 #include "op/operator.h"
-#include "op/region.h"
 #include "op/utils.h"
 #include "transform/common/mbarrier.h"
 
