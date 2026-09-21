@@ -451,6 +451,7 @@ def test_run_sh_timeout_retry_and_recovery_are_end_to_end(tmp_path, recording_fa
     shutil.copy2(CI_RUN, ci_dir / "run.sh")
     shutil.copy2(JUNIT_GENERATOR, ci_dir / "junit_from_jsonl.py")
     library = CI_LIB.read_text() + "\nci_check_card_state () { :; }\nci_configure_ptcc () { :; }\n"
+    library += 'ci_reset_gpu_on_timeout () { ci_record_device_recovery "$1" "$2" "$3" 6 PASS 0 ""; }\n'
     if recording_fails:
         library += "ci_record_device_recovery () { return 19; }\n"
     (ci_dir / "lib.sh").write_text(library, encoding="utf-8")
@@ -482,17 +483,74 @@ def test_run_sh_timeout_retry_and_recovery_are_end_to_end(tmp_path, recording_fa
     )
     records = [json.loads(line) for line in (report_dir / "tilelang.jsonl").read_text().splitlines()]
     assert records[0]["status"] == "TIMEOUT"
-    assert records[-1]["status"] == "PASS"
+    assert records[-1]["status"] == ("TIMEOUT" if recording_fails else "PASS")
     assert records[-1]["timeout_seconds"] == 1
     xml_path = report_dir / "junit-tilelang.xml"
     if recording_fails:
-        assert completed.returncode == 2, completed.stdout + completed.stderr
+        assert completed.returncode == 1, completed.stdout + completed.stderr
         assert not xml_path.exists()
-        assert "failed to record device recovery" in completed.stderr
+        assert "device recovery failed" in completed.stderr
     else:
         assert completed.returncode == 0, completed.stdout + completed.stderr
         assert [record["record_kind"] for record in records] == ["case_attempt", "device_recovery", "case_attempt", "case_result"]
-        assert records[1]["status"] == "SKIPPED"
+        assert records[1]["status"] == "PASS"
         testcase = ElementTree.parse(xml_path).getroot().find("testsuite/testcase")
         assert _properties(testcase)["attempt_statuses"] == "TIMEOUT,PASS"
         assert _properties(testcase)["device_recovery_count"] == "1"
+
+
+@pytest.mark.parametrize("recovery_mode", ["disabled", "failed"])
+def test_failed_recovery_stops_execution_and_reports_unrun_cases(tmp_path, recovery_mode):
+    plan = tmp_path / "cases.txt"
+    plan.write_text("python first.py\npython second.py\n")
+    report_dir = tmp_path / "reports"
+    launches = tmp_path / "launches"
+    script = f"""
+source {shlex.quote(str(CI_LIB))}
+ci_check_card_state () {{ :; }}
+ci_run_timed () {{
+    echo invoked >> {shlex.quote(str(launches))}
+    echo timeout > "$2"
+    CI_LAST_RUN_TIMED_OUT=1
+    return 124
+}}
+"""
+    if recovery_mode == "failed":
+        script += 'ci_reset_gpu_on_timeout () { ci_record_device_recovery "$1" "$2" "$3" 0 FAIL 1 "reset failed"; return 1; }\n'
+    script += f"ci_run_test_list {shlex.quote(str(plan))} command tilelang\n"
+    env = {
+        **os.environ,
+        "TMPDIR": str(tmp_path),
+        "CI_FAILURE_REPORT_DIR": str(report_dir),
+        "TILELANG_CACHE_DIR": str(tmp_path / "cache"),
+        "CASE_REPEAT": "3",
+        "CASE_TIMEOUT": "1",
+        "TILELANG_CI_RESET_MODE": "disabled",
+        "TANG_VISIBLE_DEVICES": "0",
+        "TEST_MARKER": "",
+    }
+    completed = subprocess.run(["bash", "-c", script], cwd=tmp_path, env=env, capture_output=True, text=True)
+    assert completed.returncode == 1, completed.stdout + completed.stderr
+    assert launches.read_text().splitlines() == ["invoked"]
+    records = [json.loads(line) for line in (report_dir / "tilelang.jsonl").read_text().splitlines()]
+    assert [r["record_kind"] for r in records] == ["case_attempt", "device_recovery", "case_result", "case_result"]
+    assert records[2]["status"] == "TIMEOUT"
+    assert records[3]["status"] == "NOT_RUN"
+    generated = _run_generator(report_dir, 2)
+    assert generated.returncode == 0, generated.stderr
+    suite = ElementTree.parse(report_dir / "junit-tilelang.xml").getroot().find("testsuite")
+    assert suite.attrib["failures"] == "2"
+    assert suite.attrib["skipped"] == "0"
+    unrun = suite.findall("testcase")[1]
+    assert unrun.find("failure").attrib["type"] == "NOT_RUN"
+    assert _properties(unrun)["attempts_used"] == "0"
+
+
+def test_not_run_requires_failed_recovery_evidence(tmp_path):
+    passed = _attempt("first.py", "PASS", 1)
+    unrun = _result(_attempt("second.py", "NOT_RUN", 0, exit_code=1, failure_reason="device unavailable"))
+    report_dir = tmp_path / "reports"
+    _write_jsonl(report_dir, [passed, _result(passed), unrun])
+    completed = _run_generator(report_dir, 2)
+    assert completed.returncode != 0
+    assert not (report_dir / "junit-tilelang.xml").exists()

@@ -403,7 +403,7 @@ PY
 }
 
 # Reset the Tang GPU after a case times out (exit 124); a hung card would
-# otherwise cascade-fail every later case. Best-effort: never aborts the run.
+# otherwise cascade-fail every later case. Resume only after verified recovery.
 # Bound sudo/pt_smi so a stuck reset cannot block GitLab cancel forever.
 ci_reset_gpu_on_timeout () {
     local dev="${TANG_VISIBLE_DEVICES:-0}"
@@ -413,7 +413,7 @@ ci_reset_gpu_on_timeout () {
     if [[ ${CI_SHUTTING_DOWN:-0} -eq 1 ]]; then
         echo "ci_reset_gpu_on_timeout: skip (job cancelling)"
         ci_record_device_recovery "$suite" "$case_id" "$attempt" "$dev" SKIPPED 0 "job cancelling" || return $?
-        return 0
+        return 1
     fi
     echo "Resetting Tang device $dev after timeout ..."
     case "$mode" in
@@ -422,7 +422,7 @@ ci_reset_gpu_on_timeout () {
                 echo "WARNING: public runner reset is restricted to Tang device 0 (got $dev)"
                 ci_record_device_recovery "$suite" "$case_id" "$attempt" "$dev" SKIPPED 0 \
                     "public reset is restricted to device 0" || return $?
-                return 0
+                return 1
             fi
             /usr/bin/timeout --foreground --kill-after=10s 60 \
                 /usr/bin/sudo -n /usr/bin/pt_smi -r -i 0 || ret=$?
@@ -432,13 +432,13 @@ ci_reset_gpu_on_timeout () {
                 echo "WARNING: pt_smi is unavailable; cannot reset timed-out Tang device"
                 ci_record_device_recovery "$suite" "$case_id" "$attempt" "$dev" SKIPPED 0 \
                     "pt_smi is unavailable" || return $?
-                return 0
+                return 1
             fi
             if [[ -z "${SUDO_MAGICWORD:-}" ]]; then
                 echo "WARNING: SUDO_MAGICWORD is unavailable; cannot reset timed-out Tang device"
                 ci_record_device_recovery "$suite" "$case_id" "$attempt" "$dev" SKIPPED 0 \
                     "reset credential is unavailable" || return $?
-                return 0
+                return 1
             fi
             printf '%s\n' "$SUDO_MAGICWORD" | sudo -S -p '' \
                 /usr/bin/timeout --foreground --kill-after=10s 60 pt_smi -r -i "$dev" || ret=$?
@@ -447,13 +447,13 @@ ci_reset_gpu_on_timeout () {
             echo "WARNING: Tang reset is disabled; runner operator intervention may be required"
             ci_record_device_recovery "$suite" "$case_id" "$attempt" "$dev" SKIPPED 0 \
                 "reset mode is disabled" || return $?
-            return 0
+            return 1
             ;;
         *)
             echo "WARNING: unsupported TILELANG_CI_RESET_MODE=$mode; Tang device was not reset"
             ci_record_device_recovery "$suite" "$case_id" "$attempt" "$dev" SKIPPED 0 \
                 "unsupported reset mode" || return $?
-            return 0
+            return 1
             ;;
     esac
     if [[ $ret -ne 0 ]]; then
@@ -461,7 +461,12 @@ ci_reset_gpu_on_timeout () {
         ci_record_device_recovery "$suite" "$case_id" "$attempt" "$dev" FAIL "$ret" \
             "pt_smi reset failed" || return $?
         ci_dump_device_status
-        return 0
+        return 1
+    fi
+    if ! (ci_check_card_state); then
+        ci_record_device_recovery "$suite" "$case_id" "$attempt" "$dev" FAIL 1 \
+            "device health check failed after reset" || return $?
+        return 1
     fi
     echo "ci_reset_gpu_on_timeout: pt_smi -r -i ${dev} OK"
     ci_record_device_recovery "$suite" "$case_id" "$attempt" "$dev" PASS 0 "" || return $?
@@ -1212,12 +1217,19 @@ ci_run_prepared_cases () {
     local -a results=()
     local success=0 fail=0 skipped=0 i ret start end elapsed line_result
     local attempt case_status reason rec_log current_mode launch_cwd logfile attempt_log current_timeout key
-    local recording_failed=0 record_ret
+    local recording_failed=0 record_ret device_unusable=0
     for ((i=0; i<num; i++)); do
         echo ">>>>>>> running case $((i+1))/$num: ${labels[$i]} <<<<<<<<"
         key=$(ci_timeout_key "${labels[$i]}" "$list_root") || return 1
         current_timeout="${CI_CASE_TIMEOUTS[$key]:-$case_timeout}"
         echo "Case timeout: ${current_timeout}s"
+        if [[ $device_unusable -eq 1 ]]; then
+            ci_record_case_result "$suite" "${labels[$i]}" "${cmds[$i]}" NOT_RUN 1 0 \
+                "not run: device recovery failed" "" "$current_timeout" || recording_failed=1
+            results+=("NOT_RUN: ${labels[$i]} (device recovery failed)")
+            fail=$((fail+1))
+            continue
+        fi
         current_mode="${case_modes[$i]}"
         launch_cwd=""
         if [[ "$current_mode" == "pytest" && -n "${PYTEST_LAUNCH_CWD:-}" ]]; then
@@ -1272,11 +1284,12 @@ ci_run_prepared_cases () {
 
             if [[ "$case_status" == "TIMEOUT" ]]; then
                 ci_reset_gpu_on_timeout "$suite" "${labels[$i]}" "$attempt" || {
-                    echo "ERROR: failed to record device recovery for ${labels[$i]}" >&2
-                    recording_failed=1
+                    echo "ERROR: device recovery failed for ${labels[$i]}; stopping GPU execution" >&2
+                    device_unusable=1
                 }
             fi
 
+            [[ $device_unusable -eq 1 ]] && break
             if [[ $case_status == "PASS" || $case_status == "SKIPPED" ]]; then
                 [[ $attempt -gt 1 ]] && echo "passed on attempt ${attempt}/${case_repeat}: ${labels[$i]}"
                 # Keep logfile only when recording a failure; PASS/SKIP drop it.

@@ -17,7 +17,7 @@ import tempfile
 from xml.sax.saxutils import escape, quoteattr
 
 
-FAILURE_STATUSES = {"FAIL", "TIMEOUT"}
+FAILURE_STATUSES = {"FAIL", "TIMEOUT", "NOT_RUN"}
 VALID_STATUSES = FAILURE_STATUSES | {"PASS", "SKIPPED"}
 
 
@@ -92,6 +92,9 @@ def _validate_record(record, line_number, suite):
     if status in FAILURE_STATUSES and not reason:
         raise ReportError(f"line {line_number}: {status} record has no failure_reason")
 
+    if status == "NOT_RUN" and (kind != "case_result" or record["elapsed_seconds"] != 0 or record["exit_code"] == 0):
+        raise ReportError(f"line {line_number}: invalid NOT_RUN result")
+
     if kind == "case_attempt":
         attempt = _require_integer(record, "attempt", line_number, minimum=1)
         total_attempts = _require_integer(record, "total_attempts", line_number, minimum=1)
@@ -164,7 +167,18 @@ def load_cases(jsonl_path, suite, expected_cases):
                     raise ReportError(f"line {line_number}: duplicate case_result for {case_id!r}")
                 attempts = state["attempts"]
                 if not attempts:
-                    raise ReportError(f"line {line_number}: case_result for {case_id!r} has no attempts")
+                    aborted = any(
+                        prior["result"] is not None
+                        and prior["result"]["status"] == "TIMEOUT"
+                        and prior["recoveries"]
+                        and prior["recoveries"][-1]["attempt"] == len(prior["attempts"])
+                        and prior["recoveries"][-1]["status"] != "PASS"
+                        for prior in states.values()
+                    )
+                    if record["status"] != "NOT_RUN" or not aborted:
+                        raise ReportError(f"line {line_number}: case_result for {case_id!r} has no attempts")
+                    state["result"] = record
+                    continue
                 final_attempt = attempts[-1]
                 if record.get("timeout_seconds") != final_attempt.get("timeout_seconds"):
                     raise ReportError(f"line {line_number}: case_result timeout disagrees with final attempt")
@@ -178,7 +192,12 @@ def load_cases(jsonl_path, suite, expected_cases):
                 ):
                     if record[key] != final_attempt[key]:
                         raise ReportError(f"line {line_number}: case_result {key!r} disagrees with final attempt")
-                if record["status"] in FAILURE_STATUSES and len(attempts) != final_attempt["total_attempts"]:
+                aborted = bool(
+                    state["recoveries"]
+                    and state["recoveries"][-1]["attempt"] == final_attempt["attempt"]
+                    and state["recoveries"][-1]["status"] != "PASS"
+                )
+                if record["status"] in FAILURE_STATUSES and len(attempts) != final_attempt["total_attempts"] and not aborted:
                     raise ReportError(f"line {line_number}: failed case {case_id!r} did not record every retry")
                 for attempt in attempts:
                     if (
@@ -202,6 +221,8 @@ def load_cases(jsonl_path, suite, expected_cases):
 
 
 def _attempt_history(attempts, recoveries):
+    if not attempts:
+        return "Not run: device recovery failed."
     lines = [f"Attempts used: {len(attempts)}/{attempts[0]['total_attempts']}"]
     for attempt in attempts:
         lines.append(
@@ -243,7 +264,7 @@ def render(suite, cases):
         lines.append(f'    <testcase classname={quoteattr(_clean(suite))} name={quoteattr(_clean(result["case"]))} time="{elapsed}">')
         lines.append("      <properties>")
         lines.append(f'        <property name="attempts_used" value="{len(attempts)}"/>')
-        lines.append(f'        <property name="attempt_limit" value="{attempts[0]["total_attempts"]}"/>')
+        lines.append(f'        <property name="attempt_limit" value="{attempts[0]["total_attempts"] if attempts else 0}"/>')
         lines.append(f'        <property name="attempt_statuses" value={quoteattr(_clean(statuses))}/>')
         lines.append(f'        <property name="attempt_durations_seconds" value={quoteattr(durations)}/>')
         if "timeout_seconds" in result:
