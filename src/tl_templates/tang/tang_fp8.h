@@ -28,12 +28,68 @@
   }
 
 // Scalar (1 byte).
-struct fp8_e4_t {
-  uint8_t __x;
-};
-struct fp8_e5_t {
-  uint8_t __x;
-};
+//
+// The GEMM operand path only ever moves these as bytes, but a plain
+// elementwise kernel (`A[i] = T.cast(x, "float8_e4m3")`) makes codegen emit a
+// direct `fp8_e4_t(x)` / `(fp8_e4_t)x` cast, so the scalar types also carry
+// numeric converting constructors. They delegate to the vendor builtin
+// __tang_cvt_float_to_fp8 (round-to-nearest-even, saturating), which is what
+// picks the E4M3 / E5M2 encoding here -- unlike the MMA path, where the
+// descriptor's EleType does. The reverse direction (fp8 -> float) needs nothing
+// here: codegen emits __tang_cvt_fp8_to_halfraw on the reinterpreted storage.
+//
+// `__x` stays public and the default constructor stays trivial, so raw-byte use
+// (`fp8_e4_t v; v.__x = b;`, reinterpret_cast to __tang_fp8_storage_t, arrays
+// of the type) is unaffected and the types remain 1-byte and trivially
+// copyable. Following the vendor's own __tang_fp8_e4m3, the conversions are
+// `explicit` and there is deliberately no `unsigned char` overload, which would
+// be ambiguous with raw-byte storage.
+#define TL_TANG_FP8_SCALAR_DEF(NAME, INTERP)                                   \
+  struct NAME {                                                                \
+    uint8_t __x;                                                               \
+                                                                               \
+    NAME() = default;                                                          \
+                                                                               \
+    __device__ explicit NAME(const float val) {                                \
+      __x = __tang_cvt_float_to_fp8(val, __TANG_SATFINITE, INTERP);            \
+    }                                                                          \
+    __device__ explicit NAME(const double val)                                 \
+        : NAME(static_cast<float>(val)) {}                                     \
+    __device__ explicit NAME(const short int val)                              \
+        : NAME(static_cast<float>(val)) {}                                     \
+    __device__ explicit NAME(const unsigned short int val)                     \
+        : NAME(static_cast<float>(val)) {}                                     \
+    __device__ explicit NAME(const int val) : NAME(static_cast<float>(val)) {} \
+    __device__ explicit NAME(const unsigned int val)                           \
+        : NAME(static_cast<float>(val)) {}                                     \
+    __device__ explicit NAME(const long int val)                               \
+        : NAME(static_cast<float>(val)) {}                                     \
+    __device__ explicit NAME(const unsigned long int val)                      \
+        : NAME(static_cast<float>(val)) {}                                     \
+    __device__ explicit NAME(const long long int val)                          \
+        : NAME(static_cast<float>(val)) {}                                     \
+    __device__ explicit NAME(const unsigned long long int val)                 \
+        : NAME(static_cast<float>(val)) {}                                     \
+                                                                               \
+    /* Non-finite values must bypass the constructors above: those use         \
+     * __TANG_SATFINITE (matching the vendor fp8 types), which clamps an       \
+     * infinite input down to MAXNORM -- right for arithmetic overflow, wrong  \
+     * for materialising an explicit infinity. __TANG_NOSAT preserves e5m2's   \
+     * inf/nan encodings; e4m3 has no infinity, so the vendor conversion       \
+     * yields NaN there (documented in __clang_tang_fp8.h). Static factory     \
+     * rather than a constructor overload so it cannot be picked up by         \
+     * implicit conversion, and so the type stays trivially copyable. */       \
+    __device__ static NAME from_float_nosat(const float val) {                 \
+      NAME out;                                                                \
+      out.__x = __tang_cvt_float_to_fp8(val, __TANG_NOSAT, INTERP);            \
+      return out;                                                              \
+    }                                                                          \
+  }
+
+TL_TANG_FP8_SCALAR_DEF(fp8_e4_t, __TANG_E4M3);
+TL_TANG_FP8_SCALAR_DEF(fp8_e5_t, __TANG_E5M2);
+
+#undef TL_TANG_FP8_SCALAR_DEF
 
 // Packed vector variants (aligned to their byte width, capped at 16B).
 TL_TANG_FP8_DEF(fp8_e4_2_t, 2, 2);

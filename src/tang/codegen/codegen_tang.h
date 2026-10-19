@@ -9,7 +9,9 @@
 #include <tvm/tirx/expr.h>
 #include <tvm/tirx/op.h>
 
+#include <optional>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -57,6 +59,7 @@ public:
   void VisitExpr_(const MinNode *op, std::ostream &os) final;
   void VisitExpr_(const MaxNode *op, std::ostream &os) final;
   void VisitExpr_(const NotNode *op, std::ostream &os) final;
+  void VisitStmt_(const AssertStmtNode *op) final;
   void VisitStmt_(const EvaluateNode *op) final;
   void VisitStmt_(const AllocBufferNode *op) final;
   void VisitStmt_(const AttrStmtNode *op) final;
@@ -154,6 +157,14 @@ private:
   bool need_cast_smem_ptr_to_int_{false};
   // whether need cooperative_groups.h
   bool need_cooperative_groups_{false};
+  // whether need <tl_templates/tang/cluster.h> (cluster arrive/wait/sync,
+  // block_rank_in_cluster). Set by the CallNode handlers for cluster ops.
+  bool need_cluster_h_{false};
+  // Cluster dimensions (x,y,z) from the "cluster_dims" PrimFunc attr, used by
+  // the threadblock_swizzle_pattern handler to emit the cluster-aware
+  // rasterization2D{Row,Column}WithCluster swizzle. Populated in AddFunction
+  // (mirrors CodeGenTileLangCUDA::cluster_dims).
+  std::optional<std::tuple<int64_t, int64_t, int64_t>> cluster_dims_;
   // Tang RNG state for tl.rng_* intrinsics, reset per-PrimFunc in
   // InitFuncState. Keep declaration discovery separate from source-order
   // initialization so rng_rand before rng_init is still rejected.

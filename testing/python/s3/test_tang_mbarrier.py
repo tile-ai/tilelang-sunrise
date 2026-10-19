@@ -29,6 +29,7 @@ expect_tx 只接通指令,不保证与 bulk copy 的 tx 配对语义:递减侧 c
 硬件计数被厂商标为不可靠。所以这里只断言它发射得出来,不做数值配对用例。
 """
 
+import pathlib
 import re
 
 import pytest
@@ -668,7 +669,7 @@ def test_tang_barrier_pass_injects_one_init_per_barrier():
     assert len(inits) == 1
     assert inits[0].args[1].value == 128
     assert len(_collect_calls(body, "tl.tl_shuffle_elect")) == 1
-    assert len(_collect_calls(body, "tl.ptx_fence_barrier_init")) == 1
+    assert len(_collect_calls(body, "tl.tang_fence_barrier_init")) == 1
     assert len(_collect_calls(body, "tirx.tvm_storage_sync")) >= 1
 
 
@@ -688,7 +689,7 @@ def test_tang_barrier_pass_keeps_each_arrive_count():
     inits = _collect_calls(body, "tirx.ptx_init_barrier_thread_count")
     assert sorted(c.args[1].value for c in inits) == [1, 1, 128, 128]
     assert len(_collect_calls(body, "tl.tl_shuffle_elect")) == 1
-    assert len(_collect_calls(body, "tl.ptx_fence_barrier_init")) == 1
+    assert len(_collect_calls(body, "tl.tang_fence_barrier_init")) == 1
 
 
 def test_tang_barrier_pass_is_a_noop_without_barriers():
@@ -703,6 +704,36 @@ def test_tang_barrier_pass_is_a_noop_without_barriers():
     body = _apply_barrier_pass(func)
 
     assert _collect_calls(body, "tirx.ptx_init_barrier_thread_count") == []
+    assert _collect_calls(body, "tl.tang_fence_barrier_init") == []
+
+
+def test_tang_fence_barrier_init_is_a_real_fence_not_a_noop():
+    """回归:这个 device helper 曾经是空函数。
+
+    当时依赖"紧接着的 __syncthreads() 会发布 init"这一邻居不变量保序,fence 本身
+    什么都不做。空 fence 在 IR 里与真 fence 长得一模一样,所以这条只能用源码级断言
+    守住:tang::ptx::mbarrier_init 自带的 fence.mem 是设备库的实现细节(换成
+    -fstpu-sreg-mbarrier 就没有了),不能作为 TileLang 的排序保证。
+    """
+    header = (pathlib.Path(__file__).resolve().parents[3] / "src" / "tl_templates" / "tang" / "barrier.h").read_text()
+    assert re.search(
+        r"TL_DEVICE void fence_barrier_init\(\)\s*\{\s*asm volatile\(\"fence\.mem;\"\);\s*\}",
+        header,
+    ), "TANG's fence_barrier_init must emit a real fence.mem, not be a no-op"
+
+
+def test_tang_fence_barrier_init_is_indexed_under_tang_op():
+    """新 op 名字必须落在 tang registry 里(而不是 backend-neutral 的 op/builtin)。"""
+
+    @T.prim_func
+    def func():
+        with T.Kernel(1, threads=128):
+            _bar = T.alloc_barrier(128)  # noqa: F841
+
+    body = _apply_barrier_pass(func)
+
+    assert len(_collect_calls(body, "tl.tang_fence_barrier_init")) == 1
+    # 旧的 backend-neutral 名字不应再出现:产生点已经改用 TANG 拼写。
     assert _collect_calls(body, "tl.ptx_fence_barrier_init") == []
 
 

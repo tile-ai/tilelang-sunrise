@@ -16,6 +16,7 @@ from tilelang.utils.tensor import (
 from tilelang.engine.param import KernelParam
 from tilelang.jit.adapter import BaseKernelAdapter
 from tilelang.profiler.bench import do_bench
+from tilelang.utils import device as device_utils
 from tvm import tirx
 
 
@@ -257,7 +258,7 @@ class Profiler:
         n_warmup: int = 0,
         n_repeat: int = 0,
         input_tensors: list[torch.Tensor] = None,
-        backend: Literal["event", "cupti", "cudagraph"] = "event",
+        backend: Literal["event", "cupti", "cudagraph", "perf_counter", "wall", "msprof", "msprof_detail"] = "event",
         quantiles: list[float] | None = None,
         return_mode: Literal["min", "max", "mean", "median"] = "mean",
         dynamic_symbolic_constraints: dict[str, int] | None = None,
@@ -272,12 +273,15 @@ class Profiler:
             rep: Number of repetitions for timing
             n_warmup: Number of warmup iterations
             n_repeat: Number of timing iterations
-            backend: Which profiling backend to use - "event", "cupti", or "cudagraph"
+            backend: Timing backend - "event", "cupti", "cudagraph", "perf_counter", "wall", "msprof", or "msprof_detail"
             input_tensors: Optional pre-generated input tensors
             dynamic_symbolic_constraints: Optional dict mapping dynamic symbolic variable
                 names to concrete int values. Use this when benchmarking kernels with
                 dynamic shapes, e.g., {"m": 2048, "n": 1024}
-            device: Optional CUDA device to benchmark on.
+            device: Optional device to benchmark on. MPS and NPU support "event" and
+                "wall"; CPU requires "wall". PTPU uses the current device for None
+                and treats integer indices as PTPU devices, including for "wall".
+                Pass an explicit CPU device for host-only wall timing.
 
         Returns:
             float: Average execution time in milliseconds
@@ -309,7 +313,12 @@ class Profiler:
                 early_stop_baseline=early_stop_baseline,
             )
 
-        if device is None:
+        if device_utils.IS_PTPU and (device is None or isinstance(device, int)):
+            device = torch.device("ptpu", torch.ptpu.current_device() if device is None else device)
+        if device is not None and not isinstance(device, int) and torch.device(device).type in ("npu", "ptpu"):
+            with getattr(torch, torch.device(device).type).device(device):
+                return run_bench()
+        if device is None or (not isinstance(device, int) and torch.device(device).type != "cuda"):
             return run_bench()
         with torch.cuda.device(device):
             return run_bench()

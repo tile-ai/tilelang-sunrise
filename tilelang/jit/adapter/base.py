@@ -59,15 +59,26 @@ class BaseKernelAdapter(ABC):
 
     # --- Common helpers to align with PyTorch stream/device semantics ---
     @staticmethod
-    def get_current_stream_functor() -> Callable[[], int]:
-        """Return a callable that reads Torch's current accelerator stream pointer.
+    def get_current_stream_functor(device: torch.device | None = None) -> Callable[[], int]:
+        """Return a callable that reads Torch's current device stream pointer.
 
-        The returned lambda yields the raw PTPU or CUDA stream handle of the
-        current PyTorch stream on the active device. It's a thunk (evaluated at
-        call time) so that any upstream stream guards are respected. If neither
-        accelerator is available, it returns a lambda that yields 0.
+        The returned lambda yields the raw stream handle of the current
+        PyTorch stream on the active device. It's a thunk (evaluated at call
+        time) so that any upstream stream guards are respected. If no supported
+        device runtime is available, it returns a lambda that yields 0.
+        An explicit Torch device takes precedence over runtime auto-detection.
         """
-        if is_ptpu_available():
+        if device is None:
+            if is_ptpu_available():
+                device = torch.device("ptpu")
+            elif hasattr(torch, "npu") and torch.npu.is_available():
+                device = torch.device("npu")
+            elif torch.cuda.is_available():
+                device = torch.device("cuda")
+            else:
+                return lambda: 0
+
+        if device.type == "ptpu":
             # Use torch_ptpu._C.rt C APIs directly to avoid Python Stream wrapper
             # and .ptpu_stream property indirection.  int() ensures a plain Python
             # int regardless of the underlying C return type.
@@ -75,18 +86,31 @@ class BaseKernelAdapter(ABC):
 
             _ptpu_get_raw_stream = torch_ptpu._C.rt.get_raw_stream
             _ptpu_current_stream = torch_ptpu._C.rt.current_stream
-            _ptpu_current_device = torch.ptpu.current_device
+            _ptpu_current_device = torch.ptpu.current_device if device.index is None else lambda: device.index
             return lambda: int(_ptpu_get_raw_stream(_ptpu_current_stream(_ptpu_current_device())))
-        if torch.cuda.is_available():
+        if device.type == "npu":
+            current_device = torch.npu.current_device if device.index is None else lambda: device.index
+            # NOTE(chaofan): Mirror the CUDA branch: use the low-level raw-stream accessor.
+            # torch.npu.current_stream() internally probes
+            # torch.cuda.is_available(), which costs ~150us per call on a
+            # CUDA-less NPU host; the _C accessor avoids that.
+            try:
+                import torch_npu
+
+                get_npu_stream = torch_npu._C._npu_getCurrentRawStream
+                return lambda: int(get_npu_stream(current_device()))
+            except (ImportError, AttributeError):
+                return lambda: int(torch.npu.current_stream(device).npu_stream)
+        elif device.type == "cuda":
             try:
                 torch.cuda._lazy_init()
-                current_device = torch._C._cuda_getDevice
+                current_device = torch._C._cuda_getDevice if device.index is None else lambda: device.index
                 get_stream = torch._C._cuda_getCurrentRawStream
                 return lambda: get_stream(current_device())
             except Exception:
                 # Fallback to Python API if internal handles are unavailable
-                return lambda: int(torch.cuda.current_stream().cuda_stream)
-        # CPU or CUDA unavailable: no stream semantics
+                return lambda: int(torch.cuda.current_stream(device).cuda_stream)
+        # CPU or device unavailable: no stream semantics
         return lambda: 0
 
     @staticmethod
@@ -94,12 +118,14 @@ class BaseKernelAdapter(ABC):
         """Return a callable that yields Torch's current device.
 
         Similar to the stream functor, we capture a callable that, when called,
-        fetches the current PTPU or CUDA device according to PyTorch. If neither
+        fetches the current device according to PyTorch. If no supported
         accelerator is available, returns ``torch.device('cpu')``.
         """
         if is_ptpu_available():
             return lambda: torch.device("ptpu", torch.ptpu.current_device())
-        if torch.cuda.is_available():
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            return lambda: torch.device("npu", torch.npu.current_device())
+        elif torch.cuda.is_available():
             try:
                 torch.cuda._lazy_init()
                 current_device = torch._C._cuda_getDevice

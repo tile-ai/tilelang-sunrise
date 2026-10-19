@@ -9,7 +9,8 @@ from tilelang.backend.target import determine_target
 from tilelang.env import env
 from tilelang.cuda.target import target_is_cuda
 from tilelang.rocm.target import target_is_cdna, target_is_gfx950
-from tvm.testing.utils import requires_cuda, requires_package, requires_llvm, requires_metal, requires_rocm, _compose
+from tilelang.tang.target import target_is_stcu, target_is_stcuv2, target_is_tang
+from tvm.testing.utils import Feature, requires_cuda, requires_package, requires_llvm, requires_metal, requires_rocm, _compose
 
 from tilelang.utils.tensor import torch_assert_close as torch_assert_close
 from .perf_regression import process_func, regression
@@ -23,7 +24,16 @@ __all__ = [
     "requires_cdna",
     "requires_cuda_or_cdna",
     "requires_gfx950",
+    "requires_tang",
+    "requires_stcu",
+    "requires_stcuv2",
+    "is_tang_target",
+    "is_stcu_target",
+    "is_stcuv2_target",
+    "is_cuda_target",
     "main",
+    "ascend_backend_compiled",
+    "requires_ascend",
     "requires_cuda_compute_version",
     "process_func",
     "regression",
@@ -52,6 +62,151 @@ def _check_is_cuda_or_cdna() -> bool:
         return target_is_cuda(target) or target_is_cdna(target)
     except (ValueError, RuntimeError):
         return False
+
+
+def is_cuda_target() -> bool:
+    """Whether the default target resolves to a CUDA target.
+
+    See :func:`is_tang_target` for why the raw setting must not be inspected.
+    """
+    try:
+        target = determine_target(env.get_default_target(), return_object=True)
+        return target_is_cuda(target)
+    except (ValueError, RuntimeError):
+        return False
+
+
+def is_tang_target() -> bool:
+    """Whether the default target resolves to a TANG target.
+
+    Tests must not inspect ``env.get_default_target()`` directly: it returns the
+    raw setting, which is ``"auto"`` by default, so ``str(...).startswith("tang")``
+    silently reports False on a TANG box.
+    """
+    try:
+        target = determine_target(env.get_default_target(), return_object=True)
+        return target_is_tang(target)
+    except (ValueError, RuntimeError):
+        return False
+
+
+def requires_tang(func):
+    """Skip the test unless the default target resolves to TANG."""
+    marks = [
+        pytest.mark.skipif(
+            not is_tang_target(),
+            reason="Requires TANG target",
+        ),
+    ]
+    return _compose([func], marks)
+
+
+def _resolved_default_target():
+    """The target the current run mode compiles for (``None`` if unresolvable)."""
+    try:
+        return determine_target(env.get_default_target(), return_object=True)
+    except (ValueError, RuntimeError):
+        return None
+
+
+def is_stcu_target() -> bool:
+    """Whether the default target resolves to TANG S2 (``stcu``).
+
+    Which arch a run targets is a property of the run *mode*, not of the machine:
+    ``ci/run.sh --arch s3`` and ``ci/s3/test_s3.sh`` select ``stcuv2`` through
+    ``TILELANG_DEFAULT_TARGET``/``TANG_ARCH``, and the S2 entry keeps ``stcu``.
+    An arch-specific test should gate on this instead of pinning a target of its
+    own, so one test file serves both modes.
+    """
+    target = _resolved_default_target()
+    return target is not None and target_is_stcu(target)
+
+
+def is_stcuv2_target() -> bool:
+    """Whether the default target resolves to TANG S3 (``stcuv2``)."""
+    target = _resolved_default_target()
+    return target is not None and target_is_stcuv2(target)
+
+
+def requires_stcu(func):
+    """Skip the test unless the current run mode targets TANG S2 (``stcu``)."""
+    marks = [
+        pytest.mark.skipif(
+            not is_stcu_target(),
+            reason="Requires TANG S2 (stcu)",
+        ),
+    ]
+    return _compose([func], marks)
+
+
+def requires_stcuv2(func):
+    """Skip the test unless the current run mode targets TANG S3 (``stcuv2``).
+
+    Also carries the ``tang_s3`` marker (registered in ``pyproject.toml``). A CI
+    list entry can therefore select exactly the S3-only tests of a file:
+
+        testing/python/language/<file>.py -m tang_s3
+
+    That is how a file whose arch-agnostic cases are not triaged for S3 yet is
+    enlisted in the S3 list while only its S3-only cases run
+    (docs/s3_list_s3_only_selection_design.md). ``requires_stcu`` deliberately
+    has no counterpart marker: the S2 lists carry whole files today.
+    """
+    marks = [
+        pytest.mark.tang_s3,
+        pytest.mark.skipif(
+            not is_stcuv2_target(),
+            reason="Requires TANG S3 (stcuv2)",
+        ),
+    ]
+    return _compose([func], marks)
+
+
+def ascend_backend_compiled() -> bool:
+    """Whether this build includes the Ascend backend (USE_ASCEND).
+
+    The Ascend sources are gated behind USE_ASCEND, so a CUDA-only build has no
+    Ascend tile ops and no Ascend pass-config options. The pass-config key is the
+    cheapest reliable probe: it is registered from src/ascend.
+    """
+    try:
+        import tvm
+
+        from tilelang.transform import PassConfigKey
+
+        with tvm.transform.PassContext(config={PassConfigKey.TL_ENABLE_AUTO_SCHEDULE: True}):
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def _ascend_device_available() -> bool:
+    """Whether an Ascend NPU is usable on this machine."""
+    try:
+        from tilelang.ascend.target import check_ascend_availability
+
+        return check_ascend_availability()
+    except Exception:
+        return False
+
+
+# Registered on the same open registry as requires_cuda/requires_rocm: the
+# Feature constructor publishes itself into Feature._all_features, which is what
+# gives the `ascend` pytest marker, the compile/run split, and `-m ascend`.
+#
+# target_kind_enabled is deliberately unset. For CUDA/Metal/ROCm it gates on
+# TVM_TEST_TARGETS, whose default list has no ascend entry, so setting it would
+# skip every Ascend test unless that variable named ascend. target_kind_hardware
+# is unset too: it would call tvm.device("ascend").exist, and ascend is a
+# TileLang target kind, not a registered TVM runtime ("Unknown optional runtime
+# ascend"). Device availability is checked through torch_npu instead.
+requires_ascend = Feature(
+    "ascend",
+    "Ascend",
+    compile_time_check=ascend_backend_compiled,
+    run_time_check=_ascend_device_available,
+)
 
 
 def requires_cdna(func):

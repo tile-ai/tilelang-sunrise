@@ -3,8 +3,10 @@ from typing import Optional
 import tilelang.language as T
 import tilelang.testing
 import torch
+from tilelang.jit import JITKernel
 from tilelang.rocm.target import check_hip_availability
-import pytest
+
+STCUV2 = {"kind": "tang", "arch": "stcuv2"}
 
 
 def _check_tang_availability():
@@ -79,7 +81,6 @@ def _get_warp_group_idx_kernel(
     return warp_group_idx_kernel
 
 
-@tilelang.jit(out_idx=[-1])
 def _shuffle_elect_kernel(num_threads: int = 128, thread_extent: int = 64):
     @T.prim_func
     def shuffle_elect_kernel(A: T.Tensor((num_threads,), T.int32)):
@@ -146,7 +147,12 @@ def run_get_warp_group_idx(
 def run_shuffle_elect(num_threads: int = 128, thread_extent: int = 64):
     if thread_extent < 0:
         raise ValueError("thread_extent must be non-negative.")
-    kernel = _shuffle_elect_kernel(num_threads, thread_extent)
+    kernel = JITKernel(
+        _shuffle_elect_kernel(num_threads, thread_extent),
+        out_idx=[-1],
+        target=STCUV2,
+        execution_backend="simulator",
+    )
     A = kernel()
     print(kernel.get_kernel_source())
     print(A)
@@ -194,12 +200,16 @@ def test_get_warp_group_idx_custom():
     run_get_warp_group_idx(num_threads=512, warp_size=32, warps_per_group=5)
 
 
-@pytest.mark.skip(reason="S2 not support yet, TODO:")
+# The shuffle-elect kernel is stcuv2-only (upstream skipped it as "S2 not support
+# yet"), so these two only run in the S3 mode. The helper keeps asking for the
+# simulator backend explicitly: that is the backend the S3 mode provides for
+# stcuv2, and naming it keeps this file runnable without the mode switch.
+@tilelang.testing.requires_stcuv2
 def test_shuffle_elect_default():
     run_shuffle_elect(num_threads=256, thread_extent=64)
 
 
-@pytest.mark.skip(reason="S2 not support yet, TODO:")
+@tilelang.testing.requires_stcuv2
 def test_shuffle_elect_block_leader():
     run_shuffle_elect(num_threads=128, thread_extent=0)
 

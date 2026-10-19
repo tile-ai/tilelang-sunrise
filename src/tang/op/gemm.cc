@@ -4,6 +4,7 @@
  */
 
 #include "op/gemm.h"
+#include "op/gemm_blockscaled.h"
 #include "op/utils.h"
 #include "support/check.h"
 #include "tang/target_utils.h"
@@ -19,6 +20,7 @@ namespace {
 constexpr const char *kTangTMMA = "tang.tmma";
 constexpr const char *kTangWGMMA = "tang.wgmma";
 constexpr const char *kTangTCGEN5 = "tang.tcgen5";
+constexpr const char *kTangTCGEN5BlockScaled = "tang.tcgen5.blockscaled";
 
 std::pair<int, int> ComputeWarpPartition(const GemmWarpPolicyNode &policy,
                                          int M, int N, int block_size,
@@ -31,7 +33,7 @@ std::pair<int, int> ComputeWarpPartition(const GemmWarpPolicyNode &policy,
   int m_warp = 1;
   int n_warp = 1;
 
-  if (gemm_inst == kTangTCGEN5) {
+  if (gemm_inst == kTangTCGEN5 || gemm_inst == kTangTCGEN5BlockScaled) {
     policy.m_warp = 1;
     policy.n_warp = num_warps;
     return {1, num_warps};
@@ -123,9 +125,24 @@ String SelectInst(const GemmNode &op, int block_size, Target target) {
   return kTangTMMA;
 }
 
+String SelectBlockScaledInst(const GemmBlockScaled &op, int,
+                             const Target &target) {
+  ICHECK(TargetTangIsSTCUV2(target))
+      << "TANG block-scaled GEMM requires stcuv2";
+  ICHECK(IsSharedBuffer(op->a_) && IsSharedBuffer(op->b_))
+      << "TANG block-scaled GEMM requires shared A and B";
+  ICHECK(op->c_.scope() == "shared.tmem")
+      << "TANG block-scaled GEMM requires C in shared.tmem";
+  ICHECK(op->scaleWorkspaceRegion_.defined())
+      << "TANG block-scaled GEMM requires a scale_tmem workspace";
+  ICHECK(op->scaleWorkspaceRegion_->buffer.scope() == "shared.tmem")
+      << "TANG block-scaled GEMM requires scale_tmem in shared.tmem";
+  return kTangTCGEN5BlockScaled;
+}
+
 bool ReuseExistingSharedLayout(String gemm_inst) {
   ICHECK(gemm_inst == kTangTMMA || gemm_inst == kTangWGMMA ||
-         gemm_inst == kTangTCGEN5);
+         gemm_inst == kTangTCGEN5 || gemm_inst == kTangTCGEN5BlockScaled);
   return false;
 }
 
@@ -137,6 +154,8 @@ bool RegisterTangGemm() {
       ComputeWarpPartition,
       ReuseExistingSharedLayout,
   });
+  RegisterGemmBlockScaledImpl(GemmBlockScaledImpl{
+      "tang.GemmBlockScaled", TargetIsTang, SelectBlockScaledInst});
   return true;
 }
 

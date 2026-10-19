@@ -42,6 +42,8 @@ TANG_ONLY_NAMES = {
 # Names present in both facades, but re-bound by the TANG dialect. They do not
 # show up as a set difference, so they need to be pinned by identity.
 TANG_SHADOWED_NAMES = {
+    "gemm",
+    "gemm_blockscaled",
     "tcgen05_after_thread_sync",
     "tcgen05_before_thread_sync",
     # TANG adds a keyword-only warp_group_size (single-warp 32) that the CUDA
@@ -88,10 +90,37 @@ def test_tang_dialect_shares_the_common_surface():
     from tilelang.tang import language as T
 
     assert set(T.__all__) >= set(T_comm.__all__)
-    assert T.copy is T_comm.copy
+    assert T.copy is cuda_language.copy
+    for name in ("gemm", "gemm_blockscaled"):
+        assert getattr(T, name).__module__ == "tilelang.tang.language.gemm_op"
+        assert getattr(T, name) is not getattr(cuda_language, name)
     # Everything TANG does not override is the very same object as in CUDA.
     for name in set(cuda_language.__all__) - TANG_SHADOWED_NAMES:
         assert getattr(T, name) is getattr(cuda_language, name), name
+
+
+@pytest.mark.parametrize("kwargs", [{}, {"coalesced_width": 4}, {"annotations": {"coalesced_width": 4}}])
+@pytest.mark.parametrize("scalar", [False, True])
+def test_tang_copy_preserves_common_ir(kwargs, scalar):
+    from tilelang.tang import language as T
+    from tilelang import tvm
+    from tvm import tirx
+
+    src = tirx.decl_buffer((128,), "float32", name="src")
+    dst = tirx.decl_buffer((128,), "float32", name="dst", scope="shared")
+    if scalar:
+        src, dst = src[0], dst[0]
+    tvm.ir.assert_structural_equal(T.copy(src, dst, **kwargs), T_comm.copy(src, dst, **kwargs))
+
+
+def test_tang_copy_preserves_typed_hint_ir():
+    from tilelang.tang import language as T
+    from tilelang import tvm
+    from tvm import tirx
+
+    src = tirx.decl_buffer((128,), "float32", name="src")
+    dst = tirx.decl_buffer((128,), "float32", name="dst", scope="shared")
+    tvm.ir.assert_structural_equal(T.copy(src, dst, disable_tma=True), T_comm.copy(src, dst, annotations={"disable_tma": True}))
 
 
 @pytest.mark.parametrize("module_name", OTHER_DIALECT_MODULES)

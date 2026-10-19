@@ -235,6 +235,7 @@ def test_run_sh_propagates_report_failure_without_overwriting_test_failure(
     (project / "case.py").write_text("pass\n", encoding="utf-8")
     (ci_dir / "lib.sh").write_text(
         """\
+ci_apply_test_mode () { :; }
 ci_parse_list_into () {
     while IFS= read -r line; do
         CI_CMDS+=("true")

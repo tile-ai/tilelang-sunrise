@@ -242,7 +242,8 @@ public:
 
   void RunInferStep(int cur_infer_id, InferLevel level, bool update_queue,
                     LayoutMap &layout_map, const LayoutMap &strict_layout_map,
-                    std::deque<int> &q, std::vector<bool> &in_queue) {
+                    std::deque<int> &q, std::vector<bool> &in_queue,
+                    int candidate_vector_size_limit = 0) {
     auto num_infer = infer_list_.size();
 
     // Range check for cur_infer_id
@@ -282,7 +283,8 @@ public:
                                                   {},
                                                   bind_var_to_expr_,
                                                   false,
-                                                  strict_layout_map},
+                                                  strict_layout_map,
+                                                  candidate_vector_size_limit},
                                   level);
     } catch (const std::bad_optional_access &e) {
       LOG(FATAL) << "bad_optional_access while inferring layout for op "
@@ -315,17 +317,20 @@ public:
         for (const auto &sib : siblings) {
           if (sib.same_as(src_buffer))
             continue;
-          bool shapes_equal =
-              src_layout->InputShape().size() == sib->shape.size();
-          if (shapes_equal) {
-            for (size_t i = 0; i < src_layout->InputShape().size(); ++i) {
-              if (!analyzer_.CanProveEqual(src_layout->InputShape()[i],
-                                           sib->shape[i])) {
-                shapes_equal = false;
-                break;
-              }
-            }
-          }
+          // A layout does not have to span its whole buffer: an operator may
+          // describe just the sub-region it touches.  After
+          // InjectSoftwarePipeline multi-buffers a shared buffer to
+          // (num_stages, ...), for instance, the gemm operand layout still
+          // describes a single stage, so InputShape() is (block_M, block_K)
+          // while the buffer is (num_stages, block_M, block_K).  A sibling of
+          // the *same shape as the source buffer* is therefore the same view
+          // over the same storage and must take the layout verbatim -- testing
+          // InputShape() instead would try to reshape a per-stage layout onto
+          // the whole staged buffer and fail the element-count check.
+          bool same_view =
+              ShapesEqual(src_buffer->shape, sib->shape, &analyzer_);
+          bool shapes_equal = same_view || ShapesEqual(src_layout->InputShape(),
+                                                       sib->shape, &analyzer_);
           Layout target_layout =
               shapes_equal
                   ? src_layout
@@ -639,18 +644,13 @@ public:
         continue;
       for (const auto &buf : buffers) {
         if (!layout_map.count(buf)) {
+          // Same view over the same storage takes the layout verbatim; see the
+          // comment in propagate_alias for why InputShape() is not a valid
+          // stand-in for the representative buffer's shape.
           bool shapes_equal =
-              rep_layout.value()->InputShape().size() == buf->shape.size();
-          if (shapes_equal) {
-            for (size_t i = 0; i < rep_layout.value()->InputShape().size();
-                 ++i) {
-              if (!analyzer_.CanProveEqual(rep_layout.value()->InputShape()[i],
-                                           buf->shape[i])) {
-                shapes_equal = false;
-                break;
-              }
-            }
-          }
+              ShapesEqual(rep.value()->shape, buf->shape, &analyzer_) ||
+              ShapesEqual(rep_layout.value()->InputShape(), buf->shape,
+                          &analyzer_);
           Layout reshaped =
               shapes_equal
                   ? rep_layout.value()
@@ -1340,15 +1340,17 @@ private:
     LayoutMap layout_map;
     AttemptCost cost;
   };
-  std::optional<AttemptOutcome>
-  RunOneAttempt(int attempt_root, const std::vector<int> &members,
-                const LayoutMap &base_layout_map,
-                const LayoutMap &strict_layout_map,
-                const std::vector<std::pair<Buffer, Fragment>> &seed_layouts,
-                const LayoutCostModel &cost_model, std::deque<int> &q,
-                std::vector<bool> &in_queue) {
+  std::optional<AttemptOutcome> RunOneAttempt(
+      int attempt_root, const std::vector<int> &members,
+      const LayoutMap &base_layout_map, const LayoutMap &strict_layout_map,
+      const std::vector<std::pair<Buffer, Fragment>> &seed_layouts,
+      const LayoutCostModel &cost_model, int candidate_vector_size_limit = 0) {
     auto back_infer_list = BackupInferList();
     LayoutMap tmp_layout_map = base_layout_map;
+    // A failed attempt can leave pending propagation work. Keep both the
+    // queue and its membership flags local so no later attempt inherits it.
+    std::deque<int> q;
+    std::vector<bool> in_queue(infer_list_.size(), false);
     for (const auto &[buffer, fragment] : seed_layouts) {
       if (!tmp_layout_map.count(buffer)) {
         tmp_layout_map.Set(buffer, fragment);
@@ -1357,8 +1359,10 @@ private:
     bool ok = true;
     std::string failure;
     try {
+      // Only the root's first inference receives the candidate cap. Its
+      // solved layout is frozen; propagation and later visits use normal args.
       RunInferStep(attempt_root, InferLevel::kFree, true, tmp_layout_map,
-                   strict_layout_map, q, in_queue);
+                   strict_layout_map, q, in_queue, candidate_vector_size_limit);
       FinishInferQueue(InferLevel::kFree, tmp_layout_map, strict_layout_map, q,
                        in_queue);
       for (int other : members) {
@@ -1458,9 +1462,6 @@ private:
 
     // For each component, try each op as root, and determine the least
     // replicated one
-    std::deque<int> q;
-    std::vector<bool> in_queue(infer_list_.size(), false);
-
     std::unique_ptr<LayoutCostModel> cost_model =
         LayoutCostModel::Create(tl_config::LayoutCostModelName(), target_);
     DLOG(INFO) << "[InferInFreeMode] cost model: " << cost_model->Name();
@@ -1481,27 +1482,41 @@ private:
         best_infer_root = attempt_root;
       };
 
-      // Try each member as the root of inference for this component.
+      // Try the native plan first, then a scalar alternative at eligible
+      // reducer roots. Scalar ownership can avoid replicated accumulator
+      // slots; the existing cost model decides whether that is worthwhile.
       for (int attempt_infer_root : members) {
-        DLOG(INFO) << "----------------------- try root " << attempt_infer_root
-                   << " members " << members.size() << '\n';
-        auto outcome = RunOneAttempt(attempt_infer_root, members, layout_map,
-                                     strict_layout_map, /*seed_layouts=*/{},
-                                     *cost_model, q, in_queue);
-        if (!outcome) {
-          continue;
-        }
-        DLOG(INFO) << "[InferInFreeMode] attempt root " << attempt_infer_root
-                   << " cost model " << cost_model->Name()
-                   << " output: mem=" << outcome->cost.mem
-                   << " regs=" << outcome->cost.regs;
-        // Keep the cheapest attempt; ties resolve to the earliest root so
-        // the selection stays deterministic (and, with the cost model
-        // disabled, byte-identical to the legacy register ordering).
-        if (!has_best || outcome->cost.BetterThan(best_cost) ||
-            (!best_cost.BetterThan(outcome->cost) &&
-             attempt_infer_root < best_infer_root)) {
-          adopt(std::move(*outcome), attempt_infer_root);
+        const auto *loop = infer_list_[attempt_infer_root].as<ParallelOpNode>();
+        bool try_scalar =
+            cost_model->ExploreReducerScalarLayouts() && loop &&
+            loop->HasReducerUpdates() && !loop->GetLoopLayout().defined() &&
+            !loop->annotated_layout_unbound_.defined() &&
+            !loop->GetRoot()->annotations.count(attr::kCoalescedWidth);
+        for (int candidate_vector_size_limit : {0, 1}) {
+          if (candidate_vector_size_limit != 0 && !try_scalar) {
+            continue;
+          }
+          DLOG(INFO) << "----------------------- try root "
+                     << attempt_infer_root << " members " << members.size()
+                     << " candidate_vector_size_limit="
+                     << candidate_vector_size_limit << '\n';
+          auto outcome = RunOneAttempt(
+              attempt_infer_root, members, layout_map, strict_layout_map,
+              /*seed_layouts=*/{}, *cost_model, candidate_vector_size_limit);
+          if (!outcome) {
+            continue;
+          }
+          DLOG(INFO) << "[InferInFreeMode] attempt root " << attempt_infer_root
+                     << " cost model " << cost_model->Name()
+                     << " output: mem=" << outcome->cost.mem
+                     << " regs=" << outcome->cost.regs;
+          // Ties keep the earliest root and its native plan. The scalar
+          // alternative must improve the score to replace the same root.
+          if (!has_best || outcome->cost.BetterThan(best_cost) ||
+              (!best_cost.BetterThan(outcome->cost) &&
+               attempt_infer_root < best_infer_root)) {
+            adopt(std::move(*outcome), attempt_infer_root);
+          }
         }
       }
       if (!has_best) {
@@ -1519,9 +1534,8 @@ private:
         if (!seeds.empty()) {
           DLOG(INFO) << "[InferInFreeMode] all attempts failed; retrying with "
                      << "wide fallback dst layouts";
-          auto outcome =
-              RunOneAttempt(members.front(), members, layout_map,
-                            strict_layout_map, seeds, *cost_model, q, in_queue);
+          auto outcome = RunOneAttempt(members.front(), members, layout_map,
+                                       strict_layout_map, seeds, *cost_model);
           if (outcome) {
             adopt(std::move(*outcome), members.front());
           }

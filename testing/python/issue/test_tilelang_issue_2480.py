@@ -29,7 +29,7 @@ def test_runtime_int8_broadcast_to_32_lanes(dtype, torch_dtype, value):
     target = tilelang.env.get_default_target()
     kernel = tilelang.compile(main, target=target)
     if str(target).startswith("cuda"):
-        constructor = "make_ulonglong4" if dtype == "uint8" else "make_longlong4"
+        constructor = "tl::broadcast<ulonglong4>" if dtype == "uint8" else "tl::broadcast<longlong4>"
         assert constructor in kernel.get_kernel_source()
     src = torch.tensor([value], dtype=torch_dtype, device=device)
     out = torch.empty(LANES, dtype=torch_dtype, device=device)
@@ -58,7 +58,7 @@ def test_constant_int8_broadcast_to_32_lanes(dtype, torch_dtype, value):
     target = tilelang.env.get_default_target()
     kernel = tilelang.compile(main, target=target)
     if str(target).startswith("cuda"):
-        constructor = "make_ulonglong4" if dtype == "uint8" else "make_longlong4"
+        constructor = "tl::broadcast<ulonglong4>" if dtype == "uint8" else "tl::broadcast<longlong4>"
         assert constructor in kernel.get_kernel_source()
     out = torch.empty(LANES, dtype=torch_dtype, device=device)
     kernel(out)

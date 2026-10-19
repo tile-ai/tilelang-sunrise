@@ -21,6 +21,7 @@ from tilelang.backend.pass_pipeline.pipeline_utils import (
     should_enable_aggressive_merge,
     should_enable_hoist_copy_addresses,
     should_enable_race_check,
+    should_enable_tang_inject_tcgen05_fence,
     should_force_let_inline,
 )
 
@@ -73,6 +74,14 @@ def TANGPassPipelineBodyPrologue(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.CanonicalizeLegacyReducer()(mod)
     mod = tilelang.transform.VerifyReducerEpoch()(mod)
     mod = tilelang.transform.VerifyBufferInit()(mod)
+
+    # stcuv2 cannot accumulate a GEMM into registers, so a `T.alloc_fragment`
+    # accumulator is promoted to tensor memory here. It has to run before
+    # PipelinePlanning (the folded `clear_accum` predicate is built from the
+    # reduction loop var, which software pipelining is about to peel and
+    # reorder) and therefore also before LayoutInference, which is where the
+    # fragment layout would otherwise be fixed.
+    mod = pass_filter(tilelang.tang.transform.PromoteTmemAccumulator, S.STCUV2)()(mod)
 
     mod = tilelang.transform.IfStmtBinding()(mod)
     mod = tilelang.transform.PipelinePlanning()(mod)
@@ -179,10 +188,24 @@ def TANGPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     )(mod)
     mod = tilelang.transform.ThreadSync("shared")(mod)
     mod = tilelang.transform.ThreadSync("shared.dyn")(mod)
+    # Auto-inject the per-domain TCGEN05/TMEM fences at conservative handoff
+    # points (src/tang/transform/inject_tcgen05_fence.cc). Must run after
+    # ThreadSync so the tvm_storage_sync calls it wraps already exist. On by
+    # default for stcuv2, like the CUDA pipeline's unconditional
+    # InjectTcgen05Fence; opt out with tl.enable_tang_inject_tcgen05_fence=False.
+    if should_enable_tang_inject_tcgen05_fence(pass_ctx=pass_ctx):
+        mod = pass_filter(tilelang.tang.transform.InjectTcgen05Fence, S.STCUV2)()(mod)
     mod = tilelang.transform.MergeIfStmt()(mod)
     mod = pass_filter(tilelang.tang.transform.InjectPTSAsyncCopy, S.STCU)()(mod)
     if not should_disable_remove_redundant_syncs(pass_ctx=pass_ctx):
         mod = tilelang.transform.RemoveRedundantSyncs()(mod)
+    # Expand the fused TMEM->global drain into its loop nest in IR, so the code
+    # generator only prints statements (src/tang/transform/expand_tang_tmem_drain.cc).
+    # Deliberately late: after RemoveRedundantSyncs, so the MMA-publish barrier
+    # the drain needs (nwarps > 1) cannot be elided, and before MakePackedAPI,
+    # which is where the global buffer's flat store indices are still the ones
+    # the fused intrinsic carried.
+    mod = pass_filter(tilelang.tang.transform.ExpandTangTmemDrain, S.STCUV2)()(mod)
     mod = tilelang.transform.MakePackedAPI()(mod)
     mod = tilelang.transform.Simplify()(mod)
     mod = tilelang.transform.LowerDeviceKernelLaunch()(mod)

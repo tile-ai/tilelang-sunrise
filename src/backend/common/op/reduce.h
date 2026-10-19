@@ -202,6 +202,16 @@ inline void CheckAllReduceWidth(int reducing_threads, int scale,
       << "(threads / scale) to be a positive power of two, got "
       << logical_width << " (threads=" << reducing_threads
       << ", scale=" << scale << ")";
+  // The butterfly pairs thread t with t ^ (scale * k).  That only moves the
+  // reduce coordinate when the non-reduced part of the thread index occupies
+  // the bits below `scale`, i.e. when `scale` is itself a power of two.
+  // Otherwise the pairs straddle reduce groups (and replicas) and the result
+  // is silently wrong or reads outside the workspace.
+  ICHECK(tirx::is_const_power_of_two_integer(Integer(scale), &shift))
+      << op_name << ": XOR-butterfly AllReduce requires scale (the thread "
+      << "stride between consecutive reduce participants) to be a power of "
+      << "two, got " << scale << " (threads=" << reducing_threads
+      << "). Pad the non-reduced fragment extent to a power of two.";
 }
 
 inline PrimExpr MakeInitValue(const ReduceOpNode &op, int vsize = 1) {
@@ -636,6 +646,15 @@ inline PrimExpr MakeUpdate(const ReduceOpNode &op, PrimExpr dst_val,
 } // namespace reduce
 
 template <typename Impl> struct ReduceLowerer {
+  static DataType GetReductionDataType(const ReduceOpNode &op, Target) {
+    return op.dst->dtype;
+  }
+
+  static void CheckAllReduceWidth(int reducing_threads, int scale,
+                                  const char *op_name, Target) {
+    reduce::CheckAllReduceWidth(reducing_threads, scale, op_name);
+  }
+
   static Stmt LowerLocal(const ReduceOpNode &op, const Buffer &src_buffer,
                          const Buffer &dst_buffer,
                          const LowerArgs &lower_args) {
@@ -1019,8 +1038,8 @@ template <typename Impl> struct ReduceLowerer {
 
         for (const auto &thread_step : reduce_plan.thread_steps) {
           int reducing_threads = thread_step.ReducingThreads();
-          reduce::CheckAllReduceWidth(reducing_threads, thread_step.scale,
-                                      "tl.reduce");
+          Impl::CheckAllReduceWidth(reducing_threads, thread_step.scale,
+                                    "tl.reduce", lower_args.target);
           int block_threads =
               static_cast<int>(*as_const_int(lower_args.thread_bounds->extent));
           auto thread_offset = lower_args.thread_bounds->min;
@@ -1042,7 +1061,8 @@ template <typename Impl> struct ReduceLowerer {
                                   ? reduction_buffer->dtype.with_lanes(vsize)
                                   : reduction_buffer->dtype;
           PrimExpr workspace;
-          bool need_workspace = reducing_threads > 32;
+          bool need_workspace = Impl::AllReduceNeedsWorkspace(
+              reducing_threads, thread_step.scale, lower_args.target);
           if (need_workspace) {
             int ws_size = block_threads * eff_batch;
             workspace = lower_args.add_workspace(ws_size, ws_dtype);
@@ -1221,8 +1241,8 @@ template <typename Impl> struct ReduceLowerer {
 
       for (const auto &thread_step : reduce_plan.thread_steps) {
         int reducing_threads = thread_step.ReducingThreads();
-        reduce::CheckAllReduceWidth(reducing_threads, thread_step.scale,
-                                    "tl.reduce");
+        Impl::CheckAllReduceWidth(reducing_threads, thread_step.scale,
+                                  "tl.reduce", lower_args.target);
         auto thread_offset = lower_args.thread_bounds->min;
         PrimExpr all_threads = lower_args.thread_bounds->extent;
         if (reducing_threads > 32 &&
@@ -1238,87 +1258,97 @@ template <typename Impl> struct ReduceLowerer {
               thread_step.scale, thread_offset, all_threads, lower_args.target);
           Array<PrimExpr> thread_reduce_args = {
               StringImm(allreduce), BufferLoad(reduction_buffer, red_indices)};
-          if (reducing_threads > 32) {
-            // Raking layout (BlockRakingLayout<threads>) needs one padding
-            // slot every SEGMENT_LENGTH scalars when SEGMENT_LENGTH is even
-            // and > 2.
-            //
-            //   SEGMENT_LENGTH = ceil(reducing_threads / 32)
-            //   USE_PADDING = (SEGMENT_LENGTH is even && > 2) ? 1 : 0
-            //   RAKING_THREADS = ceil(reducing_threads / SEGMENT_LENGTH)
-            //   GRID_ELEMENTS = RAKING_THREADS * (SEGMENT_LENGTH + USE_PADDING)
-            //
-            // For reducing_threads=32:  GRID=32   (SEG=1)
-            // For reducing_threads=64:  GRID=64   (SEG=2)
-            // For reducing_threads=128: GRID=160  (SEG=4, +padding)
-            // For reducing_threads=256: GRID=288  (SEG=8, +padding)
-            int64_t extent_i = *as_const_int(lower_args.thread_bounds->extent);
-            int64_t groups =
-                (extent_i + reducing_threads - 1) / reducing_threads;
-            int64_t segment_length = (reducing_threads + 31) / 32;
-            int64_t use_padding =
-                (segment_length > 2 && segment_length % 2 == 0) ? 1 : 0;
-            int64_t raking_threads =
-                (reducing_threads + segment_length - 1) / segment_length;
-            int64_t grid_elements =
-                raking_threads * (segment_length + use_padding);
-            int64_t per_call_scalars = groups * grid_elements;
+          if (Impl::AllReduceNeedsWorkspace(reducing_threads, thread_step.scale,
+                                            lower_args.target)) {
+            if (!TargetIsTang(lower_args.target)) {
+              int workspace_size = static_cast<int>(
+                  *as_const_int(lower_args.thread_bounds->extent));
+              thread_reduce_args.push_back(lower_args.add_workspace(
+                  workspace_size, reduction_buffer->dtype));
+            } else {
+              // Raking layout (BlockRakingLayout<threads>) needs one padding
+              // slot every SEGMENT_LENGTH scalars when SEGMENT_LENGTH is even
+              // and > 2.
+              //
+              //   SEGMENT_LENGTH = ceil(reducing_threads / 32)
+              //   USE_PADDING = (SEGMENT_LENGTH is even && > 2) ? 1 : 0
+              //   RAKING_THREADS = ceil(reducing_threads / SEGMENT_LENGTH)
+              //   GRID_ELEMENTS = RAKING_THREADS * (SEGMENT_LENGTH +
+              //   USE_PADDING)
+              //
+              // For reducing_threads=32:  GRID=32   (SEG=1)
+              // For reducing_threads=64:  GRID=64   (SEG=2)
+              // For reducing_threads=128: GRID=160  (SEG=4, +padding)
+              // For reducing_threads=256: GRID=288  (SEG=8, +padding)
+              int64_t extent_i =
+                  *as_const_int(lower_args.thread_bounds->extent);
+              int64_t groups =
+                  (extent_i + reducing_threads - 1) / reducing_threads;
+              int64_t segment_length = (reducing_threads + 31) / 32;
+              int64_t use_padding =
+                  (segment_length > 2 && segment_length % 2 == 0) ? 1 : 0;
+              int64_t raking_threads =
+                  (reducing_threads + segment_length - 1) / segment_length;
+              int64_t grid_elements =
+                  raking_threads * (segment_length + use_padding);
+              int64_t per_call_scalars = groups * grid_elements;
 
-            // When the fragment has multiple rows (block_m > 1), each
-            // row's AllReduce call reuses the same shared-memory workspace
-            // region.  On TANG hardware, back-to-back raking writes to
-            // the same grid positions can produce incorrect results for
-            // consecutive calls.  Allocate two alternating workspace
-            // slices so consecutive rows never touch the same grid.
-            static constexpr int64_t kAlternatingSlices = 2;
-            int64_t num_rows = 1;
-            bool has_dynamic_non_reduce_dim = false;
-            for (size_t d = 0; d < src_buffer->shape.size(); ++d) {
-              if ((int)d != op.dim) {
-                auto val = as_const_int(src_buffer->shape[d]);
-                if (val) {
-                  num_rows *= *val;
-                } else {
-                  // Non-const extent on a non-reduction dimension: be
-                  // conservative and enable dual-slice to avoid silent
-                  // correctness bugs on TANG hardware.
-                  has_dynamic_non_reduce_dim = true;
+              // When the fragment has multiple rows (block_m > 1), each
+              // row's AllReduce call reuses the same shared-memory workspace
+              // region.  On TANG hardware, back-to-back raking writes to
+              // the same grid positions can produce incorrect results for
+              // consecutive calls.  Allocate two alternating workspace
+              // slices so consecutive rows never touch the same grid.
+              static constexpr int64_t kAlternatingSlices = 2;
+              int64_t num_rows = 1;
+              bool has_dynamic_non_reduce_dim = false;
+              for (size_t d = 0; d < src_buffer->shape.size(); ++d) {
+                if ((int)d != op.dim) {
+                  auto val = as_const_int(src_buffer->shape[d]);
+                  if (val) {
+                    num_rows *= *val;
+                  } else {
+                    // Non-const extent on a non-reduction dimension: be
+                    // conservative and enable dual-slice to avoid silent
+                    // correctness bugs on TANG hardware.
+                    has_dynamic_non_reduce_dim = true;
+                  }
                 }
               }
-            }
-            int64_t num_slices = (num_rows > 1 || has_dynamic_non_reduce_dim)
-                                     ? kAlternatingSlices
-                                     : (int64_t)1;
-            int64_t total_scalars = num_slices * per_call_scalars;
-            ICHECK(total_scalars <= std::numeric_limits<int>::max())
-                << "total_scalars exceeds int range for add_workspace";
+              int64_t num_slices = (num_rows > 1 || has_dynamic_non_reduce_dim)
+                                       ? kAlternatingSlices
+                                       : (int64_t)1;
+              int64_t total_scalars = num_slices * per_call_scalars;
+              ICHECK(total_scalars <= std::numeric_limits<int>::max())
+                  << "total_scalars exceeds int range for add_workspace";
 
-            PrimExpr workspace = lower_args.add_workspace(
-                static_cast<int>(total_scalars), reduction_buffer->dtype);
-            thread_reduce_args.push_back(workspace);
+              PrimExpr workspace = lower_args.add_workspace(
+                  static_cast<int>(total_scalars), reduction_buffer->dtype);
+              thread_reduce_args.push_back(workspace);
 
-            if (num_rows > 1 || has_dynamic_non_reduce_dim) {
-              ICHECK(per_call_scalars <= std::numeric_limits<int>::max())
-                  << "per_call_scalars exceeds int range";
-              ICHECK(num_slices <= std::numeric_limits<int>::max())
-                  << "num_slices exceeds int range";
-              PrimExpr per_row =
-                  IntImm(DataType::Int(32), static_cast<int>(per_call_scalars));
-              PrimExpr divisor =
-                  IntImm(DataType::Int(32), static_cast<int>(num_slices));
-              // red_indices = red_layout->Forward(dst_vars).  dst_vars lists
-              // the non-reduction dimensions in tensor order, and Forward
-              // preserves spatial index ordering, so red_indices.back() is
-              // always the last non-reduction dimension.  In the unrolled
-              // For nest (built from src_var_compressed[OutputDim-1]
-              // downward), the last non-reduction var is the innermost
-              // loop — the fastest-varying index across consecutive
-              // AllReduce calls.  indexmod(…, 2) therefore toggles every
-              // invocation.
-              ICHECK(!red_indices.empty())
-                  << "red_indices must be non-empty when num_rows > 1";
-              thread_reduce_args.push_back(
-                  FloorMod(red_indices.back(), divisor) * per_row);
+              if (num_rows > 1 || has_dynamic_non_reduce_dim) {
+                ICHECK(per_call_scalars <= std::numeric_limits<int>::max())
+                    << "per_call_scalars exceeds int range";
+                ICHECK(num_slices <= std::numeric_limits<int>::max())
+                    << "num_slices exceeds int range";
+                PrimExpr per_row = IntImm(DataType::Int(32),
+                                          static_cast<int>(per_call_scalars));
+                PrimExpr divisor =
+                    IntImm(DataType::Int(32), static_cast<int>(num_slices));
+                // red_indices = red_layout->Forward(dst_vars).  dst_vars lists
+                // the non-reduction dimensions in tensor order, and Forward
+                // preserves spatial index ordering, so red_indices.back() is
+                // always the last non-reduction dimension.  In the unrolled
+                // For nest (built from src_var_compressed[OutputDim-1]
+                // downward), the last non-reduction var is the innermost
+                // loop — the fastest-varying index across consecutive
+                // AllReduce calls.  indexmod(…, 2) therefore toggles every
+                // invocation.
+                ICHECK(!red_indices.empty())
+                    << "red_indices must be non-empty when num_rows > 1";
+                thread_reduce_args.push_back(
+                    FloorMod(red_indices.back(), divisor) * per_row);
+              }
             }
           }
           auto call = Call(reduction_buffer->dtype, builtin::call_extern(),

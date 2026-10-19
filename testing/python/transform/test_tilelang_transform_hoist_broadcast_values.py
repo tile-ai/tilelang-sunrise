@@ -10,7 +10,7 @@ from tilelang.backend.target import determine_target
 from tilelang.utils.device import get_current_device
 
 _FLOAT8_E8M0FNU = getattr(torch, "float8_e8m0fnu", None)
-_IS_TANG_TARGET = str(tilelang.env.get_default_target()).startswith("tang")
+_IS_TANG_TARGET = tilelang.testing.is_tang_target()
 
 
 @tilelang.jit

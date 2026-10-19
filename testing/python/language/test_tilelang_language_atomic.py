@@ -1136,30 +1136,51 @@ def run_tile_atomic_min(K, M, N, block_M, block_N, dtype=T.float32):
     _assert_close(B, ref_B, atol=1e-3, rtol=1e-3)
 
 
-@tilelang.jit
 def tile_atomic_max_expr_program(M, N, block_M, block_N, dtype=T.float32):
     @T.prim_func
-    def atomic_max(A: T.Tensor((M, N), dtype)):
+    def atomic_max(A: T.Tensor((M, N), dtype), C: T.Tensor((M, N), dtype)):
         with T.Kernel(T.ceildiv(M, block_M), T.ceildiv(N, block_N), threads=32) as (bx, by):
-            T.atomic_max(A[bx * block_M : (bx + 1) * block_M, by * block_N : (by + 1) * block_N], 0.5)
+            # The ISS simulator models in/out buffers separately (an output
+            # buffer is freshly allocated by the adapter), so the in-place
+            # original (atomic_max on A) is expressed as C = A then
+            # atomic_max(C, 0.5) == max(A, 0.5).
+            T.copy(
+                A[bx * block_M : (bx + 1) * block_M, by * block_N : (by + 1) * block_N],
+                C[bx * block_M : (bx + 1) * block_M, by * block_N : (by + 1) * block_N],
+            )
+            T.atomic_max(
+                C[bx * block_M : (bx + 1) * block_M, by * block_N : (by + 1) * block_N],
+                0.5,
+            )
 
     return atomic_max
 
 
 def run_tile_atomic_max_expr(M, N, block_M, block_N, dtype=T.float32):
-    kernel = _compile_for_test(tile_atomic_max_expr_program, M, N, block_M, block_N, dtype=dtype)
-    import torch
+    from tilelang.jit import JITKernel
+
+    # stcuv2-only: S2/stcu has no float* atomicMax overload (the stcu clang header
+    # declares unsigned int/int/long only), which is why upstream skipped this
+    # test with "S2 atomicMax has no float* overload (int/uint only)". The ISS
+    # simulator models in/out buffers separately, hence the out-of-place
+    # C = A then atomic_max(C, 0.5) form.
+    kernel = JITKernel(
+        tile_atomic_max_expr_program(M, N, block_M, block_N, dtype=dtype),
+        out_idx=[-1],
+        target={"kind": "tang", "arch": "stcuv2"},
+        execution_backend="simulator",
+    )
 
     def ref_program(A):
         for i in range(M):
             for j in range(N):
                 A[i, j] = max(A[i, j], 0.5)
 
-    A = torch.randn(M, N, dtype=torch.float32).to(_test_device())
+    A = torch.randn(M, N, dtype=torch.float32)
     ref_A = A.clone()
     ref_program(ref_A)
-    kernel(A)
-    _assert_close(A, ref_A, atol=1e-3, rtol=1e-3)
+    C = kernel(A.ptpu())
+    torch.testing.assert_close(C.cpu(), ref_A, atol=1e-3, rtol=1e-3)
 
 
 def test_tile_atomic_max():
@@ -1170,7 +1191,7 @@ def test_tile_atomic_min():
     run_tile_atomic_min(8, 128, 128, 32, 32, dtype=T.int32)
 
 
-@pytest.mark.skip(reason="S2 atomicMax has no float* overload (int/uint only)")
+@tilelang.testing.requires_stcuv2
 def test_tile_atomic_max_expr():
     run_tile_atomic_max_expr(128, 128, 32, 32)
 
@@ -1422,6 +1443,43 @@ def test_atomic_add_contended_bf16():
     # bf16 is the dtype whose pre-SM80 add is a CAS loop; float32 contention is
     # already covered by the multi-block test_atomic_add above.
     run_atomic_add_contended(128, 128, T.bfloat16)
+    # With more elements than threads the loop vectorizes; the shared constant
+    # destination must stay scalar instead of widening to AtomicAddx2.
+    run_atomic_add_contended(256, 128, T.bfloat16)
+
+
+@tilelang.jit
+def atomic_add_fp32_shared_sm90_program(N, threads):
+    @T.prim_func
+    def atomic_add_fp32_shared_sm90(A: T.Tensor((N,), T.float32), Out: T.Tensor((N,), T.float32)):
+        with T.Kernel(1, threads=threads):
+            shared = T.alloc_shared((N,), T.float32)
+            for i in T.Parallel(N):
+                shared[i] = T.float32(0)
+            for i in T.Parallel(N):
+                T.atomic_add(shared[i], A[i])
+            for i in T.Parallel(N):
+                Out[i] = shared[i]
+
+    return atomic_add_fp32_shared_sm90
+
+
+@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version_ge(9, 0)
+def test_atomic_add_fp32_shared_stays_scalar_on_sm90():
+    n = 256
+    kernel = atomic_add_fp32_shared_sm90_program(n, 128)
+    source = kernel.get_kernel_source()
+
+    assert "AtomicAdd(" in source
+    assert "AtomicAddx2(" not in source
+    assert "AtomicAddx4(" not in source
+
+    a = torch.arange(n, dtype=torch.float32, device="cuda")
+    out = torch.empty_like(a)
+    kernel(a, out)
+
+    torch.testing.assert_close(out, a, atol=0, rtol=0)
 
 
 @tilelang.jit(target={"kind": "cuda", "arch": "sm_75"})
@@ -1461,6 +1519,202 @@ def test_atomic_add_bf16_compiles_for_sm75():
         "AtomicAddx4Ret(",
     ):
         assert helper in source, f"{helper} not exercised by the sm_75 kernel"
+
+
+# ======================= Invariant atomic destination =======================
+
+_INV_N = 64
+_INV_EXTENT = 8
+
+
+def _invariant_index(which, i):
+    if which == 0:  # contiguous, aligned
+        return i
+    if which == 1:  # contiguous with an even base
+        return i + 2
+    if which == 2:  # invariant within the 2-lane boundary
+        return i // 2
+    if which == 3:  # invariant, aligned base
+        return (i // 2) * 2
+    if which == 4:  # constant destination
+        return 0
+    if which == 5:  # invariant, odd base
+        return (i // 2) * 2 + 1
+    if which == 6:  # two-periodic: agrees on lanes 0/1, repeats at width 4
+        return i % 2
+    raise ValueError(f"unknown case {which}")
+
+
+# (which, dtype, max_width): bound on the vector width the destination may use.
+# A destination with a valid contiguous run of k elements bounds at k (4 is the
+# widest any target emits), so the assertion is target independent.
+_INVARIANT_CASES = [
+    (0, T.float16, 4),  # B[i]
+    (1, T.float16, 4),  # B[i+2]
+    (2, T.float16, 1),  # B[i//2]
+    (3, T.float16, 1),  # B[(i//2)*2]
+    (4, T.float16, 1),  # B[0]
+    (5, T.float16, 1),  # B[(i//2)*2+1]
+    (6, T.float32, 2),  # B[i%2]: only lanes 0/1 form a valid run
+]
+
+
+@tilelang.jit
+def atomic_add_invariant_program(which, dtype=T.float16):
+    @T.prim_func
+    def atomic_add_invariant(A: T.Tensor((_INV_EXTENT,), dtype), B: T.Tensor((_INV_N,), dtype)):
+        with T.Kernel(1, threads=1) as _:
+            A_local = T.alloc_fragment((_INV_EXTENT,), dtype)
+            for i in T.Parallel(_INV_EXTENT):
+                A_local[i] = A[i]
+            for i in T.Parallel(_INV_EXTENT):
+                T.atomic_add(B[_invariant_index(which, i)], A_local[i])
+
+    return atomic_add_invariant
+
+
+@tilelang.jit
+def atomic_add_invariant_shared_program(dtype=T.float16):
+    @T.prim_func
+    def atomic_add_invariant_shared(A: T.Tensor((_INV_EXTENT,), dtype), B: T.Tensor((_INV_N,), dtype)):
+        with T.Kernel(1, threads=1) as _:
+            A_local = T.alloc_fragment((_INV_EXTENT,), dtype)
+            B_shared = T.alloc_shared((_INV_N,), dtype)
+            for i in T.Parallel(_INV_N):
+                B_shared[i] = B[i]
+            for i in T.Parallel(_INV_EXTENT):
+                A_local[i] = A[i]
+            for i in T.Parallel(_INV_EXTENT):
+                T.atomic_add(B_shared[i // 2], A_local[i])
+            for i in T.Parallel(_INV_N):
+                B[i] = B_shared[i]
+
+    return atomic_add_invariant_shared
+
+
+@tilelang.jit
+def atomic_add_invariant_memory_order_program(dtype=T.float16):
+    @T.prim_func
+    def atomic_add_invariant_memory_order(A: T.Tensor((_INV_EXTENT,), dtype), B: T.Tensor((_INV_N,), dtype)):
+        with T.Kernel(1, threads=1) as _:
+            A_local = T.alloc_fragment((_INV_EXTENT,), dtype)
+            for i in T.Parallel(_INV_EXTENT):
+                A_local[i] = A[i]
+            for i in T.Parallel(_INV_EXTENT):
+                T.atomic_add(B[i // 2], A_local[i], memory_order="relaxed")
+
+    return atomic_add_invariant_memory_order
+
+
+def _invariant_reference(which, a):
+    ref = torch.zeros(_INV_N, dtype=a.dtype, device=a.device)
+    for i in range(_INV_EXTENT):
+        ref[_invariant_index(which, i)] += a[i]
+    return ref
+
+
+@pytest.mark.parametrize(
+    "target,which,dtype,max_width",
+    [
+        pytest.param("cuda", *case, marks=tilelang.testing.requires_cuda.marks())
+        for case in _INVARIANT_CASES + [(2, T.float32, 1), (5, T.float32, 1)]
+    ]
+    + [
+        pytest.param(
+            "tang",
+            which,
+            T.float32,
+            max_width,
+            marks=pytest.mark.skipif(not tilelang.testing.is_tang_target(), reason="Requires TANG target"),
+        )
+        for which, _, max_width in _INVARIANT_CASES
+    ],
+)
+def test_atomic_add_invariant_destination(target, which, dtype, max_width):
+    # TANG atomicAdd supports fp32/i32/u32; keep CUDA's fp16 cases above.
+    atomic_add_invariant_program.target = determine_target(target, return_object=True)
+    kernel = atomic_add_invariant_program(which, dtype)
+    widths = [int(w) for w in re.findall(r"AtomicAddx(\d)", kernel.get_kernel_source())]
+    assert all(w <= max_width for w in widths), (which, widths, max_width)
+    device = _test_device() if target == "tang" else "cuda"
+    a = torch.arange(1, _INV_EXTENT + 1, dtype=getattr(torch, dtype), device=device)
+    b = torch.zeros(_INV_N, dtype=getattr(torch, dtype), device=device)
+    kernel(a, b)
+    _assert_close(b, _invariant_reference(which, a.cpu()), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "target,dtype",
+    [
+        pytest.param("cuda", T.float16, marks=tilelang.testing.requires_cuda.marks()),
+        pytest.param(
+            "tang",
+            T.float32,
+            marks=pytest.mark.skipif(not tilelang.testing.is_tang_target(), reason="Requires TANG target"),
+        ),
+    ],
+)
+@pytest.mark.parametrize("program", [atomic_add_invariant_shared_program, atomic_add_invariant_memory_order_program])
+def test_atomic_add_invariant_shared_and_memory_order(program, target, dtype):
+    device = _test_device() if target == "tang" else "cuda"
+    a = torch.arange(1, _INV_EXTENT + 1, dtype=getattr(torch, dtype), device=device)
+    program.target = determine_target(target, return_object=True)
+    kernel = program(dtype)
+    assert "AtomicAddx" not in kernel.get_kernel_source()
+    b = torch.zeros(_INV_N, dtype=getattr(torch, dtype), device=device)
+    kernel(a, b)
+    _assert_close(b, _invariant_reference(2, a.cpu()), atol=0, rtol=0)
+
+
+@tilelang.jit
+def atomic_add_dynamic_rows_program(indirect):
+    rows = T.dynamic("rows")
+
+    @T.prim_func
+    def main(A: T.Tensor((4, 256), T.bfloat16), B: T.Tensor((rows, 256), T.float32), indices: T.Tensor((4,), T.int64)):
+        with T.Kernel(1, threads=128):
+            values = T.alloc_fragment((4, 256), T.float32)
+            for i, j in T.Parallel(4, 256):
+                values[i, j] = A[i, j]
+                if indirect:
+                    T.atomic_add(B[indices[i], j], values[i, j])
+                else:
+                    T.atomic_add(B[i, j], values[i, j])
+
+    return main
+
+
+@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version_ge(9, 0)
+@pytest.mark.parametrize("indirect", [False, True])
+def test_atomic_add_dynamic_rows_keep_x4(indirect):
+    """Dynamic/indirect row offsets need int64 arithmetic but retain x4 lanes."""
+    kernel = atomic_add_dynamic_rows_program(indirect)
+    assert "AtomicAddx4" in kernel.get_kernel_source()
+    a = torch.randint(1, 5, (4, 256), device="cuda").to(torch.bfloat16)
+    b = torch.zeros((8, 256), dtype=torch.float32, device="cuda")
+    indices = torch.tensor([0, 1, 0, 1], dtype=torch.int64, device="cuda")
+    kernel(a, b, indices)
+    ref = torch.zeros_like(b)
+    ref.index_add_(0, indices if indirect else torch.arange(4, device="cuda"), a.float())
+    torch.testing.assert_close(b, ref, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("surface", ["default", "common", "tang"])
+@pytest.mark.parametrize("return_prev", [False, True])
+def test_unsigned_scalar_atomic_add_preserves_abi(surface, return_prev):
+    """The legacy unsigned keyword must keep its scalar extern ABI on each facade."""
+    from tilelang.language import common
+    from tilelang.tang import language as tang
+    from tvm import tirx
+
+    atomic_add = {"default": T.atomic_add, "common": common.atomic_add, "tang": tang.atomic_add}[surface]
+    destination = tirx.decl_buffer((1,), "uint32", name="U")
+    call = atomic_add(tirx.BufferLoad(destination, [0]), tirx.const(1, "uint32"), uint_atomic=True, return_prev=return_prev)
+    assert call.op.name == "tirx.call_extern"
+    assert call.args[0].value == "atomicAddUint"
+    assert call.args[1].buffer.same_as(destination)
+    assert call.dtype == ("uint32" if return_prev else "handle")
 
 
 if __name__ == "__main__":
