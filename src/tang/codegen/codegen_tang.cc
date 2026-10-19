@@ -5,6 +5,7 @@
 #include "codegen_tang.h"
 #include "backend/common/codegen/codegen_utils.h"
 #include "support/check.h"
+#include "tang/op/builtin.h"
 #include "tang/target_utils.h"
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/function.h>
@@ -12,6 +13,7 @@
 #include <tvm/s_tir/stmt.h>
 #include <tvm/tirx/index_map.h>
 #include <tvm/tirx/op.h>
+#include <tvm/tirx/op_attr_types.h>
 
 #include <cassert>
 #include <cmath>
@@ -28,6 +30,11 @@
 namespace tvm {
 namespace codegen {
 using namespace ffi;
+
+// Reuse the common expansion after vectorization, including NaN propagation
+// and single evaluation of all three operands.
+TVM_REGISTER_OP("tl.clamp")
+    .set_attr<tirx::FLowerIntrinsic>("tang.FLowerIntrinsic", tl::LowerClamp);
 
 struct TANGMath {
   std::string operator()(DataType t, std::string name) const {
@@ -548,6 +555,10 @@ public:
   std::unordered_set<const tirx::VarNode *> used_in_atomic_add_;
 };
 
+namespace {
+
+// Each backend has its own extractor. Keep this visitor's vtable and inline
+// methods local so the linker cannot substitute the HIP/CUDA implementation.
 class LaunchConfigExtractor : public tirx::StmtVisitor {
 private:
   void VisitStmt_(const AttrStmtNode *op) final {
@@ -578,7 +589,24 @@ public:
   int64_t min_blocks_per_sm = 1;
 };
 
+} // namespace
+
 void CodeGenTileLangTANG::PrintExtraAttrs(const PrimFunc &f) {
+  // Cluster dims: emit __cluster_dims__(x, y, z) so ptcc records the
+  // "tang-cluster-dims" function attribute, which the ISS cluster launch
+  // path consumes (kernel_cfg.in keys: is_explicit_cluster,
+  // cluster_nctaid.{x,y,z}, ...). The macro expands to
+  // __attribute__((Tcluster_dims(x, y, z))) — see
+  // LLVM clang/lib/Headers/__clang_tang_runtime_wrapper.h and
+  // clang/test/CodeGenTang/cluster_dim.t.
+  if (auto opt = f->GetAttr<ffi::Array<Integer>>("cluster_dims")) {
+    auto dims = opt.value();
+    ICHECK_EQ(dims.size(), 3U) << "cluster_dims must have 3 elements";
+    stream << " __cluster_dims__(" << Downcast<Integer>(dims[0])->value << ", "
+           << Downcast<Integer>(dims[1])->value << ", "
+           << Downcast<Integer>(dims[2])->value << ")";
+  }
+
   LaunchConfigExtractor extractor;
   extractor(f->body);
   arith::Analyzer analyzer;
@@ -664,6 +692,14 @@ std::string CodeGenTileLangTANG::Finish() {
 
   if (need_barrier_h_) {
     decl_stream << "#include <tl_templates/tang/barrier.h>\n";
+  }
+
+  if (need_cluster_h_) {
+    // Cluster arrive/wait/sync + block_rank_in_cluster wrappers.
+    // The header uses native TANG cluster asm aligned with the LLVM dev_12599
+    // backend: sync.all/arrive/wait.bkcls plus
+    // __stvm_read_sreg_cluster_ctarank().
+    decl_stream << "#include <tl_templates/tang/cluster.h>\n";
   }
 
   if (need_global_barrier_) {
@@ -1113,21 +1149,24 @@ void CodeGenTileLangTANG::PrintVecElemLoad(const std::string &vec, DataType t,
       std::string ac = vec + "." + access[i / 8];
       os << "((" << type_name << ")(" << ac << " >> " << i % 8 * 8 << "))";
     }
-  } else if (t.is_float16()) {
-    if (t.lanes() <= 8) {
-      os << "((half2*)(&(" << vec << "." << access[i / 2] << ")))->"
-         << access[i % 2];
-    } else {
-      os << "(((half2*)(&(" << vec << "." << access[i / 4] << "))) + "
-         << (i / 2 % 2) << ")->" << access[i % 2];
+  } else if (t.is_float16() || t.is_bfloat16()) {
+    if (t.is_bfloat16()) {
+      enable_bf16_ = true;
     }
-  } else if (t.is_bfloat16()) {
-    enable_bf16_ = true;
+    // Lane extraction takes the carrier's address; broadcasts may be rvalues.
+    std::string packed = vec;
+    if (!name_supply_->ContainsName(vec)) {
+      packed = name_supply_->FreshName("packed_");
+      PrintIndent();
+      PrintType(t, stream);
+      stream << ' ' << packed << " = " << vec << ";\n";
+    }
+    const char *pair_type = t.is_float16() ? "half2" : "__tang_bfloat162";
     if (t.lanes() <= 8) {
-      os << "((__tang_bfloat162*)(&(" << vec << "." << access[i / 2] << ")))->"
-         << access[i % 2];
+      os << "((" << pair_type << "*)(&(" << packed << "." << access[i / 2]
+         << ")))->" << access[i % 2];
     } else {
-      os << "(((__tang_bfloat162*)(&(" << vec << "." << access[i / 4]
+      os << "(((" << pair_type << "*)(&(" << packed << "." << access[i / 4]
          << "))) + " << (i / 2 % 2) << ")->" << access[i % 2];
     }
   } else if (t.is_float8()) {
@@ -1321,7 +1360,8 @@ void CodeGenTileLangTANG::PrintStorageScope(const std::string &scope,
       << "Cannot allocate global memory when targeting TANG. You must pass "
          "all global arrays as input instead";
   if (scope == "shared" || scope == "shared.barrier" ||
-      scope == "shared.tmem" || scope == "shared.tmem_addr") {
+      scope == "shared.tmem" || scope == "shared.tmem_addr" ||
+      scope == "shared.cluster_barrier") {
     os << "__shared__ ";
   } else if (scope == "shared.dyn") {
     Target cur_target = Target::Current(/*allow_not_defined=*/true);
@@ -2390,6 +2430,12 @@ void CodeGenTileLangTANG::PrintVecStore(const BufferNode *buffer, DataType t,
  *            member stream instead).
  */
 void CodeGenTileLangTANG::VisitExpr_(const CallNode *op, std::ostream &os) {
+  if (op->op.same_as(builtin::bitwise_not()) && op->dtype.is_bool()) {
+    ICHECK_EQ(op->args.size(), 1U);
+    // Integer promotion of ~bool produces -1/-2 rather than a boolean value.
+    PrintExpr(Not(op->args[0]), os);
+    return;
+  }
   auto print_extern_call_stmt = [&](std::string name, size_t start = 0,
                                     size_t end = 0) {
     // Cache context into a private ss, otherwise the let node may generate
@@ -3193,7 +3239,13 @@ void CodeGenTileLangTANG::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->PrintIndent();
     this->stream << "(" << print_mbarrier_ptr(op->args[0])
                  << ")->arrive_on_tc_fence();\n";
-  } else if (op->op.same_as(tl::ptx_fence_barrier_init())) {
+  } else if (op->op.same_as(tl::tang_fence_barrier_init()) ||
+             op->op.same_as(tl::ptx_fence_barrier_init())) {
+    // TANG-dialect spelling first (what src/tang/transform/lower_shared_barrier
+    // .cc emits), then the backend-neutral ptx_* alias, so kernels written
+    // against the CUDA-style primitive still compile on stcuv2. Both lower to
+    // the same device helper, matching how tang_deallocate_tensor_memory
+    // accepts ptx_deallocate_tensor_memory as an alias.
     need_barrier_h_ = true;
     print_extern_call_stmt("tl::fence_barrier_init");
   } else if (op->op.same_as(tl::mbarrier_expect_tx())) {
@@ -3305,6 +3357,43 @@ void CodeGenTileLangTANG::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->PrintIndent();
     // this->stream << "cooperative_groups::this_grid().sync();\n";
     this->stream << "sync_grids(&bar0);\n";
+  } else if (op->op.same_as(tl::cluster_arrive_relaxed())) {
+    // Thread block cluster (SM90+ semantics). The Op is device-agnostic; the
+    // codegen contract is to emit the tl:: wrapper and pull in the header on
+    // demand. cluster.h uses native TANG asm (sync.*.bkcls) aligned with the
+    // LLVM dev_12599 backend.
+    need_cluster_h_ = true;
+    this->PrintIndent();
+    this->stream << "tl::cluster_arrive_relaxed();\n";
+  } else if (op->op.same_as(tl::cluster_arrive())) {
+    need_cluster_h_ = true;
+    this->PrintIndent();
+    this->stream << "tl::cluster_arrive();\n";
+  } else if (op->op.same_as(tl::cluster_wait())) {
+    need_cluster_h_ = true;
+    this->PrintIndent();
+    this->stream << "tl::cluster_wait();\n";
+  } else if (op->op.same_as(tl::cluster_sync())) {
+    need_cluster_h_ = true;
+    this->PrintIndent();
+    this->stream << "tl::cluster_sync();\n";
+  } else if (op->op.same_as(tl::block_rank_in_cluster())) {
+    // Expression form — write into ``os`` (the caller's expression stream),
+    // not into ``stream``.
+    need_cluster_h_ = true;
+    os << "tl::block_rank_in_cluster()";
+  } else if (op->op.same_as(tl::ptx_cluster_store())) {
+    // Element-wise SM-to-SM cluster copy (the fallback path for
+    // T.copy_cluster(dst_block=...)). Emits a DSM store into the peer CTA's
+    // shared memory via tl::cluster_store (mapa.shared.cluster + st.shared).
+    // args: (buffer, value, dst_block, index).
+    need_cluster_h_ = true;
+    ICHECK_EQ(op->args.size(), 4U) << "ptx_cluster_store requires 4 args";
+    this->PrintIndent();
+    this->stream << "tl::cluster_store(&" << this->PrintExpr(op->args[0]) << "["
+                 << this->PrintExpr(op->args[3]) << "], "
+                 << "(int)(" << this->PrintExpr(op->args[2]) << "), "
+                 << this->PrintExpr(op->args[1]) << ");\n";
   } else if (op->op.same_as(tl::sync_warp())) {
     this->PrintIndent();
     this->stream << "__syncwarp(";
@@ -3641,148 +3730,20 @@ void CodeGenTileLangTANG::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->stream << "tang::ptx::fence_ldt();\n";
   } else if (op->op.same_as(tl::tang_tmem_drain_16x256b_to_global())) {
     // TANG stcuv2 TMEM→global drain.
-    // args: [tmem_base_val, global_access_ptr, BM, BN, out_dtype_zero, nwarps,
-    //        N_tile]. N_tile (optional, default 128) is the per-block
-    //        accumulator column count; a tile wider than the 128-column ldt
-    //        chunk (e.g. a single block with N=256) is drained in 128-column
-    //        blocks. BN remains the GLOBAL row stride.
-    ICHECK(op->args.size() == 6U || op->args.size() == 7U)
-        << "tang_tmem_drain_16x256b_to_global expects 6 or 7 arguments";
-    std::string tmem_base = this->PrintExpr(op->args[0]);
-    std::string global_ref = this->PrintExpr(op->args[1]);
-    int BM = Downcast<IntImm>(op->args[2])->value;
-    int BN = Downcast<IntImm>(op->args[3])->value;
-    int nwarps = Downcast<IntImm>(op->args[5])->value;
-    int N_tile =
-        op->args.size() == 7U ? Downcast<IntImm>(op->args[6])->value : 128;
-    if (N_tile < 128)
-      N_tile = 128;
-    if (nwarps < 1)
-      nwarps = 1;
-    // arg[4] is a typed zero carrying the TMEM accumulator's element type.
-    // Reinterpret each word ldt returns as that type; the store then
-    // narrows/converts to whatever the C buffer holds.
     //
-    // A 16-bit accumulator (tFP16/tBF16) keeps one element per 32-bit word, in
-    // the word's low half, so reinterpreting the word's first two bytes reads
-    // it -- no unpacking needed. Reading such a word as `float` instead gives a
-    // denormal, which then flushes to zero on the way into a 16-bit C: the
-    // whole tile silently comes out empty.
-    const DataType acc_dt = op->args[4].dtype();
-    std::string acc_ty;
-    if (acc_dt.is_int() || acc_dt.is_uint()) {
-      acc_ty = "int32_t";
-    } else if (acc_dt.is_float16()) {
-      acc_ty = "__fp16";
-    } else if (acc_dt.is_bfloat16()) {
-      acc_ty = "__bf16";
-    } else {
-      acc_ty = "float";
-    }
-    need_tcgen05_common_h_ = true;
-    // The drain covers the standard 128-column TMEM accumulator tile: 16 chunks
-    // of 8 columns each (ldt_16x256b_x16), 4 registers per chunk. (Per-block
-    // tiles narrower than 128 columns are a separate unsupported
-    // configuration.) Generate step-16 warp-collective drain loop. The BM/16
-    // row-strips are round-robin distributed across the block's `nwarps` warps
-    // so every warp participates in the writeback (multi-warp drain, matching
-    // the golden reference's multi-drain-warp epilogue). Each ldt_16x256b_x16
-    // is a warp-collective load of one 16-row strip; warp `_w` handles strips
-    // _w, _w+nwarps, _w+2*nwarps, ... :
-    //   uint32_t _out[64];
-    //   int _w = ((int)threadIdx.x) / 32;
-    //   if (_w < nwarps) {
-    //     uint32_t _tid = __laneid();
-    //     for (int _r = _w*16; _r < BM; _r += nwarps*16) {
-    //       ldt_16x256b_x16(_out, C_tmem[0] + ((_r << 16) | 0));
-    //       fence_ldt();
-    //       for (int _c = 0; _c < 16; ++_c) {
-    //         4 stores per _c: C[(_r+tid/4)*BN+...] =
-    //         reinterpret_cast<float>(_out[...])
-    //       }
-    //     }
-    //   }
-    // The names above are illustrative: every temporary is drawn from the
-    // codegen's name supply. A drain nested in a user loop shares that loop's
-    // scope, so a hard-coded name would shadow the loop variable -- and the
-    // drain's own base offset is an expression in exactly that variable (the
-    // batch index of a per-batch GEMM), so it would silently re-bind to the
-    // drain's row counter and every trip would address the wrong tile.
-    // Multi-warp drain requires a block barrier first: the async tcgen05 MMA is
-    // issued (and fenced with fence_tc) by warp 0 ONLY, so only warp 0 observes
-    // the accumulator completion. Warps 1..nwarps-1 never synchronized with the
-    // MMA and would read stale/garbage TMEM. A __syncthreads() after warp 0's
-    // fence_tc publishes the finished accumulator to every draining warp
-    // (mirrors the golden reference's sync_arrive/sync_wait producer->consumer
-    // handshake). Single-warp drain (nwarps==1, warp 0) needs no extra barrier.
-    if (nwarps > 1) {
-      this->PrintIndent();
-      this->stream << "__syncthreads();\n";
-    }
-    const std::string v_out = name_supply_->FreshName("_out");
-    const std::string v_w = name_supply_->FreshName("_w");
-    const std::string v_tid = name_supply_->FreshName("_tid");
-    const std::string v_r = name_supply_->FreshName("_r");
-    const std::string v_cb = name_supply_->FreshName("_cb");
-    const std::string v_c = name_supply_->FreshName("_c");
-    this->PrintIndent();
-    this->stream << "uint32_t " << v_out << "[64];\n";
-    this->PrintIndent();
-    this->stream << "int " << v_w << " = ((int)threadIdx.x) / 32;\n";
-    this->PrintIndent();
-    this->stream << "if (" << v_w << " < " << nwarps << ") {\n";
-    int scope1 = BeginScope();
-    this->PrintIndent();
-    this->stream << "uint32_t " << v_tid << " = __laneid();\n";
-    this->PrintIndent();
-    this->stream << "for (int " << v_r << " = " << v_w << "*16; " << v_r
-                 << " < " << BM << "; " << v_r << " += " << (nwarps * 16)
-                 << ") {\n";
-    int scope2 = BeginScope();
-    // Column-block loop: each ldt_16x256b_x16 drains 128 fp32 columns; a wider
-    // per-block tile (N_tile > 128) is written 128 columns at a time. This is
-    // the TMEM/global column base; for N_tile == 128 the loop runs once at 0
-    // and is byte-identical to the single-chunk drain.
-    this->PrintIndent();
-    this->stream << "for (int " << v_cb << " = 0; " << v_cb << " < " << N_tile
-                 << "; " << v_cb << " += 128) {\n";
-    int scope_cb = BeginScope();
-    this->PrintIndent();
-    this->stream << "ldt_16x256b_x16(" << v_out << ", " << tmem_base << " + (("
-                 << v_r << " << 16) | " << v_cb << "));\n";
-    this->PrintIndent();
-    this->stream << "tang::ptx::fence_ldt();\n";
-    this->PrintIndent();
-    this->stream << "for (int " << v_c << " = 0; " << v_c << " < 16; ++" << v_c
-                 << ") {\n";
-    int scope3 = BeginScope();
-    const std::string row = "(" + v_r + "+" + v_tid + "/4)*";
-    const std::string row8 = "(" + v_r + "+" + v_tid + "/4+8)*";
-    const std::string col = v_cb + "+8*" + v_c + "+(" + v_tid + "%4)*2";
-    this->PrintIndent();
-    this->stream << global_ref << "[" << row << BN << " + " << col << "] = "
-                 << "reinterpret_cast<" << acc_ty << "&>(" << v_out << "[4*"
-                 << v_c << "]);\n";
-    this->PrintIndent();
-    this->stream << global_ref << "[" << row << BN << " + " << col << "+1] = "
-                 << "reinterpret_cast<" << acc_ty << "&>(" << v_out << "[4*"
-                 << v_c << "+1]);\n";
-    this->PrintIndent();
-    this->stream << global_ref << "[" << row8 << BN << " + " << col << "] = "
-                 << "reinterpret_cast<" << acc_ty << "&>(" << v_out << "[4*"
-                 << v_c << "+2]);\n";
-    this->PrintIndent();
-    this->stream << global_ref << "[" << row8 << BN << " + " << col << "+1] = "
-                 << "reinterpret_cast<" << acc_ty << "&>(" << v_out << "[4*"
-                 << v_c << "+3]);\n";
-    this->EndScope(scope3);
-    this->stream << "}\n";
-    this->EndScope(scope_cb);
-    this->stream << "}\n";
-    this->EndScope(scope2);
-    this->stream << "}\n";
-    this->EndScope(scope1);
-    this->stream << "}\n";
+    // The drain used to be expanded here (warp split, 16-row strip loop,
+    // warp-collective `ldt_16x256b_x16` + `fence_ldt()`, per-lane stores, and
+    // the MMA-publish `__syncthreads()` a multi-warp writeback needs). That
+    // geometry is now ordinary TIR, produced by
+    // `tl.tang.transform.ExpandTangTmemDrain`
+    // (src/tang/transform/expand_tang_tmem_drain.cc), so the generator only
+    // prints statements. Reaching this point means the pass did not run -- for
+    // example because a caller assembled the TANG pipeline without it.
+    ICHECK(false)
+        << "the fused TMEM->global drain (tang_tmem_drain_16x256b_to_global) "
+           "must be expanded by tl.tang.transform.ExpandTangTmemDrain before "
+           "code generation; it reached the TANG code generator, so the pass "
+           "did not run";
   } else if (op->op.same_as(tl::tang_tmem_st())) {
     // TANG stcuv2 TMEM store: stt_32x32b_xN(in, taddr)
     // args: [in_ref, taddr, num_elements]
@@ -4283,8 +4244,21 @@ void CodeGenTileLangTANG::VisitStmt_(const AttrStmtNode *op) {
     ICHECK(!func_name.empty() && panel_size > 0)
         << "threadblock_swizzle_pattern: failed to extract func_name and "
            "panel_size";
-    this->stream << "const dim3 blockIdx = tl::" << func_name << "<"
-                 << panel_size << ">();\n";
+    if (cluster_dims_.has_value()) {
+      auto [cluster_grid_x_ext, cluster_grid_y_ext, cluster_grid_z_ext] =
+          cluster_dims_.value();
+      ICHECK(cluster_grid_y_ext == 1 && cluster_grid_z_ext == 1)
+          << "Only support annotate threadblock swizzle for cluster on X "
+             "dimension for now!";
+      ICHECK(panel_size % cluster_grid_x_ext == 0)
+          << "panel_size must be divisible by clusterDim.x";
+      this->stream << "const dim3 blockIdx = tl::" << func_name
+                   << "WithCluster<" << panel_size / cluster_grid_x_ext << ", "
+                   << cluster_grid_x_ext << ">();\n";
+    } else {
+      this->stream << "const dim3 blockIdx = tl::" << func_name << "<"
+                   << panel_size << ">();\n";
+    }
     this->VisitStmt(op->body);
     return;
   } else if (op->attr_key == tirx::attr::storage_alignment) {
@@ -4403,7 +4377,11 @@ void CodeGenTileLangTANG::VisitStmt_(const AllocBufferNode *op) {
     if (scope == "shared" || scope == "shared.tmem" ||
         scope == "shared.tmem_addr") {
       stream << ' ' << vid << '[' << constant_size << "];\n";
-    } else if (scope == "shared.barrier") {
+    } else if (scope == "shared.barrier" || scope == "shared.cluster_barrier") {
+      // A cluster barrier is the same mbarrier array as a plain shared
+      // barrier at the storage-declaration level; the difference is only
+      // in the sync scope (``storage_sync("cluster")`` vs ``"shared"``),
+      // which lower_shared_barrier handles.
       need_barrier_h_ = true;
       auto v_id_mem = vid + "_mem";
       stream << ' ' << v_id_mem << "[" << constant_size << "];\n";
@@ -4429,6 +4407,23 @@ void CodeGenTileLangTANG::VisitStmt_(const AllocBufferNode *op) {
   }
 
   RegisterHandleType(op->buffer->data.get(), alloc_dtype);
+}
+
+void CodeGenTileLangTANG::VisitStmt_(const AssertStmtNode *op) {
+  // AssertStmt in a device kernel must not emit the inherited host error ABI.
+  std::string condition = PrintExpr(op->condition);
+  PrintIndent();
+  if (op->message_parts.empty()) {
+    stream << "device_assert(" << condition << ");\n";
+    return;
+  }
+  std::string message;
+  for (const auto &part : op->message_parts) {
+    message += part->value;
+  }
+  stream << "device_assert_with_msg(" << condition << ", ";
+  PrintEscapedCString(message, stream);
+  stream << ");\n";
 }
 
 void CodeGenTileLangTANG::VisitStmt_(const EvaluateNode *op) {
@@ -4591,8 +4586,9 @@ void CodeGenTileLangTANG::VisitExpr_(const BroadcastNode *op,
       for (int i = 0; i < lanes / 4; ++i) {
         if (i != 0)
           os << ", ";
-        os << "tl::pack_float16x4(" << v << ", " << v << ", " << v << ", " << v
-           << ")";
+        os << "((unsigned long long)__pack_half2(" << v << ", " << v
+           << ") | ((unsigned long long)__pack_half2(" << v << ", " << v
+           << ") << 32))";
       }
     }
     os << ')';
@@ -4614,8 +4610,9 @@ void CodeGenTileLangTANG::VisitExpr_(const BroadcastNode *op,
       for (int i = 0; i < lanes / 4; ++i) {
         if (i != 0)
           os << ", ";
-        os << "tl::pack_bfloat16x4(" << v << ", " << v << ", " << v << ", " << v
-           << ")";
+        os << "((unsigned long long)__pack_bfloat162(" << v << ", " << v
+           << ") | ((unsigned long long)__pack_bfloat162(" << v << ", " << v
+           << ") << 32))";
       }
     }
     os << ')';
@@ -4695,8 +4692,34 @@ void CodeGenTileLangTANG::VisitExpr_(const BroadcastNode *op,
 
 void CodeGenTileLangTANG::VisitExpr_(const ShuffleNode *op,
                                      std::ostream &os) { // NOLINT(*)
+  Array<PrimExpr> vectors = op->vectors;
+  Array<Var> temporaries;
+  for (size_t i = 0; i < vectors.size(); ++i) {
+    const PrimExpr &vector = vectors[i];
+    DataType dtype = vector.dtype();
+    if (!dtype.is_scalar() && (dtype.is_float16() || dtype.is_bfloat16()) &&
+        !vector.as<VarNode>()) {
+      std::string value = PrintExpr(vector);
+      Var temporary("packed_", dtype);
+      std::string name = AllocVarID(temporary.get());
+      PrintIndent();
+      PrintType(dtype, stream);
+      stream << ' ' << name << " = " << value << ";\n";
+      temporaries.push_back(temporary);
+      vectors.Set(i, temporary);
+    }
+  }
+  if (!temporaries.empty()) {
+    // Evaluate each packed source once per Shuffle, never across stores.
+    Shuffle materialized(vectors, op->indices);
+    VisitExpr_(materialized.get(), os);
+    for (const Var &temporary : temporaries) {
+      var_idmap_.erase(temporary.get());
+    }
+    return;
+  }
   if ((op->dtype.is_float16() || op->dtype.is_bfloat16()) &&
-      op->dtype.lanes() == 2 && op->indices.size() == 2) {
+      !op->dtype.is_scalar()) {
     std::vector<std::string> concat_vec;
     for (const PrimExpr &vec : op->vectors) {
       std::string vec_value = PrintExpr(vec);
@@ -4711,18 +4734,39 @@ void CodeGenTileLangTANG::VisitExpr_(const ShuffleNode *op,
       }
     }
 
-    os << "make_uint1(";
-    os << (op->dtype.is_bfloat16() ? "__pack_bfloat162(" : "__pack_half2(");
-    for (size_t i = 0; i < op->indices.size(); ++i) {
-      ICHECK(op->indices[i]->IsInstance<IntImmNode>())
-          << "TANG vector construction requires constant Shuffle indices";
-      int64_t index = Downcast<IntImm>(op->indices[i])->value;
-      ICHECK_LT(index, concat_vec.size());
+    // The carrier constructor takes packed words, not one argument per lane.
+    const int pack_lanes = op->dtype.lanes() <= 8 ? 2 : 4;
+    ICHECK_EQ(op->indices.size() % pack_lanes, 0U);
+    PrintVecConstructor(op->dtype, os);
+    os << '(';
+    for (size_t i = 0; i < op->indices.size(); i += pack_lanes) {
       if (i != 0)
         os << ", ";
-      os << concat_vec[index];
+      if (pack_lanes == 2) {
+        os << (op->dtype.is_bfloat16() ? "__pack_bfloat162(" : "__pack_half2(");
+      } else {
+        os << "((unsigned long long)"
+           << (op->dtype.is_bfloat16() ? "__pack_bfloat162(" : "__pack_half2(");
+      }
+      for (int lane = 0; lane < pack_lanes; ++lane) {
+        const PrimExpr &selected = op->indices[i + lane];
+        ICHECK(selected->IsInstance<IntImmNode>())
+            << "TANG vector construction requires constant Shuffle indices";
+        int64_t index = Downcast<IntImm>(selected)->value;
+        ICHECK_GE(index, 0);
+        ICHECK_LT(index, concat_vec.size());
+        if (lane == 2) {
+          os << ") | ((unsigned long long)"
+             << (op->dtype.is_bfloat16() ? "__pack_bfloat162("
+                                         : "__pack_half2(");
+        } else if (lane != 0) {
+          os << ", ";
+        }
+        os << concat_vec[index];
+      }
+      os << (pack_lanes == 2 ? ")" : ") << 32))");
     }
-    os << "))";
+    os << ')';
     return;
   }
 
@@ -4783,6 +4827,26 @@ inline void PrintConst(const FloatImmNode *op, std::ostream &os,
   }
   // Type code is kFloat8_e5m2 or kE4M4Float
   if (op->dtype.is_float8() || op->dtype.is_float4()) {
+    const bool is_inf = std::isinf(op->value);
+    if (is_inf || std::isnan(op->value)) {
+      // The finite path below formats the value as a hex float literal, which
+      // produces `inff` / `nanf` for non-finite values -- neither is a valid
+      // identifier, so ptcc rejects the kernel. Build the value through the
+      // vendor conversion instead, with saturation disabled so an infinity is
+      // preserved rather than clamped to MAXNORM (see from_float_nosat in
+      // tl_templates/tang/tang_fp8.h).
+      ICHECK(op->dtype.is_float8())
+          << "TANG codegen: " << op->dtype
+          << " has no infinity or NaN encoding, cannot emit " << op->value;
+      p->PrintType(op->dtype, os);
+      os << "::from_float_nosat(";
+      if (is_inf && op->value < 0) {
+        os << "-";
+      }
+      os << (is_inf ? "TANG_RT_INF_F" : "TANG_RT_NAN_F") << ')';
+      p->need___clang_tang_builtin_vars_h = true;
+      return;
+    }
     p->PrintType(op->dtype, os);
     os << '(' << std::hexfloat << op->value << 'f';
     os << "/*" << std::scientific << op->value << "*/";
@@ -4794,14 +4858,19 @@ inline void PrintConst(const FloatImmNode *op, std::ostream &os,
   case 64:
   case 32: {
     std::ostringstream temp;
+    // The vendor header only defines the float spellings of the non-finite
+    // helpers (TANG_RT_INF_F / TANG_RT_NAN_F) -- there is no 64-bit variant --
+    // so a double context widens the float macro rather than emitting a name
+    // that does not exist.
+    const bool is_f32 = op->dtype.bits() == 32;
     if (std::isinf(op->value)) {
       if (op->value < 0) {
         temp << "-";
       }
-      temp << ((op->dtype.bits() == 32) ? "TANG_RT_INF_F" : "TANG_RT_INF");
+      temp << (is_f32 ? "TANG_RT_INF_F" : "((double)TANG_RT_INF_F)");
       p->need___clang_tang_builtin_vars_h = true;
     } else if (std::isnan(op->value)) {
-      temp << ((op->dtype.bits() == 32) ? "TANG_RT_NAN_F" : "TANG_RT_NAN");
+      temp << (is_f32 ? "TANG_RT_NAN_F" : "((double)TANG_RT_NAN_F)");
       p->need___clang_tang_builtin_vars_h = true;
     } else {
       temp << std::hexfloat << op->value;
@@ -5114,6 +5183,7 @@ void CodeGenTileLangTANG::InitFuncState(const PrimFunc &f) {
   tang_random_generator_state_.clear();
   tang_random_generator_state_type_.clear();
   alloc_storage_alignment_.clear();
+  cluster_dims_.reset();
 }
 
 void CodeGenTileLangTANG::AddFunction(const GlobalVar &gvar,
@@ -5163,6 +5233,18 @@ void CodeGenTileLangTANG::AddFunction(const GlobalVar &gvar,
   this->PrintFuncPrefix(stream);
   CodeGenC::PrintType(f->ret_type, stream);
   this->PrintExtraAttrs(f);
+
+  // Record cluster dimensions for use in the threadblock swizzle codegen
+  // (mirrors CodeGenTileLangCUDA::AddFunction).
+  if (auto opt = f->GetAttr<ffi::Array<Integer>>("cluster_dims")) {
+    auto dims = opt.value();
+    ICHECK_EQ(dims.size(), 3U) << "cluster_dims must have 3 elements";
+    cluster_dims_ = std::make_tuple(Downcast<Integer>(dims[0])->value,
+                                    Downcast<Integer>(dims[1])->value,
+                                    Downcast<Integer>(dims[2])->value);
+  } else {
+    cluster_dims_ = std::nullopt;
+  }
 
   this->stream << " " << static_cast<std::string>(global_symbol.value()) << "(";
 

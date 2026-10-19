@@ -74,6 +74,7 @@ tileops_test:
       changes:
         paths:
           - "tileops/**/*"
+          - "src/tileops/**/*"
           - "workloads/**/*"
           - "benchmarks/**/*"
           - "tests/**/*"
@@ -81,6 +82,7 @@ tileops_test:
           - "pyproject.toml"
           - "ci/**/*"
           - "ci_test_case_list_tileops.txt"
+          - "ci_test_case_list_tileops_timeouts.tsv"
           - ".gitlab-ci.yml"
     - if: ($CI_PIPELINE_SOURCE == "schedule")
     - if: ($CI_PIPELINE_SOURCE == "web")

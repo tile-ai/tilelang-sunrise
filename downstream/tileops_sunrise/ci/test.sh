@@ -44,6 +44,11 @@ pip install pytest-xdist pyyaml
 }
 
 time {
-ci_run_test_list "$TILEOPS_HOME/ci_test_case_list_tileops.txt" pytest
+PYTHONPATH="$TILEOPS_HOME:$TILELANG_CI_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+PYTEST_AUDIT_PLUGIN_ARGS="${PYTEST_AUDIT_PLUGIN_ARGS:+$PYTEST_AUDIT_PLUGIN_ARGS }-p pytest_node_audit" \
+PYTEST_NODE_AUDIT_SOURCE_ROOT="$TILEOPS_HOME" \
+PYTEST_NODE_AUDIT_SUITE=tileops \
+PYTEST_NODE_AUDIT_PATH="$TILEOPS_HOME/ci_failure_reports/tileops-pytest.jsonl" \
+    ci_run_test_list "$TILEOPS_HOME/ci_test_case_list_tileops.txt" pytest
 }
 exit $?

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from tilelang import language as T
 from tilelang.layout import Fragment, Layout
-from tilelang.tileop.gemm.gemm_base import GemmBase
+from tilelang.tang.op.gemm.gemm_base import TangGemmBase
 from tilelang.transform.simplify import _Simplify
 from tvm import tirx
 from tvm.ir import Range
@@ -226,7 +226,7 @@ def _make_tang_ab_layout_padded(
     )
 
 
-class GemmTMMA(GemmBase):
+class GemmTMMA(TangGemmBase):
     """Lower STCU TMMA template calls."""
 
     def _warp_partition(self, target: Target, thread_nums: int) -> tuple[int, int]:
@@ -237,6 +237,34 @@ class GemmTMMA(GemmBase):
             target,
             GEMM_INST_TMMA,
         )
+
+    def _shared_operand_offset(self, region, is_a: bool, transposed: bool) -> int:
+        name = "A" if is_a else "B"
+        element_bits = region.buffer.dtype.bits
+        continuous = _as_const_int(region.buffer.shape[-1], f"{name} column extent")
+        row_origin = _as_const_int(region.region[-2].min, f"{name} row origin")
+        offset = _as_const_int(region.region[-1].min, f"{name} offset")
+        value_width = 128 // element_bits
+        c_extent = value_width if is_a else 8
+        r_extent = 8 if is_a else value_width
+        rows, cols = (c_extent, r_extent) if transposed else (r_extent, c_extent)
+        if row_origin % rows != 0 or (row_origin != 0 and (continuous % cols != 0 or offset % cols != 0)):
+            raise ValueError(
+                f"TANG TMMA {name} row origin {row_origin} requires an aligned {rows}x{cols} shared atom; "
+                f"column extent={continuous}, column origin={offset}"
+            )
+        if offset == 0:
+            return 0
+        if continuous % cols != 0 or offset % cols != 0:
+            return offset
+        has_padding = element_bits == 16 and (element_bits * continuous) % 256 == 0
+        per_tile_pad = has_padding and (self.M == self.K if is_a else self.K == self.N)
+        # A physical pointer origin is safe only if the padded mapping is additive.
+        # Whole atom rows preserve the phase; columns must preserve it for row padding.
+        tile_origin = (offset // cols) * rows * cols
+        if has_padding and not per_tile_pad and tile_origin % continuous != 0:
+            return offset
+        return 0
 
     def infer_layout(self, target: Target, thread_nums: int):
         m_warps, n_warps = self._warp_partition(target, thread_nums)
@@ -259,12 +287,13 @@ class GemmTMMA(GemmBase):
                 self.C.dtype.bits,
             )
         }
+        # Use parent layouts only where a physical origin preserves the padding phase.
         if self.A.scope() in ("shared", "shared.dyn"):
             layouts[self.A] = _make_tang_ab_layout_padded(
                 _as_const_int(self.A.shape[-2], "A row extent"),
                 _as_const_int(self.A.shape[-1], "A column extent"),
                 self.A.dtype.bits,
-                _as_const_int(self.offset_A, "A offset"),
+                self._shared_operand_offset(self.ARegion, True, self.trans_A),
                 True,
                 self.trans_A,
                 gemm_m,
@@ -277,7 +306,7 @@ class GemmTMMA(GemmBase):
                 _as_const_int(self.B.shape[-2], "B row extent"),
                 _as_const_int(self.B.shape[-1], "B column extent"),
                 self.B.dtype.bits,
-                _as_const_int(self.offset_B, "B offset"),
+                self._shared_operand_offset(self.BRegion, False, self.trans_B),
                 False,
                 self.trans_B,
                 gemm_m,
@@ -312,8 +341,11 @@ class GemmTMMA(GemmBase):
         # k-loop and skip T.clear; the flag reaches GemmTensorOp as its last
         # template argument, where the zeroing happens.
         clear_accum = _as_const_int(self.clear_accum, "clear_accum") != 0
-        offset_a = _as_const_int(self.offset_A, "A offset")
-        offset_b = _as_const_int(self.offset_B, "B offset")
+        a_shared = self.A.scope() in ("shared", "shared.dyn")
+        b_shared = self.B.scope() in ("shared", "shared.dyn")
+        # Legacy column origins stay in the template; additive origins stay in access_ptr.
+        offset_a = self._shared_operand_offset(self.ARegion, True, self.trans_A) if a_shared else _as_const_int(self.offset_A, "A offset")
+        offset_b = self._shared_operand_offset(self.BRegion, False, self.trans_B) if b_shared else _as_const_int(self.offset_B, "B offset")
         k_pack = _as_const_int(self.k_pack if self.k_pack is not None else 1, "k_pack")
         if k_pack != 1:
             raise ValueError(f"TANG STCU TMMA does not support k_pack={k_pack}; only k_pack=1")
@@ -338,13 +370,13 @@ class GemmTMMA(GemmBase):
             self.ARegion,
             "r",
             extent=self.ARegion.region[-2].extent * self.ARegion.region[-1].extent,
-            ignore_last_ndim=2,
+            ignore_last_ndim=(1 if offset_a else 0) if a_shared else 2,
         )
         b_ptr = T.access_ptr(
             self.BRegion,
             "r",
             extent=self.BRegion.region[-2].extent * self.BRegion.region[-1].extent,
-            ignore_last_ndim=2,
+            ignore_last_ndim=(1 if offset_b else 0) if b_shared else 2,
         )
         c_ptr = T.access_ptr(
             self.CRegion,

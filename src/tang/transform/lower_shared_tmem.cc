@@ -14,7 +14,10 @@
  *    2. LowerTangTmemDrain - Rewrite the TMEM->global drain loop (produced by
  *                            T.copy(C_tmem, C_global)) into the
  *                            tang_tmem_drain_16x256b_to_global intrinsic.
- *                            stcuv2-only.
+ *                            stcuv2-only.  The intrinsic's loop nest is then
+ *                            materialised in IR by ExpandTangTmemDrain
+ *                            (expand_tang_tmem_drain.cc), so the code generator
+ *                            only prints statements.
  *
  *  NOTE: these remain TWO SEPARATE passes (registered independently and
  *  scheduled at different points in tilelang/tang/pipeline.py).  They are
@@ -27,7 +30,18 @@
  *      produced by LowerSharedTmem (a producer->consumer dependency, with the
  *      middle pipeline running in between).
  */
+// The `T.deallocate_tmem` frontend marker (tl.deallocate_tmem) is declared by
+// its owner, the CUDA registry: TMEM arrived there first and the op is still
+// defined by src/cuda/op/builtin.cc. TANG lowering consumes the marker rather
+// than producing it, so it does not belong in src/tang/op/builtin.h (whose ops
+// are tl.tang_* and only ever produced by TANG lowering), and declaring it in
+// the backend-neutral src/op/builtin.h would advertise a primitive that only
+// the TMEM-capable subtargets -- sm100 and stcuv2 -- have. Take the declaration
+// from its owner, the same way lower_shared_barrier.cc takes
+// ptx_fence_barrier_init.
+#include "cuda/op/builtin.h"
 #include "op/builtin.h"
+#include "tang/op/builtin.h"
 #include "tang/target_utils.h"
 #include "tir/transforms/ir_utils.h"
 #include "tvm/ir/type.h"
@@ -57,6 +71,82 @@ using namespace ffi;
 //   Convert shared.tmem buffers to TANG address holders + tc init, and do
 //   coordinate translation (from logical address to physical address).
 // ===========================================================================
+
+using VarSet = std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual>;
+
+/*!
+ * \brief Collect TMEM buffers explicitly deallocated on fallthrough paths.
+ *
+ * A "fallthrough path" is one that reaches the end of the statement without
+ * hitting thread_return().  A buffer deallocated on such a path already has an
+ * explicit dealloc, so the automatic one at block end must be dropped.
+ *
+ * Mirrors the CUDA pass's helper of the same name; kept separate because the
+ * TANG side acts on the merged single reservation rather than per buffer.
+ *
+ * \return {buffers deallocated on fallthrough, whether the stmt can
+ * fallthrough}
+ */
+static std::pair<VarSet, bool> CollectFallthroughDeallocs(const Stmt &stmt) {
+  if (!stmt.defined())
+    return {{}, true};
+
+  // Unwrap transparent wrapper nodes
+  if (stmt.as<BindNode>())
+    return {{}, true};
+  if (auto *n = stmt.as<AttrStmtNode>())
+    return CollectFallthroughDeallocs(n->body);
+  if (auto *n = stmt.as<SBlockNode>())
+    return CollectFallthroughDeallocs(n->body);
+  if (auto *n = stmt.as<SBlockRealizeNode>())
+    return CollectFallthroughDeallocs(n->block->body);
+  if (auto *n = stmt.as<ForNode>())
+    return CollectFallthroughDeallocs(n->body);
+
+  // Sequential: accumulate deallocs; stop if any child doesn't fallthrough
+  if (auto *seq = stmt.as<SeqStmtNode>()) {
+    VarSet deallocs;
+    for (const auto &child : seq->seq) {
+      auto [d, ft] = CollectFallthroughDeallocs(child);
+      if (!ft)
+        return {{}, false};
+      deallocs.insert(d.begin(), d.end());
+    }
+    return {std::move(deallocs), true};
+  }
+
+  // Branch: collect deallocs only from branches that can fallthrough
+  if (auto *iff = stmt.as<IfThenElseNode>()) {
+    auto [then_d, then_ft] = CollectFallthroughDeallocs(iff->then_case);
+    auto [else_d, else_ft] =
+        iff->else_case.defined()
+            ? CollectFallthroughDeallocs(iff->else_case.value())
+            : std::pair<VarSet, bool>{{}, true};
+    VarSet deallocs;
+    if (then_ft)
+      deallocs.insert(then_d.begin(), then_d.end());
+    if (else_ft)
+      deallocs.insert(else_d.begin(), else_d.end());
+    return {std::move(deallocs), then_ft || else_ft};
+  }
+
+  // Leaf: detect deallocate_tmem and thread_return
+  if (auto *eval = stmt.as<EvaluateNode>()) {
+    if (auto *call = eval->value.as<CallNode>()) {
+      if (call->op.same_as(tl::deallocate_tmem())) {
+        ICHECK_EQ(call->args.size(), 1U);
+        auto *buf = call->args[0].as<VarNode>();
+        ICHECK(buf) << "tl.deallocate_tmem expects a buffer data Var";
+        return {{tvm::ffi::GetRef<Var>(buf)}, true};
+      }
+      if (call->op.same_as(builtin::thread_return())) {
+        return {{}, false};
+      }
+    }
+  }
+
+  return {{}, true};
+}
 
 class SharedTmemRewriter : public StmtExprMutator {
 public:
@@ -211,6 +301,23 @@ private:
     int num_cols_allocated = next_pow2_ge(total_cols);
 
     auto region0_base = BufferLoad(regions[0].holder, {PrimExpr(0)});
+
+    // Publish the merged reservation so that the frontend marker
+    // `T.deallocate_tmem` (tl.deallocate_tmem) can be lowered onto it in
+    // VisitExpr_(CallNode*) while walking this block's body.
+    tmem_region_base_ = region0_base;
+    tmem_num_cols_allocated_ = num_cols_allocated;
+    tmem_region_ready_ = true;
+
+    // stcuv2 keeps ONE merged reservation for every shared.tmem buffer in the
+    // block, so an explicit dealloc of any single buffer releases the whole
+    // region. The automatic tail dealloc below must therefore be dropped
+    // entirely once the user has taken manual control, or the reservation
+    // would be freed twice. (The CUDA path can suppress per buffer because
+    // each buffer owns its own allocation there.)
+    auto [explicit_deallocs, _fallthrough] =
+        CollectFallthroughDeallocs(block->body);
+    const bool has_explicit_dealloc = !explicit_deallocs.empty();
     new_body.push_back(
         Evaluate(Call(DataType::Handle(), tl::tang_init_tensor_memory(),
                       {region0_base, PrimExpr(num_cols_allocated)})));
@@ -236,12 +343,14 @@ private:
     // sync_wait(...) on all warps before tc_dealloc. The CUDA path instead
     // gates dealloc to warp 0 (the same warp that drains); on stcuv2 dealloc
     // must be collective, so a barrier is required instead.
-    new_body.push_back(
-        Evaluate(Call(DataType::Handle(), builtin::tvm_storage_sync(),
-                      {StringImm("shared")})));
-    new_body.push_back(
-        Evaluate(Call(DataType::Handle(), tl::tang_deallocate_tensor_memory(),
-                      {region0_base, PrimExpr(num_cols_allocated)})));
+    if (!has_explicit_dealloc) {
+      new_body.push_back(
+          Evaluate(Call(DataType::Handle(), builtin::tvm_storage_sync(),
+                        {StringImm("shared")})));
+      new_body.push_back(
+          Evaluate(Call(DataType::Handle(), tl::tang_deallocate_tensor_memory(),
+                        {region0_base, PrimExpr(num_cols_allocated)})));
+    }
 
     auto block_ptr = block.CopyOnWrite();
     block_ptr->annotations.erase(attr::kLayoutMap);
@@ -308,6 +417,27 @@ private:
   }
 
   PrimExpr VisitExpr_(const CallNode *op) final {
+    // Lower the frontend marker `T.deallocate_tmem(buf)` onto TANG's collective
+    // dealloc. On stcuv2 all shared.tmem buffers of the block live in one
+    // merged reservation, so there is no per-buffer release to emit: the call
+    // frees the whole region (and the block-end auto dealloc was suppressed
+    // for exactly that reason). The instruction is per-thread with no built-in
+    // synchronization and the reservation is CTA-wide, so every thread must
+    // reach this call site -- placing it under divergent control is the
+    // caller's responsibility, same as on the CUDA path.
+    if (op->op.same_as(tl::deallocate_tmem())) {
+      ICHECK_EQ(op->args.size(), 1U);
+      Var buffer_data = Downcast<Var>(op->args[0]);
+      ICHECK(tmem_region_ready_)
+          << "tl.deallocate_tmem requires a TMEM buffer allocated in the same "
+             "or an enclosing block, but no shared.tmem allocation is in scope";
+      ICHECK(var_remap_.count(buffer_data))
+          << "tl.deallocate_tmem expects a TMEM buffer allocated in the same "
+             "or an enclosing block; buffer "
+          << buffer_data->name_hint << " is not tracked by LowerSharedTmem";
+      return Call(DataType::Handle(), tl::tang_deallocate_tensor_memory(),
+                  {tmem_region_base_, PrimExpr(tmem_num_cols_allocated_)});
+    }
     if (op->op.same_as(builtin::tvm_access_ptr())) {
       ICHECK_EQ(op->args.size(), 5U);
       Var buffer_data = Downcast<Var>(op->args[1]);
@@ -332,6 +462,12 @@ private:
 
   // Datatypes for tmem
   const DataType tmem_dtype_ = DataType::UInt(32);
+  // The block's merged TMEM reservation, used to lower the frontend
+  // `tl.deallocate_tmem` marker. stcuv2 allows a single live reservation, so
+  // one (base, num_cols) pair describes the whole region.
+  PrimExpr tmem_region_base_;
+  int tmem_num_cols_allocated_ = 0;
+  bool tmem_region_ready_ = false;
   Map<Var, Var> var_remap_;
   Map<Var, Buffer> buffer_data_to_buffer_;
   Map<Buffer, Buffer> buffer_remap_;
@@ -357,7 +493,9 @@ PrimFunc LowerSharedTmem(PrimFunc f) {
 //   After copy lowering, a T.copy(C_tmem, C) on TANG produces a normal
 //   element-wise loop.  This pass detects such loops and replaces them with a
 //   proper step-16 warp-collective drain loop using the
-//   tang_tmem_ld_16x256b_x16 intrinsic.
+//   tang_tmem_ld_16x256b_x16 intrinsic -- as a single fused intrinsic, whose
+//   expansion into the loop nest below is done in IR by ExpandTangTmemDrain
+//   (expand_tang_tmem_drain.cc).
 //
 //   The reference pattern (for BM x BN fp32 TMEM):
 //     uint32_t _out[64];

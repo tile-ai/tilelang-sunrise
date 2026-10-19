@@ -39,18 +39,54 @@ repos:
     hooks:
       - id: ruff-check
         args: [--fix, --exit-non-zero-on-fix, --config, pyproject.toml]
+      - id: ruff-format
+        args: [--config, pyproject.toml]
 
   - repo: https://github.com/codespell-project/codespell
     rev: v2.4.1
     hooks:
       - id: codespell
-        additional_dependencies: [".[toml]"]
+        args: [--toml, pyproject.toml]
+        additional_dependencies: ["tomli>=2.0.1"]
         exclude: |
           (?x)(
             ^.+\.(cpp|hpp|cxx|cc|c|h|cu|cuh)$|
             ^.+\.svg$|
             ^.*\brequirements\b.*\.txt$
           )
+
+  - repo: local
+    hooks:
+      - id: shipped-refs-lint
+        name: shipped-source reference lint
+        entry: python scripts/lint/shipped_refs_lint.py
+        language: python
+        files: ^(src/tileops|tests|benchmarks|scripts|workloads)/
+        exclude: ^src/tileops/manifest/
+        types: [text]
+      - id: workload-names-lint
+        name: benchmark case name lint
+        entry: python scripts/lint/workload_names_lint.py
+        language: python
+        files: ^benchmarks/ops/.*\.py$
+
+      - id: bench-baseline-lint
+        name: benchmark baseline lint
+        entry: python scripts/lint/bench_baseline_lint.py
+        language: python
+        files: ^benchmarks/.*\.py$
+
+      - id: op-docstrings-lint
+        name: op docstring lint
+        entry: python scripts/lint/op_docstrings_lint.py
+        language: python
+        files: ^src/tileops/ops/.*\.py$
+
+      - id: tilelang-idioms-lint
+        name: TileLang idiom lint
+        entry: python scripts/lint/tilelang_idioms_lint.py
+        language: python
+        files: ^(src/tileops|tests|benchmarks|workloads)/.*\.py$
 
   - repo: https://github.com/executablebooks/mdformat
     rev: 0.7.22

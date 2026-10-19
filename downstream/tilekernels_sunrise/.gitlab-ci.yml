@@ -78,6 +78,7 @@ tilekernels_test:
           - "requirements.txt"
           - "ci/**/*"
           - "ci_test_case_list_tilekernels.txt"
+          - "ci_test_case_list_tilekernels_timeouts.tsv"
           - ".gitlab-ci.yml"
     - if: ($CI_PIPELINE_SOURCE == "schedule")
     - if: ($CI_PIPELINE_SOURCE == "web")
