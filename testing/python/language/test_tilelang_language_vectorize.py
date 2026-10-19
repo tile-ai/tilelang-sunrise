@@ -4,10 +4,13 @@ import tilelang.language as T
 
 from tilelang.backend.target import determine_target
 from tilelang.intrinsics import make_mma_swizzle_layout
+from tilelang.jit import JITKernel
 from tilelang.utils.device import get_current_device
 import pytest
 
 _FLOAT8_E8M0FNU = getattr(torch, "float8_e8m0fnu", None)
+
+STCUV2 = {"kind": "tang", "arch": "stcuv2"}
 
 
 def _target_is_tang():
@@ -193,8 +196,7 @@ def test_vectorize_local_invariant_store_accumulate():
     run_vectorize_invariant_store_accumulate(vectorize_local_invariant_store_accumulate)
 
 
-@tilelang.jit
-def vectorize_test_all_dtypes(dtype, vec_num):
+def vectorize_all_dtypes_kernel(dtype, vec_num):
     @T.prim_func
     def main(A: T.Tensor[(64,), dtype]):
         with T.Kernel(1, threads=256):
@@ -202,6 +204,9 @@ def vectorize_test_all_dtypes(dtype, vec_num):
                 A[i] = T.cast(i + 1, dtype)
 
     return main
+
+
+vectorize_test_all_dtypes = tilelang.jit(vectorize_all_dtypes_kernel)
 
 
 @pytest.mark.parametrize(
@@ -228,6 +233,65 @@ def test_vectorize_all_dtypes(dtype, vec_num):
     x = torch.empty((64,), dtype=dtype, device=device)
     kernel = vectorize_test_all_dtypes(dtype, vec_num)
     kernel(x)
+
+
+def _stcuv2_vectorize_gap(dtype, vec_num):
+    """The reason ``dtype`` x ``vec_num`` cannot work on stcuv2 yet, else None."""
+    if dtype in (torch.int64, torch.uint64) and vec_num > 4:
+        # 8 x 64bit = 512bit exceeds the widest vector the codegen will ramp.
+        return "64-bit dtypes cap at 4 lanes (Translate Ramp Node ... lanes <= 4)"
+    if dtype is torch.uint64:
+        return "simulator HBM decoder has no torch.uint64 case yet"
+    if dtype is _FLOAT8_E8M0FNU:
+        return "float8_e8m0fnu has no TANG codegen type (codegen_tang.cc GetFP8Type)"
+    return None
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.uint8,
+        torch.uint64,
+        torch.int8,
+        torch.int64,
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+        pytest.param(
+            _FLOAT8_E8M0FNU,
+            marks=pytest.mark.skipif(_FLOAT8_E8M0FNU is None, reason="torch lacks float8_e8m0fnu"),
+            id="float8_e8m0fnu",
+        ),
+    ],
+)
+@pytest.mark.parametrize("vec_num", [1, 2, 4, 8])
+@tilelang.testing.requires_stcuv2
+def test_vectorize_all_dtypes_stcuv2(dtype, vec_num, request):
+    """Same regression on S3/stcuv2 via the ISS simulator.
+
+    S2 only reaches uint8/int8/int64 at vector width 1-2 (see the skip in
+    ``test_vectorize_all_dtypes``); stcuv2 covers those plus widths 4/8 and both
+    fp8 formats. The remaining holes are marked non-strict xfail so a fix shows
+    up as XPASS instead of silently staying uncovered.
+    """
+    gap = _stcuv2_vectorize_gap(dtype, vec_num)
+    if gap is not None:
+        request.applymarker(pytest.mark.xfail(reason=gap, strict=False))
+
+    # out_idx=[0] lets the simulator adapter allocate the buffer itself; it
+    # requires ptpu tensors, so a hand-built input would have to be moved there
+    # anyway (see testing/python/s3/test_simulator_e2e.py).
+    kernel = JITKernel(
+        vectorize_all_dtypes_kernel(dtype, vec_num),
+        out_idx=[0],
+        target=STCUV2,
+        execution_backend="simulator",
+    )
+    out = kernel().cpu()
+
+    # The kernel writes 1..vec_num into the first vec_num slots, so this also
+    # pins down the float->dtype conversion rather than only that it compiled.
+    expected = torch.arange(1, vec_num + 1, dtype=torch.float32).to(dtype)
+    torch.testing.assert_close(out[:vec_num].float(), expected.float(), atol=0, rtol=0)
 
 
 @tilelang.jit
@@ -274,6 +338,64 @@ def test_tang_register_byte_broadcast(dtype, vec_num):
         compiled(scalar, output)
         torch.ptpu.synchronize()
         torch.testing.assert_close(output.cpu(), torch.full((vec_num,), value, dtype=torch_dtype), rtol=0, atol=0)
+
+
+def vectorize_broadcast_int4(dtype, vec_num):
+    @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_BUFFER_INIT_CHECK: True})
+    def kernel():
+        with T.Kernel(1, threads=128):
+            a = T.alloc_local((64,), dtype)
+            b = T.alloc_var(dtype)
+
+            for i in T.vectorized(vec_num):
+                a[i] = b
+
+    return kernel
+
+
+@tilelang.testing.requires_cuda
+@pytest.mark.parametrize("dtype", ["int4", "uint4"])
+@pytest.mark.parametrize("vec_num", [4, 8, 16, 32])
+def test_vectorize_broadcast_int4(dtype, vec_num):
+    """Broadcasting a non-constant 4-bit value to a vectorized store must emit
+    the packed-nibble carrier rather than aborting (see issue #2997). The int4
+    branch used to ICHECK on a non-constant value; the int8 branch already
+    handled it. Every packed lane count (16/32-bit carriers and make_(u)int{N})
+    is exercised here."""
+    vectorize_broadcast_int4(dtype, vec_num).compile()
+
+
+def fill_int4_buffer(dtype, fill_value):
+    M, N = 16, 64
+
+    @T.prim_func
+    def func(B: T.Tensor((M, N), dtype)):
+        with T.Kernel(1, threads=128):
+            sh = T.alloc_shared((M, N), dtype)
+            T.fill(sh, fill_value)
+            T.copy(sh, B)
+
+    return func
+
+
+@tilelang.testing.requires_cuda
+@pytest.mark.parametrize("dtype", ["int4", "uint4"])
+@pytest.mark.parametrize("fill_value", [0, 1, 7])
+def test_fill_int4_buffer(dtype, fill_value):
+    """End-to-end reproduction of issue #2997: T.fill/T.clear of an int4 buffer.
+    HoistBroadcastValues rebinds the constant fill value to a Var, so the CUDA
+    Broadcast codegen sees a non-constant value. Verify it both compiles and
+    produces the correct packed nibbles."""
+    M, N = 16, 64
+    kernel = tilelang.compile(fill_int4_buffer(dtype, fill_value))
+    # int4 buffer packs two nibbles per byte, so N columns -> N // 2 bytes.
+    out = torch.empty(M, N // 2, dtype=torch.int8, device="cuda")
+    kernel(out)
+    expected = fill_value & 0x0F
+    low = out & 0x0F
+    high = (out >> 4) & 0x0F
+    assert bool((low == expected).all()), f"low nibble mismatch for {dtype}={fill_value}"
+    assert bool((high == expected).all()), f"high nibble mismatch for {dtype}={fill_value}"
 
 
 @tilelang.jit

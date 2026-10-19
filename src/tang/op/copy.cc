@@ -4,12 +4,20 @@
  */
 
 #include "op/copy.h"
+#include "cuda/op/builtin.h"
 #include "layout/cute_layout.h"
 #include "layout/layout.h"
 #include "layout/tcgen05_layout.h"
 #include "op/builtin.h"
+#include "op/parallel.h"
 #include "op/utils.h"
+#include "tang/op/builtin.h"
 #include "tang/target_utils.h"
+#include "transform/common/loop_fusion_utils.h"
+#include "transform/loop_partition.h"
+#include "transform/loop_vectorize.h"
+
+#include <tvm/tirx/stmt_functor.h>
 
 #include <optional>
 #include <tvm/ir/transform.h>
@@ -1059,11 +1067,102 @@ Stmt LowerTangSharedToTmemCopy(const CopyNode &op, const LowerArgs &lower_args,
        IntImm(DataType::Int(32), source_is_swizzled ? 1 : 0)}));
 }
 
+// Element-wise SM-to-SM cluster copy. T.copy_cluster(dst_block=...) writes the
+// source shared buffer into the peer CTA's shared memory, element by element,
+// via ptx_cluster_store (mapa.shared.cluster + st.shared). This is the SIMT
+// fallback; the bulk cp.async.bulk.shared::cluster path is not wired yet.
+class ClusterCopyReplacer : public StmtExprMutator {
+public:
+  ClusterCopyReplacer(Buffer dst, PrimExpr dst_block, Buffer target_dst)
+      : dst_(dst), dst_block_(dst_block), target_dst_(target_dst) {}
+
+  Stmt VisitStmt_(const BufferStoreNode *op) final {
+    if (!op->buffer.same_as(dst_))
+      return StmtExprMutator::VisitStmt_(op);
+
+    // Linearize op->indices against the (possibly remapped) destination shape.
+    PrimExpr linearized_index = 0;
+    PrimExpr multiplier = 1;
+    for (int i = static_cast<int>(op->indices.size()) - 1; i >= 0; --i) {
+      linearized_index = linearized_index + op->indices[i] * multiplier;
+      if (i > 0)
+        multiplier = multiplier * target_dst_->shape[i];
+    }
+
+    Buffer target_buffer = target_dst_.same_as(dst_) ? op->buffer : target_dst_;
+    PrimExpr total_elems = 1;
+    for (const PrimExpr &s : target_buffer->shape)
+      total_elems = total_elems * s;
+
+    Stmt remote_store = Evaluate(Call(DataType::Handle(), ptx_cluster_store(),
+                                      {target_buffer.access_ptr(2), op->value,
+                                       dst_block_, linearized_index}));
+    return IfThenElse(linearized_index < total_elems, remote_store, Stmt());
+  }
+
+private:
+  Buffer dst_;
+  PrimExpr dst_block_;
+  Buffer target_dst_;
+};
+
+Stmt LowerClusterCopyElementWise(const CopyNode &op,
+                                 const LowerArgs &lower_args,
+                                 arith::Analyzer *analyzer) {
+  auto simt_loop = op.MakeSIMTLoop(analyzer);
+  auto fused_loop = Downcast<For>(ParallelLoopFuser::Fuse(simt_loop));
+
+  auto par_op = ParallelOp(fused_loop);
+  std::vector<InferLevel> levels = {InferLevel::kCommon, InferLevel::kStrict,
+                                    InferLevel::kFree};
+  for (auto level : levels) {
+    par_op->InferLayout({lower_args.target,
+                         lower_args.thread_bounds,
+                         lower_args.layout_map,
+                         analyzer,
+                         lower_args.buffer_remap,
+                         {}},
+                        level);
+  }
+  auto loop_layout = par_op->GetLoopLayout();
+  auto thread_loop = PartitionLoop(par_op->GetRoot(), lower_args.thread_index,
+                                   analyzer, loop_layout);
+  auto vectorized_thread_loop =
+      VectorizeLoop(thread_loop, lower_args.layout_map, /*vectorize_hint=*/1);
+
+  Buffer target_dst = op.dst;
+  if (lower_args.buffer_remap.count(op.dst)) {
+    target_dst = lower_args.buffer_remap[op.dst];
+  }
+  return ClusterCopyReplacer(op.dst, op.dst_block.value(),
+                             target_dst)(vectorized_thread_loop);
+}
+
 Stmt Lower(const CopyNode &op, const LowerArgs &lower_args,
            arith::Analyzer *analyzer) {
   if (TargetTangIsSTCUV2(lower_args.target)) {
     if (IsTangTmemFragmentCopy(op)) {
       return LowerTangTmemFragmentCopy(op, lower_args, analyzer);
+    }
+    // Cluster DSM copy (T.copy_cluster).
+    //   - dst_block     -> SM-to-SM copy between CTA shared memories, lowered
+    //                     element-wise via ptx_cluster_store
+    //                     (mapa.shared.cluster
+    //                     + st.shared). Requires the LLVM dev_dshm branch.
+    //   - cluster_mask  -> TMA multicast load broadcast across the cluster, not
+    //                     wired yet (cp.async.bulk.shared::cluster).
+    if (op.dst_block.defined()) {
+      ICHECK(op.src.scope() == "shared" || op.src.scope() == "shared.dyn")
+          << "copy_cluster(dst_block=...) requires a shared source buffer";
+      ICHECK(op.dst.scope() == "shared" || op.dst.scope() == "shared.dyn")
+          << "copy_cluster(dst_block=...) requires a shared destination buffer";
+      return LowerClusterCopyElementWise(op, lower_args, analyzer);
+    }
+    if (op.annotations.Get("cluster_mask")) {
+      LOG(FATAL) << "TANG/STCUV2 does not support TMA multicast cluster copy "
+                    "yet: copy_cluster(cluster_mask=...) requires "
+                    "cp.async.bulk.shared::cluster...multicast::cluster, which "
+                    "the STCU LLVM backend has not implemented.";
     }
     if (op.src.scope() == "shared.tmem") {
       if (op.dst.scope() == "global") {

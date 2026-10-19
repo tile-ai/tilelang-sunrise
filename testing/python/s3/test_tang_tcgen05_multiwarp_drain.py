@@ -7,7 +7,8 @@ BM/16 个 16-行 strip 轮转分摊给 block 的所有 warp,每个 warp 用 warp
 关键点:tcgen05 的 MMA 是**异步**且**只由 warp0 发起并 fence** 的,所以在多 warp
 写回前必须插入一次 block 级 barrier(``__syncthreads``),让所有参与写回的 warp
 都能看到已完成的累加器 —— 否则 warp>0 会读到尚未落地的 TMEM(garbage)。这条
-barrier 由 codegen 在 drain 内建里自动生成 (nwarps>1 时)。
+barrier 由 `tl.tang.transform.ExpandTangTmemDrain` pass 在 IR 里生成
+(``nwarps>1`` 时,位于 ``warp < nwarps`` guard 之外,因此 block-wide)。
 
 一个标准的 ``T.copy(C_tmem, C_global)`` 在 128 线程 block 上会自动展开成 4-warp
 写回,无需用户手写切分。
@@ -85,31 +86,40 @@ def _run(kernel, M, N, K, dtype):
 
 
 def test_drain_lowering_is_multiwarp():
-    """A plain drain lowers to a per-warp strided strip loop + a block barrier."""
+    """A plain drain lowers to a per-warp strip loop + a block barrier.
+
+    The drain's geometry is emitted by the ExpandTangTmemDrain pass (in IR), so
+    the shape pinned here is the round-robin strip split across all four warps of
+    the 128-thread block: BM/(nwarps*16) = 2 strips per warp, with the
+    MMA-publish barrier in front of the warp guard (block-wide, never guarded).
+    """
     src = _lower_src(_make_gemm(128, 128, 64, 64, "float16"))
-    # per-warp id and warp-guarded strip loop
-    assert re.search(r"_w\s*=\s*\(\(int\)threadIdx\.x\)\s*/\s*32", src), "expected per-warp id (_w = threadIdx.x / 32)"
-    # The counter's name comes from the codegen's name supply (it must not
-    # collide with an enclosing loop variable), so match it back-referentially
-    # rather than pinning a literal.
-    assert re.search(r"for\s*\(int (\w+) = _w\*16;.*\1 \+= 64\)", src), "expected round-robin strip loop with nwarps*16 (=64) stride"
-    # a block barrier must precede the multi-warp ldt so warps>0 see the MMA out
-    assert "__syncthreads();" in src, "expected a block barrier before drain"
     assert re.search(r"ldt_16x256b_x16\(", src), "expected 16x256b ldt drain"
+    assert re.search(r"for \(int k = 0; k < 2; \+\+k\)", src), "expected BM/(nwarps*16) = 2 round-robin strips per warp"
+    # a block barrier must precede the multi-warp ldt so warps>0 see the MMA out
+    assert re.search(r"__syncthreads\(\);\s*uint _out\[64\];", src), (
+        "expected the MMA-publish barrier before the drain (and outside the guard)"
+    )
 
 
-@pytest.mark.parametrize("drain_warps,stride", [(1, 16), (2, 32), (4, 64)])
-def test_drain_warps_knob_lowering(drain_warps, stride):
+@pytest.mark.parametrize("drain_warps,strips", [(1, 8), (2, 4), (4, 2)])
+def test_drain_warps_knob_lowering(drain_warps, strips):
     """`drain_warps=N` caps the writeback to N warps; the barrier stays block-wide.
 
-    The __syncthreads (MMA publish) is emitted for all threads regardless -- it
-    sits OUTSIDE the `if (_w < N)` guard -- so reducing N never deadlocks.
+    N warps split the 8 row strips of the 128-row tile, so each takes
+    BM/(N*16) strips. The __syncthreads (MMA publish) is emitted before the
+    `warp < N` guard -- it sits OUTSIDE it -- so reducing N never deadlocks.
     """
     src = _lower_src(_make_gemm(128, 128, 64, 64, "float16", drain_warps=drain_warps))
-    assert re.search(rf"if \(_w < {drain_warps}\)", src), f"expected drain restricted to {drain_warps} warp(s)"
-    assert re.search(rf"for\s*\(int (\w+) = _w\*16;.*\1 \+= {stride}\)", src), f"expected strip stride nwarps*16={stride}"
+    assert re.search(rf"for \(int k = 0; k < {strips}; \+\+k\)", src), f"expected {strips} strips per warp (BM/({drain_warps}*16))"
     if drain_warps > 1:
-        assert "__syncthreads();" in src, "multi-warp drain needs the block barrier"
+        assert re.search(r"__syncthreads\(\);\s*uint _out\[64\];", src), "multi-warp drain needs the block barrier before the warp guard"
+    if drain_warps < 4:
+        # Restricting the writeback keeps a warp guard; for all four warps of a
+        # 128-thread block the guard is provably true and folds away.
+        assert re.search(rf"if \(\(\(int\)threadIdx\.x\) < {drain_warps * 32}\)", src), (
+            f"expected drain restricted to {drain_warps} warp(s)"
+        )
 
 
 # ===========================================================================

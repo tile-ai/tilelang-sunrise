@@ -3,46 +3,38 @@ import torch
 import torch.nn.functional as F
 
 from tests.test_base import FixtureBase, TestBase
+from tileops.kernels.norm.ada_layer_norm import AdaLayerNormKernel
 from tileops.ops.norm.ada_layer_norm_zero import AdaLayerNormZeroFwdOp
-from workloads.normalization import AdaLayerNormZeroTest as _AdaLayerNormZeroTestWorkload
+from workloads.normalization import AdaLayerNormZeroWorkload
 
 
-class AdaLayerNormZeroTest(_AdaLayerNormZeroTestWorkload, TestBase):
-    def ref_program(
-        self, x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, gate: torch.Tensor,
-    ) -> torch.Tensor:
-        # AdaLN-Zero: y = gate * (scale * LayerNorm(x) + shift)
-        normed = F.layer_norm(
-            x.float(),
-            (self.n,),
-            weight=None,
-            bias=None,
-            eps=self.eps,
-        )
-        y = gate.float() * (scale.float() * normed + shift.float())
-        return y.to(x.dtype)
+class AdaLayerNormZeroTest(AdaLayerNormZeroWorkload, TestBase):
+    pass
 
 
 class AdaLayerNormZeroFixture(FixtureBase):
     PARAMS = [
-        ("m, n, dtype", [
-            # Standard aligned shapes -- fp32
-            pytest.param(1024, 4096, torch.float32, marks=pytest.mark.smoke),
-            # Standard aligned shapes -- fp16
-            pytest.param(1024, 4096, torch.float16, marks=pytest.mark.smoke),
-            # Standard aligned shapes -- bf16
-            pytest.param(1024, 4096, torch.bfloat16, marks=pytest.mark.smoke),
-            pytest.param(4096, 4096, torch.float32, marks=pytest.mark.full),
-            pytest.param(4096, 4096, torch.float16, marks=pytest.mark.full),
-            pytest.param(4096, 4096, torch.bfloat16, marks=pytest.mark.full),
-            # Non-power-of-two hidden dims
-            pytest.param(1024, 3000, torch.float32, marks=pytest.mark.full),
-            pytest.param(1024, 3000, torch.float16, marks=pytest.mark.full),
-            pytest.param(1024, 3000, torch.bfloat16, marks=pytest.mark.full),
-            # Tail-M: M not divisible by block_m
-            pytest.param(1025, 4096, torch.float16, marks=pytest.mark.full),
-            pytest.param(1025, 4096, torch.bfloat16, marks=pytest.mark.full),
-        ]),
+        (
+            "m, n, dtype",
+            [
+                # Standard aligned shapes -- fp32
+                pytest.param(1024, 4096, torch.float32, marks=pytest.mark.smoke),
+                # Standard aligned shapes -- fp16
+                pytest.param(1024, 4096, torch.float16, marks=pytest.mark.smoke),
+                # Standard aligned shapes -- bf16
+                pytest.param(1024, 4096, torch.bfloat16, marks=pytest.mark.smoke),
+                pytest.param(4096, 4096, torch.float32, marks=pytest.mark.full),
+                pytest.param(4096, 4096, torch.float16, marks=pytest.mark.full),
+                pytest.param(4096, 4096, torch.bfloat16, marks=pytest.mark.full),
+                # Non-power-of-two hidden dims
+                pytest.param(1024, 3000, torch.float32, marks=pytest.mark.full),
+                pytest.param(1024, 3000, torch.float16, marks=pytest.mark.full),
+                pytest.param(1024, 3000, torch.bfloat16, marks=pytest.mark.full),
+                # Tail-M: M not divisible by block_m
+                pytest.param(1025, 4096, torch.float16, marks=pytest.mark.full),
+                pytest.param(1025, 4096, torch.bfloat16, marks=pytest.mark.full),
+            ],
+        ),
     ]
 
 
@@ -58,18 +50,58 @@ def _get_tolerances(dtype: torch.dtype) -> tuple[float, float]:
 @AdaLayerNormZeroFixture
 def test_ada_layer_norm_zero_op(m: int, n: int, dtype: torch.dtype) -> None:
     test = AdaLayerNormZeroTest(m, n, dtype)
-    op = AdaLayerNormZeroFwdOp(dtype=dtype)
+    op = AdaLayerNormZeroFwdOp()
     atol, rtol = _get_tolerances(dtype)
     test.check(op, *test.gen_inputs(), atol=atol, rtol=rtol)
 
 
+@pytest.mark.smoke
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_ada_layer_norm_zero_kernel_handles_natural_unaligned_shape(
+    dtype: torch.dtype,
+) -> None:
+    m, n = 16, 1152
+    test = AdaLayerNormZeroTest(m, n, dtype)
+    inputs = test.gen_inputs()
+    kernel = AdaLayerNormKernel(n, test.eps, dtype, has_gate=True)
+    actual = kernel(*inputs)
+    expected = test.ref_program(*(x.cpu() for x in inputs))
+    assert actual.shape == (m, n)
+    atol, rtol = _get_tolerances(dtype)
+    torch.testing.assert_close(actual.cpu(), expected, atol=atol, rtol=rtol)
+
+
+@pytest.mark.smoke
+def test_ada_layer_norm_zero_copy_handles_row_tail() -> None:
+    """Regression: the selected copy path must support block_m > 1 and tail rows."""
+    m, n, block_m = 17, 514, 4
+    dtype = torch.float16
+    test = AdaLayerNormZeroTest(m, n, dtype)
+    inputs = test.gen_inputs()
+    kernel = AdaLayerNormKernel(
+        n,
+        test.eps,
+        dtype,
+        has_gate=True,
+        config={"block_m": block_m, "threads": 128},
+    )
+    assert kernel.config["block_m"] == block_m
+    actual = kernel(*inputs)
+    expected = test.ref_program(*(x.cpu() for x in inputs))
+    atol, rtol = _get_tolerances(dtype)
+    torch.testing.assert_close(actual.cpu(), expected, atol=atol, rtol=rtol)
+
+
 class AdaLayerNormZero3DFixture(FixtureBase):
     PARAMS = [
-        ("batch, seq, hidden, dtype", [
-            pytest.param(2, 512, 4096, torch.float32, marks=pytest.mark.smoke),
-            pytest.param(2, 512, 4096, torch.float16, marks=pytest.mark.smoke),
-            pytest.param(2, 512, 4096, torch.bfloat16, marks=pytest.mark.smoke),
-        ]),
+        (
+            "batch, seq, hidden, dtype",
+            [
+                pytest.param(2, 512, 4096, torch.float32, marks=pytest.mark.smoke),
+                pytest.param(2, 512, 4096, torch.float16, marks=pytest.mark.smoke),
+                pytest.param(2, 512, 4096, torch.bfloat16, marks=pytest.mark.smoke),
+            ],
+        ),
     ]
 
 
@@ -81,9 +113,9 @@ def test_ada_layer_norm_zero_3d(batch: int, seq: int, hidden: int, dtype: torch.
     shift = torch.randn(batch, seq, hidden, dtype=dtype).ptpu()
     gate = torch.randn(batch, seq, hidden, dtype=dtype).ptpu()
 
-    op = AdaLayerNormZeroFwdOp(dtype=dtype)
+    op = AdaLayerNormZeroFwdOp()
 
-    # Reference computed on CPU: F.layer_norm is not available on PTPU.
+    # Reference: gate * (scale * LayerNorm(x) + shift)
     eps = 1e-5
     x_cpu = x.cpu().float()
     scale_cpu = scale.cpu().float()
@@ -99,9 +131,6 @@ def test_ada_layer_norm_zero_3d(batch: int, seq: int, hidden: int, dtype: torch.
     atol, rtol = _get_tolerances(dtype)
     y_cpu = y.cpu()
     y_ref_cpu = y_ref.cpu()
-    assert torch.allclose(y_cpu, y_ref_cpu, atol=atol, rtol=rtol), \
+    assert torch.allclose(y_cpu, y_ref_cpu, atol=atol, rtol=rtol), (
         f"3D test failed, max err: {(y_cpu - y_ref_cpu).abs().max()}"
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-vvs"])
+    )

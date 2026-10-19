@@ -11,7 +11,7 @@ import json
 import torch
 
 import tilelang
-import tilelang.language as T
+import tilelang.tang.language as T
 from tilelang.transform.pass_config import PassConfigKey
 from tilelang.utils.device import get_current_device
 

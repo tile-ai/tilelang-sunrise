@@ -18,7 +18,7 @@ Requires PTPU hardware (S2/S3).
 import pytest
 import torch
 import tilelang
-import tilelang.language as T
+import tilelang.tang.language as T
 from tilelang.transform.pass_config import PassConfigKey
 
 requires_ptpu = pytest.mark.skipif(

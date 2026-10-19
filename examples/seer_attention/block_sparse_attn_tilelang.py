@@ -3,6 +3,7 @@ import torch
 
 import tilelang
 import tilelang.language as T
+from tilelang.utils.device import get_current_device
 import torch.nn.functional as F
 
 
@@ -129,17 +130,19 @@ def blocksparse_flashattn(batch, heads, seq_q, seq_kv, dim, downsample_len, is_c
     return kernel_func(block_M, block_N, num_stages, threads)
 
 
-def test_topk_sparse_attention():
+def test_topk_sparse_attention(batch=4, heads=2, sequence_length=256, topk=2):
+    """Validate causal block-sparse self-attention."""
     # Config
-    BATCH, N_HEADS, SEQ_LEN, D_HEAD = 4, 2, 256, 64
-    TOPK = 2  # Keep top 8 elements per row
+    BATCH, N_HEADS, SEQ_LEN, D_HEAD = batch, heads, sequence_length, 64
+    TOPK = topk  # Keep top 8 elements per row
     BLOCK = 64
     torch.manual_seed(0)
+    device = get_current_device()
 
     # Create inputs
-    q = torch.randn(BATCH, N_HEADS, SEQ_LEN, D_HEAD, device="ptpu", dtype=torch.float16)
-    k = torch.randn(BATCH, N_HEADS, SEQ_LEN, D_HEAD, device="ptpu", dtype=torch.float16)
-    v = torch.randn(BATCH, N_HEADS, SEQ_LEN, D_HEAD, device="ptpu", dtype=torch.float16)
+    q = torch.randn(BATCH, N_HEADS, SEQ_LEN, D_HEAD, device=device, dtype=torch.float16)
+    k = torch.randn(BATCH, N_HEADS, SEQ_LEN, D_HEAD, device=device, dtype=torch.float16)
+    v = torch.randn(BATCH, N_HEADS, SEQ_LEN, D_HEAD, device=device, dtype=torch.float16)
 
     sm_scale = 1.0 / (D_HEAD**0.5)
 
@@ -152,7 +155,7 @@ def test_topk_sparse_attention():
 
     # Run tilelang kernel
     kernel = blocksparse_flashattn(BATCH, N_HEADS, SEQ_LEN, SEQ_LEN, D_HEAD, downsample_len, is_causal=True)
-    tilelang_output = kernel(q, k, v, block_mask_cpu.to(device="ptpu", dtype=torch.int8))
+    tilelang_output = kernel(q, k, v, block_mask_cpu.to(device=device, dtype=torch.int8))
 
     # Compute reference on CPU
     q_cpu = q.cpu().float()
@@ -177,30 +180,32 @@ def test_topk_sparse_attention():
     print("Pass topk sparse attention test with qlen == klen")
 
 
-def test_topk_sparse_attention_qlen_lt_klen():
+def test_topk_sparse_attention_qlen_lt_klen(batch=1, heads=1, query_length=128, kv_length=256, topk=1):
+    """Validate causal block-sparse attention when query is shorter than KV."""
     # Config
-    BATCH, N_HEADS = 1, 1
-    Q_LEN, K_LEN, D_HEAD = 128, 256, 64  # qlen < klen; here, past_len = 256 - 128 = 128.
-    TOPK = 1
+    BATCH, N_HEADS = batch, heads
+    Q_LEN, K_LEN, D_HEAD = query_length, kv_length, 64
+    TOPK = topk
     BLOCK = 64  # block size used in downsampling
     torch.manual_seed(0)
+    device = get_current_device()
 
-    # Create inputs on PTPU.
-    q = torch.randn(BATCH, N_HEADS, Q_LEN, D_HEAD, device="ptpu", dtype=torch.float16)
-    k = torch.randn(BATCH, N_HEADS, K_LEN, D_HEAD, device="ptpu", dtype=torch.float16)
-    v = torch.randn(BATCH, N_HEADS, K_LEN, D_HEAD, device="ptpu", dtype=torch.float16)
+    # Create inputs.
+    q = torch.randn(BATCH, N_HEADS, Q_LEN, D_HEAD, device=device, dtype=torch.float16)
+    k = torch.randn(BATCH, N_HEADS, K_LEN, D_HEAD, device=device, dtype=torch.float16)
+    v = torch.randn(BATCH, N_HEADS, K_LEN, D_HEAD, device=device, dtype=torch.float16)
     sm_scale = 1.0 / (D_HEAD**0.5)
 
     downsample_factor = BLOCK
     downsample_len = math.ceil(K_LEN / downsample_factor)  # number of blocks along one dimension
-    x_ds = torch.randn(BATCH, N_HEADS, downsample_len, downsample_len, dtype=torch.float16)
-    # Force the first column to be high so that the first block is always selected.
-    x_ds[:, :, :, 0] = 100
+    x_ds = torch.full((BATCH, N_HEADS, downsample_len, downsample_len), -100, dtype=torch.float16)
+    diagonal = torch.arange(downsample_len)
+    x_ds[:, :, diagonal, diagonal] = 100
     block_mask_cpu = get_sparse_attn_mask_from_topk(x_ds, topk=TOPK)
 
     kernel = blocksparse_flashattn(BATCH, N_HEADS, Q_LEN, K_LEN, D_HEAD, downsample_len, is_causal=True)
     print(kernel.get_kernel_source())
-    tilelang_output = kernel(q, k, v, block_mask_cpu.to(device="ptpu", dtype=torch.int8))
+    tilelang_output = kernel(q, k, v, block_mask_cpu.to(device=device, dtype=torch.int8))
 
     # Compute reference on CPU
     q_cpu = q.cpu().float()
@@ -213,7 +218,7 @@ def test_topk_sparse_attention_qlen_lt_klen():
     full_mask_full = torch.kron(block_mask_cpu.bool(), torch.ones(BLOCK, BLOCK, dtype=torch.bool))
     full_mask_full = full_mask_full[..., :K_LEN, :K_LEN]
 
-    effective_mask = full_mask_full[..., past_len:K_LEN, :]  # shape: (B, H, Q_LEN, K_LEN)
+    effective_mask = full_mask_full[..., :Q_LEN, :]  # shape: (B, H, Q_LEN, K_LEN)
 
     i_global = torch.arange(past_len, K_LEN).unsqueeze(1)  # shape: (Q_LEN, 1)
     j_global = torch.arange(K_LEN).unsqueeze(0)  # shape: (1, K_LEN)

@@ -1,0 +1,217 @@
+# Dense GEMM family.
+#
+# GemmFwdOp is input-inferred: m/n/k and the dtype are derived from the forward
+# inputs, so nothing is committed at construction. Roofline binds m/n/k and
+# dtype during forward() and therefore uses func mode (the callable reads
+# op.m/op.n/op.k/op.dtype), which stays correct across all trans_a/trans_b
+# layouts where a single static `vars` expression could not.
+GemmFwdOp:
+  ref_api: "torch.matmul"
+  family: gemm
+  status: implemented
+
+  signature:
+    inputs:
+      a: {dtype: "float16 | bfloat16"}
+      b: {dtype: "same_as(a)"}
+    outputs:
+      d: {dtype: "same_as(a)"}
+    params:
+      trans_a: {type: bool, default: false}
+      trans_b: {type: bool, default: true}
+    shape_rules:
+    # d is logical [M, N] for all four layouts: M is a's non-K axis (axis 1 if
+    # a is stored [K, M] under trans_a, else axis 0); N is b's non-K axis.
+    - "d.shape == ((a.shape[1] if trans_a else a.shape[0]), (b.shape[0] if trans_b else b.shape[1]))"
+
+  workloads:
+  # m/n/k are the logical GEMM dims (trans-independent); trans_a/trans_b pick
+  # the storage layout the kernel compiles for. The NT (n, k) shapes mirror
+  # DeepGEMM's normal-GEMM test set (DeepSeek-V3 MLP/attention projections),
+  # swept over decode (m=128) and prefill (m=4096) token counts.
+  - {m: 1024, n: 1024, k: 1024, trans_a: false, trans_b: false, dtypes: [float16, bfloat16], label: "square-1k-nn"}
+  - {m: 128, n: 2112, k: 7168, trans_a: false, trans_b: true, dtypes: [bfloat16], label: "ds-v3-decode-gate-up"}
+  - {m: 128, n: 7168, k: 2048, trans_a: false, trans_b: true, dtypes: [bfloat16], label: "ds-v3-decode-down"}
+  - {m: 4096, n: 2112, k: 7168, trans_a: false, trans_b: true, dtypes: [bfloat16], label: "ds-v3-prefill-gate-up"}
+  - {m: 4096, n: 7168, k: 2048, trans_a: false, trans_b: true, dtypes: [bfloat16], label: "ds-v3-prefill-down"}
+  - {m: 4096, n: 4096, k: 7168, trans_a: false, trans_b: true, dtypes: [float16, bfloat16], label: "ds-v3-prefill-attn-proj"}
+  - {m: 4096, n: 7168, k: 16384, trans_a: false, trans_b: true, dtypes: [bfloat16], label: "k-dominant-7168x16384"}
+  - {m: 4096, n: 24576, k: 1536, trans_a: false, trans_b: true, dtypes: [bfloat16], label: "wide-n-24576"}
+  # Mid-m band: samples of m = 9..127, the token-count gap below the
+  # decode/prefill sweep (m in {128, 1024, 4096}); n/k reuse the
+  # DeepSeek-V3 projection shapes above.
+  - {m: 16, n: 4096, k: 7168, trans_a: false, trans_b: true, dtypes: [bfloat16], label: "mid-m16-attn"}
+  - {m: 32, n: 4096, k: 7168, trans_a: false, trans_b: true, dtypes: [bfloat16], label: "mid-m32-attn"}
+  - {m: 64, n: 7168, k: 2048, trans_a: false, trans_b: true, dtypes: [bfloat16], label: "mid-m64-down"}
+  - {m: 96, n: 2112, k: 7168, trans_a: false, trans_b: true, dtypes: [bfloat16], label: "mid-m96-gate-up"}
+  # Single- and two-token decode. These are the only workloads whose m reaches
+  # the bandwidth kernel-modes — one per mode, on the same projection as the
+  # decode rows above so the three token counts are comparable. The two-token
+  # shape keeps n narrow on purpose: on a grid wide enough for the
+  # operand-swapped generic kernel that one serves m = 2 instead.
+  - {m: 1, n: 2112, k: 7168, trans_a: false, trans_b: true, dtypes: [bfloat16], label: "ds-v3-decode-gate-up-b1"}
+  - {m: 2, n: 2112, k: 7168, trans_a: false, trans_b: true, dtypes: [bfloat16], label: "ds-v3-decode-gate-up-b2"}
+
+  roofline:
+    func: "tileops.perf.formulas.gemm_fwd_roofline"
+
+  source:
+    kernel: tileops/kernels/gemm/dense.py
+    op: tileops/ops/gemm/gemm.py
+    test: tests/ops/test_gemm.py
+    bench: benchmarks/ops/bench_gemm.py
+    bench_manifest_driven: true
+    kernel_map:
+      gemm_kernel: GemmKernel
+      gemm_basic_kernel: GemmBasicKernel
+      gemv_kernel: GemvKernel
+      small_batch_kernel: SmallBatchGemmKernel
+
+GemmFp8FwdOp:
+  ref_api: "torch._scaled_mm"
+  family: gemm
+  status: implemented
+
+  signature:
+    inputs:
+      a: {dtype: "float8_e4m3fn", shape: "[M, K]"}
+      b: {dtype: "same_as(a)", shape: "[N, K]"}
+      scale_a: {dtype: "float32"}
+      scale_b: {dtype: "float32"}
+      bias: {dtype: "bfloat16", shape: "[N]", optional: true}
+    outputs:
+      d: {dtype: "bfloat16 | float16", shape: "[M, N]"}
+    params:
+      out_dtype: {type: dtype, default: bfloat16}
+    shape_rules:
+    - "a.shape[1] == b.shape[1]"
+    - "d.shape == (a.shape[0], b.shape[0])"
+    - "(scale_a.shape == (1, 1) and scale_b.shape == (1, 1)) or (scale_a.shape == (a.shape[0], (a.shape[1] + 127) // 128) and scale_b.shape == (b.shape[0], (a.shape[1] + 127) // 128))"
+    - "bias is None or bias.shape == (b.shape[0],)"
+
+  workloads:
+  - {m: 128, n: 2112, k: 7168, scale_mode: per_tensor, dtypes: [float8_e4m3fn], label: "ds-v3-decode-gate-up-per-tensor"}
+  - {m: 128, n: 7168, k: 2048, scale_mode: per_tensor, dtypes: [float8_e4m3fn], label: "ds-v3-decode-down-per-tensor"}
+  - {m: 4096, n: 2112, k: 7168, scale_mode: per_tensor, dtypes: [float8_e4m3fn], label: "ds-v3-prefill-gate-up-per-tensor"}
+  - {m: 4096, n: 7168, k: 2048, scale_mode: per_tensor, dtypes: [float8_e4m3fn], label: "ds-v3-prefill-down-per-tensor"}
+  - {m: 128, n: 2112, k: 7168, scale_mode: block128, dtypes: [float8_e4m3fn], label: "ds-v3-decode-gate-up-block128"}
+  - {m: 128, n: 7168, k: 2048, scale_mode: block128, dtypes: [float8_e4m3fn], label: "ds-v3-decode-down-block128"}
+  - {m: 4096, n: 2112, k: 7168, scale_mode: block128, dtypes: [float8_e4m3fn], label: "ds-v3-prefill-gate-up-block128"}
+  - {m: 4096, n: 7168, k: 2048, scale_mode: block128, dtypes: [float8_e4m3fn], label: "ds-v3-prefill-down-block128"}
+  - {m: 4096, n: 4096, k: 7168, scale_mode: block128, dtypes: [float8_e4m3fn], label: "ds-v3-prefill-attn-proj-block128"}
+  - {m: 4096, n: 7168, k: 16384, scale_mode: block128, dtypes: [float8_e4m3fn], label: "k-dominant-7168x16384-block128"}
+  - {m: 4096, n: 24576, k: 1536, scale_mode: block128, dtypes: [float8_e4m3fn], label: "wide-n-24576-block128"}
+  - {m: 8, n: 7168, k: 2048, scale_mode: per_tensor, dtypes: [float8_e4m3fn], label: "small-batch-down-m8-per-tensor"}
+  - {m: 1, n: 7168, k: 2048, scale_mode: per_tensor, dtypes: [float8_e4m3fn], label: "gemv-down-m1-per-tensor"}
+  - {m: 1, n: 7168, k: 2048, scale_mode: block128, dtypes: [float8_e4m3fn], label: "gemv-down-m1-block128"}
+  - {m: 128, n: 2112, k: 7168, scale_mode: per_tensor, dtypes: [float8_e4m3fn], bias_shape: [2112], label: "ds-v3-decode-gate-up-per-tensor-bias"}
+  roofline:
+    func: "tileops.perf.formulas.gemm_fp8_fwd_roofline"
+
+  source:
+    kernel: tileops/kernels/gemm/dense.py
+    op: tileops/ops/gemm/gemm.py
+    test: tests/ops/test_gemm.py
+    bench: benchmarks/ops/bench_gemm.py
+    bench_manifest_driven: true
+    kernel_map:
+      gemm_fp8_epilogue_kernel: GemmFp8EpilogueKernel
+      gemm_fp8_block_scaled_kernel: GemmFp8BlockScaledKernel
+
+GemmW4A16FwdOp:
+  ref_api: "none"
+  family: gemm
+  status: implemented
+
+  signature:
+    inputs:
+      activation: {dtype: "float16", shape: "[M, K]"}
+      packed_weight: {dtype: "uint8", shape: "[N, K_PACKED]"}
+      weight_scale: {dtype: "float32", shape: "[N, GROUPS]"}
+      weight_zero: {dtype: "uint8", shape: "[N, GROUPS]"}
+    outputs:
+      output: {dtype: "same_as(activation)", shape: "[M, N]"}
+    params:
+      group_size: {type: int, default: 128}
+    shape_rules:
+    - "activation.shape[1] % group_size == 0"
+    - "packed_weight.shape == (weight_scale.shape[0], activation.shape[1] // 2)"
+    - "weight_scale.shape == (packed_weight.shape[0], activation.shape[1] // group_size)"
+    - "weight_zero.shape == weight_scale.shape"
+    - "output.shape == (activation.shape[0], packed_weight.shape[0])"
+
+  workloads:
+  # Decode-oriented coverage. The small non-decode shapes are compile/smoke
+  # checks only; they are not intended to claim full GEMM performance coverage.
+  - {m: 64, n: 64, k: 128, dtypes: [float16], label: "compile-smoke-square-64x64x128"}
+  - {m: 128, n: 256, k: 256, dtypes: [float16], label: "compile-smoke-rect-128x256x256"}
+  - {m: 1, n: 8192, k: 8192, dtypes: [float16], label: "decode-l2-resident-ish"}
+  - {m: 1, n: 8192, k: 16384, dtypes: [float16], label: "decode-hbm-streaming-threshold"}
+  - {m: 1, n: 7168, k: 20480, dtypes: [float16], label: "decode-non-power2-low-cta"}
+  - {m: 1, n: 8192, k: 81920, dtypes: [float16], label: "decode-long-k-pressure"}
+
+  roofline:
+    func: "tileops.perf.formulas.gemm_w4a16_fwd_roofline"
+
+  source:
+    kernel: tileops/kernels/gemm/w4a16.py
+    op: tileops/ops/gemm/gemm.py
+    test: tests/ops/test_gemm.py
+    bench: benchmarks/ops/bench_gemm.py
+    bench_manifest_driven: true
+    kernel_map:
+      gemm_w4a16_kernel: GemmW4A16Kernel
+      gemm_w4a16_decode_kernel: GemmW4A16DecodeKernel
+
+GroupedGemmFwdOp:
+  ref_api: "none"
+  family: gemm
+  status: implemented
+
+  signature:
+    inputs:
+      a: {dtype: "float16 | bfloat16"}
+      b: {dtype: "same_as(a)"}
+      batch_sizes: {dtype: "int32", shape: "[batch_count]"}
+      batch_offsets: {dtype: "int32", shape: "[batch_count]"}
+      batch_padded_offsets: {dtype: "int32", shape: "[batch_count]"}
+    outputs:
+      output: {dtype: "same_as(a)"}
+    params:
+      transpose_a: {type: bool, default: false}
+      transpose_b: {type: bool, default: true}
+    shape_rules:
+    - "batch_sizes.ndim == 1"
+    - "batch_offsets.shape == batch_sizes.shape"
+    - "batch_padded_offsets.shape == batch_sizes.shape"
+    - "a.ndim == 2"
+    - "b.ndim == (2 if transpose_a else 3)"
+    - "a.shape[0] > 0 and a.shape[1] > 0"
+    - "b.shape[0] == batch_sizes.shape[0] if (not transpose_a) else True"
+    - "b.shape[2 if transpose_b else 1] == a.shape[1] if (not transpose_a) else True"
+    - "b.shape[1 if transpose_b else 0] == a.shape[0] if transpose_a else True"
+    # The output rank and extents follow transpose_a, which also decides b's rank.
+    - "output.ndim == (3 if transpose_a else 2)"
+    - "transpose_a or output.shape == (a.shape[0], b.shape[1 if transpose_b else 2])"
+    - "not transpose_a or output.shape == (batch_sizes.shape[0], a.shape[1], b.shape[0 if transpose_b else 1])"
+
+  workloads:
+  - {batch_sum: 4096, batch_count: 16, n: 4096, k: 4096, dtype: float16, transpose_a: false, transpose_b: true, dtypes: [float16], label: "nt-batch16-m4096-n4096-k4096"}
+  - {batch_sum: 4096, batch_count: 16, n: 4096, k: 4096, dtype: bfloat16, transpose_a: false, transpose_b: true, dtypes: [bfloat16], label: "nt-batch16-m4096-n4096-k4096"}
+  - {batch_sum: 4096, batch_count: 16, n: 4096, k: 4096, dtype: float16, transpose_a: false, transpose_b: false, dtypes: [float16], label: "nn-batch16-m4096-n4096-k4096"}
+  - {batch_sum: 4096, batch_count: 16, n: 4096, k: 4096, dtype: float16, transpose_a: true, transpose_b: false, dtypes: [float16], label: "tn-batch16-m4096-n4096-k4096"}
+
+  roofline:
+    func: "tileops.perf.formulas.grouped_gemm_roofline"
+
+  source:
+    kernel:
+    - tileops/kernels/grouped_gemm/grouped_gemm_persistent.py
+    - tileops/kernels/grouped_gemm/grouped_gemm.py
+    kernel_map:
+      grouped_gemm_persistent: GroupedGemmPersistentKernel
+      grouped_gemm_kernel: GroupedGemmKernel
+    op: tileops/ops/gemm/grouped_gemm.py
+    test: tests/ops/test_grouped_gemm.py
+    bench: benchmarks/ops/bench_grouped_gemm.py
+    bench_manifest_driven: true

@@ -3,6 +3,7 @@ import math
 import argparse
 import tilelang
 import tilelang.language as T
+from tilelang.utils.device import get_current_device
 
 
 @tilelang.jit(pass_configs={"tl.disable_tma_lower": True, "tl.disable_warp_specialized": True})
@@ -204,7 +205,7 @@ def run_tilelang_grouped_gemm(
         raise NotImplementedError("grouped GEMM backward example does not support transposed B")
 
     padding_M = block_M
-    device = torch.device("ptpu")
+    device = get_current_device()
     dtype = torch.float16
 
     A, B, C, batch_sizes, batch_offsets, batch_padded_offsets = construct_inputs(batch_sizes_list, K, M, False, padding_M, device, dtype)
@@ -227,10 +228,9 @@ def run_tilelang_grouped_gemm(
     dB = B.grad.clone()
     B.grad = None
 
-    if torch.allclose(O.cpu().float(), O_ref, rtol=1e-2, atol=1e-2) and torch.allclose(dB.cpu().float(), dB_ref, rtol=5e-2, atol=5e-2):
-        print("✅ Tilelang and Torch match")
-    else:
-        print("❌ Tilelang and Torch mismatch")
+    torch.testing.assert_close(O.cpu().float(), O_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(dB.cpu().float(), dB_ref, rtol=5e-2, atol=5e-2)
+    print("✅ Tilelang and Torch match")
 
     if profile:
         from tilelang.profiler import do_bench

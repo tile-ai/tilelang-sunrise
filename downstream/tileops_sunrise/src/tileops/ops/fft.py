@@ -1,0 +1,159 @@
+import math
+from typing import Dict, Optional
+
+import torch
+
+from tileops.kernels.fft import FFTC2CKernel
+from tileops.kernels.kernel_base import Kernel
+
+from .op_base import Op
+
+__all__ = ["FFTC2CFwdOp"]
+
+
+class FFTC2CFwdOp(Op):
+    """
+    1D Complex-to-Complex Fast Fourier Transform operation.
+
+    Computes the one-dimensional discrete Fourier transform of complex input.
+    This is equivalent to torch.fft.fft.
+
+    Supports batched input: any leading dimensions are flattened into a single
+    batch dimension, processed in parallel by the kernel, and reshaped back.
+
+    Uses pre-computed twiddle factor LUT and shared-memory butterfly fusion
+    for optimal GPU performance.
+
+    """
+
+    def __init__(self, tune: bool = False, kernel_map: Optional[Dict[str, Kernel]] = None) -> None:
+        """Build the op. Shapes and dtype are taken from the first call.
+
+        Args:
+            tune: Whether to enable autotuning (default: False)
+            kernel_map: Optional custom kernel mapping for testing
+        """
+        self.n = None
+        self.dtype = None
+        self.tune = tune
+
+        self.dispatch_kernel(kernel_map)
+        self._twiddle_cache: Dict[
+            tuple[int, torch.dtype, int | None], tuple[torch.Tensor, torch.Tensor]
+        ] = {}
+        self.kernel = None
+
+    def _get_kernel(
+        self,
+        inputs: "tuple[torch.Tensor | None, ...]",
+        n: int,
+        batch_size: int,
+        dtype: torch.dtype,
+        device_index: int | None,
+    ) -> Kernel:
+        key = (n, batch_size, dtype, device_index)
+        return self.get_or_build_kernel(
+            "fft_c2c_kernel",
+            inputs,
+            key=key,
+            build=lambda: self.kernel_map["fft_c2c_kernel"](
+                n,
+                batch_size,
+                dtype,
+                tune=self.tune,
+            ),
+        )
+
+    @staticmethod
+    def _build_lut(
+        n: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Pre-compute the full twiddle factor LUT for all butterfly stages.
+
+        For stage s, half_m = 2^s twiddle factors are stored at offset (half_m - 1):
+            LUT[half_m - 1 + k] = exp(-2πi * k / m),  k = 0..half_m-1,  m = 2*half_m
+
+        All angles are computed in float64 for precision, then cast to the
+        real component dtype (float32 for complex64, float64 for complex128).
+        """
+        real_dtype = torch.float32 if dtype == torch.complex64 else torch.float64
+        log2n = int(math.log2(n))
+        lut_size = n - 1
+
+        angles = torch.zeros(lut_size, dtype=torch.float64)
+        for s in range(log2n):
+            half_m = 1 << s
+            m = half_m * 2
+            k_vals = torch.arange(half_m, dtype=torch.float64)
+            angles[half_m - 1 : 2 * half_m - 1] = -2.0 * math.pi * k_vals / m
+
+        lut_real = torch.cos(angles).to(real_dtype).to(device)
+        lut_imag = torch.sin(angles).to(real_dtype).to(device)
+        return lut_real, lut_imag
+
+    def _get_lut(
+        self, n: int, dtype: torch.dtype, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        key = (n, dtype, device.index)
+        if key not in self._twiddle_cache:
+            self._twiddle_cache[key] = self._build_lut(n, dtype, device)
+        return self._twiddle_cache[key]
+
+    @property
+    def default_kernel_map(self) -> Dict[str, Kernel]:
+        return {"fft_c2c_kernel": FFTC2CKernel}
+
+    def _infer_output_shapes(
+        self,
+        input_shape: tuple[int, ...],
+    ) -> dict[str, tuple[int, ...]]:
+        """Manifest ``outputs``: ``same_as(input)`` — a transform moves no axis."""
+        return {"output": tuple(input_shape)}
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        """Compute 1D FFT of complex input.
+
+        Args:
+            input: Input tensor of shape (..., n) with complex dtype.
+
+        Returns:
+            Output tensor of same shape as input with FFT applied along the
+            last dimension.
+        """
+        x = input
+        if x.device.type not in {"cuda", "ptpu"}:
+            raise ValueError("input must be a GPU tensor")
+        if x.dtype not in (torch.complex64, torch.complex128):
+            raise ValueError(f"input.dtype must be complex64 or complex128, got {x.dtype}")
+        if x.ndim == 0:
+            raise ValueError("input must be at least 1D")
+        n = x.shape[-1]
+        if n <= 0 or n & (n - 1) != 0:
+            raise ValueError(f"FFT size must be a positive power of 2, got {n}")
+
+        # ptpu 后端缺 view_as_real（.real/.imag 都会触发），改用 view(float32) 把
+        # complex64 直接 reinterpret 成 interleaved real/imag（最后一维 n*2），再切片。
+        x_pair = x.view(torch.float32)  # (..., n*2)
+        x_real = x_pair[..., 0::2].contiguous()  # (..., n)
+        x_imag = x_pair[..., 1::2].contiguous()  # (..., n)
+        original_shape = x.shape
+
+        # Flatten all batch dimensions into a single batch dimension
+        batch_size = x_real[..., 0].numel() if x.ndim > 1 else 1
+        x_real = x_real.reshape(batch_size, n)
+        x_imag = x_imag.reshape(batch_size, n)
+
+        self.n = n
+        self.dtype = x.dtype
+        self.twiddle_real, self.twiddle_imag = self._get_lut(n, x.dtype, x.device)
+        kernel = self._get_kernel((input,), n, batch_size, x.dtype, x.device.index)
+        self.kernel = kernel
+        y_pair = kernel(x_real, x_imag, self.twiddle_real, self.twiddle_imag)
+
+        # The kernel writes the final butterfly directly in interleaved layout.
+        # view_as_complex is metadata-only on CUDA but unimplemented on ptpu, so
+        # reinterpret via view(complex64) and drop the trailing unit dim instead.
+        return y_pair.reshape(*original_shape, 2).view(torch.complex64).reshape(original_shape)

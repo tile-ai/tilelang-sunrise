@@ -1,55 +1,142 @@
-<img src=./images/tilelang-sunrise-logo.png />
+<img src="./images/tilelang-sunrise-logo.png" alt="TileLang-Sunrise logo" />
 
 <div align="center">
 
 # TileLang-Sunrise
 [![Upstream TileLang PyPI version](https://badge.fury.io/py/tilelang.svg)](https://badge.fury.io/py/tilelang)
-[![Ask TileLang DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/tile-ai/tilelang)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/tile-ai/tilelang)
 [![Discord](https://img.shields.io/badge/Discord-%235865F2.svg?logo=discord&logoColor=white)](https://discord.gg/TUrHyJnKPG)
 [![Puzzles](https://img.shields.io/badge/🧩_Learn-TileLang_Puzzles-blueviolet)](https://github.com/tile-ai/tilelang-puzzles)
+[![LSP](https://img.shields.io/badge/LSP-TileLang_LSP-orange?logo=visualstudiocode&logoColor=white)](https://github.com/tile-ai/tilelang-lsp)
+
+[Documentation](https://tilelang.com/) ·
+[Sunrise Installation](#installation) ·
+[Examples](./examples) ·
+[Upstream Releases](https://github.com/tile-ai/tilelang/releases) ·
+[Contributing](https://github.com/tile-ai/tilelang/blob/main/CONTRIBUTING.md) ·
+[TileLang (Ascend 950)](./tilelang/ascend/README.md)
 </div>
 
-TileLang-Sunrise is the Sunrise S2/TANG backend distribution of [Tile Language (**tile-lang**)](https://github.com/tile-ai/tilelang), a concise domain-specific language designed to streamline the development of high-performance GPU/CPU/accelerator kernels (e.g., GEMM, Dequant GEMM, FlashAttention, LinearAttention). By employing a Pythonic syntax with an underlying compiler infrastructure on top of [TVM](https://tvm.apache.org/), TileLang-Sunrise allows developers to focus on productivity without sacrificing the low-level optimizations necessary for state-of-the-art performance.
+TileLang-Sunrise is the Sunrise S2/TANG backend distribution of [Tile Language (**tile-lang**)](https://github.com/tile-ai/tilelang), a concise domain-specific language designed to streamline the development of high-performance GPU/CPU/NPU kernels (e.g., GEMM, Dequant GEMM, FlashAttention, LinearAttention). By employing a Pythonic syntax with an underlying compiler infrastructure on top of [TVM](https://tvm.apache.org/), TileLang-Sunrise allows developers to focus on productivity without sacrificing the low-level optimizations necessary for state-of-the-art performance.
 
-<img src=./images/MatmulExample.png />
+This source tree tracks the upstream [TileLang v0.1.15](https://github.com/tile-ai/tilelang/releases/tag/v0.1.15) baseline. Upstream backend announcements do not imply validation on Sunrise hardware.
+
+<img src="./images/MatmulExample.png" alt="TileLang tiled matrix multiplication example" />
 
 ## Upstream TileLang Latest News
-- 02/02/2026 🧩: Check out [TileLang Puzzles](https://github.com/tile-ai/tilelang-puzzles), a fun and interactive way to learn TileLang programming with 10 progressively harder puzzles!
-- 12/18/2025 🚀: Added [CuTeDSL backend](https://github.com/tile-ai/tilelang/pull/1421) support, enabling compilation to NVIDIA CUTLASS CuTe DSL! Join us in building and optimizing this exciting new backend: [Issue #1454](https://github.com/tile-ai/tilelang/issues/1454).
-- 12/17/2025 🔬: Integrated [Z3 theorem prover](https://github.com/tile-ai/tilelang/pull/1367) into TVM Arith Analyzer, bringing SMT-based symbolic reasoning for enhanced optimizations and automatic correctness verification!
-- 10/31/2025 🔧: Migrated to [apache-tvm-ffi](https://github.com/tile-ai/tilelang/pull/1108), significantly reducing CPU overhead!
-- 10/30/2025 📦: We have released v0.1.6.post2, which is the last version compatible with Python 3.8.
-- 10/07/2025 🍎: Added Apple Metal Device support, check out [Pull Request #799](https://github.com/tile-ai/tilelang/pull/799) for details.
-- 09/29/2025  🎉: Thrilled to announce that ​​AscendC​​ and ​Ascend​NPU IR​​ backends targeting Huawei Ascend chips are now supported!
-Check out the preview here:
-🔗 [link](https://github.com/tile-ai/tilelang-ascend).
-This includes implementations across two branches:
-[ascendc_pto](https://github.com/tile-ai/tilelang-ascend) and
-[npuir](https://github.com/tile-ai/tilelang-ascend/tree/npuir).
-Feel free to explore and share your feedback!
-- 07/04/2025 🚀: Introduced `T.gemm_sp` for 2:4 sparse tensor core support, check out [Pull Request #526](https://github.com/tile-ai/tilelang/pull/526) for details.
-- 06/05/2025 ✨: Added [NVRTC Backend](https://github.com/tile-ai/tilelang/pull/461) to significantly reduce compilation time for cute templates!
-- 04/14/2025 🚀: Added high-performance FlashMLA implementation for AMD MI300X, achieving performance parity with hand-optimized assembly kernels of Aiter! See [example_mla_amd](./examples/deepseek_mla/amd/README.md) for details.
-- 03/03/2025 🚀: Added high-performance MLA Decoding support using only 80 lines of Python code, achieving performance on par with FlashMLA on H100 (see [example_mla_decode.py](./examples/deepseek_mla/example_mla_decode.py))! We also provide [documentation](./examples/deepseek_mla/README.md) explaining how TileLang achieves this.
-- 02/15/2025 ✨: Added WebGPU Codegen support, see [Pull Request #86](https://github.com/tile-ai/tilelang/pull/86)!
-- 02/12/2025 ✨: Excited to announce the release of [v0.1.0](https://github.com/tile-ai/tilelang/releases/tag/v0.1.0)!
-- 02/10/2025 🚀: Added debug tools for TileLang—`T.print` for printing variables/buffers ([docs](https://tilelang.com/tutorials/debug_tools_for_tilelang.html)) and a memory layout plotter ([examples/plot_layout](./examples/plot_layout)).
-- 01/20/2025 ✨: We are excited to announce that tile-lang, a dsl for high performance AI workloads, is now open source and available to the public!
 
-## Tested Devices
-TileLang-Sunrise supports Sunrise S2 accelerators through the TANG backend.
+- **[TileLang v0.1.15](https://github.com/tile-ai/tilelang/releases/tag/v0.1.15):** adds Ascend 950, backend-owned launch options, compile-time Python iteration, unified block-scaled GEMM, and runtime/compiler correctness fixes. Review the compatibility notes before upgrading.
+- **2026-09-30 — [Ascend 950 backend](./tilelang/ascend/README.md):** TileLang now officially supports Huawei Ascend 950 NPUs with native code generation, automatic scheduling and synchronization, SIMD/SIMT vector programming, etc. Explore the Ascend examples for GEMM, FlashAttention, and more.
+- **2026-08-04 — [TileLang LSP open sourced](https://github.com/tile-ai/tilelang-lsp):** published a Language Server Protocol implementation for TileLang with inlay hints for buffer shapes, dtypes, scopes, and inferred layouts, plus hover details and precise diagnostics.
+- **2026-08-03 — [TileLang v0.1.13](https://github.com/tile-ai/tilelang/releases/tag/v0.1.13):** shipped the multi-backend language dialect, source locations in compiler diagnostics, new CUDA and Metal hardware paths, and a broad set of correctness fixes. This release removes several legacy APIs; read the compatibility notes before upgrading.
+- **2026-07-30 — [SM120 NVF4 block-scaled MMA](https://github.com/tile-ai/tilelang/pull/2364):** added an optimized Blackwell path for `T.mma_gemm_blockscaled` and a corresponding SM120 example.
+- **2026-07-28 — [Metal 4 cooperative-tensor GEMM](https://github.com/tile-ai/tilelang/pull/2252):** added cooperative-tensor `T.gemm` support for Apple M5, while retaining the simdgroup fallback for unsupported shapes and systems.
 
-## OP Implementation Examples
-**TileLang-Sunrise** provides the building blocks to implement a wide variety of operators. Some examples include:
+<details>
+<summary><strong>Earlier news (2025–2026)</strong></summary>
 
-- [Matrix Multiplication](./examples/gemm/)
-- [Dequantization GEMM](./examples/dequantize_gemm/)
-- [Flash Attention](./examples/flash_attention/)
-- [Flash Linear Attention](./examples/linear_attention/)
-- [Flash MLA Decoding](./examples/deepseek_mla/)
-- [Native Sparse Attention](./examples/deepseek_nsa/)
+### 2026
 
-Within the `examples` directory, you will also find additional complex kernels—such as convolutions, forward/backward passes for FlashAttention, more operators will continuously be added.
+- **2026-07-28 — [Source-aware compiler diagnostics](https://github.com/tile-ai/tilelang/pull/2751):** carried Python source locations into TIRX and surfaced them in compiler errors.
+- **2026-07-24 — [Multi-backend language dialect](https://github.com/tile-ai/tilelang/pull/2734):** reorganized the language layer around shared semantics with static CUDA, ROCm, and Metal dialects.
+- **2026-07-23 — [Block-causal attention for dLLM](https://github.com/tile-ai/tilelang/pull/2499):** added fixed-length and variable-length block-causal attention examples for diffusion language models.
+- **2026-07-22 — [IR Lower Trace](https://github.com/tile-ai/tilelang/pull/2725):** introduced a debugging tool for inspecting IR changes across every compiler pass and the final code-generation step.
+- **2026-07-22 — [DeepSeek V3.2 sparse MLA backward](https://github.com/tile-ai/tilelang/pull/2592):** selected the launch width adaptively from the head-block size.
+- **2026-07-21 — [DeepSeek V3.2 top-k optimization](https://github.com/tile-ai/tilelang/pull/2659):** improved the sparse-attention top-k selector's memory access pattern, delivering approximately 1.9× higher performance in the reported benchmark.
+- **2026-07-16 — [Compiler pass timing](https://github.com/tile-ai/tilelang/pull/2622):** added profiling for compiler passes with a configurable reporting threshold.
+- **2026-07-12 — [IKET profiler integration](https://github.com/tile-ai/tilelang/pull/2515):** added CUDA timeline instrumentation and profiling support.
+- **2026-07-08 — [TileLang v0.1.12](https://github.com/tile-ai/tilelang/releases/tag/v0.1.12):** added the LLVM backend, tile scheduler, backend registry, pass visualizer, and expanded Blackwell support.
+- **2026-07-06 — [Pass Visualizer](https://github.com/tile-ai/tilelang/pull/2449):** introduced a structure-tree browser for inspecting compiler transformations.
+- **2026-06-26 — [Cross-host CUDA binary cache](https://github.com/tile-ai/tilelang/pull/2459):** enabled compiled CUDA binaries to be reused across compatible hosts.
+- **2026-06-24 — [Tile scheduler](https://github.com/tile-ai/tilelang/pull/2441):** introduced persistent tile-scheduling primitives for kernel authors.
+- **2026-06-24 — [Backend CodeGen registry](https://github.com/tile-ai/tilelang/pull/2442):** moved device and [host CodeGen](https://github.com/tile-ai/tilelang/pull/2446) dispatch behind a backend registry.
+- **2026-06-18 — [LLVM backend](https://github.com/tile-ai/tilelang/pull/2409):** added CPU lowering and execution through LLVM.
+- **2026-06-18 — [Arbitrary-layout TMA lowering](https://github.com/tile-ai/tilelang/pull/2380):** enabled TMA transfers for swizzled shared-memory layouts.
+- **2026-06-16 — [Pass Diff](https://github.com/tile-ai/tilelang/pull/2375):** added compiler-pass IR comparison for debugging lowering changes.
+- **2026-06-08 — [TileLang v0.1.11](https://github.com/tile-ai/tilelang/releases/tag/v0.1.11):** expanded scan, pipeline, backend, CUDA, ROCm, and Metal functionality.
+- **2026-05-25 — [Scan operators](https://github.com/tile-ai/tilelang/pull/2262):** introduced tile-level scan primitives.
+- **2026-05-25 — [TileLang v0.1.10](https://github.com/tile-ai/tilelang/releases/tag/v0.1.10):** broadened AMD and Blackwell support, added initial Metal GEMM, improved Windows packaging, and expanded autotuning.
+- **2026-05-24 — [CDNA4 MXFP4](https://github.com/tile-ai/tilelang/pull/2132):** added FP4 E2M1 matrix-core support for AMD gfx950.
+- **2026-05-22 — [Metal simdgroup GEMM](https://github.com/tile-ai/tilelang/pull/1869):** added the first Metal `T.gemm` path using `simdgroup_matrix` MMA.
+- **2026-05-20 — [Cluster copies](https://github.com/tile-ai/tilelang/pull/1908):** introduced `T.copy_cluster` for TMA multicast and SM-to-SM cluster transfers.
+- **2026-05-20 — [TMA gather/scatter](https://github.com/tile-ai/tilelang/pull/2129):** added `tile::gather4` and `tile::scatter4` support.
+- **2026-05-20 — [Native SM75 MMA GEMM](https://github.com/tile-ai/tilelang/pull/2198):** added FP16, INT8, and INT4 tensor-core paths for Turing GPUs.
+- **2026-05-20 — [TIRX migration](https://github.com/tile-ai/tilelang/pull/2216):** moved TileLang IR usage to TVM's TIRX representation.
+- **2026-05-11 — [Parallel autotuning](https://github.com/tile-ai/tilelang/pull/2159):** added pipelined compilation, grouped compilation, and multi-GPU benchmarking.
+- **2026-05-07 — [DeepSeek V4 operators](https://github.com/tile-ai/tilelang/pull/2148):** added TileLang examples for DeepSeek V4 workloads.
+- **2026-05-06 — [Windows support](https://github.com/tile-ai/tilelang/pull/2093):** added complete Windows build and runtime support with cross-platform fixes.
+- **2026-04-28 — [MXFP8 grouped GEMM](https://github.com/tile-ai/tilelang/pull/2098):** added block-scaled grouped GEMM examples with transposed-B support on Blackwell.
+- **2026-04-25 — [HISA sparse-attention indexer](https://github.com/tile-ai/tilelang/pull/2069):** added hierarchical sparse-attention indexing examples.
+- **2026-04-24 — [Blackwell MXFP8 block-scaled GEMM](https://github.com/tile-ai/tilelang/pull/1945):** added MXFP8 block-scaled matrix multiplication on SM100.
+- **2026-04-22 — [TileLang v0.1.9](https://github.com/tile-ai/tilelang/releases/tag/v0.1.9):** delivered CuTe DSL GEMM V2, Metal code generation improvements, and build-without-host-toolchain support.
+- **2026-04-22 — [RDNA3/RDNA3.5 WMMA](https://github.com/tile-ai/tilelang/pull/2044):** added WMMA lowering for AMD gfx11 GPUs.
+- **2026-04-20 — [INT4 `T.gemm`](https://github.com/tile-ai/tilelang/pull/2063):** added INT4 matrix multiplication to the CUDA GEMM path.
+- **2026-04-17 — [CUDA source kernels](https://github.com/tile-ai/tilelang/pull/1970):** introduced `T.CUDASourceCodeKernel` for embedding custom CUDA source.
+- **2026-04-15 — [AutoDD frozen regions](https://github.com/tile-ai/tilelang/pull/2045):** added `__freeze__` annotations to preserve selected code during automatic delta debugging.
+- **2026-03-27 — [TMA stores](https://github.com/tile-ai/tilelang/pull/1981):** added store support to `T.tma_copy`.
+- **2026-03-24 — [Two-SM Blackwell kernels](https://github.com/tile-ai/tilelang/pull/1882):** added two-SM TMA, TMEM, and TCGEN5 MMA support.
+- **2026-03-23 — [AMD RDNA4](https://github.com/tile-ai/tilelang/pull/1951):** upgraded the ROCm path and added RDNA4 GPU support.
+- **2026-03-22 — [FlashAttention on SM100](https://github.com/tile-ai/tilelang/pull/1910):** added Blackwell FlashAttention examples.
+- **2026-03-18 — [Producer-consumer warp specialization](https://github.com/tile-ai/tilelang/pull/1909):** added automatic warp-specialized pipelines and the `T.tma_copy` API.
+- **2026-03-12 — [Eager-mode autotuning](https://github.com/tile-ai/tilelang/pull/1906):** enabled the autotuner with eager JIT kernels.
+- **2026-03-10 — [CPU `T.gemm`](https://github.com/tile-ai/tilelang/pull/1904):** added matrix multiplication support for the CPU target.
+- **2026-03-05 — [IR dump configuration](https://github.com/tile-ai/tilelang/pull/1903):** added a TileLang pass configuration for dumping intermediate IR.
+- **2026-02-28 — [CUDA cluster primitives](https://github.com/tile-ai/tilelang/pull/1874):** added cluster launch, query, synchronization, and barrier operations.
+- **2026-02-28 — [TCGEN5 MMA tensor-shared path](https://github.com/tile-ai/tilelang/pull/1866):** added the tensor-memory/shared-memory Blackwell GEMM path.
+- **2026-02-24 — [Host-toolchain-free builds](https://github.com/tile-ai/tilelang/pull/1833):** enabled installation without a host C/C++ toolchain when supported artifacts are available.
+- **2026-02-23 — [CuTe DSL GEMM V2](https://github.com/tile-ai/tilelang/pull/1855):** added SM90 and SM100 GEMM V2 support to the CuTe DSL backend.
+- **2026-02-16 — [TileLang v0.1.8](https://github.com/tile-ai/tilelang/releases/tag/v0.1.8):** shipped dynamic pipeline improvements, logging documentation, richer layout representations, and AMD fixes.
+- **2026-02-14 — [Cross-CUDA release wheels](https://github.com/tile-ai/tilelang/pull/1826):** unified multiple CUDA versions behind a single wheel.
+- **2026-02-14 — [Hierarchical reductions](https://github.com/tile-ai/tilelang/pull/1762):** added hierarchical and warp-level reduction intrinsics.
+- **2026-02-09 — [CUDA runtime stubs](https://github.com/tile-ai/tilelang/pull/1821):** added lazy-loading CUDART and NVRTC stubs for CUDA 11, 12, and 13 compatible wheels.
+- **2026-02-08 — [Layout visualization improvements](https://github.com/tile-ai/tilelang/pull/1811):** improved rendering and inspection of TileLang layouts.
+- **2026-02-02 — [TileLang Puzzles](https://github.com/tile-ai/tilelang-puzzles):** published ten progressively harder exercises for learning TileLang interactively.
+
+### 2025
+
+- **2025-12-18 — [CuTe DSL backend](https://github.com/tile-ai/tilelang/pull/1421):** added compilation through NVIDIA CUTLASS CuTe DSL; follow ongoing work in [issue #1454](https://github.com/tile-ai/tilelang/issues/1454).
+- **2025-12-17 — [Z3 integration](https://github.com/tile-ai/tilelang/pull/1367):** integrated SMT-based symbolic reasoning into the TVM arithmetic analyzer.
+- **2025-10-31 — [Apache TVM FFI migration](https://github.com/tile-ai/tilelang/pull/1108):** moved the runtime interface to `apache-tvm-ffi` to reduce host-side overhead.
+- **2025-10-30 — [TileLang v0.1.6.post2](https://github.com/tile-ai/tilelang/releases/tag/v0.1.6.post2):** published the final TileLang release compatible with Python 3.8.
+- **2025-10-07 — [Apple Metal backend](https://github.com/tile-ai/tilelang/pull/799):** introduced Metal device support for Apple silicon.
+- **2025-09-29 — [Huawei Ascend adapters](https://github.com/tile-ai/tilelang-ascend):** published AscendC and Ascend NPU IR backend work in the external TileLang Ascend project.
+- **2025-07-04 — [2:4 sparse tensor cores](https://github.com/tile-ai/tilelang/pull/526):** introduced `T.gemm_sp` for structured-sparse matrix multiplication.
+- **2025-06-05 — [NVRTC execution backend](https://github.com/tile-ai/tilelang/pull/461):** added an NVRTC path to reduce compilation time for generated CUDA templates.
+- **2025-04-14 — [FlashMLA on AMD MI300X](https://github.com/tile-ai/tilelang/tree/main/examples/deepseek_mla/amd):** published the optimized AMD implementation and accompanying documentation.
+- **2025-03-03 — [MLA decoding on H100](https://github.com/tile-ai/tilelang/tree/main/examples/deepseek_mla):** published the compact TileLang implementation, benchmarks, and optimization walkthrough.
+- **2025-02-15 — [WebGPU code generation](https://github.com/tile-ai/tilelang/pull/86):** added the initial WebGPU backend.
+- **2025-02-12 — [TileLang v0.1.0](https://github.com/tile-ai/tilelang/releases/tag/v0.1.0):** published the first v0.1 public release.
+- **2025-02-10 — [Debugging and layout tools](https://tilelang.com/tutorials/debug_tools_for_tilelang.html):** added `T.print` and fragment-layout visualization workflows.
+- **2025-01-20 — [TileLang open sourced](https://github.com/tile-ai/tilelang):** made the project publicly available.
+
+</details>
+
+See [all releases](https://github.com/tile-ai/tilelang/releases) for complete changelogs and compatibility notes.
+
+## Sunrise and Upstream Backend Support
+
+TileLang-Sunrise targets Sunrise S2 through `target="tang"` and PyTorch `ptpu` tensors. The following describes **upstream TileLang** backend availability; it is not a Sunrise validation matrix.
+
+TileLang is evolving into a multi-backend compiler (**TileLang-X**) built around a modular backend abstraction. See the [backend architecture](tilelang/backend/README.md) for the design, or ask a coding agent to use the [backend integration skill](.agents/skills/tilelang-backend/SKILL.md) when porting TileLang to a new backend.
+
+The currently supported backends are listed below. `Primary` identifies TileLang's core backend, while `Supported` and `Experimental` backends are implemented in the main repository. `Ecosystem` adapters live in separate repositories, are not included in TileLang release wheels, and may follow independent compatibility schedules. Prebuilt wheels are available for Linux x86-64/AArch64, Windows x86-64, and macOS arm64.
+
+TileLang uses `Target` objects to represent compilation targets. The default `auto` target detects CUDA, HIP, Metal, and Ascend devices; select an explicit target when compiling for another backend or architecture. See the [target guide](https://tilelang.com/get_started/targets.html) for target syntax, architecture options, and backend-specific notes, or the corresponding adapter repository for installation and tested-device details.
+
+| Backend | Target | Platforms and hardware | Support level | Notes |
+| --- | --- | --- | --- | --- |
+| NVIDIA CUDA | `cuda` | Linux x86-64/AArch64, Windows x86-64; code paths from SM70 through SM120 | Primary | Release wheels and CI coverage; TMA, WGMMA, and TMEM features require the corresponding GPU architecture. |
+| AMD ROCm/HIP | `hip` | Linux; CDNA and RDNA GPUs, including gfx942/gfx950 paths | Supported | Included in Linux wheels; a ROCm runtime is required. CI runs on a self-hosted gfx942 (MI300X) runner; gfx950 is not yet covered. |
+| Huawei Ascend 950 | `ascend` | Linux; Ascend 950 NPUs | Supported | Build from source with `USE_ASCEND=ON`; requires CANN and `torch_npu`. See the [Ascend guide](./tilelang/ascend/README.md). |
+| Apple Metal | `metal` | macOS on Apple silicon | Supported | Release wheels and CI coverage; Metal 4 cooperative tensors are available on supported M5 systems. |
+| LLVM CPU | `llvm` | Host CPUs | Experimental | Build from source with `USE_LLVM=ON`; LLVM 15 or newer is required. |
+| NVIDIA CuTe DSL | `cutedsl` | NVIDIA GPUs | Experimental | Requires `nvidia-cutlass-dsl`. |
+| WebGPU | `webgpu` | WebGPU runtimes | Experimental | Code generation and runtime integration are still evolving. |
+| Huawei Ascend A2/A3 | `ascendc` / `pto` / `npuir` | Ascend A2 and A3 | Ecosystem | Developed in [tilelang-ascend](https://github.com/tile-ai/tilelang-ascend) and the MLIR-based [tilelang-mlir-ascend](https://github.com/tile-ai/tilelang-mlir-ascend). |
+| MetaX MACA | `maca` | MetaX C500 and C600 | Ecosystem | Developed in [tilelang-metax](https://github.com/tile-ai/tilelang-metax); requires the MACA software stack. |
+| Moore Threads MUSA | `musa` | S5000, S4000, and M1000 | Ecosystem | Developed in [tilelang-musa](https://github.com/tile-ai/tilelang-musa) and released independently. |
+| HYGON | `hcu` | Linux; BW1000, BW1100, BW150 and K100_AI | Ecosystem | Developed in [tilelang-hygon](https://github.com/tile-ai/tilelang-hygon); requires the DTK software stack. |
+| Sunrise-AI TANG | `tang` | Sunrise S2 and S3 | Ecosystem | Developed in [tilelang-sunrise](https://github.com/tile-ai/tilelang-sunrise). The TANG software stack is required. |
 
 ## Installation
 ### Environment Dependencies
@@ -57,7 +144,7 @@ Within the `examples` directory, you will also find additional complex kernels�
 The Sunrise backend requires a compatible TANG Runtime, `torch_ptpu 0.2.3+torch 2.10`, and matching Triton packages. Configure the following paths for your local environment before installation:
 
 ```bash
-TANGRT_LIB_PATH="/usr/local/tangrt/lib/linux-x86_64:/usr/lib64"
+TANGRT_LIB_PATH="/usr/local/tangrt/targets/linux-x86_64/lib:/usr/local/tangrt/lib/linux-x86_64:/usr/lib64"
 export LD_LIBRARY_PATH=${TANGRT_LIB_PATH}:$LD_LIBRARY_PATH
 export STPU_TANGRT_PATH=/usr/local/tangrt
 
@@ -76,13 +163,11 @@ Install the required system dependencies, then install TileLang-Sunrise locally:
 sudo apt-get update
 sudo apt-get install -y python3-setuptools gcc libtinfo-dev zlib1g-dev build-essential cmake libedit-dev libxml2-dev
 
-pip install -e . -v # remove -e option if you don't want to install in editable mode, -v for verbose output
+export USE_TANG=ON USE_CUDA=OFF USE_ROCM=OFF USE_ASCEND=OFF
+pip install -e . -v
 ```
 
-We currently provide three ways to install **TileLang-Sunrise** from source:
-- [Install from Source (using your own TVM installation)](./docs/get_started/Installation.md#method-1-install-from-source-using-your-own-tvm-installation)
-- [Install from Source (using the bundled TVM submodule)](./docs/get_started/Installation.md#method-2-install-from-source-using-the-bundled-tvm-submodule)
-- [Install Using the Provided Script](./docs/get_started/Installation.md#method-3-install-using-the-provided-script)
+The repository's [CI install entry](./ci/install.sh) builds the pinned TVM/TVM-FFI dependencies and verifies the installed wheel. See [the build guide](./docs/get_started/Installation.md#building-from-source) for the upstream source layout and [custom TVM paths](./docs/get_started/Installation.md#building-with-customized-tvm-path). Upstream `pip install tilelang` wheels do not provide the Sunrise TANG distribution.
 
 ## Quick Start
 
@@ -96,6 +181,7 @@ The following example defines a GEMM kernel and validates its output against PyT
 import tilelang
 import tilelang.language as T
 import torch
+import torch_ptpu  # Register the PTPU device backend.
 
 
 @tilelang.jit(out_idx=[-1], target="tang")
@@ -139,26 +225,20 @@ torch.testing.assert_close(C.cpu(), expected, atol=1e-2, rtol=1e-2)
 print("GEMM correctness check passed.")
 ```
 
-### Dive Deep into TileLang-Sunrise Beyond GEMM
+## Examples
 
-In addition to GEMM, we provide a variety of examples to showcase the versatility and power of TileLang-Sunrise, including:
+- **Start here:** [quickstart](https://github.com/tile-ai/tilelang/blob/main/examples/quickstart.py) and [elementwise kernels](https://github.com/tile-ai/tilelang/tree/main/examples/elementwise)
+- **GEMM and quantization:** [GEMM](https://github.com/tile-ai/tilelang/tree/main/examples/gemm), [grouped GEMM](https://github.com/tile-ai/tilelang/tree/main/examples/grouped_gemm), [FP8 GEMM](https://github.com/tile-ai/tilelang/tree/main/examples/gemm_fp8), [dequantization GEMM](https://github.com/tile-ai/tilelang/tree/main/examples/dequantize_gemm), and [block-scaled GEMM](https://github.com/tile-ai/tilelang/tree/main/examples/blockscaled_gemm_sm100)
+- **Attention and sequence models:** [FlashAttention](https://github.com/tile-ai/tilelang/tree/main/examples/flash_attention), [Flash Decoding](https://github.com/tile-ai/tilelang/tree/main/examples/flash_decoding), [block-sparse attention](https://github.com/tile-ai/tilelang/tree/main/examples/blocksparse_attention), [linear attention](https://github.com/tile-ai/tilelang/tree/main/examples/linear_attention), and [GDN](https://github.com/tile-ai/tilelang/tree/main/examples/gdn)
+- **Model workloads:** [DeepSeek MLA](https://github.com/tile-ai/tilelang/tree/main/examples/deepseek_mla), [DeepSeek V3.2](https://github.com/tile-ai/tilelang/tree/main/examples/deepseek_v32), [DeepSeek V4](https://github.com/tile-ai/tilelang/tree/main/examples/deepseek_v4), and [DeepSeek mHC](https://github.com/tile-ai/tilelang/tree/main/examples/deepseek_mhc)
+- **Architecture-specific kernels:** [AMD](https://github.com/tile-ai/tilelang/tree/main/examples/amd), [TCGEN05](https://github.com/tile-ai/tilelang/tree/main/examples/gemm_tcgen05), and [SM120](https://github.com/tile-ai/tilelang/tree/main/examples/gemm_sm120)
+- **Compiler and debugging tools:** [analyzer](https://github.com/tile-ai/tilelang/tree/main/examples/analyze), [layout visualization](https://github.com/tile-ai/tilelang/tree/main/examples/plot_layout), [AutoDD](https://github.com/tile-ai/tilelang/tree/main/examples/autodd), and [IKET](https://github.com/tile-ai/tilelang/tree/main/examples/iket)
 
-- [Dequantize GEMM](./examples/dequantize_gemm/): Achieve high-performance dequantization by **fine-grained control over per-thread operations**, with many features now adopted as default behaviors in [BitBLAS](https://github.com/microsoft/BitBLAS), which utilizing magic layout transformation and intrins to accelerate dequantize gemm.
-- [FlashAttention](./examples/flash_attention/): Enable cross-operator fusion with simple and intuitive syntax, and we also provide an example of auto tuning.
-- [LinearAttention](./examples/linear_attention/): Examples include RetNet and Mamba implementations.
-- [Convolution](./examples/convolution/): Implementations of Convolution with IM2Col.
-
-## Upcoming Features
-
-Check the [upstream TileLang v0.2.0 release plan](https://github.com/tile-ai/tilelang/issues/79) for upcoming features.
-
----
-
-Upstream TileLang has now been used in project [BitBLAS](https://github.com/microsoft/BitBLAS) and [AttentionEngine](https://github.com/microsoft/AttentionEngine).
+Browse the [complete examples directory](https://github.com/tile-ai/tilelang/tree/main/examples) for additional operators, tests, and architecture-specific implementations.
 
 ## Join the Discussion
 
-Welcome to join the upstream TileLang Discord community for discussions, support, and collaboration!
+Welcome to join our Discord community for discussions, support, and collaboration!
 
 [![Join our Discord](https://img.shields.io/badge/Discord-Join%20Us-blue?logo=discord&style=for-the-badge)](https://discord.gg/TUrHyJnKPG)
 

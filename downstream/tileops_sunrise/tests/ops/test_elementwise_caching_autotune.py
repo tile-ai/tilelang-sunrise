@@ -5,7 +5,7 @@ Validates:
   after init_config (no per-forward recompilation).
 - autotune_configs is defined for UnaryKernel and FusedGatedKernel with >= 3 configs.
 - Custom kernels (LeakyRelu, Elu, etc.) also cache compiled functions.
-- Serialization-fallback autotune works for UnaryKernel and FusedGatedKernel.
+- tune=True reaches the autotuner for UnaryKernel and FusedGatedKernel.
 """
 
 import pytest
@@ -50,9 +50,7 @@ class TestUnaryCaching:
     @pytest.mark.parametrize("kernel_cls", [ReluFwdKernel, SigmoidFwdKernel, AbsFwdKernel])
     def test_unary_has_compiled_fn(self, kernel_cls):
         k = kernel_cls(N, torch.float16)
-        assert hasattr(k, "_compiled_fn"), (
-            f"{kernel_cls.__name__} missing _compiled_fn after init"
-        )
+        assert hasattr(k, "_compiled_fn"), f"{kernel_cls.__name__} missing _compiled_fn after init"
         assert k._compiled_fn is not None
 
     @pytest.mark.full
@@ -80,14 +78,17 @@ class TestFusedGatedCaching:
     """FusedGatedKernel subclasses should have _compiled_fn after __init__."""
 
     @pytest.mark.full
-    @pytest.mark.parametrize("kernel_cls", [
-        SiluAndMulFwdKernel, GeluAndMulFwdKernel, GeluTanhAndMulFwdKernel,
-    ])
+    @pytest.mark.parametrize(
+        "kernel_cls",
+        [
+            SiluAndMulFwdKernel,
+            GeluAndMulFwdKernel,
+            GeluTanhAndMulFwdKernel,
+        ],
+    )
     def test_fused_gated_has_compiled_fn(self, kernel_cls):
         k = kernel_cls(32, 64, torch.float16)
-        assert hasattr(k, "_compiled_fn"), (
-            f"{kernel_cls.__name__} missing _compiled_fn after init"
-        )
+        assert hasattr(k, "_compiled_fn"), f"{kernel_cls.__name__} missing _compiled_fn after init"
         assert k._compiled_fn is not None
 
     @pytest.mark.full
@@ -202,9 +203,22 @@ class TestAutotuneConfigs:
             assert "num_per_thread" in c
 
     @pytest.mark.full
+    def test_fused_gated_tune_true_reaches_the_autotuner(self):
+        """tune=True picks a config out of the search space, and does not fall back."""
+        import warnings
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            k = SiluAndMulFwdKernel(1024, 4096, torch.float16, tune=True)
+        assert not [w for w in caught if "falling back" in str(w.message)], (
+            f"fell back instead of tuning: {[str(w.message) for w in caught]}"
+        )
+        assert k.config["threads"] in {c["threads"] for c in k.autotune_configs}
+
+    @pytest.mark.full
     def test_binary_autotune_configs_still_works(self):
         """BinaryKernel autotune_configs must still work (no regression)."""
-        k = AddFwdKernel(N, torch.float16, (N,), (1,), (1,), N, N)
+        k = AddFwdKernel((N,), (N,), torch.float16)
         configs = k.autotune_configs
         assert configs is not None
         assert len(configs) >= 3
@@ -243,7 +257,3 @@ class TestCachingCorrectness:
         out = k(x)
         ref = torch.nn.functional.leaky_relu(x.cpu().float(), 0.01).to(torch.float16)
         torch.testing.assert_close(out.cpu(), ref, atol=1e-3, rtol=1e-3)
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-vvs"])

@@ -1,93 +1,84 @@
-from typing import Optional
+"""Benchmark for the FP8 lightning indexer op.
+
+Workload shapes come from the ops manifest; roofline FLOP and byte counts
+come from the op's ``eval_roofline()`` via :class:`ManifestBenchmark`.
+
+The reference materializes the ``[batch, heads, seq_len, seq_len_kv]`` scores the op
+folds into its matmul epilogue, and peaks near 104 GB on these rows. A device that
+cannot hold that fails in the reference rather than in the op.
+"""
 
 import pytest
-import torch
 
-from benchmarks.benchmark_base import BenchmarkBase, BenchmarkReport
-from tileops.ops import FP8LightningIndexerOp
+from benchmarks.baselines import TORCH_COMPILE_TAG, compiled_reference
+from benchmarks.benchmark_base import ManifestBenchmark, fields, workload_params
+from tileops.manifest import load_workloads
+from tileops.ops import FP8LightningIndexerFwdOp
 from workloads.fp8_lightning_indexer import FP8LightningIndexerWorkload
 
-
-class _FP8LightningIndexerBaseline(FP8LightningIndexerWorkload):
-    """Adds baseline ref_program for benchmark profiling."""
-
-    def ref_program(self, q: torch.Tensor, kv: torch.Tensor, weights: torch.Tensor,
-                    cu_seqlen_ks: torch.Tensor, cu_seqlen_ke: torch.Tensor) -> tuple[torch.Tensor]:
-        k = kv
-        q = q.float()
-        k = k.float()
-        batch, seq_len, heads, index_dim = q.shape
-        seq_len_kv = self.seq_len_kv
-        kv_group = self.kv_group
-        heads_per_group = heads // kv_group
-
-        k = k.view(batch, seq_len_kv, kv_group, index_dim)
-        q = q.view(batch, seq_len, kv_group, heads_per_group, index_dim)
-
-        mask_lo = torch.arange(0, seq_len_kv, device="ptpu")[None, :] >= cu_seqlen_ks[:, None]
-        mask_hi = torch.arange(0, seq_len_kv, device="ptpu")[None, :] < cu_seqlen_ke[:, None]
-        mask = mask_lo & mask_hi
-
-        score = torch.einsum("bsghd,bngd->bghsn", q, k)
-        weights = weights.view(seq_len, kv_group, heads_per_group)
-        weights = weights.permute(1, 2, 0).unsqueeze(0).unsqueeze(-1)
-        score = score.relu() * weights
-        logits = score.sum(dim=2)
-        logits = logits.permute(0, 2, 3, 1)
-        mask_expanded = mask.unsqueeze(0).unsqueeze(-1)
-        logits = logits.masked_fill(~mask_expanded, float("-inf"))
-        return (logits,)
+# Autotuning and the kernel-config override are bench-run policy, not
+# workload properties; manifest workloads do not carry them.
+_TUNE = False
+_CONFIG = None
 
 
-class FP8LightningIndexerBenchmark(BenchmarkBase[FP8LightningIndexerWorkload]):
-
-    def calculate_flops(self) -> Optional[float]:
-        # Flops depend on the actual mask cost which varies per input
-        return None
-
-    def calculate_memory(self) -> Optional[float]:
-        t = self.workload
-        dtype = torch.float8_e4m3fn
-        accum_dtype = torch.float32
-        index_dtype = torch.int32
-
-        index_q_memory = t.batch * t.seq_len * t.heads * t.index_dim * dtype.itemsize
-        index_k_memory = t.batch * t.seq_len_kv * t.index_dim * t.kv_group * dtype.itemsize
-        index_k_scale_memory = t.batch * t.seq_len_kv * t.kv_group * accum_dtype.itemsize
-        logits_memory = t.batch * t.seq_len * t.seq_len_kv * t.kv_group * accum_dtype.itemsize
-        weights_memory = t.seq_len * t.heads * accum_dtype.itemsize
-        cu_seqlens_ks_memory = t.seq_len * index_dtype.itemsize
-        cu_seqlens_ke_memory = t.seq_len * index_dtype.itemsize
-
-        return (index_q_memory + index_k_memory + index_k_scale_memory + logits_memory +
-                weights_memory + cu_seqlens_ks_memory + cu_seqlens_ke_memory)
+_SHAPE_KEYS = (
+    "batch",
+    "seq_len",
+    "heads",
+    "index_dim",
+    "seq_len_kv",
+    "kv_group",
+    "clean_logits",
+)
 
 
-_FP8_LIGHTING_INDEXER_BENCH_PARAMS = [
-    pytest.param(1, 4096, 32, 64, 8192, 1, True, None, False, id="default-config"),
-    pytest.param(1, 2048, 16, 64, 4096, 1, True, None, False, id="mid-shape"),
-]
+def _one_row_per_shape(workloads: list[dict]) -> list[dict]:
+    """The rows this bench measures: one per shape.
+
+    ``FP8LightningIndexerWorkload.gen_inputs`` emits bf16 and the op quantizes
+    inside, so two rows differing only in ``dtypes`` are one measurement.
+    """
+    seen, rows = set(), []
+    for w in workloads:
+        shape = tuple(str(w[key]) for key in _SHAPE_KEYS)
+        if shape in seen:
+            continue
+        seen.add(shape)
+        rows.append(w)
+    return rows
 
 
 @pytest.mark.parametrize(
-    "batch, seq_len, heads, index_dim, seq_len_kv, kv_group, clean_logits, config, tune",
-    _FP8_LIGHTING_INDEXER_BENCH_PARAMS,
+    "batch, seq_len, heads, index_dim, seq_len_kv, kv_group, clean_logits",
+    workload_params(
+        _one_row_per_shape(load_workloads(FP8LightningIndexerFwdOp)),
+        fields(*_SHAPE_KEYS),
+        smoke_first=True,
+    ),
 )
-def test_fp8_lightning_indexer_bench(batch: int, seq_len: int, heads: int, index_dim: int,
-                                    seq_len_kv: int, kv_group: int, clean_logits: bool,
-                                    config: Optional[dict], tune: bool) -> None:
-    test = _FP8LightningIndexerBaseline(batch, seq_len, heads, index_dim, seq_len_kv, kv_group,
-                                  clean_logits, config)
-    bm = FP8LightningIndexerBenchmark(test)
+def test_fp8_lightning_indexer_bench(
+    batch: int,
+    seq_len: int,
+    heads: int,
+    index_dim: int,
+    seq_len_kv: int,
+    kv_group: int,
+    clean_logits: bool,
+) -> None:
+    test = FP8LightningIndexerWorkload(
+        batch, seq_len, heads, index_dim, seq_len_kv, kv_group, clean_logits, _CONFIG
+    )
     inputs = test.gen_inputs()
 
-    op = FP8LightningIndexerOp(clean_logits=clean_logits, config=config, tune=tune)
-    result = bm.profile(op, *inputs)
-    BenchmarkReport.record(op, locals(), result, tag="tileops")
+    op = FP8LightningIndexerFwdOp(clean_logits=clean_logits, config=_CONFIG, tune=_TUNE)
+    bm = ManifestBenchmark(op, test)
 
-    result_bl = bm.profile(test.ref_program, *inputs)
-    BenchmarkReport.record(op, locals(), result_bl, tag="torch-ref")
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-vvs"])
+    bm.compare(
+        {
+            "tileops": op,
+            "torch-ref": test.ref_program,
+            TORCH_COMPILE_TAG: compiled_reference(test.ref_program),
+        },
+        *inputs,
+    )

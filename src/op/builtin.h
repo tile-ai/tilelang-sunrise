@@ -39,6 +39,12 @@ static constexpr const char *kLocalVarInit = "tl.local_var_init";
 static constexpr const char *kNonRestrictParams = "tl.non_restrict_params";
 static constexpr const char *kLexicalAllocScope = "lexical_alloc_scope";
 
+// Annotation on the tilelang_root block recording the SIMT thread-block
+// extents requested by T.Kernel(threads=...). It is a launch hint: SIMT
+// backends materialize it as threadIdx.* thread_extent scopes, other
+// backends ignore it.
+static constexpr const char *kLaunchThreads = "tl.launch_threads";
+
 } // namespace attr
 
 inline ffi::Optional<PrimExpr> GetAnnotatedMbarPhaseExpr(
@@ -206,6 +212,13 @@ static constexpr const char *kPassProfileThresholdMs =
 DataType cuTensorMapType();
 TVM_DLL const Op &tvm_ffi_call_with_result();
 
+/*! \brief Elementwise clamp with NaN propagation and single-evaluation
+ * operands. */
+TVM_DLL const Op &clamp();
+
+/*! \brief Shared clamp expansion for backends without a device helper. */
+TVM_DLL PrimExpr LowerClamp(PrimExpr expr);
+
 /*!
  * \brief TileLang intrinsic for carrying pointer access metadata in frontend.
  *
@@ -250,6 +263,19 @@ TVM_DLL const Op &access_ptr();
  * - args[2 + i]: extent of axis i (may be a dynamic PrimExpr).
  */
 TVM_DLL const Op &region();
+
+/*!
+ * \brief Placeholder for the thread index along one launch axis.
+ *
+ * T.Kernel binds each thread variable as `LetStmt(tx, launch_thread_idx(axis))`
+ * so the kernel body can reference a thread index before the target is known.
+ * tl.MaterializeKernelLaunch replaces the binding with a real threadIdx.*
+ * thread_extent scope on SIMT backends and rejects any use on backends
+ * without SIMT. It must never reach codegen.
+ *
+ * int32 launch_thread_idx(axis)
+ */
+TVM_DLL const Op &launch_thread_idx();
 
 // Packed x2 element-wise math (float32x2, bfloat16x2, float16x2)
 TVM_DLL const Op &add2();
@@ -351,6 +377,19 @@ TVM_DLL const Op &sync_grid();
  *
  */
 TVM_DLL const Op &sync_warp();
+
+// RNG ops. #2855 registers these under the CUDA dialect, but this fork also
+// consumes them from backend-neutral code (loop_vectorize) and the Ascend
+// codegen/SIMT RNG path, so declare them here too (registration stays in
+// cuda/op/builtin.cc; a redeclaration is harmless).
+TVM_DLL const Op &rng_init();
+TVM_DLL const Op &rng_rand();
+TVM_DLL const Op &rng_rand_float();
+
+// device_assert lowers through the Ascend codegen (toolkit assert()) as well as
+// CUDA; #2855 files it under the CUDA dialect, so redeclare for asc codegen.
+TVM_DLL const Op &device_assert();
+TVM_DLL const Op &device_assert_with_msg();
 
 /*!
  * \brief Warp-vote: non-zero if ANY active lane in the mask has a non-zero
@@ -629,103 +668,6 @@ TVM_DLL const Op &pts_load_async();
 TVM_DLL const Op &pts_store_async();
 TVM_DLL const Op &pts_syncthreads();
 TVM_DLL const Op &get_mbarrier();
-TVM_DLL const Op &tl_tang_gemm();
-TVM_DLL const Op &tang_fill_fragment();
-TVM_DLL const Op &tang_tcgen05_mma_ss();
-TVM_DLL const Op &tang_tcgen05_mma_ts();
-
-/*!
- * \brief TANG intrinsic: stage block-scaled GEMM scale factors global -> TMEM
- * (stcuv2). Emits the warp-0 `.32x32b` staging loop (SFA -> cols [0,16),
- * SFB -> cols [16,32)) plus a trailing fence_stt.
- * args: [SFA_ptr, SFB_ptr, SF_tmem_ptr, M, N, k_cells, stride_sfa, stride_sfb].
- */
-TVM_DLL const Op &tang_scale_stage();
-
-/*!
- * \brief TANG intrinsic: block-scaled tcgen5 MMA (mxf8f6f4/mxf4/nvfp4, stcuv2).
- * Maps to tang::ptx::mma_scale<enable_input_d> with mma_data_desc<> /
- * mma_scale_desc<> marker intrinsics.
- * args: [C_ptr, A_ptr, B_ptr, SF_tmem_ptr, LBO_A, SBO_A, SW_A, LBO_B, SBO_B,
- *        SW_B, D_FMT, A_FMT, B_FMT, AMaj, BMaj, M, N, K, scale_vec,
- *        scale_format, enable_input_d].
- */
-TVM_DLL const Op &tang_tcgen05_mma_scale();
-TVM_DLL const Op &tang_init_tensor_memory();
-TVM_DLL const Op &tang_deallocate_tensor_memory();
-TVM_DLL const Op &tang_tcgen05_mma_arrive();
-TVM_DLL const Op &tang_tmem_ld();
-
-/*!
- * \brief TANG intrinsic: tensor memory store 16x256b (stcuv2).
- * Maps to tang::ptx::stt_16x256b_x{N}(in, taddr), the register->TMEM store
- * counterpart of tang_tmem_ld_16x256b. args: [in_ref, taddr, num_chunks];
- * each thread stores 4*num_chunks 32-bit registers.
- */
-TVM_DLL const Op &tang_tmem_st_16x256b();
-
-/*!
- * \brief TANG intrinsic: stage an MMA A operand into tensor memory (stcuv2).
- * Maps to tl::tang_tmem_st_a_operand<CELLS>(frag, taddr), a `.32x32b` store in
- * which lane == A row and the row's K elements are bit-packed into 32-bit TMEM
- * cells. This is the layout mma_atmem reads, and it is unrelated to the
- * accumulator's tang_tmem_st_16x256b. args: [in_ref, taddr, num_cells].
- */
-TVM_DLL const Op &tang_tmem_st_a_operand();
-TVM_DLL const Op &tang_tmem_ld_16x256b();
-TVM_DLL const Op &tang_tmem_ld_16x256b_x16();
-TVM_DLL const Op &tang_tmem_drain_16x256b_to_global();
-TVM_DLL const Op &tang_tmem_st();
-
-/*!
- * \brief TANG intrinsic: tensor memory -> shared memory copy (stcuv2).
- * Maps to tl::tang_cp_tmem_to_shared_sw128a8(smem, taddr, rows), i.e. the
- * cpt2s copy engine path that bypasses the register file entirely.
- * args: [smem_ptr, tmem_addr, rows].
- */
-TVM_DLL const Op &tang_cp_tmem_to_shared();
-
-/*!
- * \brief TANG intrinsic: shared memory -> tensor memory copy (stcuv2).
- * Maps to tl::tang_cp_shared_to_tmem(smem, taddr, rows, cols, row_words), the
- * cps2t copy engine path used to stage an MMA A operand without a register
- * round trip. `cols` and `row_words` count 32-bit words, not elements.
- * args: [smem_ptr, tmem_addr, rows, cols, row_words].
- */
-TVM_DLL const Op &tang_cp_shared_to_tmem();
-TVM_DLL const Op &tang_tmem_fence();
-TVM_DLL const Op &tang_cp_async_bulk();
-
-/*!
- * \brief TANG intrinsic: swizzled 3D bulk copy with an explicit swizzle mode
- * and pack mode (global <-> shared, stcuv2). Maps to
- * tl::tang_bulk_{g2s,s2g}<SwizzleMode, PackPaddingMode>.
- *
- * `pack_mode` is a tang::ptx::PackPaddingMode: 0 = no_pack, 1 = b4p4x16, which
- * makes the copy engine spread packed global fp4 (2 e2m1 codes per byte) into
- * the one-code-per-byte layout an mxf8f6f4 operand reads. Only the load
- * direction with a 32-byte atom and a 128-byte shared row supports a non-zero
- * mode; the lowering checks that before emitting one.
- *
- * args: [direction, dst, src, rows, smem_row_bytes, gmem_row_bytes,
- *        num_threads, swizzle_mode, pack_mode].
- */
-TVM_DLL const Op &tang_cp_async_bulk_sw();
-
-/*!
- * \brief TANG intrinsic: unswizzled 1D bulk copy (global <-> shared, stcuv2).
- * Maps to tl::tang_bulk_{g2s,s2g}_1d. Used for shared buffers that are pure
- * staging stops rather than MMA operands: the swizzled 3D pair does not
- * round-trip (docs/tang_bulk_copy_gs_layout.md §15.2), the 1D form does.
- * args: [direction, dst, src, rows, smem_row_bytes, gmem_row_bytes,
- *        num_threads].
- */
-TVM_DLL const Op &tang_cp_async_bulk_1d();
-TVM_DLL const Op &tang_fence_tc();
-TVM_DLL const Op &tang_fence_tc_arrive();
-TVM_DLL const Op &tang_fence_g2s_arrive();
-TVM_DLL const Op &tang_sync_wait();
-TVM_DLL const Op &tang_sync_arrive();
 
 /*!
  * \brief tilelang intrinsic for CUDA/HIP read-only cache load (__ldg).

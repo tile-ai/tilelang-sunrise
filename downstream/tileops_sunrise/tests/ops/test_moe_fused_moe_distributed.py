@@ -19,7 +19,28 @@ import torch
 import torch.distributed as dist
 
 from tests.test_base import FixtureBase
-from tileops.ops.moe import FusedMoe, SharedFusedMoE
+from tileops.ops.moe import FusedMoeFwdOp, SharedFusedMoE
+from tileops.ops.moe.abc import PrepareResult
+from tileops.ops.moe.prepare_finalize.no_dp_ep import MoEPrepareAndFinalizeNoDPEP
+from tileops.ops.moe.routed_expert.fused_routed_expert import FusedMoEExpertsFwdOp
+
+
+class _LocalExpertPrepare(MoEPrepareAndFinalizeNoDPEP):
+    """Map global routing to this rank using the public prepare hook."""
+
+    def __init__(self, expert_map):
+        self.expert_map = expert_map
+
+    def prepare(self, hidden, topk_weights, topk_ids, num_experts):
+        local_ids = self.expert_map[topk_ids.long()]
+        valid = local_ids >= 0
+        return PrepareResult(
+            hidden_q=hidden,
+            scale=None,
+            topk_weights=torch.where(valid, topk_weights, 0),
+            topk_ids=torch.where(valid, local_ids, 0).to(topk_ids.dtype),
+        )
+
 
 # Every test in this module is a multi-GPU / distributed Expert-Parallel test:
 # it requires torchrun + NCCL + >=2 CUDA GPUs (dist.init_process_group(backend=
@@ -30,6 +51,7 @@ pytestmark = pytest.mark.skip(reason="S2上不支持多卡测试")
 # vLLM optional import
 try:
     from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts as _vllm_fused_experts
+
     _VLLM_AVAILABLE = True
 except ImportError:
     _VLLM_AVAILABLE = False
@@ -60,6 +82,7 @@ def setup_distributed():
 
 class DistributedFixture(FixtureBase):
     """Fixture for distributed EP tests."""
+
     PARAMS = [
         (
             "T, E_global, K, H, F, world_size",
@@ -73,12 +96,25 @@ class DistributedFixture(FixtureBase):
 
 class SharedDistributedFixture(FixtureBase):
     """Fixture for SharedFusedMoE distributed EP tests."""
+
     PARAMS = [
         (
             "T, E_global, K, H, F, shared_F, world_size",
             [
-                pytest.param(64, 8, 2, 128, 64, 32, 2, marks=pytest.mark.smoke, id="smoke-shared-ep2"),
-                pytest.param(512, 384, 8, 7168, 2048, 18432, 8, marks=pytest.mark.full, id="kimi-k2-shared-ep8"),
+                pytest.param(
+                    64, 8, 2, 128, 64, 32, 2, marks=pytest.mark.smoke, id="smoke-shared-ep2"
+                ),
+                pytest.param(
+                    512,
+                    384,
+                    8,
+                    7168,
+                    2048,
+                    18432,
+                    8,
+                    marks=pytest.mark.full,
+                    id="kimi-k2-shared-ep8",
+                ),
             ],
         )
     ]
@@ -124,13 +160,17 @@ def test_kimi_k2_ep_distributed(T, E_global, K, H, F, world_size):
     expert_map[start_expert:end_expert] = torch.arange(E_local, dtype=torch.int32, device=dev)
 
     # TileOPs: local computation with expert_map
-    op_local = FusedMoe(
-        num_tokens=T, num_experts=E_global, top_k=K,
-        hidden_size=H, ffn_size=F,
-        scoring_func="sigmoid", renormalize=True, with_correction_bias=True,
+    op_local = FusedMoeFwdOp(
+        num_tokens=T,
+        num_experts=E_global,
+        top_k=K,
+        hidden_size=H,
+        ffn_size=F,
+        scoring_func="sigmoid",
+        renormalize=True,
         routed_scaling_factor=2.827,
-        dtype=dtype,
-        expert_map=expert_map,
+        prepare_finalize=_LocalExpertPrepare(expert_map),
+        experts=FusedMoEExpertsFwdOp(T, E_local, K, H, F, routed_scaling_factor=2.827),
     )
     out_local = op_local(hidden, gating, w_gate_up_local, w_down_local, correction_bias)
 
@@ -139,12 +179,15 @@ def test_kimi_k2_ep_distributed(T, E_global, K, H, F, world_size):
 
     # Rank-0 computes full reference and compares
     if rank == 0:
-        op_full = FusedMoe(
-            num_tokens=T, num_experts=E_global, top_k=K,
-            hidden_size=H, ffn_size=F,
-            scoring_func="sigmoid", renormalize=True, with_correction_bias=True,
+        op_full = FusedMoeFwdOp(
+            num_tokens=T,
+            num_experts=E_global,
+            top_k=K,
+            hidden_size=H,
+            ffn_size=F,
+            scoring_func="sigmoid",
+            renormalize=True,
             routed_scaling_factor=2.827,
-            dtype=dtype,
         )
         out_full = op_full(hidden, gating, w_gate_up_full, w_down_full, correction_bias)
 
@@ -201,17 +244,26 @@ def test_shared_fused_moe_ep_distributed(T, E_global, K, H, F, shared_F, world_s
 
     # TileOPs: local computation with expert_map + shared expert (tp_size=1, no TP on shared)
     op_local = SharedFusedMoE(
-        num_tokens=T, num_experts=E_global, top_k=K,
-        hidden_size=H, ffn_size=F,
-        scoring_func="sigmoid", renormalize=True, with_correction_bias=True,
+        num_tokens=T,
+        num_experts=E_global,
+        top_k=K,
+        hidden_size=H,
+        ffn_size=F,
+        scoring_func="sigmoid",
+        renormalize=True,
         routed_scaling_factor=2.827,
-        dtype=dtype,
-        expert_map=expert_map,
+        prepare_finalize=_LocalExpertPrepare(expert_map),
+        experts=FusedMoEExpertsFwdOp(T, E_local, K, H, F, routed_scaling_factor=2.827),
         shared_ffn_size=shared_F,
     )
     shared_out, routed_out_local = op_local(
-        hidden, gating, w_gate_up_local, w_down_local, correction_bias,
-        shared_w_gate_up=shared_w_gate_up, shared_w_down=shared_w_down,
+        hidden,
+        gating,
+        w_gate_up_local,
+        w_down_local,
+        correction_bias,
+        shared_w_gate_up=shared_w_gate_up,
+        shared_w_down=shared_w_down,
     )
 
     # All-reduce routed output
@@ -220,25 +272,36 @@ def test_shared_fused_moe_ep_distributed(T, E_global, K, H, F, shared_F, world_s
     # Rank-0 computes full reference
     if rank == 0:
         op_full = SharedFusedMoE(
-            num_tokens=T, num_experts=E_global, top_k=K,
-            hidden_size=H, ffn_size=F,
-            scoring_func="sigmoid", renormalize=True, with_correction_bias=True,
+            num_tokens=T,
+            num_experts=E_global,
+            top_k=K,
+            hidden_size=H,
+            ffn_size=F,
+            scoring_func="sigmoid",
+            renormalize=True,
             routed_scaling_factor=2.827,
-            dtype=dtype,
             shared_ffn_size=shared_F,
         )
         shared_out_full, routed_out_full = op_full(
-            hidden, gating, w_gate_up_full, w_down_full, correction_bias,
-            shared_w_gate_up=shared_w_gate_up, shared_w_down=shared_w_down,
+            hidden,
+            gating,
+            w_gate_up_full,
+            w_down_full,
+            correction_bias,
+            shared_w_gate_up=shared_w_gate_up,
+            shared_w_down=shared_w_down,
         )
 
         # Verify shared output (should be identical across ranks)
-        torch.testing.assert_close(shared_out.float(), shared_out_full.float(), rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(
+            shared_out.float(), shared_out_full.float(), rtol=1e-5, atol=1e-5
+        )
 
         # Verify routed output (after all-reduce)
         # Higher tolerance needed due to distributed EP numerical variance (see line 155 comment)
-        torch.testing.assert_close(routed_out_local.float(), routed_out_full.float(), rtol=5e-2, atol=5e-2)
-
+        torch.testing.assert_close(
+            routed_out_local.float(), routed_out_full.float(), rtol=5e-2, atol=5e-2
+        )
 
     dist.barrier()
     dist.destroy_process_group()
@@ -289,34 +352,46 @@ def test_fused_moe_vs_vllm_distributed(T, E_global, K, H, F, world_size):
 
     # Compute routing (same for both)
     from tileops.ops.moe import FusedTopKOp
-    fk = FusedTopKOp(T, E_global, K, "sigmoid", True, with_correction_bias=True)
+
+    fk = FusedTopKOp(top_k=K, scoring_func="sigmoid", renormalize=True)
     topk_weights, topk_ids = fk(gating, correction_bias)
 
     # ========== TileOPs: expert_map local filtering ==========
-    op_tileops = FusedMoe(
-        num_tokens=T, num_experts=E_global, top_k=K,
-        hidden_size=H, ffn_size=F,
-        scoring_func="sigmoid", renormalize=True, with_correction_bias=True,
+    op_tileops = FusedMoeFwdOp(
+        num_tokens=T,
+        num_experts=E_global,
+        top_k=K,
+        hidden_size=H,
+        ffn_size=F,
+        scoring_func="sigmoid",
+        renormalize=True,
         routed_scaling_factor=2.827,
-        dtype=dtype,
-        expert_map=expert_map,
+        prepare_finalize=_LocalExpertPrepare(expert_map),
+        experts=FusedMoEExpertsFwdOp(T, E_local, K, H, F, routed_scaling_factor=2.827),
     )
     out_tileops = op_tileops(hidden, gating, w_gate_up_local, w_down_local, correction_bias)
     dist.all_reduce(out_tileops, op=dist.ReduceOp.SUM)
 
     # ========== vLLM: use fused_moe with full weights on rank-0 only ==========
     if rank == 0:
-        out_vllm = _vllm_fused_experts(
-            hidden, w_gate_up_full, w_down_full,
-            topk_weights, topk_ids,
-            inplace=False,
-        ) * 2.827
+        out_vllm = (
+            _vllm_fused_experts(
+                hidden,
+                w_gate_up_full,
+                w_down_full,
+                topk_weights,
+                topk_ids,
+                inplace=False,
+            )
+            * 2.827
+        )
 
         # Higher tolerance needed due to distributed EP numerical variance (see line 155 comment)
         torch.testing.assert_close(out_tileops.float(), out_vllm.float(), rtol=5e-2, atol=5e-2)
 
     dist.barrier()
     dist.destroy_process_group()
+
 
 @DistributedFixture
 def test_fused_moe_vs_vllm_ep_layer(T, E_global, K, H, F, world_size):
@@ -364,28 +439,39 @@ def test_fused_moe_vs_vllm_ep_layer(T, E_global, K, H, F, world_size):
 
     # Compute routing
     from tileops.ops.moe import FusedTopKOp
-    fk = FusedTopKOp(T, E_global, K, "sigmoid", True, with_correction_bias=True)
+
+    fk = FusedTopKOp(top_k=K, scoring_func="sigmoid", renormalize=True)
     topk_weights, topk_ids = fk(gating, correction_bias)
 
     # ========== TileOPs: expert_map local filtering ==========
-    op_tileops = FusedMoe(
-        num_tokens=T, num_experts=E_global, top_k=K,
-        hidden_size=H, ffn_size=F,
-        scoring_func="sigmoid", renormalize=True, with_correction_bias=True,
+    op_tileops = FusedMoeFwdOp(
+        num_tokens=T,
+        num_experts=E_global,
+        top_k=K,
+        hidden_size=H,
+        ffn_size=F,
+        scoring_func="sigmoid",
+        renormalize=True,
         routed_scaling_factor=2.827,
-        dtype=dtype,
-        expert_map=expert_map,
+        prepare_finalize=_LocalExpertPrepare(expert_map),
+        experts=FusedMoEExpertsFwdOp(T, E_local, K, H, F, routed_scaling_factor=2.827),
     )
     out_tileops = op_tileops(hidden, gating, w_gate_up_local, w_down_local, correction_bias)
 
     # ========== vLLM: fused_experts with expert_map ==========
-    out_vllm = _vllm_fused_experts(
-        hidden, w_gate_up_local, w_down_local,
-        topk_weights, topk_ids,
-        inplace=False,
-        expert_map=expert_map,
-        global_num_experts=E_global,
-    ) * 2.827
+    out_vllm = (
+        _vllm_fused_experts(
+            hidden,
+            w_gate_up_local,
+            w_down_local,
+            topk_weights,
+            topk_ids,
+            inplace=False,
+            expert_map=expert_map,
+            global_num_experts=E_global,
+        )
+        * 2.827
+    )
 
     # All-reduce both outputs
     dist.all_reduce(out_tileops, op=dist.ReduceOp.SUM)

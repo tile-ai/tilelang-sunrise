@@ -1,0 +1,2 @@
+# Cold-cache validation compiles 48 kernels and takes about 1000 seconds.
+examples/block_causal_attention/test_block_causal_attention.py	1800

@@ -12,8 +12,7 @@ Output dtype is part of the contract: ``All`` / ``Any`` must return
 asserts both the output shape (in particular, a 0-D tensor for
 ``dim=None, keepdim=False``) and the exact output dtype, plus numeric
 equality with PyTorch. Once green, the corresponding manifest entries can
-flip from ``status: spec-only`` to ``status: implemented`` in a separate
-manifest-only PR per the trust model.
+flip from ``status: spec-only`` to ``status: implemented``.
 """
 
 from __future__ import annotations
@@ -37,7 +36,9 @@ _UNALIGNED_SHAPE = (4, 8, 255)
 
 @pytest.mark.smoke
 @pytest.mark.parametrize(
-    "op_cls, torch_fn", _OP_CASES, ids=[c[0].__name__ for c in _OP_CASES],
+    "op_cls, torch_fn",
+    _OP_CASES,
+    ids=[c[0].__name__ for c in _OP_CASES],
 )
 @pytest.mark.parametrize(
     "dim",
@@ -68,33 +69,33 @@ def test_logical_reduce_conformance(
     """
     torch.manual_seed(0)
     # Mix in exact zeros so All/Any actually see a False contribution.
-    raw = torch.randn(*_SHAPE, dtype=dtype, device="cuda")
-    zero_mask = torch.rand(_SHAPE, device="cuda") < 0.1
+    raw = torch.randn(*_SHAPE, dtype=dtype, device="ptpu")
+    zero_mask = torch.rand(_SHAPE, device="ptpu") < 0.1
     x = raw.masked_fill(zero_mask, 0)
 
-    op = op_cls(dtype=dtype, dim=dim, keepdim=keepdim)
+    op = op_cls(dim=dim, keepdim=keepdim)
     y = op(x)
     if dim is None:
-        ref = torch_fn(x)
+        ref = torch_fn(x.cpu())
         if keepdim:
             ref = ref.reshape([1] * x.ndim)
     else:
-        ref = torch_fn(x, dim=dim, keepdim=keepdim)
+        ref = torch_fn(x.cpu(), dim=dim, keepdim=keepdim)
 
-    assert y.dtype == torch.bool, (
-        f"{op_cls.__name__} output dtype {y.dtype}, expected torch.bool"
-    )
+    assert y.dtype == torch.bool, f"{op_cls.__name__} output dtype {y.dtype}, expected torch.bool"
     assert ref.dtype == torch.bool
     assert y.shape == ref.shape, (
         f"{op_cls.__name__} dim={dim} keepdim={keepdim} dtype={dtype}: "
         f"shape {y.shape} vs ref {ref.shape}"
     )
-    torch.testing.assert_close(y, ref, atol=0, rtol=0)
+    torch.testing.assert_close(y.cpu(), ref, atol=0, rtol=0)
 
 
 @pytest.mark.smoke
 @pytest.mark.parametrize(
-    "op_cls, torch_fn", _OP_CASES, ids=[c[0].__name__ for c in _OP_CASES],
+    "op_cls, torch_fn",
+    _OP_CASES,
+    ids=[c[0].__name__ for c in _OP_CASES],
 )
 @pytest.mark.parametrize(
     "dim",
@@ -105,7 +106,9 @@ def test_logical_reduce_conformance(
     ],
 )
 def test_logical_reduce_unaligned_innermost(
-    op_cls: type, torch_fn: Callable, dim,
+    op_cls: type,
+    torch_fn: Callable,
+    dim,
 ) -> None:
     """Unaligned innermost dim must still match PyTorch.
 
@@ -115,19 +118,19 @@ def test_logical_reduce_unaligned_innermost(
     """
     torch.manual_seed(0)
     dtype = torch.float16
-    raw = torch.randn(*_UNALIGNED_SHAPE, dtype=dtype, device="cuda")
-    zero_mask = torch.rand(_UNALIGNED_SHAPE, device="cuda") < 0.1
+    raw = torch.randn(*_UNALIGNED_SHAPE, dtype=dtype, device="ptpu")
+    zero_mask = torch.rand(_UNALIGNED_SHAPE, device="ptpu") < 0.1
     x = raw.masked_fill(zero_mask, 0)
 
-    op = op_cls(dtype=dtype, dim=dim, keepdim=False)
+    op = op_cls(dim=dim, keepdim=False)
     y = op(x)
-    ref = torch_fn(x) if dim is None else torch_fn(x, dim=dim, keepdim=False)
+    ref = torch_fn(x.cpu()) if dim is None else torch_fn(x.cpu(), dim=dim, keepdim=False)
 
     assert y.dtype == torch.bool
     assert y.shape == ref.shape, (
         f"{op_cls.__name__} dim={dim} unaligned: shape {y.shape} vs ref {ref.shape}"
     )
-    torch.testing.assert_close(y, ref, atol=0, rtol=0)
+    torch.testing.assert_close(y.cpu(), ref, atol=0, rtol=0)
 
 
 # CountNonzero: separate matrix because the op does not accept ``keepdim``.
@@ -155,23 +158,20 @@ def test_count_nonzero_conformance(dim, dtype: torch.dtype) -> None:
     the output dtype.
     """
     torch.manual_seed(0)
-    raw = torch.randn(*_SHAPE, dtype=dtype, device="cuda")
-    zero_mask = torch.rand(_SHAPE, device="cuda") < 0.1
+    raw = torch.randn(*_SHAPE, dtype=dtype, device="ptpu")
+    zero_mask = torch.rand(_SHAPE, device="ptpu") < 0.1
     x = raw.masked_fill(zero_mask, 0)
 
-    op = CountNonzeroFwdOp(dtype=dtype, dim=dim)
+    op = CountNonzeroFwdOp(dim=dim)
     y = op(x)
-    ref = torch.count_nonzero(x, dim=dim)
+    ref = torch.count_nonzero(x.cpu(), dim=dim)
 
-    assert y.dtype == torch.int64, (
-        f"CountNonzeroFwdOp output dtype {y.dtype}, expected torch.int64"
-    )
+    assert y.dtype == torch.int64, f"CountNonzeroFwdOp output dtype {y.dtype}, expected torch.int64"
     assert ref.dtype == torch.int64
     assert y.shape == ref.shape, (
-        f"CountNonzeroFwdOp dim={dim} dtype={dtype}: "
-        f"shape {y.shape} vs ref {ref.shape}"
+        f"CountNonzeroFwdOp dim={dim} dtype={dtype}: shape {y.shape} vs ref {ref.shape}"
     )
-    torch.testing.assert_close(y, ref, atol=0, rtol=0)
+    torch.testing.assert_close(y.cpu(), ref, atol=0, rtol=0)
 
 
 @pytest.mark.smoke
@@ -187,20 +187,16 @@ def test_count_nonzero_unaligned_innermost(dim) -> None:
     """Unaligned innermost dim must still match ``torch.count_nonzero``."""
     torch.manual_seed(0)
     dtype = torch.float16
-    raw = torch.randn(*_UNALIGNED_SHAPE, dtype=dtype, device="cuda")
-    zero_mask = torch.rand(_UNALIGNED_SHAPE, device="cuda") < 0.1
+    raw = torch.randn(*_UNALIGNED_SHAPE, dtype=dtype, device="ptpu")
+    zero_mask = torch.rand(_UNALIGNED_SHAPE, device="ptpu") < 0.1
     x = raw.masked_fill(zero_mask, 0)
 
-    op = CountNonzeroFwdOp(dtype=dtype, dim=dim)
+    op = CountNonzeroFwdOp(dim=dim)
     y = op(x)
-    ref = torch.count_nonzero(x, dim=dim)
+    ref = torch.count_nonzero(x.cpu(), dim=dim)
 
     assert y.dtype == torch.int64
     assert y.shape == ref.shape, (
         f"CountNonzeroFwdOp dim={dim} unaligned: shape {y.shape} vs ref {ref.shape}"
     )
-    torch.testing.assert_close(y, ref, atol=0, rtol=0)
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-vvs"])
+    torch.testing.assert_close(y.cpu(), ref, atol=0, rtol=0)

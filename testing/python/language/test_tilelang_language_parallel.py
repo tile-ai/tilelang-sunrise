@@ -67,6 +67,43 @@ def test_parallel_static_extent():
 
 
 @pytest.mark.parametrize(
+    "execution_target",
+    [
+        pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA or ROCm runtime unavailable")),
+        pytest.param("tang", marks=pytest.mark.skipif(not tilelang.testing.is_tang_target(), reason="Requires TANG target")),
+    ],
+)
+@pytest.mark.parametrize("enable_let_inline", [False, True])
+@pytest.mark.parametrize("rows,cols,threads,thread_start", [(1, 2, 2, 0), (2, 8, 4, 0), (3, 5, 8, 0), (2, 8, 8, 4)])
+def test_parallel_let_indices(rows, cols, threads, thread_start, enable_let_inline, execution_target):
+    size = 2 * rows * cols + 8
+
+    @T.prim_func
+    def main(A: T.Tensor((size,), T.int32), B: T.Tensor((size,), T.int32)):
+        with T.Kernel(2, threads=threads) as bx:
+            if T.get_thread_binding() >= thread_start:
+                for i, j in T.Parallel(rows, cols):
+                    offset = bx * rows * cols + i * cols
+                    idx = offset + j + 4
+                    B[idx] = A[idx] * 3 + idx
+                for i, j in T.Parallel(rows, cols):
+                    offset = bx * rows * cols + i * cols
+                    idx = offset + j + 4
+                    B[idx] = B[idx] + 5
+
+    config = {tilelang.PassConfigKey.TL_SIMPLIFY: {tilelang.PassConfigKey.TL_SIMPLIFY_ENABLE_LET_INLINE: enable_let_inline}}
+    target = ("hip" if torch.version.hip else "cuda") if execution_target == "cuda" else tilelang.env.get_default_target()
+    device = "cuda" if execution_target == "cuda" else get_current_device()
+    kernel = tilelang.compile(main, target=target, execution_backend="tvm_ffi", pass_configs=config)
+    data = torch.arange(size, dtype=torch.int32, device=device)
+    output = torch.full_like(data, -7)
+    kernel(data, output)
+    expected = torch.full_like(data, -7)
+    expected[4:-4] = data[4:-4] * 4 + 5
+    torch.testing.assert_close(output.cpu(), expected.cpu(), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
     "valid_len",
     PARALLEL_DYNAMIC_VALID_LENGTHS,
     ids=[f"valid_len={value}" for value in PARALLEL_DYNAMIC_VALID_LENGTHS],

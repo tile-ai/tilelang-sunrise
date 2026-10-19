@@ -18,6 +18,10 @@ class BmmWorkload(WorkloadBase):
         b = torch.randn(self.batch, self.k, self.n, device="ptpu", dtype=self.dtype)
         return a, b
 
+    def ref_program(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return torch.bmm(a, b)
+
+
 _FP8_INIT_SCALE: float = 0.25
 
 
@@ -30,7 +34,7 @@ class BmmFp8Workload(WorkloadBase):
       ``a`` signature).
     * ``b`` is produced in ``[B, K, N]`` (N-contiguous).  This is the *KN*
       layout advertised by the manifest as the primary path.  The alternate
-      ``[B, N, K]`` layout accepted by ``BmmFp8Op`` is exercised directly in
+      ``[B, N, K]`` layout accepted by ``BmmFp8KNFwdOp`` is exercised directly in
       ``tests/ops/test_bmm.py`` (see ``test_bmm_fp8_accepts_nk_layout_when_k_ne_n``),
       not through this workload.
     * ``scale_a`` / ``scale_b`` are per-tensor rank-0 fp32 scalars in
@@ -55,17 +59,32 @@ class BmmFp8Workload(WorkloadBase):
 
     def gen_inputs(self) -> tuple[torch.Tensor, ...]:
         a = (
-            torch.randn(self.batch, self.m, self.k, device="ptpu") * _FP8_INIT_SCALE
-        ).to(self.dtype).contiguous()
+            (torch.randn(self.batch, self.m, self.k, device="cpu") * _FP8_INIT_SCALE)
+            .to(self.dtype)
+            .ptpu()
+            .contiguous()
+        )
         b = (
-            torch.randn(self.batch, self.k, self.n, device="ptpu") * _FP8_INIT_SCALE
-        ).to(self.dtype).contiguous()
+            (torch.randn(self.batch, self.k, self.n, device="cpu") * _FP8_INIT_SCALE)
+            .to(self.dtype)
+            .ptpu()
+            .contiguous()
+        )
         # per_tensor uses 0-D scalars (empty shape); torch.rand accepts an
         # empty size tuple and produces a rank-0 tensor.
-        scale_a = (
-            0.5 + torch.rand((), device="ptpu", dtype=torch.float32)
-        ).contiguous()
-        scale_b = (
-            0.5 + torch.rand((), device="ptpu", dtype=torch.float32)
-        ).contiguous()
+        scale_a = (0.5 + torch.rand((), device="ptpu", dtype=torch.float32)).contiguous()
+        scale_b = (0.5 + torch.rand((), device="ptpu", dtype=torch.float32)).contiguous()
         return a, b, scale_a, scale_b
+
+    def ref_program(self, *inputs: torch.Tensor) -> torch.Tensor:
+        a, b, scale_a, scale_b = inputs
+        # per_tensor: 0-D fp32 scalars (matching flashinfer.bmm_fp8).
+        assert scale_a.dim() == 0 and scale_b.dim() == 0, (
+            f"BmmFp8Workload only supports per-tensor scales, got "
+            f"{tuple(scale_a.shape)} / {tuple(scale_b.shape)}"
+        )
+        # b is [B, K, N] (torch.bmm layout, matching BmmFp8KNFwdOp).
+        a_f = a.float() * scale_a
+        b_f = b.float() * scale_b
+        out = torch.bmm(a_f, b_f)
+        return out.to(self.out_dtype)

@@ -2,6 +2,8 @@
 
 #include "common.h"
 
+#include <type_traits>
+
 namespace tl {
 
 namespace detail {
@@ -65,11 +67,50 @@ template <int thread_extent> TL_DEVICE bool tl_shuffle_elect() {
 
 } // namespace tl
 
-// __match_any_sync for TANG/PTCC: delegate to clang's builtin match_any_sync.
-// Must be at global scope (outside tl namespace) so generated code can find it.
-#ifndef __match_any_sync
-static inline __device__ unsigned int __match_any_sync(unsigned int __mask,
-                                                       int __val) {
+// ---------------------------------------------------------------------------
+// __match_any_sync for TANG/PTCC.
+//
+// The toolchain has used two names for this builtin. Older revisions declare
+// `match_any_sync`; newer ones declare `__match_any_sync`, the CUDA spelling
+// that codegen already emits. Both are plain function declarations, so the
+// `#ifndef __match_any_sync` this bridge used to be guarded by could never
+// detect anything: the name is not a macro, so the guard was always true.
+//
+// Probe for the declaration instead, and bridge only when it is missing. The
+// bridge is a template on purpose. A template cannot redeclare the toolchain's
+// non-template overload -- that is the "static declaration of
+// '__match_any_sync' follows non-static declaration" error -- and once SFINAE
+// removes it the call resolves straight to the toolchain's own function.
+//
+// Must stay at global scope, outside namespace tl, so generated code finds it.
+// ---------------------------------------------------------------------------
+namespace tl {
+namespace detail {
+
+// True when the toolchain declares `__match_any_sync` itself. The probe has to
+// sit above the bridge, so that it only ever sees the toolchain's declaration.
+// TVal{} keeps the expression dependent, which is what makes a missing
+// declaration a substitution failure rather than a hard error.
+template <class TVal, class = void>
+struct has_vendor_match_any_sync : std::false_type {};
+
+template <class TVal>
+struct has_vendor_match_any_sync<
+    TVal, std::void_t<decltype(__match_any_sync(0u, TVal{}))>>
+    : std::true_type {};
+
+} // namespace detail
+} // namespace tl
+
+// The condition has to sit in the return type AND depend on TVal. A default
+// template argument is not part of the immediate context, and a condition that
+// does not depend on TVal is evaluated when the template is declared rather
+// than during substitution -- GCC reports either one as a hard error instead of
+// a substitution failure.
+template <class TVal>
+static inline __device__
+    std::enable_if_t<!tl::detail::has_vendor_match_any_sync<TVal>::value,
+                     unsigned int>
+    __match_any_sync(unsigned int __mask, TVal __val) {
   return match_any_sync(__mask, __val);
 }
-#endif

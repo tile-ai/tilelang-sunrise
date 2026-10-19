@@ -1,76 +1,76 @@
+"""Benchmarks for InstanceNormFwdOp.
+
+flag_gems ships no instance_norm, so the tag goes to its ``group_norm`` with one
+group per channel, which computes the same thing. torch eager and inductor complete
+the row.
+"""
+
+import math
+
 import pytest
 import torch
 import torch.nn.functional as F
 
-from benchmarks.benchmark_base import BenchmarkReport, ManifestBenchmark
-from tileops.manifest import load_workloads
-from tileops.ops.norm.instance_norm import (
-    InstanceNormFwdOp,
-    InstanceNormNoAffineFwdOp,
+from benchmarks.baselines import (
+    FLAGGEMS_TAG,
+    TORCH_COMPILE_TAG,
+    assert_matches_reference,
+    compiled_reference,
+    flaggems_group_norm,
+    reference_tolerance,
 )
-from workloads.normalization import InstanceNormTest
-
-_OP_NAME = "InstanceNormFwdOp"
-_OP_NAME_NO_AFFINE = "InstanceNormNoAffineFwdOp"
-
-
-def _build_params(workloads):
-    params = []
-    for w in workloads:
-        shape = w["x_shape"]
-        n, c, spatial = shape[0], shape[1], tuple(shape[2:])
-        label = w.get("label", f"{n}x{c}x{'x'.join(map(str, spatial))}")
-        for dtype_str in w["dtypes"]:
-            dtype = getattr(torch, dtype_str)
-            params.append(pytest.param(n, c, spatial, dtype, True,
-                                       id=f"{label}-{dtype_str}"))
-    return params
+from benchmarks.benchmark_base import ManifestBenchmark, workload_params
+from tileops.manifest import load_workloads
+from tileops.ops.norm.instance_norm import InstanceNormFwdOp
+from workloads.normalization import InstanceNormWorkload
 
 
-_AFFINE_PARAMS = _build_params(load_workloads(_OP_NAME))
-_NO_AFFINE_PARAMS = _build_params(load_workloads(_OP_NAME_NO_AFFINE))
+def _instance_norm_args(w: dict, dtype: torch.dtype) -> tuple:
+    """``(n, c, spatial, dtype, tune, affine)``; a row is affine exactly when it
+    declares ``weight_shape``."""
+    n, c, *spatial = w["x_shape"]
+    return (n, c, tuple(spatial), dtype, True, "weight_shape" in w)
 
 
-@pytest.mark.parametrize("n, c, spatial, dtype, tune", _AFFINE_PARAMS)
-def test_instance_norm_bench(n: int, c: int, spatial: tuple,
-                             dtype: torch.dtype, tune: bool) -> None:
-    test = InstanceNormTest(n, c, spatial, dtype)
-    x, weight, bias = test.gen_inputs()
+@pytest.mark.parametrize(
+    "n, c, spatial, dtype, tune, affine",
+    workload_params(load_workloads(InstanceNormFwdOp), _instance_norm_args),
+)
+def test_instance_norm_bench(
+    n: int, c: int, spatial: tuple, dtype: torch.dtype, tune: bool, affine: bool
+) -> None:
+    test = InstanceNormWorkload(n, c, spatial, dtype)
+    x, _, _, weight, bias = test.gen_inputs()
+    if not affine:
+        weight = bias = None
 
     op = InstanceNormFwdOp(tune=tune)
-    bm = ManifestBenchmark(_OP_NAME, op, test)
-    result = bm.profile(op, x, weight, bias)
-    BenchmarkReport.record(op, locals(), result, tag="tileops")
+    bm = ManifestBenchmark(op, test)
 
     # Baseline: torch.nn.functional.instance_norm
-    def baseline_fn(x, weight, bias):
+    def baseline_fn(x, running_mean, running_var, weight, bias):
         return F.instance_norm(x, weight=weight, bias=bias, eps=1e-5)
 
-    result_bl = bm.profile(baseline_fn, x, weight, bias)
-    BenchmarkReport.record(op, locals(), result_bl, tag="torch")
+    # One group per channel is instance norm.
+    group_norm_fn = flaggems_group_norm(n, c, math.prod(spatial), c, 1e-5)
 
+    def flaggems_fn(x, running_mean, running_var, weight, bias):
+        return group_norm_fn(x, weight, bias)
 
-@pytest.mark.parametrize("n, c, spatial, dtype, tune", _NO_AFFINE_PARAMS)
-def test_instance_norm_no_affine_bench(n: int, c: int, spatial: tuple,
-                                       dtype: torch.dtype, tune: bool) -> None:
-    test = InstanceNormTest(n, c, spatial, dtype)
-    x, _, _ = test.gen_inputs()
+    assert_matches_reference(
+        flaggems_fn, baseline_fn, x, None, None, weight, bias, **reference_tolerance(dtype)
+    )
 
-    op = InstanceNormNoAffineFwdOp(tune=tune)
-    bm = ManifestBenchmark(_OP_NAME_NO_AFFINE, op, test)
-    # Running stats are required positional args (R16) but ignored on the
-    # use_input_stats=True path; pass placeholders.
-    rm = torch.zeros(c, dtype=torch.float32, device="ptpu")
-    rv = torch.ones(c, dtype=torch.float32, device="ptpu")
-    result = bm.profile(op, x, rm, rv)
-    BenchmarkReport.record(op, locals(), result, tag="tileops")
-
-    def baseline_no_affine(x):
-        return F.instance_norm(x, weight=None, bias=None, eps=1e-5)
-
-    result_bl = bm.profile(baseline_no_affine, x)
-    BenchmarkReport.record(op, locals(), result_bl, tag="torch")
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-vvs"])
+    bm.compare(
+        {
+            "tileops": op,
+            FLAGGEMS_TAG: flaggems_fn,
+            "torch": baseline_fn,
+            TORCH_COMPILE_TAG: compiled_reference(baseline_fn),
+        },
+        x,
+        None,
+        None,
+        weight,
+        bias,
+    )

@@ -77,6 +77,13 @@ class PassConfigKey(str, Enum):
     TL_DISABLE_WARP_SPECIALIZED = "tl.disable_warp_specialized"
     """Disable warp specialization optimization. Default: False"""
 
+    TL_ENABLE_AUTO_SCHEDULE = "tl.enable_auto_schedule"
+    """Enable Ascend auto scheduling. Default: True."""
+
+    TL_ENABLE_AUTO_WARP_SPECIALIZATION = "tl.enable_auto_warp_specialization"
+    """Name of the automatic warp-specialization scheduler to run (e.g.
+    "role_based"). Default: unset (disabled)."""
+
     TL_ENABLE_FAST_MATH = "tl.enable_fast_math"
     """
         Enable fast math optimization. Default: False
@@ -140,8 +147,7 @@ class PassConfigKey(str, Enum):
     TL_DISABLE_TMA_LOWER = "tl.disable_tma_lower"
     """Deprecated flag — prevents plain T.copy() from auto-lowering to TMA store.
 
-    Temporarily re-enabled for backward compatibility. Will be removed in
-    v0.1.10.
+    Temporarily re-enabled for backward compatibility.
     """
 
     TL_DISABLE_SAFE_MEMORY_ACCESS = "tl.disable_safe_memory_legalize"
@@ -185,6 +191,24 @@ class PassConfigKey(str, Enum):
     """Enable non-predicated LDG/STG lowering for global memory access.
     When enabled, converts Ramp-based global buffer load/store to ldg/stg intrinsics.
     Default: False"""
+
+    TL_ENABLE_TANG_INJECT_TCGEN05_FENCE = "tl.enable_tang_inject_tcgen05_fence"
+    """Enable automatic TCGEN05/TMEM fence injection on stcuv2 (S3).
+
+    When enabled, tilelang.tang.transform.InjectTcgen05Fence wraps shared-memory
+    syncs and the linear barrier wait/arrive handoffs that bracket a
+    TCGEN05/TMEM operation with the fence of the neighbour's domain
+    (``fence_tc<0>`` for TC work, ``fence_tmem<3>`` for LDT, ``fence_tmem<2>``
+    for STT), so an S3 kernel that just uses TMEM does not have to place the
+    fences by hand.
+
+    On by default, mirroring the CUDA pipeline which runs its
+    InjectTcgen05Fence unconditionally. The pass is a no-op on non-stcuv2
+    targets and on functions without TC/TMEM operations; set this to False for
+    a bit-exact A/B against an uninstrumented pipeline.
+
+    Default: True
+    """
 
     TL_ENABLE_LOWER_LDGSTG_PREDICATED = "tl.enable_lower_ldgstg_predicated"
     """Enable predicated LDG/STG lowering.
@@ -417,7 +441,7 @@ class PassConfigKey(str, Enum):
 
 _DEPRECATED_PASS_CONFIG_MESSAGES = {
     PassConfigKey.TL_DISABLE_TMA_LOWER.value: (
-        "`tl.disable_tma_lower` is deprecated and will be removed in v0.1.10. Use `T.copy(..., disable_tma=True)` per-copy instead."
+        "`tl.disable_tma_lower` is deprecated. Use `T.copy(..., disable_tma=True)` per-copy instead."
     ),
 }
 

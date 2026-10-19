@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Summarize the ops manifest: status, coverage, workloads, roofline.
 
-The manifest at ``tileops/manifest/`` is the project's source of truth.
+The manifest at ``src/tileops/manifest/`` is the project's source of truth.
 This script aggregates it into a single snapshot intended for CI status
 reporting and project dashboards.
 
@@ -57,7 +57,6 @@ def collect_stats(manifest: dict[str, dict]) -> dict[str, Any]:
     kernel_map_ok = 0
     bench_manifest_ok = 0
     ref_api_ok = 0
-    variant_count = 0
 
     # Conformance flags: things expected for implemented ops but missing.
     missing_kernel_map: list[str] = []
@@ -86,8 +85,6 @@ def collect_stats(manifest: dict[str, dict]) -> dict[str, Any]:
             bench_manifest_ok += 1
         if op.get("ref_api"):
             ref_api_ok += 1
-        if op.get("variant_of"):
-            variant_count += 1
 
         if status == "implemented":
             if not _has_kernel_map(op):
@@ -137,7 +134,6 @@ def collect_stats(manifest: dict[str, dict]) -> dict[str, Any]:
             "roofline": roofline_ok,
             "kernel_map": kernel_map_ok,
             "bench_manifest_driven": bench_manifest_ok,
-            "variant_of": variant_count,
         },
         "conformance_gaps": {
             "implemented_without_kernel_map": sorted(missing_kernel_map),
@@ -168,8 +164,7 @@ def render_text(stats: dict[str, Any]) -> str:
     lines.append("=" * 60)
     lines.append(f"Total ops:    {total}")
     lines.append(
-        f"Implemented:  {by_status.get('implemented', 0):4d}  "
-        f"[{_bar(pct)}] {pct * 100:5.1f}%"
+        f"Implemented:  {by_status.get('implemented', 0):4d}  [{_bar(pct)}] {pct * 100:5.1f}%"
     )
     lines.append(f"Spec-only:    {by_status.get('spec-only', 0):4d}")
     if by_status.get("deprecated"):
@@ -198,20 +193,16 @@ def render_text(stats: dict[str, Any]) -> str:
         p = n / total if total else 0
         lines.append(f"  {label:<32} {n:4d}/{total}  {p * 100:5.1f}%")
     lines.append("")
-    lines.append(f"Workloads total: {stats['workloads_total']}  "
-                 f"(avg {stats['workloads_avg_per_implemented']:.2f} per implemented op)")
+    lines.append(
+        f"Workloads total: {stats['workloads_total']}  "
+        f"(avg {stats['workloads_avg_per_implemented']:.2f} per implemented op)"
+    )
     lines.append("")
     gaps = stats["conformance_gaps"]
     lines.append("Conformance gaps")
     lines.append("-" * 60)
-    lines.append(
-        f"  implemented without kernel_map: "
-        f"{len(gaps['implemented_without_kernel_map'])}"
-    )
-    lines.append(
-        f"  implemented without roofline:   "
-        f"{len(gaps['implemented_without_roofline'])}"
-    )
+    lines.append(f"  implemented without kernel_map: {len(gaps['implemented_without_kernel_map'])}")
+    lines.append(f"  implemented without roofline:   {len(gaps['implemented_without_roofline'])}")
     lines.append(
         f"  implemented without bench:      "
         f"{len(gaps['implemented_without_bench_manifest_driven'])}"
@@ -276,12 +267,10 @@ def render_markdown(stats: dict[str, Any]) -> str:
     lines.append("### Conformance gaps")
     lines.append("")
     lines.append(
-        f"- Implemented ops without `kernel_map`: "
-        f"**{len(gaps['implemented_without_kernel_map'])}**"
+        f"- Implemented ops without `kernel_map`: **{len(gaps['implemented_without_kernel_map'])}**"
     )
     lines.append(
-        f"- Implemented ops without `roofline`: "
-        f"**{len(gaps['implemented_without_roofline'])}**"
+        f"- Implemented ops without `roofline`: **{len(gaps['implemented_without_roofline'])}**"
     )
     lines.append(
         f"- Implemented ops without `source.bench_manifest_driven`: "
@@ -294,8 +283,7 @@ def render_markdown(stats: dict[str, Any]) -> str:
     spec_list = gaps["spec_only_ops"]
     if spec_list:
         lines.append("")
-        lines.append("<details><summary>Spec-only ops "
-                     f"({len(spec_list)})</summary>")
+        lines.append(f"<details><summary>Spec-only ops ({len(spec_list)})</summary>")
         lines.append("")
         lines.append("| | | |")
         lines.append("| --- | --- | --- |")
@@ -325,9 +313,7 @@ def render_badges(stats: dict[str, Any]) -> dict[str, dict[str, Any]]:
     impl = stats["by_status"].get("implemented", 0)
     pct_impl = (impl / total * 100) if total else 0.0
 
-    missing_bench = len(
-        stats["conformance_gaps"]["implemented_without_bench_manifest_driven"]
-    )
+    missing_bench = len(stats["conformance_gaps"]["implemented_without_bench_manifest_driven"])
     impl_benched = impl - missing_bench
     pct_bench = (impl_benched / impl * 100) if impl else 0.0
 
@@ -364,11 +350,8 @@ def render_diff(current: dict[str, Any], baseline: dict[str, Any]) -> str:
     d_impl = current["by_status"].get("implemented", 0) - baseline["by_status"].get(
         "implemented", 0
     )
-    d_spec = current["by_status"].get("spec-only", 0) - baseline["by_status"].get(
-        "spec-only", 0
-    )
-    lines.append(f"- Total ops: {baseline['total_ops']} → {current['total_ops']} "
-                 f"({d_total:+d})")
+    d_spec = current["by_status"].get("spec-only", 0) - baseline["by_status"].get("spec-only", 0)
+    lines.append(f"- Total ops: {baseline['total_ops']} → {current['total_ops']} ({d_total:+d})")
     lines.append(
         f"- Implemented: {baseline['by_status'].get('implemented', 0)} → "
         f"{current['by_status'].get('implemented', 0)} ({d_impl:+d})"
@@ -439,9 +422,7 @@ def main(argv: list[str] | None = None) -> int:
         args.badge_output.mkdir(parents=True, exist_ok=True)
         for slug, payload in badges.items():
             fname = f"manifest-{slug.replace('_', '-')}.json"
-            (args.badge_output / fname).write_text(
-                json.dumps(payload, indent=2) + "\n"
-            )
+            (args.badge_output / fname).write_text(json.dumps(payload, indent=2) + "\n")
     return 0
 
 

@@ -4,7 +4,7 @@ import tilelang.testing
 import tilelang
 import torch
 import pytest
-from tilelang.utils.device import get_current_device
+from tilelang.utils.device import IS_CUDA, IS_PTPU, get_current_device
 
 
 def matmul(
@@ -247,7 +247,7 @@ def run_tvm_ffi_kernel_multi_stream(
     tensor_c = torch.randn(M, N, dtype=out_dtype, device=device)
 
     num_streams = 4
-    accelerator = torch.ptpu if str(tilelang.env.get_default_target()).startswith("tang") else torch.cuda
+    accelerator = torch.ptpu if tilelang.testing.is_tang_target() else torch.cuda
     for _ in range(num_streams):
         stream = accelerator.Stream()
         with accelerator.stream(stream):
@@ -432,7 +432,7 @@ def test_tvm_ffi_l2_persistent_map():
     kernel = elementwise_add_with_l2_cache(M, N)
 
     source = kernel.get_host_source()
-    if not str(tilelang.env.get_default_target()).startswith("tang"):
+    if not tilelang.testing.is_tang_target():
         assert "__tvm_cuda_stream_set_access_policy_window_packed" in source, (
             "Expected __tvm_cuda_stream_set_access_policy_window_packed in the kernel source"
         )
@@ -507,6 +507,36 @@ def test_tvm_ffi_pdl():
     tilelang.testing.torch_assert_close(c, ref_c, atol=1e-5, rtol=1e-5)
 
     print("pdl test passed!")
+
+
+@pytest.mark.skipif(not (IS_CUDA or IS_PTPU), reason="Requires CUDA or TANG")
+def test_tvm_ffi_dynamic_shape_output_before_input():
+    """An output may precede the input that supplies its symbolic dimension.
+
+    The dynamic-symbolic map records parameter indices taken from the PrimFunc
+    signature, and an output's shape is resolved while that output is being
+    allocated. When the output precedes its input, the referenced slot is not an
+    input, so resolving it against the compacted input list reads the wrong tensor
+    or runs off the end of that list.
+    """
+    N = T.dynamic("N")
+
+    @tilelang.jit(out_idx=[0], execution_backend="tvm_ffi")
+    def kernel():
+        @T.prim_func
+        def main(
+            B: T.Tensor((N,), "float32"),
+            A: T.Tensor((N,), "float32"),
+        ):
+            with T.Kernel(1, threads=128):
+                for i in T.Parallel(N):
+                    B[i] = A[i] + T.float32(9)
+
+        return main
+
+    a = torch.arange(128, dtype=torch.float32, device=get_current_device())
+    out = kernel()(a)
+    tilelang.testing.torch_assert_close(out, a + 9, atol=0, rtol=0)
 
 
 if __name__ == "__main__":

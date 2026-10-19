@@ -18,6 +18,16 @@ def is_ptpu_available() -> bool:
 
 IS_PTPU = is_ptpu_available()
 
+IS_NPU = False
+try:
+    if not hasattr(torch, "npu"):
+        import torch_npu  # noqa: F401
+    IS_NPU = hasattr(torch, "npu") and torch.npu.is_available()
+except ImportError:
+    IS_NPU = False
+except Exception as e:
+    print(f"An unexpected error occurred while checking NPU availability: {e}")
+
 IS_MPS = False
 try:
     IS_MPS = torch.backends.mps.is_available()
@@ -27,11 +37,25 @@ except Exception as e:
     print(f"An unexpected error occurred while checking MPS availability: {e}")
 
 
+if IS_PTPU:
+    Event = torch.ptpu.Event
+elif IS_CUDA:
+    Event = torch.cuda.Event
+elif IS_NPU:
+    Event = torch.npu.Event
+elif IS_MPS:
+    Event = torch.mps.Event
+else:
+    Event = None
+
+
 def get_current_device():
     if is_ptpu_available():
         return torch.device("ptpu", torch.ptpu.current_device())
     if IS_CUDA:
         return torch.device("cuda", torch.cuda.current_device())
+    if IS_NPU:
+        return torch.device("npu", torch.npu.current_device())
     if IS_MPS:
         return torch.device("mps", 0)
     return torch.device("cpu")
@@ -45,6 +69,34 @@ def is_device_assert_supported() -> bool:
     meaningless and ``device_assert`` degrades to a no-op.
     """
     return IS_CUDA or is_ptpu_available()
+
+
+def device_synchronize(device: int | torch.device | None = None) -> None:
+    """Synchronize CUDA/HIP, MPS, or NPU, preferring CUDA when no device is given."""
+    if device is None:
+        if IS_PTPU:
+            torch.ptpu.synchronize()
+        elif IS_CUDA:
+            torch.cuda.synchronize()
+        elif IS_NPU:
+            torch.npu.synchronize()
+        elif IS_MPS:
+            torch.mps.synchronize()
+        else:
+            raise RuntimeError("No device is available")
+        return
+
+    device_type = "cuda" if isinstance(device, int) else torch.device(device).type
+    if device_type == "ptpu":
+        torch.ptpu.synchronize(device)
+    elif device_type == "cuda":
+        torch.cuda.synchronize(device)
+    elif device_type == "npu":
+        torch.npu.synchronize(device)
+    elif device_type == "mps":
+        torch.mps.synchronize()
+    else:
+        raise ValueError(f"device_synchronize only supports CUDA/HIP, MPS, or NPU devices, got {device}")
 
 
 def get_available_cpu_count() -> int:

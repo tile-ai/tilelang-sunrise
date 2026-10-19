@@ -3,48 +3,43 @@ import torch
 import torch.nn.functional as F
 
 from tests.test_base import FixtureBase, TestBase
-from tileops.ops.norm.group_norm import GroupNormFwdOp, GroupNormNoAffineFwdOp
-from workloads.normalization import GroupNormTest as _GroupNormTestWorkload
+from tileops.ops.norm.group_norm import GroupNormFwdOp
+from workloads.normalization import GroupNormWorkload
 
 
-class GroupNormTest(_GroupNormTestWorkload, TestBase):
-    def ref_program(self, x: torch.Tensor, weight: torch.Tensor,
-                    bias: torch.Tensor) -> torch.Tensor:
-        return F.group_norm(
-            x.float(),
-            self.g,
-            weight=weight.float(),
-            bias=bias.float(),
-            eps=self.eps,
-        ).to(x.dtype)
+class GroupNormTest(GroupNormWorkload, TestBase):
+    pass
 
 
 class GroupNormFixture(FixtureBase):
     PARAMS = [
-        ("n, c, spatial, g, dtype, tune", [
-            # Small CI-friendly shapes -- fp32
-            pytest.param(2, 32, (8, 8), 8, torch.float32, False, marks=pytest.mark.smoke),
-            # Small CI-friendly shapes -- fp16
-            pytest.param(2, 32, (8, 8), 8, torch.float16, False, marks=pytest.mark.smoke),
-            # Small CI-friendly shapes -- bf16
-            pytest.param(2, 32, (8, 8), 8, torch.bfloat16, False, marks=pytest.mark.smoke),
-            pytest.param(4, 16, (4, 4), 4, torch.float32, False, marks=pytest.mark.full),
-            pytest.param(4, 16, (4, 4), 4, torch.float16, False, marks=pytest.mark.full),
-            pytest.param(4, 16, (4, 4), 4, torch.bfloat16, False, marks=pytest.mark.full),
-            # Different group counts
-            pytest.param(2, 32, (4, 4), 1, torch.float16, False, marks=pytest.mark.full),
-            pytest.param(2, 32, (4, 4), 32, torch.float16, False, marks=pytest.mark.full),
-            pytest.param(2, 32, (4, 4), 16, torch.float16, False, marks=pytest.mark.full),
-            # 1D spatial
-            pytest.param(2, 32, (16,), 8, torch.float16, False, marks=pytest.mark.full),
-            # 3D spatial
-            pytest.param(2, 16, (4, 4, 4), 4, torch.float16, False, marks=pytest.mark.full),
-            # Non-power-of-two channels per group
-            pytest.param(2, 30, (4, 4), 5, torch.float16, False, marks=pytest.mark.full),
-            # Non-aligned spatial: exercises partial-tile path
-            pytest.param(2, 32, (7, 7), 8, torch.float16, False, marks=pytest.mark.full),
-            pytest.param(2, 32, (7, 7), 8, torch.bfloat16, False, marks=pytest.mark.full),
-        ]),
+        (
+            "n, c, spatial, g, dtype, tune",
+            [
+                # Small CI-friendly shapes -- fp32
+                pytest.param(2, 32, (8, 8), 8, torch.float32, False, marks=pytest.mark.smoke),
+                # Small CI-friendly shapes -- fp16
+                pytest.param(2, 32, (8, 8), 8, torch.float16, False, marks=pytest.mark.smoke),
+                # Small CI-friendly shapes -- bf16
+                pytest.param(2, 32, (8, 8), 8, torch.bfloat16, False, marks=pytest.mark.smoke),
+                pytest.param(4, 16, (4, 4), 4, torch.float32, False, marks=pytest.mark.full),
+                pytest.param(4, 16, (4, 4), 4, torch.float16, False, marks=pytest.mark.full),
+                pytest.param(4, 16, (4, 4), 4, torch.bfloat16, False, marks=pytest.mark.full),
+                # Different group counts
+                pytest.param(2, 32, (4, 4), 1, torch.float16, False, marks=pytest.mark.full),
+                pytest.param(2, 32, (4, 4), 32, torch.float16, False, marks=pytest.mark.full),
+                pytest.param(2, 32, (4, 4), 16, torch.float16, False, marks=pytest.mark.full),
+                # 1D spatial
+                pytest.param(2, 32, (16,), 8, torch.float16, False, marks=pytest.mark.full),
+                # 3D spatial
+                pytest.param(2, 16, (4, 4, 4), 4, torch.float16, False, marks=pytest.mark.full),
+                # Non-power-of-two channels per group
+                pytest.param(2, 30, (4, 4), 5, torch.float16, False, marks=pytest.mark.full),
+                # Non-aligned spatial: exercises partial-tile path
+                pytest.param(2, 32, (7, 7), 8, torch.float16, False, marks=pytest.mark.full),
+                pytest.param(2, 32, (7, 7), 8, torch.bfloat16, False, marks=pytest.mark.full),
+            ],
+        ),
     ]
 
 
@@ -59,29 +54,32 @@ def _get_tolerances(dtype: torch.dtype) -> tuple[float, float]:
 
 
 @GroupNormFixture
-def test_group_norm_op(n: int, c: int, spatial: tuple, g: int,
-                       dtype: torch.dtype, tune: bool) -> None:
+def test_group_norm_op(
+    n: int, c: int, spatial: tuple, g: int, dtype: torch.dtype, tune: bool
+) -> None:
     test = GroupNormTest(n, c, spatial, g, dtype)
     op = GroupNormFwdOp(num_groups=g)
     atol, rtol = _get_tolerances(dtype)
-    inputs = tuple(
-        x.ptpu() if isinstance(x, torch.Tensor) else x for x in test.gen_inputs()
-    )
+    inputs = tuple(x.ptpu() if isinstance(x, torch.Tensor) else x for x in test.gen_inputs())
     test.check(op, *inputs, atol=atol, rtol=rtol)
 
 
 class GroupNormNonContigFixture(FixtureBase):
     PARAMS = [
-        ("n, c, spatial, g, dtype", [
-            pytest.param(2, 32, (8, 8), 8, torch.float16, marks=pytest.mark.smoke),
-            pytest.param(2, 32, (8, 8), 8, torch.bfloat16, marks=pytest.mark.smoke),
-        ]),
+        (
+            "n, c, spatial, g, dtype",
+            [
+                pytest.param(2, 32, (8, 8), 8, torch.float16, marks=pytest.mark.smoke),
+                pytest.param(2, 32, (8, 8), 8, torch.bfloat16, marks=pytest.mark.smoke),
+            ],
+        ),
     ]
 
 
 @GroupNormNonContigFixture
-def test_group_norm_non_contiguous(n: int, c: int, spatial: tuple, g: int,
-                                   dtype: torch.dtype) -> None:
+def test_group_norm_non_contiguous(
+    n: int, c: int, spatial: tuple, g: int, dtype: torch.dtype
+) -> None:
     """Test with non-contiguous input (sliced tensor)."""
     shape = (n, c * 2, *spatial)
     x_full = torch.randn(shape, dtype=dtype)
@@ -92,44 +90,34 @@ def test_group_norm_non_contiguous(n: int, c: int, spatial: tuple, g: int,
     op = GroupNormFwdOp(num_groups=g)
 
     y_ref = F.group_norm(
-        x.contiguous().float(), g,
-        weight=weight.float(), bias=bias.float(), eps=1e-5,
+        x.contiguous().float(),
+        g,
+        weight=weight.float(),
+        bias=bias.float(),
+        eps=1e-5,
     ).to(dtype)
 
     y = op(x.ptpu(), weight.ptpu(), bias.ptpu())
 
     y = y.cpu()
     atol, rtol = _get_tolerances(dtype)
-    assert torch.allclose(y, y_ref, atol=atol, rtol=rtol), \
+    assert torch.allclose(y, y_ref, atol=atol, rtol=rtol), (
         f"Non-contiguous test failed, max err: {(y - y_ref).abs().max()}"
+    )
 
 
 @pytest.mark.smoke
-def test_group_norm_rejects_none_weight_or_bias() -> None:
-    """Affine op rejects ``weight=None`` / ``bias=None``; affine-free path lives on NoAffine."""
+def test_group_norm_no_affine_matches_torch() -> None:
+    """Omitting the affine pair is the torch.nn.GroupNorm(affine=False) path."""
     n, c, spatial, g, dtype = 2, 32, (8, 8), 8, torch.float16
     op = GroupNormFwdOp(num_groups=g)
     x = torch.randn((n, c, *spatial), dtype=dtype, device="ptpu")
-    weight = torch.randn((c,), dtype=dtype, device="ptpu")
-    bias = torch.randn((c,), dtype=dtype, device="ptpu")
-
-    with pytest.raises((ValueError, TypeError)):
-        op(x, None, bias)
-    with pytest.raises((ValueError, TypeError)):
-        op(x, weight, None)
-    with pytest.raises((ValueError, TypeError)):
-        op(x, None, None)
-
-
-@pytest.mark.smoke
-def test_group_norm_forward_required_signature() -> None:
-    """`forward` declares weight and bias as required (no Optional, no default)."""
-    import inspect
-    sig = inspect.signature(GroupNormFwdOp.forward)
-    weight_param = sig.parameters["weight"]
-    bias_param = sig.parameters["bias"]
-    assert weight_param.default is inspect.Parameter.empty
-    assert bias_param.default is inspect.Parameter.empty
+    y = op(x)
+    y_ref = F.group_norm(x.cpu().float(), g, weight=None, bias=None, eps=1e-5).to(dtype)
+    atol, rtol = _get_tolerances(dtype)
+    assert torch.allclose(y.cpu(), y_ref, atol=atol, rtol=rtol), (
+        f"max err: {(y.cpu() - y_ref).abs().max()}"
+    )
 
 
 @pytest.mark.smoke
@@ -141,17 +129,23 @@ def test_group_norm_lazily_specializes_per_device() -> None:
     n, c, spatial, g, dtype = 2, 32, (8, 8), 8, torch.float16
     op = GroupNormFwdOp(num_groups=g)
     x_other = torch.randn(
-        (n, c, *spatial), dtype=dtype, device=torch.device("ptpu", 1),
+        (n, c, *spatial),
+        dtype=dtype,
+        device=torch.device("ptpu", 1),
     )
     weight_other = torch.randn(
-        (c,), dtype=dtype, device=torch.device("ptpu", 1),
+        (c,),
+        dtype=dtype,
+        device=torch.device("ptpu", 1),
     )
     bias_other = torch.randn(
-        (c,), dtype=dtype, device=torch.device("ptpu", 1),
+        (c,),
+        dtype=dtype,
+        device=torch.device("ptpu", 1),
     )
     y = op(x_other, weight_other, bias_other)
     assert y.device == x_other.device
-    assert len(op._kernel_cache) == 1
+    assert len(list(op.iter_kernels())) == 1
 
 
 @pytest.mark.smoke
@@ -170,23 +164,27 @@ def test_group_norm_lazy_cache_reuse_and_respecialization() -> None:
 
         y = op(x, weight, bias)
         y_ref = F.group_norm(
-            x_cpu.float(), 4, weight=weight_cpu.float(), bias=bias_cpu.float(), eps=1e-5,
+            x_cpu.float(),
+            4,
+            weight=weight_cpu.float(),
+            bias=bias_cpu.float(),
+            eps=1e-5,
         ).to(dtype)
         atol, rtol = _get_tolerances(dtype)
         assert torch.allclose(y.cpu(), y_ref, atol=atol, rtol=rtol)
 
     run_case(2, 16, (4, 4), torch.float16)
-    assert len(op._kernel_cache) == 1
+    assert len(list(op.iter_kernels())) == 1
     assert op.eval_roofline() == (
         5 * 2 * 16 * 16,
         (2 * 2 * 16 * 16 + 2 * 16) * torch.float16.itemsize,
     )
 
     run_case(2, 16, (4, 4), torch.float16)
-    assert len(op._kernel_cache) == 1
+    assert len(list(op.iter_kernels())) == 1
 
     run_case(3, 24, (2, 8), torch.bfloat16)
-    assert len(op._kernel_cache) == 2
+    assert len(list(op.iter_kernels())) == 2
     assert op.eval_roofline() == (
         5 * 3 * 24 * 16,
         (2 * 3 * 24 * 16 + 2 * 24) * torch.bfloat16.itemsize,
@@ -212,7 +210,9 @@ def test_group_norm_rejects_affine_device_mismatch() -> None:
     bias_same = torch.randn((c,), dtype=dtype, device=torch.device("ptpu", 0))
 
     weight_same = torch.randn(
-        (c,), dtype=dtype, device=torch.device("ptpu", 0),
+        (c,),
+        dtype=dtype,
+        device=torch.device("ptpu", 0),
     )
     with pytest.raises(ValueError, match="weight on"):
         op(x, weight_other, bias_same)
@@ -222,42 +222,63 @@ def test_group_norm_rejects_affine_device_mismatch() -> None:
 
 class GroupNormNoAffineFixture(FixtureBase):
     PARAMS = [
-        ("n, c, spatial, g, dtype", [
-            pytest.param(2, 32, (8, 8), 8, torch.float32, marks=pytest.mark.smoke),
-            pytest.param(2, 32, (8, 8), 8, torch.float16, marks=pytest.mark.smoke),
-            pytest.param(2, 32, (8, 8), 8, torch.bfloat16, marks=pytest.mark.smoke),
-            pytest.param(4, 16, (4, 4), 4, torch.float16, marks=pytest.mark.full),
-            # Non-aligned spatial: exercises padding path.
-            pytest.param(2, 32, (7, 7), 8, torch.float16, marks=pytest.mark.full),
-            # 1D spatial.
-            pytest.param(2, 32, (16,), 8, torch.float16, marks=pytest.mark.full),
-            # 3D spatial.
-            pytest.param(2, 16, (4, 4, 4), 4, torch.float16, marks=pytest.mark.full),
-        ]),
+        (
+            "n, c, spatial, g, dtype",
+            [
+                pytest.param(2, 32, (8, 8), 8, torch.float32, marks=pytest.mark.smoke),
+                pytest.param(2, 32, (8, 8), 8, torch.float16, marks=pytest.mark.smoke),
+                pytest.param(2, 32, (8, 8), 8, torch.bfloat16, marks=pytest.mark.smoke),
+                pytest.param(4, 16, (4, 4), 4, torch.float16, marks=pytest.mark.full),
+                # Non-aligned spatial: exercises padding path.
+                pytest.param(2, 32, (7, 7), 8, torch.float16, marks=pytest.mark.full),
+                # 1D spatial.
+                pytest.param(2, 32, (16,), 8, torch.float16, marks=pytest.mark.full),
+                # 3D spatial.
+                pytest.param(2, 16, (4, 4, 4), 4, torch.float16, marks=pytest.mark.full),
+            ],
+        ),
     ]
 
 
 @GroupNormNoAffineFixture
-def test_group_norm_no_affine_op(n: int, c: int, spatial: tuple, g: int,
-                                 dtype: torch.dtype) -> None:
+def test_group_norm_no_affine_op(
+    n: int, c: int, spatial: tuple, g: int, dtype: torch.dtype
+) -> None:
     """No-affine GroupNorm op matches torch.nn.functional.group_norm with weight=bias=None."""
-    op = GroupNormNoAffineFwdOp(num_groups=g)
+    op = GroupNormFwdOp(num_groups=g)
     x_cpu = torch.randn((n, c, *spatial), dtype=dtype)
     x = x_cpu.ptpu()
     y = op(x)
     y_ref = F.group_norm(x_cpu.float(), g, weight=None, bias=None, eps=1e-5).to(dtype)
     atol, rtol = _get_tolerances(dtype)
-    assert torch.allclose(y.cpu(), y_ref, atol=atol, rtol=rtol), \
+    assert torch.allclose(y.cpu(), y_ref, atol=atol, rtol=rtol), (
         f"max err: {(y.cpu() - y_ref).abs().max()}"
+    )
 
 
 @pytest.mark.smoke
-def test_group_norm_no_affine_forward_signature() -> None:
-    """No-affine forward accepts only x — no weight/bias parameters."""
+def test_group_norm_forward_signature() -> None:
+    """One forward takes x plus the optional affine pair."""
     import inspect
-    sig = inspect.signature(GroupNormNoAffineFwdOp.forward)
+
+    sig = inspect.signature(GroupNormFwdOp.forward)
     params = [p for p in sig.parameters if p != "self"]
-    assert params == ["x"], f"expected ['x'], got {params}"
+    assert params == ["x", "weight", "bias"], f"got {params}"
+    for name in ("weight", "bias"):
+        assert sig.parameters[name].default is None, f"{name} must default to None"
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("give", ["weight", "bias"])
+def test_group_norm_rejects_half_the_affine_switch(give: str) -> None:
+    """weight and bias are one switch; half of it is an error."""
+    n, c, spatial, g, dtype = 2, 32, (8, 8), 8, torch.float16
+    op = GroupNormFwdOp(num_groups=g)
+    x = torch.randn((n, c, *spatial), dtype=dtype, device="ptpu")
+    t = torch.randn((c,), dtype=dtype, device="ptpu")
+    kwargs = {give: t}
+    with pytest.raises(ValueError, match="one switch"):
+        op(x, **kwargs)
 
 
 @pytest.mark.smoke
@@ -267,37 +288,36 @@ def test_group_norm_no_affine_lazily_specializes_per_device() -> None:
         pytest.skip("multi-device test requires >= 2 PTPU devices")
 
     n, c, spatial, g, dtype = 2, 32, (8, 8), 8, torch.float16
-    op = GroupNormNoAffineFwdOp(num_groups=g)
+    op = GroupNormFwdOp(num_groups=g)
     x_other = torch.randn(
-        (n, c, *spatial), dtype=dtype, device=torch.device("ptpu", 1),
+        (n, c, *spatial),
+        dtype=dtype,
+        device=torch.device("ptpu", 1),
     )
     y = op(x_other)
     assert y.device == x_other.device
-    assert len(op._kernel_cache) == 1
+    assert len(list(op.iter_kernels())) == 1
 
 
 @pytest.mark.smoke
-@pytest.mark.parametrize("n, c, spatial, g", [
-    # M = N * num_groups not divisible by max block_m (16): triggers tail
-    # program reading/writing rows >= M before the M-padding fix.
-    (1, 24, (4, 4), 3),   # M = 3
-    (3, 30, (2, 2), 5),   # M = 15
-    (1, 16, (8, 8), 1),   # M = 1
-])
-def test_group_norm_no_affine_tail_block(n: int, c: int, spatial: tuple,
-                                         g: int) -> None:
-    """No-affine GroupNorm handles M not divisible by the kernel's block_m."""
+@pytest.mark.parametrize(
+    "n, c, spatial, g",
+    [
+        # Very few rows, so the grid is one or two blocks wide.
+        (1, 24, (4, 4), 3),  # M = 3
+        (3, 30, (2, 2), 5),  # M = 15
+        (1, 16, (8, 8), 1),  # M = 1
+    ],
+)
+def test_group_norm_no_affine_tail_block(n: int, c: int, spatial: tuple, g: int) -> None:
+    """No-affine GroupNorm handles a row count smaller than one grid block."""
     dtype = torch.float16
-    op = GroupNormNoAffineFwdOp(num_groups=g)
+    op = GroupNormFwdOp(num_groups=g)
     x_cpu = torch.randn((n, c, *spatial), dtype=dtype)
     x = x_cpu.ptpu()
     y = op(x)
-    y_ref = F.group_norm(x_cpu.float(), g, weight=None, bias=None,
-                        eps=1e-5).to(dtype)
+    y_ref = F.group_norm(x_cpu.float(), g, weight=None, bias=None, eps=1e-5).to(dtype)
     atol, rtol = _get_tolerances(dtype)
-    assert torch.allclose(y.cpu(), y_ref, atol=atol, rtol=rtol), \
+    assert torch.allclose(y.cpu(), y_ref, atol=atol, rtol=rtol), (
         f"max err: {(y.cpu() - y_ref).abs().max()}"
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-vvs"])
+    )

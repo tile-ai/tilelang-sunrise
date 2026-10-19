@@ -47,7 +47,18 @@ TL_DEVICE void mbarrier_init(::tang::ptx::__mbarrier_t &smem_barrier,
 }
 
 TL_DEVICE void mbarrier_inval(::tang::ptx::__mbarrier_t &smem_barrier) {
-  ::tang::ptx::mbarrier_inval(&smem_barrier);
+  // ::tang::ptx::mbarrier_inval is not available in every cccl tree: at this
+  // toolchain's resource directory,
+  // cccl/tang/__ptx/instructions/mbarrier_init.h declares mbarrier_init and
+  // nothing else, so naming the inval wrapper does not compile. Newer trees do
+  // declare it, having added it alongside init.
+  //
+  // Re-initialising is not a behaviour compromise, whatever the tree: the
+  // vendor's own __mbarrier_inval is literally `__mbarrier_init(bar, 0)` (see
+  // __clang_tang_builtin_vars.h), and cccl's block-scope barrier does the same
+  // thing -- cccl/tang/__barrier/barrier_block_scope.h re-initialises with
+  // mbarrier_init(&bar, 0x00000000) and leaves the inval call commented out.
+  ::tang::ptx::mbarrier_init(&smem_barrier, 0x00000000);
 }
 
 TL_DEVICE void mbarrier_arrive(::tang::ptx::__mbarrier_t &smem_barrier,
@@ -105,12 +116,33 @@ fence_tc_arrive_mbarrier(::tang::ptx::__mbarrier_t &smem_barrier) {
       &smem_barrier, static_cast<::tang::ptx::FenceGroup>(FenceGroup));
 }
 
-// CUDA needs fence.mbarrier_init.release.cluster between the init store and the
-// first use of a barrier. On TANG the device library's mbarrier_init already
-// ends in fence.mem, and LowerSharedBarrier emits a __syncthreads() right after
-// this call to publish the init to the rest of the block, so there is nothing
-// left for this fence to order.
-TL_DEVICE void fence_barrier_init() {}
+// Order the shared.mbarrier init stores before any thread can use the barrier.
+//
+// CUDA spells this `fence.mbarrier_init.release.cluster`. TANG has no
+// mbarrier-init-specific fence at all -- the whole fence family is fence.mem /
+// fence.alu / fence.tc / fence.fg / fence.tmem / fence.all / fence.arrive* --
+// and the vendor documents fence.mem as the CTA-scope release primitive
+// ("Prefer CTA release via fence.mem; do not use fence.all / sync.wait here",
+// __clang_tang_builtin_vars.h), which is also what the device library's own
+// mbarrier_init ends with. fence.mem is therefore the closest TANG equivalent.
+//
+// Written as raw asm because there is no public wrapper for a *plain*
+// fence.mem: the cccl umbrella only exposes fence_mem(FenceGroup), which is the
+// fence-group form (__stvm_fence_mem_reg) used to retire async copies, not a
+// memory release. The spelling below is verbatim what
+// stpu-device-libs/cccl/src/mbarrier_init.t uses.
+//
+// Redundant with the fence inside mbarrier_init on the tang::ptx path the code
+// generator uses today, and that redundancy is deliberate: inheriting the
+// device library's trailing fence would make TileLang's ordering guarantee an
+// implementation detail of one toolchain configuration. The alternative
+// -fstpu-sreg-mbarrier path (__sreg_mbarrier_*, a software publish through a
+// shared-register lock) contains no fence at all, and this op has to stay
+// correct if that path is ever selected.
+//
+// This only orders the init; LowerSharedBarrier emits a __syncthreads() right
+// after the call to publish it to the rest of the block.
+TL_DEVICE void fence_barrier_init() { asm volatile("fence.mem;"); }
 
 } // namespace tl
 

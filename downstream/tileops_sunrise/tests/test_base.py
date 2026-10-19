@@ -6,6 +6,7 @@ from abc import abstractmethod
 from functools import partial
 from typing import Any
 
+import pytest
 import torch
 
 from workloads.workload_base import FixtureBase, FixtureMeta, WorkloadBase
@@ -36,7 +37,9 @@ def _to_tuple(outputs):
     raise ValueError(f"Unsupported output type: {type(outputs)}")
 
 
-def allclose_compare(output: torch.Tensor, output_ref: torch.Tensor, atol: float = 1e-8, rtol: float = 1e-5) -> None:
+def allclose_compare(
+    output: torch.Tensor, output_ref: torch.Tensor, atol: float = 1e-8, rtol: float = 1e-5
+) -> None:
     """Default comparison using torch.allclose."""
     if output.device.type == "ptpu" or output_ref.device.type == "ptpu":
         torch.ptpu.synchronize()
@@ -62,28 +65,27 @@ def exact_compare(output: torch.Tensor, output_ref: torch.Tensor) -> None:
 class TestBase(WorkloadBase):
     """Abstract base class for op correctness testing.
 
-    Inherits gen_inputs() from WorkloadBase.
-    Subclasses must implement ref_program() for correctness checking.
+    Inherits gen_inputs() from WorkloadBase, and ref_program() too when the
+    workload is named for one op; a test on a shape-only workload defines
+    ref_program itself.
     Provides check() for comparing op output against reference.
     """
+
     __test__ = False
 
     @abstractmethod
     def ref_program(self, *inputs: Any) -> Any:
         """Reference implementation for correctness checking.
 
-        Must be overridden by every concrete test subclass.
-        Should return the same outputs as the op under test, using a
-        simpler/trusted implementation (e.g. PyTorch built-ins).
+        Supplied by the workload for ops whose workload names them, otherwise
+        by the test subclass. Returns the same outputs as the op under test,
+        using a simpler/trusted implementation (e.g. PyTorch built-ins).
         """
         raise NotImplementedError
 
-    def check(self,
-              op,
-              *inputs: torch.Tensor,
-              compare=None,
-              atol: float = 1e-08,
-              rtol: float = 1e-05) -> None:
+    def check(
+        self, op, *inputs: torch.Tensor, compare=None, atol: float = 1e-08, rtol: float = 1e-05
+    ) -> None:
         """Check the correctness of the op against ref_program.
 
         Args:
@@ -106,13 +108,16 @@ class TestBase(WorkloadBase):
             if any(isinstance(x, torch.Tensor) and x.device.type == "ptpu" for x in inputs):
                 torch.ptpu.synchronize()
             cpu_inputs = tuple(
-                x.cpu() if isinstance(x, torch.Tensor) else x for x in inputs
+                x.detach().cpu().requires_grad_(x.requires_grad)
+                if isinstance(x, torch.Tensor)
+                else x
+                for x in inputs
             )
             outputs_ref = self.ref_program(*cpu_inputs)
         except RuntimeError as e:
             if "out of memory" in str(e):
                 _logger.warning("op=%s module=%s status=skip_oom", op_name, op_module)
-                return
+                pytest.skip(f"CPU reference out of memory: {e}")
             raise e
 
         outputs_ref = _to_tuple(outputs_ref)
@@ -128,16 +133,21 @@ class TestBase(WorkloadBase):
 
         outputs = _to_tuple(outputs)
 
-        assert len(outputs) == len(outputs_ref), \
+        assert len(outputs) == len(outputs_ref), (
             f"outputs: {len(outputs)} and outputs_ref: {len(outputs_ref)} have different size"
+        )
 
-        # Compute error metrics before comparison (so we report even on failure).
+        # Error metrics before the comparison, so a failing case still reports them.
         max_abs_err = 0.0
         for output, output_ref in zip(outputs, outputs_ref, strict=True):
             if output_ref is not None:
                 if output.device.type == "ptpu" or output_ref.device.type == "ptpu":
                     torch.ptpu.synchronize()
-                err = (output.cpu().float() - output_ref.cpu().float()).abs().max().item()
+                # Widen before subtracting so narrow dtypes do not lose the
+                # error to rounding. .float() alone would drop the imaginary
+                # part of a complex output and under-report it.
+                wide = torch.complex64 if output.is_complex() else torch.float32
+                err = (output.cpu().to(wide) - output_ref.cpu().to(wide)).abs().max().item()
                 max_abs_err = max(max_abs_err, err)
 
         # Store for conftest hook to attach to pytest report.
@@ -151,5 +161,6 @@ class TestBase(WorkloadBase):
             if output_ref is not None:
                 cmp(output.cpu(), output_ref.cpu())
 
-        _logger.info("op=%s module=%s status=pass max_abs_err=%.2e",
-                      op_name, op_module, max_abs_err)
+        _logger.info(
+            "op=%s module=%s status=pass max_abs_err=%.2e", op_name, op_module, max_abs_err
+        )

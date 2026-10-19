@@ -1,11 +1,68 @@
 """Workload definitions for the GQA attention ops."""
 
 import math
+from itertools import accumulate
 
 import torch
 
-from tileops.ops import GroupedQueryAttentionFwdOp
 from workloads.workload_base import WorkloadBase
+
+
+def make_cu_seqlens(lengths: list[int]) -> torch.Tensor:
+    """Exclusive prefix sum of *lengths*, the packed-varlen offset vector."""
+    return torch.tensor([0, *accumulate(lengths)], device="ptpu", dtype=torch.int32)
+
+
+def make_interleaved_block_table(batch: int, max_pages_per_req: int) -> torch.Tensor:
+    """Block table whose logical pages sit out of order in physical memory.
+
+    Each request owns a contiguous run of physical pages and reads them
+    even-indices-first, so a kernel that ignores the table and walks physical
+    pages in order produces a different answer than one that honours it.
+    """
+    rows = []
+    for b in range(batch):
+        start = b * max_pages_per_req
+        pages = list(range(start, start + max_pages_per_req))
+        rows.append(pages[::2] + pages[1::2])
+    return torch.tensor(rows, device="ptpu", dtype=torch.int32).contiguous()
+
+
+def paged_cache_row(
+    block_table: torch.Tensor, batch_idx: int, logical_pos: int, page_size: int
+) -> int:
+    """Row of the page pool holding logical position *logical_pos* of *batch_idx*."""
+    logical_page = logical_pos // page_size
+    page_offset = logical_pos % page_size
+    physical_page = int(block_table[batch_idx, logical_page].item())
+    return physical_page * page_size + page_offset
+
+
+def make_unit_cache_scales() -> tuple[torch.Tensor, torch.Tensor]:
+    """The K and V dequantisation scales of an unquantised cache."""
+    scale = torch.ones((1,), device="ptpu", dtype=torch.float32)
+    return scale, scale.clone()
+
+
+def fill_paged_cache_from_logical(
+    k_pages: torch.Tensor,
+    v_pages: torch.Tensor,
+    k_old: list[torch.Tensor],
+    v_old: list[torch.Tensor],
+    block_table: torch.Tensor,
+    page_size: int,
+) -> None:
+    """Scatter each request's logical cache rows into the pages *block_table* names.
+
+    ``k_old`` and ``v_old`` carry one ``[cache_len, heads_kv, dim]`` tensor per
+    request, in batch order, holding that request's cache in logical position
+    order. ``k_pages`` and ``v_pages`` are written in place.
+    """
+    for b, (k_b, v_b) in enumerate(zip(k_old, v_old, strict=True)):
+        for pos in range(k_b.shape[0]):
+            row = paged_cache_row(block_table, b, pos, page_size)
+            k_pages[row].copy_(k_b[pos])
+            v_pages[row].copy_(v_b[pos])
 
 
 def _compute_gqa_square_lse(
@@ -29,10 +86,17 @@ def _compute_gqa_square_lse(
     return (torch.logsumexp(scores, dim=-1) * math.log2(math.e)).to(q.device)
 
 
-class GroupedQueryAttentionBwdTest(WorkloadBase):
-
-    def __init__(self, batch: int, heads: int, heads_kv: int, seq_len: int, dim: int,
-                 is_causal: bool, dtype: torch.dtype) -> None:
+class GroupedQueryAttentionBwdWorkload(WorkloadBase):
+    def __init__(
+        self,
+        batch: int,
+        heads: int,
+        heads_kv: int,
+        seq_len: int,
+        dim: int,
+        is_causal: bool,
+        dtype: torch.dtype,
+    ) -> None:
         self.batch = batch
         self.heads = heads
         self.heads_kv = heads_kv
@@ -42,32 +106,36 @@ class GroupedQueryAttentionBwdTest(WorkloadBase):
         self.dtype = dtype
 
     def gen_inputs(
-        self
+        self,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        q = torch.randn(self.batch,
-            self.seq_len,
-            self.heads,
-            self.dim,
-            dtype=self.dtype,
-            requires_grad=True).ptpu()
-        k = torch.randn(self.batch,
-            self.seq_len,
-            self.heads_kv,
-            self.dim,
-            dtype=self.dtype,
-            requires_grad=True).ptpu()
-        v = torch.randn(self.batch,
-            self.seq_len,
-            self.heads_kv,
-            self.dim,
-            dtype=self.dtype,
-            requires_grad=True).ptpu()
-        grad_output = torch.randn(self.batch, self.seq_len, self.heads, self.dim, dtype=self.dtype).ptpu()
+        q = torch.randn(
+            self.batch, self.seq_len, self.heads, self.dim, dtype=self.dtype, requires_grad=True
+        ).ptpu()
+        k = torch.randn(
+            self.batch, self.seq_len, self.heads_kv, self.dim, dtype=self.dtype, requires_grad=True
+        ).ptpu()
+        v = torch.randn(
+            self.batch, self.seq_len, self.heads_kv, self.dim, dtype=self.dtype, requires_grad=True
+        ).ptpu()
+        grad_output = torch.randn(
+            self.batch, self.seq_len, self.heads, self.dim, dtype=self.dtype
+        ).ptpu()
 
-        fwd_op = GroupedQueryAttentionFwdOp(self.batch, self.heads, self.heads_kv, self.seq_len,
-                                            self.dim, self.is_causal, self.dtype)
-        with torch.no_grad():
-            o = fwd_op(q, k, v)
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+
+        with torch.no_grad(), sdpa_kernel(backends=[SDPBackend.MATH]):
+            o = (
+                torch.nn.functional.scaled_dot_product_attention(
+                    q.cpu().transpose(1, 2),
+                    k.cpu().transpose(1, 2),
+                    v.cpu().transpose(1, 2),
+                    is_causal=self.is_causal,
+                    enable_gqa=True,
+                )
+                .transpose(1, 2)
+                .contiguous()
+                .to(q.device)
+            )
             lse = _compute_gqa_square_lse(
                 q,
                 k,
@@ -80,39 +148,20 @@ class GroupedQueryAttentionBwdTest(WorkloadBase):
         return q, k, v, o, grad_output, lse
 
 
-class GroupedQueryAttentionFwdTest(WorkloadBase):
+class GroupedQueryAttentionDenseDecodeWorkload(WorkloadBase):
+    """Single-token decode over a contiguous BSHD KV cache."""
 
-    def __init__(self, batch: int, heads: int, heads_kv: int, seq_len: int, dim: int,
-                 is_causal: bool, dtype: torch.dtype) -> None:
-        self.batch = batch
-        self.heads = heads
-        self.heads_kv = heads_kv
-        self.seq_len = seq_len
-        self.dim = dim
-        self.is_causal = is_causal
-        self.dtype = dtype
-
-    def gen_inputs(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        q = torch.randn(self.batch, self.seq_len, self.heads, self.dim,
-            dtype=self.dtype).ptpu().contiguous()
-        k = torch.randn(self.batch, self.seq_len, self.heads_kv, self.dim,
-            dtype=self.dtype).ptpu().contiguous()
-        v = torch.randn(self.batch, self.seq_len, self.heads_kv, self.dim,
-            dtype=self.dtype).ptpu().contiguous()
-        return q, k, v
-
-
-class GroupedQueryAttentionDecodeTest(WorkloadBase):
-
-    def __init__(self,
-                 batch: int,
-                 heads: int,
-                 heads_kv: int,
-                 seq_len_kv: int,
-                 dim: int,
-                 dtype: torch.dtype,
-                 sm_scale: float | None = None,
-                 softcap: float | None = None) -> None:
+    def __init__(
+        self,
+        batch: int,
+        heads: int,
+        heads_kv: int,
+        seq_len_kv: int,
+        dim: int,
+        dtype: torch.dtype,
+        sm_scale: float | None = None,
+        softcap: float | None = None,
+    ) -> None:
         self.batch = batch
         self.heads = heads
         self.heads_kv = heads_kv
@@ -123,26 +172,43 @@ class GroupedQueryAttentionDecodeTest(WorkloadBase):
         self.softcap = 0.0 if softcap is None else softcap
 
     def gen_inputs(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        Q = torch.randn(self.batch, self.heads, self.dim, device='ptpu', dtype=self.dtype)
-        K = torch.randn(
-            self.batch, self.seq_len_kv, self.heads_kv, self.dim, device='ptpu', dtype=self.dtype)
-        V = torch.randn(
-            self.batch, self.seq_len_kv, self.heads_kv, self.dim, device='ptpu', dtype=self.dtype)
-        return Q, K, V
+        q = torch.randn(self.batch, 1, self.heads, self.dim, device="ptpu", dtype=self.dtype)
+        k = torch.randn(
+            self.batch,
+            self.seq_len_kv,
+            self.heads_kv,
+            self.dim,
+            device="ptpu",
+            dtype=self.dtype,
+        )
+        v = torch.randn_like(k)
+        return q, k, v
+
+    def ref_program(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        groups = self.heads // self.heads_kv
+        q_bhsd = q.transpose(1, 2).float()
+        k_bhsd = k.repeat_interleave(groups, dim=2).transpose(1, 2).float()
+        v_bhsd = v.repeat_interleave(groups, dim=2).transpose(1, 2).float()
+        scores = torch.matmul(q_bhsd, k_bhsd.transpose(-2, -1)) * self.sm_scale
+        if self.softcap > 0:
+            scores = self.softcap * torch.tanh(scores / self.softcap)
+        probs = torch.softmax(scores, dim=-1)
+        return torch.matmul(probs, v_bhsd).transpose(1, 2).to(q.dtype).contiguous()
 
 
-class GroupedQueryAttentionDecodePagedTest(WorkloadBase):
-
-    def __init__(self,
-                 batch: int,
-                 heads: int,
-                 heads_kv: int,
-                 seqlen_kv: int,
-                 dim: int,
-                 page_size: int,
-                 dtype: torch.dtype,
-                 sm_scale: float | None = None,
-                 softcap: float | None = None) -> None:
+class GroupedQueryAttentionDecodePagedWorkload(WorkloadBase):
+    def __init__(
+        self,
+        batch: int,
+        heads: int,
+        heads_kv: int,
+        seqlen_kv: int,
+        dim: int,
+        page_size: int,
+        dtype: torch.dtype,
+        sm_scale: float | None = None,
+        softcap: float | None = None,
+    ) -> None:
         self.batch = batch
         self.heads = heads
         self.heads_kv = heads_kv
@@ -154,20 +220,26 @@ class GroupedQueryAttentionDecodePagedTest(WorkloadBase):
         self.softcap = 0.0 if softcap is None else softcap
 
     def gen_inputs(
-            self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         num_pages = self.seqlen_kv // self.page_size
         real_seqlen_kv = torch.randint(
-            self.page_size, self.seqlen_kv + 1, (self.batch,), dtype=torch.int32)
-        real_seqlen_kv = (real_seqlen_kv // self.page_size) * self.page_size
+            self.page_size, self.seqlen_kv + 1, (self.batch,), dtype=torch.int32, device="ptpu"
+        )
+        # torch `//` (aten::floor_divide) is unimplemented on the TANG ptpu backend;
+        # round real_seqlen_kv down to a page_size multiple on CPU, then move back.
+        real_seqlen_kv = (real_seqlen_kv.cpu() // self.page_size) * self.page_size
         real_seqlen_kv[0] = min(real_seqlen_kv[0].item(), self.seqlen_kv)
-        real_seqlen_kv = real_seqlen_kv.ptpu()
+        real_seqlen_kv = real_seqlen_kv.to("ptpu")
 
         q = torch.randn(self.batch, self.heads, self.dim, dtype=self.dtype, device="ptpu")
         k = torch.randn(self.seqlen_kv, self.heads_kv, self.dim, dtype=self.dtype, device="ptpu")
         v = torch.randn(self.seqlen_kv, self.heads_kv, self.dim, dtype=self.dtype, device="ptpu")
-        block_table = torch.arange(
-            num_pages, dtype=torch.int32,
-        ).unsqueeze(0).expand(self.batch, -1).contiguous().ptpu()
+        block_table = (
+            torch.arange(num_pages, dtype=torch.int32, device="ptpu")
+            .unsqueeze(0)
+            .expand(self.batch, -1)
+        )
 
         q = q.contiguous()
         k = k.contiguous()
@@ -178,37 +250,18 @@ class GroupedQueryAttentionDecodePagedTest(WorkloadBase):
         return q, k, v, real_seqlen_kv, block_table
 
 
-class GQAPrefillFwdTest(WorkloadBase):
-
-    def __init__(self, batch: int, heads: int, heads_kv: int, seq_len_q: int,
-                 seq_len_kv: int, dim: int, is_causal: bool, dtype: torch.dtype) -> None:
-        self.batch = batch
-        self.heads = heads
-        self.heads_kv = heads_kv
-        self.seq_len_q = seq_len_q
-        self.seq_len_kv = seq_len_kv
-        self.dim = dim
-        self.is_causal = is_causal
-        self.dtype = dtype
-
-    def gen_inputs(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        q = torch.randn(
-            self.batch, self.seq_len_q, self.heads, self.dim, device='ptpu',
-            dtype=self.dtype).contiguous()
-        k = torch.randn(
-            self.batch, self.seq_len_kv, self.heads_kv, self.dim, device='ptpu',
-            dtype=self.dtype).contiguous()
-        v = torch.randn(
-            self.batch, self.seq_len_kv, self.heads_kv, self.dim, device='ptpu',
-            dtype=self.dtype).contiguous()
-        return q, k, v
-
-
-class GQAPrefillVarlenFwdTest(WorkloadBase):
-
-    def __init__(self, batch: int, heads: int, heads_kv: int, q_lens: list[int],
-                 kv_lens: list[int], dim: int, is_causal: bool,
-                 dtype: torch.dtype) -> None:
+class GQAPrefillVarlenFwdWorkload(WorkloadBase):
+    def __init__(
+        self,
+        batch: int,
+        heads: int,
+        heads_kv: int,
+        q_lens: list[int],
+        kv_lens: list[int],
+        dim: int,
+        is_causal: bool,
+        dtype: torch.dtype,
+    ) -> None:
         self.batch = batch
         self.heads = heads
         self.heads_kv = heads_kv
@@ -235,35 +288,42 @@ class GQAPrefillVarlenFwdTest(WorkloadBase):
         return max(self.kv_lens)
 
     def gen_inputs(
-        self
+        self,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         q = torch.randn(
-            self.total_q, self.heads, self.dim, device='ptpu',
-            dtype=self.dtype).contiguous()
+            self.total_q, self.heads, self.dim, device="ptpu", dtype=self.dtype
+        ).contiguous()
         k = torch.randn(
-            self.total_kv, self.heads_kv, self.dim, device='ptpu',
-            dtype=self.dtype).contiguous()
+            self.total_kv, self.heads_kv, self.dim, device="ptpu", dtype=self.dtype
+        ).contiguous()
         v = torch.randn(
-            self.total_kv, self.heads_kv, self.dim, device='ptpu',
-            dtype=self.dtype).contiguous()
+            self.total_kv, self.heads_kv, self.dim, device="ptpu", dtype=self.dtype
+        ).contiguous()
         cu_seqlens_q = torch.tensor(
-            [0] + torch.tensor(self.q_lens).cumsum(0).tolist(),
-            dtype=torch.int32,
-            device='ptpu')
+            [0] + torch.tensor(self.q_lens).cumsum(0).tolist(), dtype=torch.int32, device="ptpu"
+        )
         cu_seqlens_kv = torch.tensor(
-            [0] + torch.tensor(self.kv_lens).cumsum(0).tolist(),
-            dtype=torch.int32,
-            device='ptpu')
+            [0] + torch.tensor(self.kv_lens).cumsum(0).tolist(), dtype=torch.int32, device="ptpu"
+        )
         return q, k, v, cu_seqlens_q, cu_seqlens_kv
 
 
-
-class GQAPrefillPagedWithKVCacheFwdTest(WorkloadBase):
-
-    def __init__(self, batch: int, heads: int, heads_kv: int, q_lens: list[int],
-                 cache_lens: list[int], page_size: int, dim: int, is_causal: bool,
-                 dtype: torch.dtype, fuse_rope: bool = False,
-                 rotary_dim: int | None = None, softcap: float | None = None) -> None:
+class GQAPrefillPagedWithKVCacheFwdWorkload(WorkloadBase):
+    def __init__(
+        self,
+        batch: int,
+        heads: int,
+        heads_kv: int,
+        q_lens: list[int],
+        cache_lens: list[int],
+        page_size: int,
+        dim: int,
+        is_causal: bool,
+        dtype: torch.dtype,
+        fuse_rope: bool = False,
+        rotary_dim: int | None = None,
+        softcap: float | None = None,
+    ) -> None:
         self.batch = batch
         self.heads = heads
         self.heads_kv = heads_kv
@@ -294,72 +354,56 @@ class GQAPrefillPagedWithKVCacheFwdTest(WorkloadBase):
         return (self.max_total_len + self.page_size - 1) // self.page_size
 
     def gen_inputs(
-        self
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
-               torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        self,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        int,
+    ]:
         q = torch.randn(
-            self.total_q, self.heads, self.dim, device='ptpu',
-            dtype=self.dtype).contiguous()
+            self.total_q, self.heads, self.dim, device="ptpu", dtype=self.dtype
+        ).contiguous()
         k_new = torch.randn(
-            self.total_q, self.heads_kv, self.dim, device='ptpu',
-            dtype=self.dtype).contiguous()
+            self.total_q, self.heads_kv, self.dim, device="ptpu", dtype=self.dtype
+        ).contiguous()
         v_new = torch.randn(
-            self.total_q, self.heads_kv, self.dim, device='ptpu',
-            dtype=self.dtype).contiguous()
+            self.total_q, self.heads_kv, self.dim, device="ptpu", dtype=self.dtype
+        ).contiguous()
         physical_tokens = self.batch * self.max_pages_per_req * self.page_size
         k_pages = torch.randn(
-            physical_tokens, self.heads_kv, self.dim, device='ptpu',
-            dtype=self.dtype).contiguous()
+            physical_tokens, self.heads_kv, self.dim, device="ptpu", dtype=self.dtype
+        ).contiguous()
         v_pages = torch.randn_like(k_pages)
-        cu_seqlens_q = torch.tensor(
-            [0] + torch.tensor(self.q_lens).cumsum(0).tolist(),
-            dtype=torch.int32,
-            device='ptpu')
-        cache_seqlens = torch.tensor(self.cache_lens, dtype=torch.int32, device='ptpu')
-        block_table = torch.arange(
-            self.batch * self.max_pages_per_req, dtype=torch.int32,
-            device='ptpu').reshape(self.batch, self.max_pages_per_req).contiguous()
+        cu_seqlens_q = make_cu_seqlens(self.q_lens)
+        cache_seqlens = torch.tensor(self.cache_lens, dtype=torch.int32, device="ptpu")
+        # Identity mapping, not make_interleaved_block_table: a timed run reports the
+        # page walk of a cache that was filled in order, and the correctness of the
+        # walk under a permuted table is the test's question.
+        block_table = (
+            torch.arange(self.batch * self.max_pages_per_req, dtype=torch.int32, device="ptpu")
+            .reshape(self.batch, self.max_pages_per_req)
+            .contiguous()
+        )
         return (
-            q, k_new, v_new, k_pages, v_pages, cu_seqlens_q, cache_seqlens,
-            block_table, self.max_seqlen_q)
+            q,
+            k_new,
+            v_new,
+            k_pages,
+            v_pages,
+            cu_seqlens_q,
+            cache_seqlens,
+            block_table,
+            self.max_seqlen_q,
+        )
 
 
-class GroupedQueryAttentionSlidingWindowFwdTest(WorkloadBase):
-
-    def __init__(
-        self,
-        batch: int,
-        seq: int,
-        heads: int,
-        heads_kv: int,
-        dim: int,
-        is_causal: bool,
-        wl: int,
-        wr: int,
-        dtype: torch.dtype,
-    ) -> None:
-        self.batch = batch
-        self.seq = seq
-        self.heads = heads
-        self.heads_kv = heads_kv
-        self.dim = dim
-        self.is_causal = is_causal
-        self.wl = wl
-        self.wr = wr
-        self.dtype = dtype
-
-    def gen_inputs(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        q = torch.randn(self.batch, self.seq, self.heads,    self.dim,
-                        dtype=self.dtype, device="ptpu") * 0.1
-        k = torch.randn(self.batch, self.seq, self.heads_kv, self.dim,
-                        dtype=self.dtype, device="ptpu") * 0.1
-        v = torch.randn(self.batch, self.seq, self.heads_kv, self.dim,
-                        dtype=self.dtype, device="ptpu") * 0.1
-        return q, k, v
-
-
-class GroupedQueryAttentionSlidingWindowVarlenFwdTest(WorkloadBase):
-
+class GroupedQueryAttentionSlidingWindowVarlenFwdWorkload(WorkloadBase):
     def __init__(
         self,
         batch: int,
@@ -386,25 +430,63 @@ class GroupedQueryAttentionSlidingWindowVarlenFwdTest(WorkloadBase):
 
     def gen_inputs(
         self,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor,
-               torch.Tensor, torch.Tensor, int]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
         total_q = sum(self.seqlens_q)
         total_k = sum(self.seqlens_k)
-        q = torch.randn(total_q, self.heads, self.dim,
-                        dtype=self.dtype, device="ptpu") * 0.1
-        k = torch.randn(total_k, self.heads_kv, self.dim,
-                        dtype=self.dtype, device="ptpu") * 0.1
-        v = torch.randn(total_k, self.heads_kv, self.dim,
-                        dtype=self.dtype, device="ptpu") * 0.1
+        q = torch.randn(total_q, self.heads, self.dim, dtype=self.dtype, device="ptpu") * 0.1
+        k = torch.randn(total_k, self.heads_kv, self.dim, dtype=self.dtype, device="ptpu") * 0.1
+        v = torch.randn(total_k, self.heads_kv, self.dim, dtype=self.dtype, device="ptpu") * 0.1
 
         cu_seqlens_q = torch.tensor(
-            [0] + list(torch.cumsum(
-                torch.tensor(self.seqlens_q), 0).tolist()),
-            dtype=torch.int32, device="ptpu")
+            [0] + list(torch.cumsum(torch.tensor(self.seqlens_q), 0).tolist()),
+            dtype=torch.int32,
+            device="ptpu",
+        )
         cu_seqlens_k = torch.tensor(
-            [0] + list(torch.cumsum(
-                torch.tensor(self.seqlens_k), 0).tolist()),
-            dtype=torch.int32, device="ptpu")
+            [0] + list(torch.cumsum(torch.tensor(self.seqlens_k), 0).tolist()),
+            dtype=torch.int32,
+            device="ptpu",
+        )
         max_seqlen_q = max(self.seqlens_q)
 
         return q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q
+
+
+class SlidingWindowAttentionWorkload(WorkloadBase):
+    def __init__(self, batch, seq, heads, heads_kv, dim, is_causal, wl, wr, dtype):
+        self.batch, self.seq, self.heads, self.heads_kv, self.dim = batch, seq, heads, heads_kv, dim
+        self.is_causal, self.wl, self.wr, self.dtype = is_causal, wl, wr, dtype
+
+    def gen_inputs(self):
+        return tuple(
+            torch.randn(self.batch, self.seq, h, self.dim, dtype=self.dtype).to("ptpu")
+            for h in (self.heads, self.heads_kv, self.heads_kv)
+        )
+
+
+class GroupedQueryAttentionSquareFwdWorkload(WorkloadBase):
+    def __init__(self, batch, heads, heads_kv, seq_len, dim, is_causal, dtype):
+        self.batch, self.heads, self.heads_kv = batch, heads, heads_kv
+        self.seq_len, self.dim = seq_len, dim
+        self.is_causal, self.dtype = is_causal, dtype
+
+    def gen_inputs(self):
+        q = torch.randn(self.batch, self.seq_len, self.heads, self.dim, dtype=self.dtype).ptpu()
+        k = torch.randn(self.batch, self.seq_len, self.heads_kv, self.dim, dtype=self.dtype).ptpu()
+        v = torch.randn(self.batch, self.seq_len, self.heads_kv, self.dim, dtype=self.dtype).ptpu()
+        return q, k, v
+
+    def ref_program(self, q, k, v):
+        import torch.nn.functional as F
+
+        return (
+            F.scaled_dot_product_attention(
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+                is_causal=self.is_causal,
+                enable_gqa=True,
+            )
+            .transpose(1, 2)
+            .contiguous()
+        )

@@ -5,27 +5,39 @@ import torch
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from benchmarks.benchmark_base import BenchmarkReport, ManifestBenchmark
-from benchmarks.ops.attention.manifest_params import gqa_decode_paged_args, manifest_params
+from benchmarks.benchmark_base import (
+    ManifestBenchmark,
+    then_dtype,
+    workload_params,
+)
+from benchmarks.ops.attention.workload_args import gqa_decode_paged_args
 from tileops.manifest import load_workloads
 from tileops.ops import GroupedQueryAttentionDecodePagedWithKVCacheFwdOp
-from workloads.attention.gqa import GroupedQueryAttentionDecodePagedTest
-
-_OP_NAME = "GroupedQueryAttentionDecodePagedWithKVCacheFwdOp"
+from workloads.attention.gqa import GroupedQueryAttentionDecodePagedWorkload
 
 
-class _GroupedQueryAttentionDecodePagedTestBaseline(GroupedQueryAttentionDecodePagedTest):
-    """Adds baseline ref_program for benchmark profiling."""
+class GroupedQueryAttentionDecodePagedTestBaseline(GroupedQueryAttentionDecodePagedWorkload):
+    """Times SDPA on the reassembled pages, not an explicit softmax.
 
-    def ref_program(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                    real_seqlen_kv: torch.Tensor, block_table: torch.Tensor) -> torch.Tensor:
+    ``sdpa_kernel(MATH)`` replaces the test reference's explicit
+    matmul/softcap/softmax chain, so the ratio is against torch's own attention.
+    """
+
+    def ref_program(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        real_seqlen_kv: torch.Tensor,
+        block_table: torch.Tensor,
+    ) -> torch.Tensor:
         """Reassemble paged K/V to logical layout per batch, then GQA (expand to heads) + SDPA."""
         batch, _, dim = q.shape
         seqlen_kv, _, _ = k.shape
         kv_group_num = self.heads // self.heads_kv
         out_list = []
         for i_b in range(batch):
-            q_b = q[i_b:i_b + 1, :, :]
+            q_b = q[i_b : i_b + 1, :, :]
             k_logical = torch.zeros(seqlen_kv, self.heads_kv, dim, dtype=q.dtype, device=q.device)
             v_logical = torch.zeros(seqlen_kv, self.heads_kv, dim, dtype=q.dtype, device=q.device)
             num_pages = math.ceil(real_seqlen_kv[i_b].item() / self.page_size)
@@ -33,12 +45,14 @@ class _GroupedQueryAttentionDecodePagedTestBaseline(GroupedQueryAttentionDecodeP
                 start_pos = block_table[i_b, i_paged].item() * self.page_size
                 end_pos = min(start_pos + self.page_size, seqlen_kv)
                 page_len = end_pos - start_pos
-                k_logical[i_paged * self.page_size:i_paged * self.page_size +
-                          page_len, :, :] = k[start_pos:end_pos, :, :]
-                v_logical[i_paged * self.page_size:i_paged * self.page_size +
-                          page_len, :, :] = v[start_pos:end_pos, :, :]
-            k_logical = k_logical[:real_seqlen_kv[i_b].item(), :, :]
-            v_logical = v_logical[:real_seqlen_kv[i_b].item(), :, :]
+                k_logical[i_paged * self.page_size : i_paged * self.page_size + page_len, :, :] = k[
+                    start_pos:end_pos, :, :
+                ]
+                v_logical[i_paged * self.page_size : i_paged * self.page_size + page_len, :, :] = v[
+                    start_pos:end_pos, :, :
+                ]
+            k_logical = k_logical[: real_seqlen_kv[i_b].item(), :, :]
+            v_logical = v_logical[: real_seqlen_kv[i_b].item(), :, :]
             group_id = torch.arange(self.heads, dtype=torch.long, device=q.device) // kv_group_num
             k_bhsd = k_logical[:, group_id, :].unsqueeze(0).transpose(1, 2)
             v_bhsd = v_logical[:, group_id, :].unsqueeze(0).transpose(1, 2)
@@ -69,9 +83,12 @@ def _fa3_gqa_decode_paged(test, k, v):
     def baseline_fn(q, k, v, real_seqlen_kv, block_table):
         # Q is (batch, heads, dim) — add seq dim for flash_attn
         out = flash_attn_with_kvcache(
-            q.unsqueeze(1), k_paged, v_paged,
+            q.unsqueeze(1),
+            k_paged,
+            v_paged,
             cache_seqlens=real_seqlen_kv.int(),
-            page_table=block_table.int())
+            page_table=block_table.int(),
+        )
         out = out[0] if isinstance(out, tuple) else out
         return out.squeeze(1)
 
@@ -129,9 +146,12 @@ def _flashinfer_gqa_decode_paged(test, q, k, v, real_seqlen_kv, block_table):
     return run_fn
 
 
-_GQA_DECODE_PAGED_BENCH_PARAMS = manifest_params(
-    load_workloads(_OP_NAME),
-    gqa_decode_paged_args,
+_GQA_DECODE_PAGED_BENCH_PARAMS = workload_params(
+    load_workloads(GroupedQueryAttentionDecodePagedWithKVCacheFwdOp),
+    then_dtype(
+        gqa_decode_paged_args,
+        tune=False,
+    ),
 )
 
 
@@ -139,36 +159,47 @@ _GQA_DECODE_PAGED_BENCH_PARAMS = manifest_params(
     "batch, heads, heads_kv, seqlen_kv, dim, page_size, sm_scale, softcap, dtype, tune",
     _GQA_DECODE_PAGED_BENCH_PARAMS,
 )
-def test_gqa_decode_paged_bench(batch: int, heads: int, heads_kv: int, seqlen_kv: int, dim: int,
-                                page_size: int, sm_scale: float | None,
-                                softcap: float | None, dtype: torch.dtype, tune: bool) -> None:
-    test = _GroupedQueryAttentionDecodePagedTestBaseline(
-        batch, heads, heads_kv, seqlen_kv, dim, page_size, dtype,
-        sm_scale=sm_scale, softcap=softcap)
+def test_gqa_decode_paged_bench(
+    batch: int,
+    heads: int,
+    heads_kv: int,
+    seqlen_kv: int,
+    dim: int,
+    page_size: int,
+    sm_scale: float | None,
+    softcap: float | None,
+    dtype: torch.dtype,
+    tune: bool,
+) -> None:
+    test = GroupedQueryAttentionDecodePagedTestBaseline(
+        batch, heads, heads_kv, seqlen_kv, dim, page_size, dtype, sm_scale=sm_scale, softcap=softcap
+    )
     inputs = test.gen_inputs()
     q, k, v, real_seqlen_kv, block_table = inputs
 
     op = GroupedQueryAttentionDecodePagedWithKVCacheFwdOp(
-        batch, heads, heads_kv, seqlen_kv, dim, page_size, dtype,
-        sm_scale=sm_scale, softcap=softcap, tune=tune)
-    bm = ManifestBenchmark(_OP_NAME, op, test)
-    result = bm.profile(op, *inputs)
-    BenchmarkReport.record(op, locals(), result, tag="tileops")
+        batch,
+        heads,
+        heads_kv,
+        seqlen_kv,
+        dim,
+        page_size,
+        sm_scale=sm_scale,
+        softcap=softcap,
+        tune=tune,
+    )
+    bm = ManifestBenchmark(op, test)
+    functors = {"tileops": op}
 
     fa3_fn = _fa3_gqa_decode_paged(test, k, v)
     if fa3_fn is not None:
-        result_fa3 = bm.profile(fa3_fn, *inputs)
-        BenchmarkReport.record(op, locals(), result_fa3, tag="fa3")
+        functors["fa3"] = fa3_fn
 
     fi_fn = _flashinfer_gqa_decode_paged(test, *inputs)
     if fi_fn is not None:
-        result_fi = bm.profile(fi_fn, *inputs)
-        BenchmarkReport.record(op, locals(), result_fi, tag="flashinfer")
+        functors["flashinfer"] = fi_fn
 
     if fa3_fn is None and fi_fn is None:
-        result_bl = bm.profile(test.ref_program, *inputs)
-        BenchmarkReport.record(op, locals(), result_bl, tag="torch-ref")
+        functors["torch-ref"] = test.ref_program
 
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-vvs"])
+    bm.compare(functors, *inputs)

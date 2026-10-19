@@ -86,6 +86,17 @@ def should_disable_remove_redundant_syncs(pass_ctx: PassContext | None = None) -
     return bool(pass_ctx.config.get(tilelang.PassConfigKey.TL_DISABLE_REMOVE_REDUNDANT_SYNCS, False))
 
 
+def should_enable_tang_inject_tcgen05_fence(pass_ctx: PassContext | None = None) -> bool:
+    """On by default: S3 kernels should not have to place TCGEN05/TMEM fences by hand.
+
+    Mirrors the CUDA pipeline, which runs its InjectTcgen05Fence unconditionally.
+    Set ``tl.enable_tang_inject_tcgen05_fence=False`` to opt out.
+    """
+    if pass_ctx is None:
+        pass_ctx = tilelang.transform.get_pass_context()
+    return bool(pass_ctx.config.get(tilelang.PassConfigKey.TL_ENABLE_TANG_INJECT_TCGEN05_FENCE, True))
+
+
 def should_disable_merge_loop(pass_ctx: PassContext | None = None) -> bool:
     if pass_ctx is None:
         pass_ctx = tilelang.transform.get_pass_context()

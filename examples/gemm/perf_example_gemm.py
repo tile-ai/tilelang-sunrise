@@ -1,5 +1,5 @@
 import tilelang
-import tilelang.language as T
+import tilelang.tang.language as T
 from tilelang.profiler import do_bench
 from tilelang.transform.pass_config import PassConfigKey
 
@@ -206,6 +206,9 @@ def matmul(
     Pipeline:
       1. Prefetch block 0 via async DMA (async_scope=1)
       2. Loop: async copy block k while gemm runs on block k-1
+
+    Local-load type fields are retained for configuration compatibility;
+    the STCU template fixes load/MMA interleaving independently of them.
 
     Key optimizations:
       - async_scope=1: non-blocking DMA for true copy/gemm overlap

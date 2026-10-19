@@ -1,0 +1,1781 @@
+"""Roofline cost-model functions for Tier 2 ops (attention, conv, MoE, etc.).
+
+Each function takes the bound Op instance and returns a ``(flops, bytes)``
+tuple of ints, matching the ``Op.eval_roofline(self) -> tuple[int, int]``
+shape that codegen emits for ``func`` mode (see ``docs/design/roofline.md`` §4.4.2).
+
+These are referenced from ``src/tileops/manifest/`` via the ``roofline.func``
+field.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from tileops.ops.op_base import Op
+
+__all__ = [
+    "add_fwd_roofline",
+    "bitwise_and_fwd_roofline",
+    "bitwise_or_fwd_roofline",
+    "bitwise_xor_fwd_roofline",
+    "cb_producer_roofline",
+    "clamp_fwd_roofline",
+    "da_cumsum_fwd_roofline",
+    "deepseek_dsa_decode_roofline",
+    "deepseek_mla_decode_roofline",
+    "deltanet_decode_roofline",
+    "div_fwd_roofline",
+    "dropout_roofline",
+    "engram_decode_roofline",
+    "engram_gate_conv_bwd_roofline",
+    "engram_gate_conv_fwd_roofline",
+    "eq_fwd_roofline",
+    "fft_c2c_roofline",
+    "floor_divide_fwd_roofline",
+    "fp8_lightning_indexer_roofline",
+    "fp8_quant_roofline",
+    "fused_moe_fwd_bytes",
+    "gated_deltanet_decode_roofline",
+    "gated_deltanet_fwd_roofline",
+    "gated_deltanet_prefill_fwd_roofline",
+    "ge_fwd_roofline",
+    "gemm_fwd_roofline",
+    "gemm_w4a16_fwd_roofline",
+    "gla_decode_roofline",
+    "gqa_bwd_roofline",
+    "gqa_decode_paged_roofline",
+    "gqa_fwd_roofline",
+    "gqa_prefill_paged_with_kv_cache_fwd_roofline",
+    "gqa_prefill_varlen_fwd_roofline",
+    "gqa_sliding_window_varlen_fwd_roofline",
+    "grouped_gemm_roofline",
+    "gt_fwd_roofline",
+    "le_fwd_roofline",
+    "lerp_fwd_roofline",
+    "lerp_tensor_fwd_roofline",
+    "logical_and_fwd_roofline",
+    "logical_or_fwd_roofline",
+    "lt_fwd_roofline",
+    "mamba2_fwd_roofline",
+    "masked_fill_fwd_roofline",
+    "maximum_fwd_roofline",
+    "mha_bwd_roofline",
+    "mha_decode_paged_roofline",
+    "mean_pooling_fwd_roofline",
+    "mhc_post_roofline",
+    "mhc_pre_roofline",
+    "minimum_fwd_roofline",
+    "moe_expert_mlp_roofline",
+    "moe_grouped_gemm_roofline",
+    "mul_fwd_roofline",
+    "ne_fwd_roofline",
+    "pow_fwd_roofline",
+    "remainder_fwd_roofline",
+    "rope_position_ids_roofline",
+    "rope_roofline",
+    "ssd_chunk_scan_fwd_roofline",
+    "ssd_chunk_state_fwd_roofline",
+    "ssd_decode_roofline",
+    "ssd_state_passing_fwd_roofline",
+    "sub_fwd_roofline",
+    "topk_selector_roofline",
+    "where_fwd_roofline",
+]
+
+
+# MHA prefill
+
+
+def _shape_or_attrs(op: Any | None, kwargs: dict[str, Any]) -> dict[str, Any]:
+    if op is not None and not isinstance(op, dict):
+        return vars(op)
+    if isinstance(op, dict):
+        return op
+    return kwargs
+
+
+def mha_bwd_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:
+    """Roofline for multi-head attention backward."""
+    data = _shape_or_attrs(op, kwargs)
+    if "q_shape" in data:
+        batch, seq_len, heads, dim = data["q_shape"]
+    else:
+        batch, seq_len, heads, dim = (
+            data["batch"],
+            data["seq_len"],
+            data["heads"],
+            data["dim"],
+        )
+    is_causal = bool(data.get("is_causal", True))
+    elem_bytes = _dtype_itemsize(data.get("dtype", data.get("dtypes", "float16")))
+
+    flops = 10 * batch * heads * seq_len * seq_len * dim
+    if is_causal:
+        flops //= 2
+    nbytes = batch * 7 * heads * seq_len * dim * elem_bytes
+    return int(flops), int(nbytes)
+
+
+# GQA prefill
+
+
+def gqa_fwd_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:
+    """Roofline for dense grouped-query attention forward."""
+    data = _shape_or_attrs(op, kwargs)
+    if "q_shape" in data:
+        batch, seq_len_q, heads, dim = data["q_shape"]
+        kv_shape = data.get("k_shape", data.get("kv_shape"))
+        if kv_shape is None:
+            raise KeyError("dense GQA roofline requires k_shape or kv_shape")
+        _, seq_len_kv, heads_kv, _ = kv_shape
+    else:
+        batch, seq_len_q, seq_len_kv, heads, heads_kv, dim = (
+            data["batch"],
+            data.get("seq_len_q", data.get("seq_len")),
+            data.get("seq_len_kv", data.get("seq_len")),
+            data["heads"],
+            data["heads_kv"],
+            data["dim"],
+        )
+    is_causal = bool(data.get("is_causal", True))
+    elem_bytes = _dtype_itemsize(data.get("dtype", data.get("dtypes", "float16")))
+
+    left = data.get("window_size_left", -1)
+    right = data.get("window_size_right", -1)
+    if left >= 0 or right >= 0 or seq_len_q > seq_len_kv:
+        visible_scores = 0
+        for row in range(seq_len_q):
+            position = row + seq_len_kv - seq_len_q
+            first = max(0, position - left) if left >= 0 else 0
+            last = min(seq_len_kv - 1, position) if is_causal else seq_len_kv - 1
+            if right >= 0:
+                last = min(last, position + right)
+            visible_scores += max(0, last - first + 1)
+    else:
+        visible_scores = seq_len_q * seq_len_kv
+        if is_causal:
+            visible_scores = seq_len_q * (seq_len_kv - seq_len_q) + seq_len_q * (seq_len_q + 1) // 2
+    flops = 4 * batch * heads * visible_scores * dim
+    q_elems = batch * seq_len_q * heads * dim
+    kv_elems = batch * seq_len_kv * heads_kv * dim
+    return int(flops), int(2 * (q_elems + kv_elems) * elem_bytes)
+
+
+def _dtype_itemsize(dtype: Any) -> int:
+    if isinstance(dtype, (list, tuple)):
+        dtype = dtype[0] if dtype else "float16"
+    if hasattr(dtype, "itemsize"):
+        return int(dtype.itemsize)
+    dtype_name = str(dtype)
+    if "complex128" in dtype_name:
+        return 16
+    if "complex64" in dtype_name:
+        return 8
+    if "float32" in dtype_name or "int32" in dtype_name:
+        return 4
+    if "float64" in dtype_name or "int64" in dtype_name:
+        return 8
+    if "bool" in dtype_name or "int8" in dtype_name or "uint8" in dtype_name:
+        return 1
+    return 2
+
+
+def _supplied(op: Any, name: str) -> bool:
+    """Whether the call passed the ``optional: true`` input *name*.
+
+    Mirrors the two bindings inline roofline synthesis accepts: the tensor on
+    ``self.<name>``, or its shape on ``self.<name>_shape``.
+    """
+    if getattr(op, name, None) is not None:
+        return True
+    return getattr(op, f"{name}_shape", None) is not None
+
+
+def _causal_prefill_visible_scores(seq_len_q: int, seq_len_kv: int) -> int:
+    # Bottom-right alignment: when the query run is longer than the key run, its
+    # leading queries see no keys at all, so only the last seq_len_kv rows count.
+    rows = min(seq_len_q, seq_len_kv)
+    return rows * seq_len_kv - rows * (rows - 1) // 2
+
+
+def gated_deltanet_fwd_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:
+    """Roofline for the Gated DeltaNet training forward.
+
+    Same chunkwise matmul work as the prefill helper, over the same conservative
+    model. The byte count differs: this forward also materializes the per-chunk
+    state ``S`` and the ``Aw`` / ``Au`` training artifacts that backward reads.
+    """
+    prefill_flops, prefill_bytes = gated_deltanet_prefill_fwd_roofline(op, **kwargs)
+    data = _shape_or_attrs(op, kwargs)
+    if "q_shape" in data:
+        q_shape, v_shape = data["q_shape"], data["v_shape"]
+        layout = str(data.get("layout", "bthd")).lower()
+        if layout == "bthd":
+            batch, seq_len, heads, dim_k = q_shape
+            dim_v = v_shape[3]
+        else:
+            batch, heads, seq_len, dim_k = q_shape
+            dim_v = v_shape[3]
+        chunk_size = data.get("chunk_size", 64) or 64
+    else:
+        batch, heads, seq_len = data["batch"], data["heads"], data["seq_len"]
+        dim_k, dim_v = data["dim_k"], data["dim_v"]
+        chunk_size = data["chunk_size"] or 64
+    elem_bytes = _dtype_itemsize(data.get("dtype", data.get("dtypes", "float16")))
+
+    num_chunks = seq_len // chunk_size
+    # S [B, H, NC + 1, DK, DV] plus Aw and Au, each [B, H, S, chunk_size].
+    state_elems = batch * heads * (num_chunks + 1) * dim_k * dim_v
+    wy_elems = 2 * batch * heads * seq_len * chunk_size
+    # The prefill model already counts one [B, H, DK, DV] final state.
+    prefill_state_elems = batch * heads * dim_k * dim_v
+    extra = (state_elems + wy_elems - prefill_state_elems) * elem_bytes
+
+    # Aw comes from a chunk-local block solve the prefill path does not run:
+    # one triangular inverse per chunk, then applying it across DK.
+    blocksolve_flops = (
+        2 * batch * heads * num_chunks * chunk_size * chunk_size * (chunk_size + dim_k)
+    )
+    return int(prefill_flops + blocksolve_flops), int(prefill_bytes + extra)
+
+
+def gated_deltanet_prefill_fwd_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:
+    """Approximate roofline for Gated DeltaNet zero-state prefill.
+
+    This models the dominant chunkwise matmul work in the current
+    implementation. It is intentionally conservative; the helper exists so the
+    manifest and benchmark share one explicit cost-model hook.
+    """
+    data = _shape_or_attrs(op, kwargs)
+    if "q_shape" in data:
+        layout = str(data.get("layout", "bthd")).lower()
+        q_shape = data["q_shape"]
+        v_shape = data["v_shape"]
+        if layout == "bthd":
+            batch, seq_len, heads, dim_k = q_shape
+            _, v_seq_len, v_heads, dim_v = v_shape
+        elif layout == "bhtd":
+            batch, heads, seq_len, dim_k = q_shape
+            _, v_heads, v_seq_len, dim_v = v_shape
+        else:
+            raise ValueError(f"Unsupported GDN prefill layout: {layout}")
+        if v_seq_len != seq_len or v_heads != heads:
+            raise ValueError("GDN prefill q_shape and v_shape must share seq_len and heads")
+        chunk_size = data.get("chunk_size", 64) or 64
+    else:
+        batch, heads, seq_len, dim_k, dim_v, chunk_size = (
+            data["batch"],
+            data["heads"],
+            data["seq_len"],
+            data["dim_k"],
+            data["dim_v"],
+            data["chunk_size"] or 64,
+        )
+    elem_bytes = _dtype_itemsize(data.get("dtype", data.get("dtypes", "float16")))
+
+    num_chunks = seq_len // chunk_size
+    state_flops = 4 * batch * heads * num_chunks * chunk_size * dim_k * dim_v
+    intra_flops = 4 * batch * heads * num_chunks * chunk_size * chunk_size * (dim_k + dim_v)
+    flops = state_flops + intra_flops
+
+    input_elems = (
+        3 * batch * heads * seq_len * dim_k
+        + batch * heads * seq_len * dim_v
+        + 2 * batch * heads * seq_len
+    )
+    output_elems = batch * heads * seq_len * dim_v + batch * heads * dim_k * dim_v
+    nbytes = (input_elems + output_elems) * elem_bytes
+    return int(flops), int(nbytes)
+
+
+def _linear_attention_decode_dims(data: dict[str, Any]) -> tuple[int, int, int, int]:
+    if "q_shape" in data:
+        batch, heads, dim_k = data["q_shape"]
+        state_shape = data["state_shape"]
+        _, state_heads, state_dim_k, dim_v = state_shape
+        if state_heads != heads or state_dim_k != dim_k:
+            raise ValueError("decode q_shape and state_shape must share heads and dim_k")
+        return batch, heads, dim_k, dim_v
+    return data["batch"], data["heads"], data["dim_k"], data["dim_v"]
+
+
+def deltanet_decode_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:
+    """Roofline for single-step DeltaNet recurrence decode."""
+    data = _shape_or_attrs(op, kwargs)
+    batch, heads, dim_k, dim_v = _linear_attention_decode_dims(data)
+    elem_bytes = _dtype_itemsize(data.get("dtype", data.get("dtypes", "float16")))
+
+    flops = 2 * batch * heads * (3 * dim_k * dim_v + dim_k)
+    nbytes = batch * heads * (2 * dim_k + 2 * dim_v + 1 + 2 * dim_k * dim_v)
+    return int(flops), int(nbytes * elem_bytes)
+
+
+def gated_deltanet_decode_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:
+    """Roofline for single-step Gated DeltaNet recurrence decode."""
+    data = _shape_or_attrs(op, kwargs)
+    batch, heads, dim_k, dim_v = _linear_attention_decode_dims(data)
+    elem_bytes = _dtype_itemsize(data.get("dtype", data.get("dtypes", "float16")))
+
+    flops = 2 * batch * heads * (3 * dim_k * dim_v + dim_k)
+    nbytes = batch * heads * (2 * dim_k + 2 * dim_v + 2 + 2 * dim_k * dim_v)
+    return int(flops), int(nbytes * elem_bytes)
+
+
+def gla_decode_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:
+    """Roofline for single-step GLA recurrence decode."""
+    data = _shape_or_attrs(op, kwargs)
+    batch, heads, dim_k, dim_v = _linear_attention_decode_dims(data)
+    elem_bytes = _dtype_itemsize(data.get("dtype", data.get("dtypes", "float16")))
+
+    flops = 2 * batch * heads * (2 * dim_k * dim_v + dim_k)
+    nbytes = batch * heads * (3 * dim_k + 2 * dim_v + 2 * dim_k * dim_v)
+    return int(flops), int(nbytes * elem_bytes)
+
+
+def _chunkwise_dims_bhsd(data: dict) -> tuple[int, int, int, int, int]:
+    """``(batch, heads, seq_len, dim_k, dim_v)`` for an op declaring ``q [B, H, S, DK]``."""
+    if "q_shape" in data:
+        batch, heads, seq_len, dim_k = data["q_shape"]
+        return batch, heads, seq_len, dim_k, data["v_shape"][3]
+    return _chunkwise_dims_bound(data)
+
+
+def _chunkwise_dims_bshd(data: dict) -> tuple[int, int, int, int, int]:
+    """``(batch, heads, seq_len, dim_k, dim_v)`` for an op declaring ``q [B, S, H, DK]``."""
+    if "q_shape" in data:
+        batch, seq_len, heads, dim_k = data["q_shape"]
+        return batch, heads, seq_len, dim_k, data["v_shape"][3]
+    return _chunkwise_dims_bound(data)
+
+
+def _chunkwise_dims_bound(data: dict) -> tuple[int, int, int, int, int]:
+    """The same five numbers off an instance that has run a call, in either order."""
+    return (
+        int(data["batch"]),
+        int(data["heads"]),
+        int(data["seq_len"]),
+        int(data["dim_k"]),
+        int(data["dim_v"]),
+    )
+
+
+def deltanet_fwd_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:
+    """Roofline for the chunked DeltaNet training forward, head-major.
+
+    Two state matmuls per token. In: q, k, v, beta. Out: the output, the four chunk
+    buffers the backward reads, and the per-chunk state, which is fp32 whatever the
+    inputs are.
+    """
+    data = _shape_or_attrs(op, kwargs)
+    batch, heads, seq_len, dim_k, dim_v = _chunkwise_dims_bhsd(data)
+    chunk = int(data.get("chunk_size", 64))
+    elem_bytes = _dtype_itemsize(data.get("dtype", data.get("dtypes", "float16")))
+
+    flops = 2 * batch * heads * seq_len * dim_k * dim_v
+    per_token = (2 * dim_k + dim_v + 1) + (dim_v + 2 * chunk + dim_k + dim_v)
+    state = batch * heads * (seq_len // chunk + 1) * dim_k * dim_v
+    nbytes = batch * heads * seq_len * per_token * elem_bytes + state * 4
+    return int(flops), int(nbytes)
+
+
+def deltanet_bwd_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:
+    """Roofline for the chunked DeltaNet backward, head-major.
+
+    Twice the forward's matmul work. In: do, q, k, v, beta and the chunk buffers the
+    forward saved, the fp32 state among them. Out: the four gradients.
+    """
+    data = _shape_or_attrs(op, kwargs)
+    batch, heads, seq_len, dim_k, dim_v = _chunkwise_dims_bhsd(data)
+    chunk = int(data.get("chunk_size", 64))
+    elem_bytes = _dtype_itemsize(data.get("dtype", data.get("dtypes", "float16")))
+
+    flops = 4 * batch * heads * seq_len * dim_k * dim_v
+    per_token = (3 * dim_k + 3 * dim_v + 1 + 2 * chunk) + (2 * dim_k + dim_v + 1)
+    state = batch * heads * (seq_len // chunk + 1) * dim_k * dim_v
+    nbytes = batch * heads * seq_len * per_token * elem_bytes + state * 4
+    return int(flops), int(nbytes)
+
+
+def gated_deltanet_bwd_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:
+    """Roofline for the Gated DeltaNet backward, head-major.
+
+    The gate adds one tensor in and one gradient out over the ungated backward. The
+    per-chunk state the forward saved is read in the input dtype.
+    """
+    data = _shape_or_attrs(op, kwargs)
+    batch, heads, seq_len, dim_k, dim_v = _chunkwise_dims_bhsd(data)
+    chunk = int(data.get("chunk_size", 64))
+    elem_bytes = _dtype_itemsize(data.get("dtype", data.get("dtypes", "float16")))
+
+    flops = 4 * batch * heads * seq_len * dim_k * dim_v
+    tokens = batch * heads * seq_len
+    state = batch * heads * (seq_len // chunk + 1) * dim_k * dim_v
+    nbytes = (tokens * (4 * dim_k + 3 * dim_v + 4) + state) * elem_bytes
+    return int(flops), int(nbytes)
+
+
+def gla_fwd_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:
+    """Roofline for the chunked GLA forward, token-major: one state matmul pair per token."""
+    data = _shape_or_attrs(op, kwargs)
+    batch, heads, seq_len, dim_k, dim_v = _chunkwise_dims_bshd(data)
+    elem_bytes = _dtype_itemsize(data.get("dtype", data.get("dtypes", "float16")))
+
+    flops = 2 * batch * heads * seq_len * dim_k * dim_v
+    tokens = batch * seq_len * heads
+    state = batch * heads * dim_k * dim_v
+    seeded = data.get("initial_state") is not None or data.get("initial_state_shape") is not None
+    # in: q, k, v, g and the fp32 state a caller may seed; out: o and the fp32 final state.
+    nbytes = tokens * (3 * dim_k + 2 * dim_v) * elem_bytes + state * (2 if seeded else 1) * 4
+    return int(flops), int(nbytes)
+
+
+def gla_bwd_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:
+    """Roofline for the chunked GLA backward, token-major: twice the forward's matmuls.
+
+    In: q, k, v, g, do in the input dtype, plus the fp32 per-chunk states and the
+    final-state gradient. Out: four gradients, which the kernel accumulates in fp32.
+    """
+    data = _shape_or_attrs(op, kwargs)
+    batch, heads, seq_len, dim_k, dim_v = _chunkwise_dims_bshd(data)
+    chunk = int(data.get("chunk_size", 64))
+    elem_bytes = _dtype_itemsize(data.get("dtype", data.get("dtypes", "float16")))
+
+    flops = 4 * batch * heads * seq_len * dim_k * dim_v
+    tokens = batch * seq_len * heads
+    states = batch * heads * dim_k * dim_v * (seq_len // chunk + 2)
+    nbytes = (
+        tokens * (3 * dim_k + 2 * dim_v) * elem_bytes
+        + tokens * (3 * dim_k + dim_v) * 4
+        + states * 4
+    )
+    return int(flops), int(nbytes)
+
+
+def _distribute_total(total: int, batch: int, max_len: int) -> list[int]:
+    lengths = [0] * batch
+    remaining = total
+    for idx in range(batch):
+        slots_left = batch - idx - 1
+        value = min(max_len, remaining - slots_left)
+        lengths[idx] = value
+        remaining -= value
+    return lengths
+
+
+def gqa_prefill_varlen_fwd_roofline(
+    op: Any | None = None,
+    **kwargs: Any,
+) -> tuple[int, int]:
+    """Conservative roofline for packed-varlen GQA prefill.
+
+    Preferred workload binding supplies explicit ``q_lens`` and ``kv_lens``.
+    If they are absent, this falls back to a deterministic fill from aggregate
+    totals and ``max_seqlen_*`` so benchmark metadata remains reproducible.
+    Causal mode uses bottom-right alignment independently per request.
+    """
+    data = _shape_or_attrs(op, kwargs)
+    if "q_shape" not in data and data.get("_roofline_kwargs") is not None:
+        data = dict(data["_roofline_kwargs"])
+    q_shape = data["q_shape"]
+    k_shape = data["k_shape"]
+    total_q, heads, dim = q_shape
+    total_kv, heads_kv, _ = k_shape
+    batch = int(data["batch"])
+    max_seqlen_q = int(data["max_seqlen_q"])
+    max_seqlen_kv = int(data["max_seqlen_kv"])
+    is_causal = bool(data.get("is_causal", True))
+    elem_bytes = _dtype_itemsize(data.get("dtype", data.get("dtypes", "float16")))
+
+    q_lens = data.get("q_lens")
+    kv_lens = data.get("kv_lens")
+    if q_lens is None and (cu_seqlens_q := data.get("cu_seqlens_q")) is not None:
+        values = [int(x) for x in cu_seqlens_q.detach().cpu().tolist()]
+        q_lens = [values[idx + 1] - values[idx] for idx in range(len(values) - 1)]
+    if kv_lens is None and (cu_seqlens_kv := data.get("cu_seqlens_kv")) is not None:
+        values = [int(x) for x in cu_seqlens_kv.detach().cpu().tolist()]
+        kv_lens = [values[idx + 1] - values[idx] for idx in range(len(values) - 1)]
+    if q_lens is None:
+        q_lens = _distribute_total(total_q, batch, max_seqlen_q)
+    if kv_lens is None:
+        kv_lens = _distribute_total(total_kv, batch, max_seqlen_kv)
+
+    visible = 0
+    for q_len, kv_len in zip(q_lens, kv_lens, strict=True):
+        visible += (
+            _causal_prefill_visible_scores(int(q_len), int(kv_len))
+            if is_causal
+            else int(q_len) * int(kv_len)
+        )
+    flops = 4 * heads * visible * dim
+
+    q_elems = total_q * heads * dim
+    kv_elems = total_kv * heads_kv * dim
+    o_elems = q_elems
+    cu_bytes = 2 * (batch + 1) * 4
+    nbytes = (q_elems + 2 * kv_elems + o_elems) * elem_bytes + cu_bytes
+    return int(flops), int(nbytes)
+
+
+def gqa_prefill_paged_with_kv_cache_fwd_roofline(
+    op: Any | None = None,
+    **kwargs: Any,
+) -> tuple[int, int]:
+    """Conservative roofline for paged-cache GQA prefill.
+
+    Paged workloads should bind explicit per-request ``q_lens`` and
+    ``cache_lens``. If they are absent, fall back to a deterministic fill from
+    aggregate metadata so older workload entries remain evaluable.
+    """
+    data = _shape_or_attrs(op, kwargs)
+    total_q = int(data["total_q"]) if "total_q" in data else None
+    batch = int(data["batch"])
+    heads = int(data["heads"])
+    heads_kv = int(data["heads_kv"])
+    dim = int(data["dim"])
+    max_pages_per_req = int(data["max_pages_per_req"])
+    page_size = int(data["page_size"])
+    max_seqlen_q = int(data.get("max_seqlen_q", max_pages_per_req * page_size))
+    is_causal = bool(data.get("is_causal", True))
+    elem_bytes = _dtype_itemsize(data.get("dtype", data.get("dtypes", "float16")))
+
+    q_lens = data.get("q_lens")
+    if total_q is None and q_lens is not None:
+        total_q = int(sum(q_lens))
+    if total_q is None:
+        total_q = batch * max_seqlen_q
+    if q_lens is None:
+        q_lens = _distribute_total(total_q, batch, max_seqlen_q)
+    cache_lens = data.get("cache_lens")
+    if cache_lens is None:
+        max_position = data.get("max_position")
+        max_total_len = max_pages_per_req * page_size if max_position is None else int(max_position)
+        cache_lens = [max(max_total_len - int(q_len), 0) for q_len in q_lens]
+
+    visible = 0
+    old_kv_tokens = 0
+    for q_len, old_len in zip(q_lens, cache_lens, strict=True):
+        q_len = int(q_len)
+        old_len = int(old_len)
+        old_kv_tokens += old_len
+        visible += (
+            q_len * old_len + q_len * (q_len + 1) // 2 if is_causal else q_len * (old_len + q_len)
+        )
+    flops = 4 * heads * visible * dim
+
+    q_elems = total_q * heads * dim
+    old_kv_elems = 2 * old_kv_tokens * heads_kv * dim
+    new_kv_elems = 2 * total_q * heads_kv * dim
+    append_kv_elems = new_kv_elems
+    o_elems = q_elems
+    metadata_bytes = (batch + 1) * 4 + batch * 4 + batch * max_pages_per_req * 4
+    nbytes = (
+        q_elems + old_kv_elems + new_kv_elems + append_kv_elems + o_elems
+    ) * elem_bytes + metadata_bytes
+    return int(flops), int(nbytes)
+
+
+def gqa_bwd_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:
+    """Roofline for grouped-query attention backward."""
+    data = _shape_or_attrs(op, kwargs)
+    if "q_shape" in data:
+        batch, seq_len, heads, dim = data["q_shape"]
+        _, _, heads_kv, _ = data["kv_shape"]
+    else:
+        batch, seq_len, heads, heads_kv, dim = (
+            data["batch"],
+            data["seq_len"],
+            data["heads"],
+            data["heads_kv"],
+            data["dim"],
+        )
+    is_causal = bool(data.get("is_causal", True))
+    elem_bytes = _dtype_itemsize(data.get("dtype", data.get("dtypes", "float16")))
+
+    flops = 10 * batch * heads * seq_len * seq_len * dim
+    if is_causal:
+        flops //= 2
+    nbytes = batch * (3 * heads + 4 * heads_kv) * seq_len * dim * elem_bytes
+    return int(flops), int(nbytes)
+
+
+# MHA decode
+
+
+def mha_decode_paged_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:
+    """Roofline for paged MHA decode with KV cache."""
+    data = _shape_or_attrs(op, kwargs)
+    if "q_shape" in data:
+        batch, seqlen_q, heads, dim = data["q_shape"]
+        seqlen_kv, _, _ = data["kv_shape"]
+    else:
+        batch, seqlen_q, heads, seqlen_kv, dim = (
+            data["batch"],
+            data["seqlen_q"],
+            data["heads"],
+            data["seqlen_kv"],
+            data["dim"],
+        )
+    elem_bytes = _dtype_itemsize(data.get("dtype", data.get("dtypes", "float16")))
+    flops = 4 * batch * heads * seqlen_q * seqlen_kv * dim
+    q_elems = batch * seqlen_q * heads * dim
+    kv_elems = seqlen_kv * heads * dim
+    metadata_bytes = (
+        batch * 4
+        + batch * max(1, (seqlen_kv + int(data["page_size"]) - 1) // int(data["page_size"])) * 4
+    )
+    nbytes = (q_elems + 2 * kv_elems + q_elems) * elem_bytes + metadata_bytes
+    return int(flops), int(nbytes)
+
+
+# GQA decode
+
+
+def gqa_decode_paged_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:
+    """Roofline for paged GQA decode with KV cache."""
+    data = _shape_or_attrs(op, kwargs)
+    if "q_shape" in data:
+        batch, heads, dim = data["q_shape"]
+        seqlen_kv, heads_kv, _ = data["kv_shape"]
+    else:
+        batch, heads, heads_kv, seqlen_kv, dim = (
+            data["batch"],
+            data["heads"],
+            data["heads_kv"],
+            data["seqlen_kv"],
+            data["dim"],
+        )
+    elem_bytes = _dtype_itemsize(data.get("dtype", data.get("dtypes", "float16")))
+    flops = 4 * batch * heads * seqlen_kv * dim
+    q_elems = batch * heads * dim
+    kv_elems = seqlen_kv * heads_kv * dim
+    page_size = int(data["page_size"])
+    metadata_bytes = batch * 4 + batch * max(1, (seqlen_kv + page_size - 1) // page_size) * 4
+    nbytes = (q_elems + 2 * kv_elems + q_elems) * elem_bytes + metadata_bytes
+    return int(flops), int(nbytes)
+
+
+def gqa_sliding_window_varlen_fwd_roofline(
+    op: Any | None = None,
+    **kwargs: Any,
+) -> tuple[int, int]:
+    """Roofline for variable-length GQA sliding window forward."""
+    data = _shape_or_attrs(op, kwargs)
+    batch = int(data["batch"])
+    heads = int(data["heads"])
+    heads_kv = int(data["heads_kv"])
+    dim = int(data["dim"])
+    total_q = int(data.get("total_q", 0))
+    total_k = int(data.get("total_k", 0))
+    max_seqlen_q = int(data.get("max_seqlen_q", total_q // batch if batch else total_q))
+    q_lens = data.get("q_lens")
+    k_lens = data.get("k_lens")
+    if q_lens is None:
+        q_lens = _distribute_total(total_q, batch, max_seqlen_q)
+    if k_lens is None:
+        max_seqlen_k = int(data.get("max_seqlen_k", total_k // batch if batch else total_k))
+        k_lens = _distribute_total(total_k, batch, max_seqlen_k)
+    total_q = sum(q_lens)
+    total_k = sum(k_lens)
+    is_causal = bool(data.get("is_causal", True))
+    wl = int(data.get("window_size_left", -1))
+    wr = int(data.get("window_size_right", -1))
+    elem_bytes = _dtype_itemsize(data.get("dtype", data.get("dtypes", "float16")))
+
+    total_attended = 0
+    for sq, sk in zip(q_lens, k_lens, strict=True):
+        offset = int(sk) - int(sq)
+        for q_pos in range(int(sq)):
+            hi = (
+                min(q_pos + offset, int(sk) - 1)
+                if is_causal
+                else (min(q_pos + offset + wr, int(sk) - 1) if wr >= 0 else int(sk) - 1)
+            )
+            lo = max(0, q_pos + offset - wl) if wl >= 0 else 0
+            total_attended += max(0, hi - lo + 1)
+    flops = 4 * heads * total_attended * dim
+    nbytes = (
+        total_q * heads * dim + 2 * total_k * heads_kv * dim + total_q * heads * dim
+    ) * elem_bytes
+    return int(flops), int(nbytes)
+
+
+# DeepSeek MLA / DSA decode
+
+
+def deepseek_mla_decode_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:
+    """Roofline for DeepSeek MLA decode with KV cache."""
+    data = _shape_or_attrs(op, kwargs)
+    if "q_shape" in data:
+        batch, heads, dim = data["q_shape"]
+        _, seqlen_kv, heads_kv, _ = data["kv_shape"]
+        pe_dim = data["pe_dim"]
+    else:
+        batch, heads, heads_kv, seqlen_kv, dim, pe_dim = (
+            data["batch"],
+            data["heads"],
+            data["heads_kv"],
+            data["seqlen_kv"],
+            data["dim"],
+            data["pe_dim"],
+        )
+    elem_bytes = _dtype_itemsize(data.get("dtype", data.get("dtypes", "float16")))
+    flops = 2 * batch * heads * seqlen_kv * (2 * dim + pe_dim)
+    nbytes = (
+        batch * heads * (dim + pe_dim)
+        + batch * seqlen_kv * heads_kv * (dim + pe_dim)
+        + batch * heads * dim
+    ) * elem_bytes
+    return int(flops), int(nbytes)
+
+
+def deepseek_dsa_decode_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:
+    """Roofline for DeepSeek sparse attention decode."""
+    data = _shape_or_attrs(op, kwargs)
+    if "q_shape" in data:
+        batch, seq_len, heads, q_dim = data["q_shape"]
+        _, seq_len_kv, heads_kv, _ = data["kv_shape"]
+        dim_tail = data["dim_tail"]
+        dim = q_dim - dim_tail
+        topk = data["topk"]
+    else:
+        batch, seq_len, heads, seq_len_kv, dim, dim_tail, topk, heads_kv = (
+            data["batch"],
+            data["seq_len"],
+            data["heads"],
+            data["seq_len_kv"],
+            data["dim"],
+            data["dim_tail"],
+            data["topk"],
+            data["heads_kv"],
+        )
+    elem_bytes = _dtype_itemsize(data.get("dtype", data.get("dtypes", "float16")))
+    flops = 2 * batch * seq_len * heads * topk * (2 * dim + dim_tail)
+    q_elems = batch * seq_len * heads * (dim + dim_tail)
+    kv_elems = batch * seq_len_kv * heads_kv * (dim + dim_tail)
+    o_elems = batch * seq_len * heads * dim
+    index_bytes = batch * seq_len * heads_kv * topk * 4
+    nbytes = (q_elems + kv_elems + o_elems) * elem_bytes + index_bytes
+    return int(flops), int(nbytes)
+
+
+# Elementwise — mixed-dtype ops requiring func-mode roofline
+
+
+def where_fwd_roofline(op: "Op") -> tuple[int, int]:
+    """Roofline for ``torch.where`` forward (bool condition + float input/other).
+
+    Func mode: the byte accounting mixes a 1-byte bool condition with the
+    float input/other dtype, which inline mode cannot express (it binds
+    ``elem_bytes`` to a single dtype).
+
+    ``flops = N_total`` (one predicated select per element).
+    ``bytes = N_total + 3 * N_total * elem_bytes`` — logical, post-broadcast:
+    a 1-byte condition read broadcast to ``N_total``, plus input, other, out.
+    """
+    n_total = int(op.N_total)
+    elem_bytes = op.dtype.itemsize
+    flops = n_total
+    nbytes = n_total + 3 * n_total * elem_bytes
+    return flops, nbytes
+
+
+# Clamp family (Tensor-bound variants)
+#
+# Func mode: ``N_total`` is post-broadcast, and ``broadcast_shapes`` is not in
+# the inline vars-layer namespace (docs/design/roofline.md §4.4.4), so inline
+# codegen cannot bind it. ``ClampScalarFwdOp`` stays inline — no broadcasting.
+
+
+def clamp_fwd_roofline(op: "Op") -> tuple[int, int]:
+    """Roofline for ``ClampFwdOp`` (Tensor-bound clamp).
+
+    ``torch.clamp(input, min, max)`` with each bound a Tensor or absent,
+    broadcasting across the operands present. Per docs/design/roofline.md §1.3 a
+    two-sided clamp collapses to one fused compare-and-select, so
+    ``flops = N_total`` either way; bytes read input and each bound that was
+    passed, then write out.
+    """
+    n_total = int(op.N_total)
+    elem_bytes = op.dtype.itemsize
+    reads = 1 + _supplied(op, "min") + _supplied(op, "max")
+    return n_total, (reads + 1) * n_total * elem_bytes
+
+
+def lerp_tensor_fwd_roofline(op: "Op") -> tuple[int, int]:
+    """Roofline for ``LerpTensorFwdOp`` (Tensor-weight ``torch.lerp``).
+
+    Per output element: 3 flops (sub + mul + add); 3 reads + 1 write at
+    post-broadcast ``N_total``.
+    """
+    n_total = int(op.N_total)
+    elem_bytes = op.dtype.itemsize
+    return 3 * n_total, 4 * n_total * elem_bytes
+
+
+# MaskedFill family
+#
+# Func mode: out-of-place ``masked_fill`` broadcasts ``input`` against ``mask``
+# bidirectionally, and ``broadcast_shapes`` is not in the inline vars-layer
+# namespace (docs/design/roofline.md §4.4.4). One function serves both the
+# Tensor-value and Scalar-value variants — the 0-dim read folds into the
+# per-element write cost.
+
+
+def masked_fill_fwd_roofline(op: "Op") -> tuple[int, int]:
+    """Roofline for ``MaskedFillFwdOp`` and ``MaskedFillScalarFwdOp``.
+
+    Out-of-place ``Tensor.masked_fill``; output shape is the bidirectional
+    broadcast of ``input`` and ``mask``. One predicated select per element →
+    ``flops = N_total``; ``bytes = N_total + 2 * N_total * elem_bytes`` for the
+    1-byte mask read plus input read and out write. The 0-dim ``value`` read
+    (Tensor-value variant) is negligible.
+    """
+    n_total = int(op.N_total)
+    elem_bytes = op.dtype.itemsize
+    flops = n_total
+    nbytes = n_total + 2 * n_total * elem_bytes
+    return flops, nbytes
+
+
+def _binary_broadcast_roofline(
+    op: "Op", *, flops_per_elem: int, bool_output: bool
+) -> tuple[int, int]:
+    """Shared core for the broadcast-binary roofline family."""
+    a_numel = int(op.a_numel)
+    b_numel = int(op.b_numel)
+    n_total = int(op.N_total)
+    elem_bytes = op.dtype.itemsize
+    out_elem_bytes = 1 if bool_output else elem_bytes
+    flops = flops_per_elem * n_total
+    nbytes = (a_numel + b_numel) * elem_bytes + n_total * out_elem_bytes
+    return flops, nbytes
+
+
+def add_fwd_roofline(op: "Op") -> tuple[int, int]:
+    return _binary_broadcast_roofline(op, flops_per_elem=2, bool_output=False)
+
+
+def sub_fwd_roofline(op: "Op") -> tuple[int, int]:
+    return _binary_broadcast_roofline(op, flops_per_elem=2, bool_output=False)
+
+
+def mul_fwd_roofline(op: "Op") -> tuple[int, int]:
+    return _binary_broadcast_roofline(op, flops_per_elem=1, bool_output=False)
+
+
+def div_fwd_roofline(op: "Op") -> tuple[int, int]:
+    return _binary_broadcast_roofline(op, flops_per_elem=1, bool_output=False)
+
+
+def remainder_fwd_roofline(op: "Op") -> tuple[int, int]:
+    return _binary_broadcast_roofline(op, flops_per_elem=4, bool_output=False)
+
+
+def pow_fwd_roofline(op: "Op") -> tuple[int, int]:
+    return _binary_broadcast_roofline(op, flops_per_elem=3, bool_output=False)
+
+
+def floor_divide_fwd_roofline(op: "Op") -> tuple[int, int]:
+    return _binary_broadcast_roofline(op, flops_per_elem=2, bool_output=False)
+
+
+def lerp_fwd_roofline(op: "Op") -> tuple[int, int]:
+    return _binary_broadcast_roofline(op, flops_per_elem=3, bool_output=False)
+
+
+def maximum_fwd_roofline(op: "Op") -> tuple[int, int]:
+    return _binary_broadcast_roofline(op, flops_per_elem=1, bool_output=False)
+
+
+def minimum_fwd_roofline(op: "Op") -> tuple[int, int]:
+    return _binary_broadcast_roofline(op, flops_per_elem=1, bool_output=False)
+
+
+def eq_fwd_roofline(op: "Op") -> tuple[int, int]:
+    return _binary_broadcast_roofline(op, flops_per_elem=1, bool_output=True)
+
+
+def ne_fwd_roofline(op: "Op") -> tuple[int, int]:
+    return _binary_broadcast_roofline(op, flops_per_elem=1, bool_output=True)
+
+
+def gt_fwd_roofline(op: "Op") -> tuple[int, int]:
+    return _binary_broadcast_roofline(op, flops_per_elem=1, bool_output=True)
+
+
+def lt_fwd_roofline(op: "Op") -> tuple[int, int]:
+    return _binary_broadcast_roofline(op, flops_per_elem=1, bool_output=True)
+
+
+def ge_fwd_roofline(op: "Op") -> tuple[int, int]:
+    return _binary_broadcast_roofline(op, flops_per_elem=1, bool_output=True)
+
+
+def le_fwd_roofline(op: "Op") -> tuple[int, int]:
+    return _binary_broadcast_roofline(op, flops_per_elem=1, bool_output=True)
+
+
+def logical_and_fwd_roofline(op: "Op") -> tuple[int, int]:
+    return _binary_broadcast_roofline(op, flops_per_elem=3, bool_output=True)
+
+
+def logical_or_fwd_roofline(op: "Op") -> tuple[int, int]:
+    return _binary_broadcast_roofline(op, flops_per_elem=3, bool_output=True)
+
+
+def bitwise_and_fwd_roofline(op: "Op") -> tuple[int, int]:
+    return _binary_broadcast_roofline(op, flops_per_elem=1, bool_output=False)
+
+
+def bitwise_or_fwd_roofline(op: "Op") -> tuple[int, int]:
+    return _binary_broadcast_roofline(op, flops_per_elem=1, bool_output=False)
+
+
+def bitwise_xor_fwd_roofline(op: "Op") -> tuple[int, int]:
+    return _binary_broadcast_roofline(op, flops_per_elem=1, bool_output=False)
+
+
+# MoE
+
+
+def fused_topk_roofline(op: "Op") -> tuple[int, int]:
+    """Roofline for FusedTopKOp: score every logit, then keep the top k of them.
+
+    Func-mode: the float32 ``correction_bias`` a sigmoid call may pass is read at a
+    different width than the logits, so one ``elem_bytes`` cannot express the total.
+    """
+    num_tokens, num_experts = op.gating_output_shape
+    top_k = int(op.top_k)
+    elem_bytes = _dtype_itemsize(op.dtype)
+
+    flops = num_tokens * num_experts * 2 * (1 + top_k)
+    # Out: one float32 weight and one int32 id per kept slot.
+    nbytes = num_tokens * num_experts * elem_bytes + num_tokens * top_k * 8
+    if _supplied(op, "correction_bias"):
+        # One add per score before the selection reads it, and the bias read itself.
+        flops += num_tokens * num_experts
+        nbytes += num_experts * 4
+    return int(flops), int(nbytes)
+
+
+def fused_moe_fwd_bytes(op: "Op") -> tuple[int, int]:
+    """Roofline for FusedMoeFwdOp.
+
+    Func-mode: byte traffic mixes float32 gating (and the float32 correction
+    bias, when the call passes one) with hidden-states / weights at
+    ``op.dtype``, so a single ``elem_bytes`` cannot express the total.
+    """
+    num_tokens = int(op.num_tokens)
+    num_experts = int(op.num_experts)
+    top_k = int(op.top_k)
+    hidden_size = int(op.hidden_size)
+    ffn_size = int(op.ffn_size)
+    elem_bytes = _dtype_itemsize(op.dtype)
+
+    flops = num_tokens * top_k * 6 * ffn_size * hidden_size
+    weight_bytes = num_experts * 3 * ffn_size * hidden_size * elem_bytes
+    token_bytes = 2 * num_tokens * hidden_size * elem_bytes
+    gating_bytes = num_tokens * num_experts * 4  # float32 logits
+    bias_bytes = num_experts * 4 if _supplied(op, "correction_bias") else 0
+    return flops, weight_bytes + token_bytes + gating_bytes + bias_bytes
+
+
+def gemm_fwd_roofline(op: "Op") -> tuple[int, int]:
+    """Roofline for dense ``GemmFwdOp`` (``d = a @ b``, fp16/bf16).
+
+    ``GemmFwdOp`` is input-inferred, so the logical dims ``m/n/k`` and the dtype
+    are bound on the op during ``forward()``; this reads them directly, which
+    stays correct across all ``trans_a``/``trans_b`` layouts (the logical dims
+    are transpose-independent). Valid only after the first ``forward()``.
+
+    Raises:
+        RuntimeError: If called before ``forward()`` has bound the dims.
+    """
+    if getattr(op, "m", None) is None or getattr(op, "dtype", None) is None:
+        raise RuntimeError(
+            "GemmFwdOp.eval_roofline() is valid only after the first forward(); "
+            "m/n/k and dtype are inferred from the inputs."
+        )
+    m, n, k = op.m, op.n, op.k
+    elem_bytes = op.dtype.itemsize
+    flops = 2 * m * n * k
+    nbytes = (m * k + n * k + m * n) * elem_bytes
+    return int(flops), int(nbytes)
+
+
+def gemm_fp8_fwd_roofline(op: "Op") -> tuple[int, int]:
+    """Roofline for dense FP8 ``GemmFp8FwdOp``."""
+    if getattr(op, "m", None) is None or getattr(op, "dtype", None) is None:
+        raise RuntimeError(
+            "GemmFp8FwdOp.eval_roofline() is valid only after the first forward(); "
+            "m/n/k and dtype are inferred from the inputs."
+        )
+    m, n, k = op.m, op.n, op.k
+    input_bytes = op.dtype.itemsize
+    out_bytes = op.out_dtype.itemsize
+    scale_a_shape = getattr(op, "scale_a_shape", (1, 1))
+    scale_b_shape = getattr(op, "scale_b_shape", (1, 1))
+    scale_elems = scale_a_shape[0] * scale_a_shape[1] + scale_b_shape[0] * scale_b_shape[1]
+    flops = 2 * m * n * k
+    nbytes = (m * k + n * k) * input_bytes + m * n * out_bytes + scale_elems * 4
+    if getattr(op, "has_bias", False):
+        nbytes += n * out_bytes
+    return int(flops), int(nbytes)
+
+
+def gemm_w4a16_fwd_roofline(op: "Op") -> tuple[int, int]:
+    """Roofline for dense W4A16 ``GemmW4A16FwdOp``."""
+    if getattr(op, "m", None) is None or getattr(op, "dtype", None) is None:
+        raise RuntimeError(
+            "GemmW4A16FwdOp.eval_roofline() is valid only after the first forward(); "
+            "m/n/k and dtype are inferred from the inputs."
+        )
+    m, n, k = op.m, op.n, op.k
+    elem_bytes = op.dtype.itemsize
+    group_size = int(getattr(op, "group_size", 128))
+    groups = k // group_size
+    flops = 2 * m * n * k
+    activation_bytes = m * k * elem_bytes
+    packed_weight_bytes = n * k // 2
+    metadata_bytes = n * groups * (4 + 1)
+    output_bytes = m * n * elem_bytes
+    return int(flops), int(activation_bytes + packed_weight_bytes + metadata_bytes + output_bytes)
+
+
+def grouped_gemm_roofline(op: "Op") -> tuple[int, int]:
+    batch_sum = int(op.batch_sum)
+    batch_count = int(op.batch_count)
+    n = int(getattr(op, "N", getattr(op, "n", 0)))
+    k = int(getattr(op, "K", getattr(op, "k", 0)))
+    elem = _dtype_itemsize(getattr(op, "dtype", "float16"))
+
+    flops = 2 * batch_sum * n * k
+    if not bool(op.transpose_a):
+        memory_a = batch_sum * k
+        memory_c = batch_sum * n
+        memory_b = batch_count * n * k
+    else:
+        memory_a = batch_sum * n
+        memory_c = batch_count * n * k
+        memory_b = k * batch_sum if bool(op.transpose_b) else batch_sum * k
+    return int(flops), int((memory_a + memory_b + memory_c) * elem)
+
+
+def _staged_moe_input_shapes(op: "Op") -> tuple:
+    if getattr(op, "input_shapes", None) is None or getattr(op, "dtype", None) is None:
+        raise RuntimeError(f"{type(op).__name__}.eval_roofline requires a prior forward call")
+    return tuple(op.input_shapes)
+
+
+def _staged_moe_rows(a_shape: tuple) -> int:
+    # Contiguous layouts hand over [M, K], masked ones [E, max_m, K].
+    rows = 1
+    for dim in a_shape[:-1]:
+        rows *= int(dim)
+    return rows
+
+
+def moe_grouped_gemm_roofline(op: "Op") -> tuple[int, int]:
+    a_shape, b_shape, meta_shape = _staged_moe_input_shapes(op)
+    rows = _staged_moe_rows(a_shape)
+    num_experts, n, k = (int(dim) for dim in b_shape)
+    elem = op.dtype.itemsize
+    # The output width is the op's, not the operands': out_dtype may keep fp32,
+    # and a fused gated activation writes act(gate) * up, half of N.
+    out_elem = op.resolve_output_dtype(op.dtype).itemsize
+    n_out = n // 2 if op.activation is not None else n
+    flops = 2 * rows * n * k
+    nbytes = (rows * k + num_experts * n * k) * elem + rows * n_out * out_elem
+    nbytes += int(meta_shape[0]) * 4
+    return int(flops), int(nbytes)
+
+
+def moe_expert_mlp_roofline(op: "Op") -> tuple[int, int]:
+    x_shape, gate_shape, down_shape, meta_shape = _staged_moe_input_shapes(op)
+    rows = _staged_moe_rows(x_shape)
+    num_experts, two_ffn, hidden = (int(dim) for dim in gate_shape)
+    ffn = int(down_shape[2])
+    elem = op.dtype.itemsize
+    flops = rows * (2 * two_ffn * hidden + 6 * ffn + 2 * hidden * ffn)
+    weights = num_experts * two_ffn * hidden + num_experts * hidden * ffn
+    nbytes = (2 * rows * hidden + weights) * elem + int(meta_shape[0]) * 4
+    return int(flops), int(nbytes)
+
+
+def rope_roofline(op: "Op") -> tuple[int, int]:
+    seq_len = int(op.seq_len)
+    head_dim = int(op.head_dim)
+    batch = int(getattr(op, "batch", 1))
+    num_heads = int(getattr(op, "num_heads", 1))
+    layout = getattr(op, "layout", "1d")
+    elem = _dtype_itemsize(getattr(op, "dtype", "float16"))
+    outer = batch * num_heads if layout == "2d" else 1
+    x_elems = outer * seq_len * head_dim
+    cos_sin_elems = seq_len * (head_dim // 2) * 2
+    flops = 4 * x_elems
+    nbytes = (2 * x_elems + cos_sin_elems) * elem
+    return int(flops), int(nbytes)
+
+
+def rope_position_ids_roofline(op: "Op") -> tuple[int, int]:
+    num_tokens = int(op.num_tokens)
+    num_heads = int(op.num_heads)
+    head_dim = int(op.head_dim)
+    rotary_dim = int(getattr(op, "rotary_dim", head_dim) or head_dim)
+    max_position = int(op.max_position)
+    elem = _dtype_itemsize(getattr(op, "dtype", "float16"))
+    x_elems = num_tokens * num_heads * head_dim
+    cos_sin_elems = max_position * (rotary_dim // 2) * 2
+    pos_elems = num_tokens
+    return int(4 * x_elems), int((2 * x_elems + cos_sin_elems) * elem + pos_elems * 4)
+
+
+def dropout_roofline(op: "Op") -> tuple[int, int]:
+    n_total = int(op.N_total)
+    elem = _dtype_itemsize(getattr(op, "dtype", "float16"))
+    if not bool(getattr(op, "training", True)) or float(getattr(op, "p", 0.5)) == 0.0:
+        return 0, int(2 * n_total * elem)
+    if float(getattr(op, "p", 0.5)) == 1.0:
+        return 0, int(n_total * elem)
+    return int(n_total), int(2 * n_total * elem)
+
+
+def fp8_quant_roofline(op: "Op") -> tuple[int, int]:
+    batch = int(op.batch)
+    seq_len_kv = int(op.seq_len_kv)
+    kv_group = int(op.kv_group)
+    index_dim = int(op.index_dim)
+    in_elem = _dtype_itemsize(getattr(op, "in_dtype", "float16"))
+    groups = batch * seq_len_kv * kv_group
+    elems = groups * index_dim
+    flops = 6 * elems + groups
+    nbytes = elems * in_elem + elems * 1 + groups * 4
+    return int(flops), int(nbytes)
+
+
+def fp8_lightning_indexer_roofline(op: "Op") -> tuple[int, int]:
+    batch = int(op.batch)
+    seq_len = int(op.seq_len)
+    heads = int(op.heads)
+    index_dim = int(op.index_dim)
+    seq_len_kv = int(op.seq_len_kv)
+    kv_group = int(op.kv_group)
+    scores = batch * seq_len * seq_len_kv * kv_group
+    q_elems = batch * seq_len * heads * index_dim
+    k_elems = batch * seq_len_kv * kv_group * index_dim
+    weights = seq_len * heads
+    # The public forward accepts either bf16 tensors that are quantized inside
+    # the op or pre-quantized fp8 tensors. The op does not currently retain
+    # the observed input dtype, so default to bf16 for conservative bandwidth.
+    index_elem = _dtype_itemsize(getattr(op, "dtype", "bfloat16"))
+    flops = 2 * scores * index_dim
+    nbytes = (q_elems + k_elems) * index_elem + batch * seq_len_kv * kv_group * 4
+    nbytes += weights * 4
+    nbytes += 2 * seq_len * 4 + scores * 4
+    return int(flops), int(nbytes)
+
+
+def topk_selector_roofline(op: "Op") -> tuple[int, int]:
+    batch = int(op.batch)
+    seq_len = int(op.seq_len)
+    seq_len_kv = int(op.seq_len_kv)
+    kv_group = int(op.kv_group)
+    topk = int(op.topk)
+    in_elem = _dtype_itemsize(getattr(op, "in_dtype", "float32"))
+    out_elem = _dtype_itemsize(getattr(op, "out_dtype", "int32"))
+    comparisons = batch * seq_len * kv_group * seq_len_kv
+    nbytes = comparisons * in_elem + batch * seq_len * 2 * out_elem
+    nbytes += batch * seq_len * kv_group * topk * out_elem
+    return int(comparisons), int(nbytes)
+
+
+def _engram_elem_bytes(op: "Op") -> int:
+    return _dtype_itemsize(getattr(op, "dtype", "float16"))
+
+
+def engram_gate_conv_fwd_roofline(op: "Op") -> tuple[int, int]:
+    m = int(op.M)
+    seq_len = int(op.seq_len)
+    d = int(getattr(op, "d_padded", op.d))
+    elem = _engram_elem_bytes(op)
+    flops = m * seq_len * (24 * d) + 20 * m * seq_len
+    nbytes = (5 * m * seq_len * d) * elem + 4 * m * seq_len * 4 + 6 * d * elem
+    return int(flops), int(nbytes)
+
+
+def engram_gate_conv_bwd_roofline(op: "Op") -> tuple[int, int]:
+    m = int(op.M)
+    seq_len = int(op.seq_len)
+    d = int(getattr(op, "d_padded", op.d))
+    elem = _engram_elem_bytes(op)
+    fwd_flops = m * seq_len * (24 * d) + 20 * m * seq_len
+    read_bytes = 5 * m * seq_len * d * elem + 6 * d * elem + 4 * m * seq_len * 4
+    write_bytes = 3 * m * seq_len * d * elem + 10 * d * 4 + m * seq_len * d * 4
+    return int(fwd_flops * 2.5), int(read_bytes + write_bytes)
+
+
+def engram_decode_roofline(op: "Op") -> tuple[int, int]:
+    batch = int(op.batch)
+    d_mem = int(op.d_mem)
+    d = int(getattr(op, "d_padded", op.d))
+    max_conv_len = int(op.max_conv_len)
+    conv_kernel_size = int(op.conv_kernel_size)
+    elem = _engram_elem_bytes(op)
+    flops = 4 * batch * d_mem * d + batch * (16 * d + conv_kernel_size * 2 * d) + 20 * batch
+    nbytes = (
+        batch * d_mem
+        + batch * d
+        + 2 * batch * max_conv_len * d
+        + 2 * d_mem * d
+        + 2 * d
+        + conv_kernel_size * d
+        + batch * d
+    ) * elem
+    return int(flops), int(nbytes)
+
+
+def fft_c2c_roofline(op: "Op") -> tuple[int, int]:
+    import math
+
+    n = int(op.n)
+    elem = _dtype_itemsize(getattr(op, "dtype", "complex64"))
+    # Runtime batch is inferred from the input and kernel cache. Before a
+    # forward call, the constructed default kernel represents batch=1.
+    batch = int(getattr(getattr(op, "kernel", None), "batch_size", 1) or 1)
+    return int(batch * 5 * n * math.log2(n)), int(batch * 2 * n * elem)
+
+
+def mean_pooling_fwd_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:
+    """Roofline for the chunked sequence mean.
+
+    One add per input row and one divide per output element. Counting the adds off the
+    input rather than off ``chunks * chunk_size`` keeps a ragged split's short last chunk
+    from being priced as a full one; ``offsets`` partitions the whole sequence axis, so the
+    row count is the same either way.
+    """
+    data = _shape_or_attrs(op, kwargs)
+    if "x_shape" in data:
+        batch, seq_len, heads, dim = data["x_shape"]
+    else:
+        batch, seq_len, heads, dim = (
+            data["batch"],
+            data["seq_len"],
+            data["heads"],
+            data["dim"],
+        )
+    indices_shape = data.get("indices_shape")
+    if data.get("chunks") is not None:
+        chunks = int(data["chunks"])
+    elif indices_shape is not None:
+        chunks = int(indices_shape[0])
+    else:
+        chunks = -(-int(seq_len) // int(data["chunk_size"]))
+    elem_bytes = _dtype_itemsize(data.get("dtype", data.get("dtypes", "float16")))
+
+    out_elems = int(batch) * chunks * int(heads) * int(dim)
+    in_elems = int(batch) * int(seq_len) * int(heads) * int(dim)
+    nbytes = (in_elems + out_elems) * elem_bytes
+    # A ragged call also reads the int32 pair that describes the split.
+    offsets_shape = data.get("offsets_shape")
+    if offsets_shape is not None:
+        nbytes += (int(offsets_shape[0]) + chunks * 2) * 4
+    return in_elems + out_elems, nbytes
+
+
+def mhc_pre_roofline(op: "Op") -> tuple[int, int]:
+    batch = int(op.batch)
+    n_expand = int(op.n_expand)
+    c_x = int(op.c_x)
+    x_dim = n_expand * c_x
+    phi_dim = n_expand * n_expand + 2 * n_expand
+    x_elem = _dtype_itemsize(getattr(op, "dtype", "bfloat16"))
+
+    x_phi_flops = 2 * batch * x_dim * phi_dim
+    x_layer_flops = 2 * batch * c_x * n_expand
+    x_res_flops = 2 * batch * n_expand * c_x * n_expand
+    flops = x_phi_flops + x_layer_flops + x_res_flops
+
+    phi_bytes = x_dim * phi_dim * 4
+    b_bytes = phi_dim * 4
+    x_bytes = batch * x_dim * x_elem
+    output_bytes = batch * (x_dim + c_x) * x_elem
+    nbytes = phi_bytes + b_bytes + x_bytes + output_bytes
+    return int(flops), int(nbytes)
+
+
+def mhc_post_roofline(op: "Op") -> tuple[int, int]:
+    batch = int(op.batch)
+    n_expand = int(op.n_expand)
+    c_x = int(op.c_x)
+    x_elem = _dtype_itemsize(getattr(op, "dtype", "bfloat16"))
+    flops = 2 * batch * n_expand * c_x
+    x_layer_out_bytes = batch * c_x * x_elem
+    h_post_bytes = batch * n_expand * 4
+    x_res_bytes = batch * n_expand * c_x * x_elem
+    x_out_bytes = batch * n_expand * c_x * x_elem
+    nbytes = x_layer_out_bytes + h_post_bytes + x_res_bytes + x_out_bytes
+    return int(flops), int(nbytes)
+
+
+def bmm_fwd_roofline(op: "Op") -> tuple[int, int]:
+    """Roofline for batched GEMM ``BmmFwdOp`` (``d[i] = a[i] @ b[i]``).
+
+    Models ``torch.bmm`` exactly: strict 3D-3D with no broadcasting. Each of
+    the ``B`` batch items is an independent ``(M, K) @ (K, N)`` GEMM whose
+    flops/bytes are ``B``-scaled totals. ``BmmFwdOp`` is input-inferred, so
+    the logical dims ``batch/m/n/k`` and the dtype are bound on the op during
+    ``forward()``; this reads them directly, matching ``gemm_fwd_roofline``'s
+    contract. Valid only after the first ``forward()``.
+
+    Raises:
+        RuntimeError: If called before ``forward()`` has bound the dims.
+    """
+    if getattr(op, "m", None) is None or getattr(op, "dtype", None) is None:
+        raise RuntimeError(
+            "BmmFwdOp.eval_roofline() is valid only after the first forward(); "
+            "batch/m/n/k and dtype are inferred from the inputs."
+        )
+    batch, m, n, k = op.batch, op.m, op.n, op.k
+    elem_bytes = op.dtype.itemsize
+    flops = 2 * batch * m * n * k
+    nbytes = batch * (m * k + n * k + m * n) * elem_bytes
+    return int(flops), int(nbytes)
+
+
+def bmm_fp8_fwd_roofline(op: "Op") -> tuple[int, int]:
+    """Roofline for batched FP8 GEMM ``BmmFp8KNFwdOp``.
+
+    Layout matches the fp16 ``bmm_fwd_roofline``: ``a``: $[B \\times M \\times K]$,
+    ``b``: $[B \\times K \\times N]$. Per-tensor scales only and no fused bias, so bytes are
+    ``B*M*K`` (A, fp8) + ``B*K*N`` (B, fp8) + ``B*M*N`` (C, ``out_dtype``)
+    + 8 for the two batch-independent fp32 scales.
+
+    Valid only after the first ``forward()`` binds dims and dtype.
+    """
+    if getattr(op, "m", None) is None or getattr(op, "dtype", None) is None:
+        raise RuntimeError(
+            "BmmFp8KNFwdOp.eval_roofline() is valid only after the first forward(); "
+            "batch/m/n/k and dtype are inferred from the inputs."
+        )
+    batch, m, n, k = op.batch, op.m, op.n, op.k
+    input_bytes = op.dtype.itemsize
+    out_bytes = op.out_dtype.itemsize
+    flops = 2 * batch * m * n * k
+    nbytes = batch * ((m * k + n * k) * input_bytes + m * n * out_bytes) + 8
+    return int(flops), int(nbytes)
+
+
+# Mamba-2 / State-Space Dual (SSD) family. All helpers are valid only after the
+# first ``forward()``.
+
+
+def _da_cumsum_fwd_cost(
+    batch: int, seq_len: int, n_heads: int, elem_bytes: int, *, has_dt_bias: bool, dt_softplus: bool
+) -> tuple[int, int]:
+    tokens = batch * seq_len * n_heads
+    # Unconditional: clamp + dt * A + cumsum add; bias add (+1) and
+    # softplus (~4 flops) only when configured.
+    flops = (3 + (1 if has_dt_bias else 0) + (4 if dt_softplus else 0)) * tokens
+    nbytes = (
+        tokens * 4  # dt (float32, read)
+        + n_heads * 4  # A (float32, read)
+        + (n_heads * 4 if has_dt_bias else 0)  # dt_bias (float32, read)
+        + tokens * elem_bytes  # dt_out (target dtype, write)
+        + tokens * 4  # dA_cumsum (float32, write)
+    )
+    return int(flops), int(nbytes)
+
+
+def da_cumsum_fwd_roofline(op: "Op") -> tuple[int, int]:
+    """Roofline for the Mamba-2 dA_cumsum forward stage."""
+    return _da_cumsum_fwd_cost(
+        int(op.batch),
+        int(op.seq_len),
+        int(op.n_heads),
+        _dtype_itemsize(getattr(op, "dtype", "float32")),
+        has_dt_bias=_supplied(op, "dt_bias"),
+        dt_softplus=bool(getattr(op, "dt_softplus", False)),
+    )
+
+
+def cb_producer_roofline(op: "Op") -> tuple[int, int]:
+    """Roofline for the causal C@B coupling-matrix producer."""
+    batch = int(op.batch)
+    num_chunks = int(op.num_chunks)
+    n_groups = int(op.n_groups)
+    chunk_len = int(op.chunk_len)
+    d_state = int(op.d_state)
+    elem_bytes = _dtype_itemsize(getattr(op, "dtype", "float16"))
+
+    seq_len = num_chunks * chunk_len
+    # Causal masking halves the 2*Q*Q*N GEMM work per (batch, chunk, group).
+    flops = batch * num_chunks * n_groups * chunk_len * chunk_len * d_state
+    nbytes = (
+        2 * batch * seq_len * n_groups * d_state * elem_bytes  # C, B
+        + batch * num_chunks * n_groups * chunk_len**2 * elem_bytes  # cb
+    )
+    return int(flops), int(nbytes)
+
+
+def _ssd_chunk_state_fwd_cost(
+    batch: int,
+    num_chunks: int,
+    chunk_len: int,
+    n_heads: int,
+    d_head: int,
+    d_state: int,
+    n_groups: int,
+    elem_bytes: int,
+    *,
+    has_seq_idx: bool,
+) -> tuple[int, int]:
+    seq_len = num_chunks * chunk_len
+    tokens = batch * seq_len * n_heads
+    # Per (batch, chunk, head): (P x Q) @ (Q x N) GEMM; plus per-token decay
+    # weights (exp + mul) and x row scaling.
+    flops = (
+        2 * batch * num_chunks * n_heads * d_head * d_state * chunk_len
+        + 4 * tokens
+        + tokens * d_head
+    )
+    nbytes = (
+        tokens * d_head * elem_bytes  # x
+        + batch * seq_len * n_groups * d_state * elem_bytes  # Bmat
+        + tokens * elem_bytes  # dt
+        + tokens * 4  # dA_cumsum
+        + (batch * seq_len * 4 if has_seq_idx else 0)  # seq_idx
+        + batch * num_chunks * n_heads * d_head * d_state * 4  # states out
+    )
+    return int(flops), int(nbytes)
+
+
+def ssd_chunk_state_fwd_roofline(op: "Op") -> tuple[int, int]:
+    """Roofline for the SSD per-chunk state computation."""
+    return _ssd_chunk_state_fwd_cost(
+        int(op.batch),
+        int(op.num_chunks),
+        int(op.chunk_len),
+        int(op.n_heads),
+        int(op.d_head),
+        int(op.d_state),
+        int(op.n_groups),
+        _dtype_itemsize(getattr(op, "dtype", "float16")),
+        has_seq_idx=_supplied(op, "seq_idx"),
+    )
+
+
+def _ssd_state_passing_fwd_cost(
+    batch: int,
+    num_chunks: int,
+    n_heads: int,
+    d_state: int,
+    elem_bytes: int,
+    *,
+    has_initial_states: bool,
+) -> tuple[int, int]:
+    state_elems = batch * num_chunks * n_heads * d_state
+    # Multiply-add per state element along the chunk scan; the decay scalar
+    # exp(dA_chunk_cumsum[b, h, c]) is computed once per (batch, head, chunk)
+    # and shared across the state dimension.
+    flops = 2 * state_elems + batch * n_heads * num_chunks
+    nbytes = (
+        state_elems * elem_bytes  # states (read)
+        + batch * n_heads * num_chunks * 4  # dA_chunk_cumsum
+        + (
+            batch * n_heads * d_state * 4  # initial_states
+            if has_initial_states
+            else 0
+        )
+        + state_elems * 4  # out (float32)
+        + batch * n_heads * d_state * 4  # final_states
+    )
+    return int(flops), int(nbytes)
+
+
+def ssd_state_passing_fwd_roofline(op: "Op") -> tuple[int, int]:
+    """Roofline for the SSD inter-chunk state scan."""
+    return _ssd_state_passing_fwd_cost(
+        int(op.batch),
+        int(op.num_chunks),
+        int(op.n_heads),
+        int(op.d_state),
+        _dtype_itemsize(getattr(op, "dtype", "float32")),
+        has_initial_states=_supplied(op, "initial_states"),
+    )
+
+
+def ssd_chunk_scan_fwd_roofline(op: "Op") -> tuple[int, int]:
+    """Roofline for the fused SSD chunk output scan."""
+    batch = int(op.batch)
+    num_chunks = int(op.num_chunks)
+    chunk_len = int(op.chunk_len)
+    n_heads = int(op.n_heads)
+    d_head = int(op.d_head)
+    d_state = int(op.d_state)
+    n_groups = int(op.n_groups)
+    elem_bytes = _dtype_itemsize(getattr(op, "dtype", "float16"))
+
+    seq_len = num_chunks * chunk_len
+    tokens = batch * seq_len * n_heads
+    # History path: per-token (1 x N) @ (N x P); intra-chunk path: causal
+    # (Q x Q) @ (Q x P) per (batch, chunk, head) — causal masking halves it.
+    flops = 2 * tokens * d_state * d_head + batch * num_chunks * n_heads * chunk_len**2 * d_head
+    nbytes = (
+        tokens * d_head * elem_bytes  # x
+        + batch * num_chunks * n_groups * chunk_len**2 * elem_bytes  # cb
+        + tokens * 4  # dA_cumsum
+        + batch * seq_len * n_groups * d_state * elem_bytes  # C
+        + batch * num_chunks * n_heads * d_head * d_state * 4  # prev_states
+        + tokens * elem_bytes  # dt
+        + tokens * d_head * 4  # y out
+    )
+    return int(flops), int(nbytes)
+
+
+def ssd_decode_roofline(op: "Op") -> tuple[int, int]:
+    """Roofline for the single-token Mamba-2 SSD decode step."""
+    batch = int(op.batch)
+    n_heads = int(op.n_heads)
+    d_head = int(op.d_head)
+    d_state = int(op.d_state)
+    n_groups = int(op.n_groups)
+    elem_bytes = _dtype_itemsize(getattr(op, "dtype", "float16"))
+
+    state_elems = batch * n_heads * d_head * d_state
+    # Per state element under the multiply/add convention: dt * A, exp,
+    # two products for dt * x * B, the decay multiply, the state add, and
+    # the output multiply-add against C — eight ops total.
+    flops = 8 * state_elems
+    nbytes = (
+        n_heads * d_head * d_state * 4  # A
+        + batch * n_heads * d_head * 4  # dt
+        + batch * n_heads * d_head * elem_bytes  # x
+        + 2 * batch * n_groups * d_state * elem_bytes  # B_in, C_in
+        + 2 * state_elems * 4  # state (read + write)
+        + batch * n_heads * d_head * 4  # y_out
+    )
+    return int(flops), int(nbytes)
+
+
+def _mamba2_fwd_cost(op: Any, *, has_dt_bias: bool, has_initial_states: bool) -> tuple[int, int]:
+    batch = int(op.batch)
+    seq_len = int(op.seqlen)
+    num_chunks = int(op.num_chunks)
+    chunk_len = int(op.chunk_size)
+    n_heads = int(op.n_heads)
+    d_head = int(op.d_head)
+    d_state = int(op.d_state)
+    n_groups = int(op.n_groups)
+    elem_bytes = _dtype_itemsize(getattr(op, "dtype", "float16"))
+    dt_softplus = bool(getattr(op, "dt_softplus", False))
+
+    tokens = batch * seq_len * n_heads
+    state_elems = batch * num_chunks * n_heads * d_head * d_state
+    # FLOPs are the exact sum of the five standalone stage cost helpers, with
+    # the state-passing stage running over the flattened d_head * d_state dim.
+    flops = (
+        _da_cumsum_fwd_cost(
+            batch, seq_len, n_heads, elem_bytes, has_dt_bias=has_dt_bias, dt_softplus=dt_softplus
+        )[0]
+        + batch * num_chunks * n_groups * chunk_len**2 * d_state  # cb (causal)
+        + _ssd_chunk_state_fwd_cost(
+            batch,
+            num_chunks,
+            chunk_len,
+            n_heads,
+            d_head,
+            d_state,
+            n_groups,
+            elem_bytes,
+            has_seq_idx=False,
+        )[0]
+        + _ssd_state_passing_fwd_cost(
+            batch,
+            num_chunks,
+            n_heads,
+            d_head * d_state,
+            elem_bytes,
+            has_initial_states=has_initial_states,
+        )[0]
+        + 2 * tokens * d_state * d_head  # scan history
+        + batch * num_chunks * n_heads * chunk_len**2 * d_head  # scan intra (causal)
+    )
+    nbytes = (
+        tokens * d_head * elem_bytes  # x
+        + tokens * 4  # dt
+        + 2 * batch * seq_len * n_groups * d_state * elem_bytes  # B, C
+        + n_heads * 4  # A
+        + (n_heads * 4 if has_dt_bias else 0)  # dt_bias
+        + (
+            batch * n_heads * d_head * d_state * 4  # initial_states
+            if has_initial_states
+            else 0
+        )
+        # dominant intermediates: cb, chunk states (read + write), dt_out,
+        # dA_cumsum
+        + batch * num_chunks * n_groups * chunk_len**2 * elem_bytes
+        + 2 * state_elems * 4
+        + tokens * elem_bytes
+        + tokens * 4
+        + tokens * d_head * 4  # y out
+    )
+    return int(flops), int(nbytes)
+
+
+def mamba2_fwd_roofline(op: Any) -> tuple[int, int]:
+    """End-to-end Mamba-2 SSD forward: sums the five stage costs (state
+    passing runs over the flattened ``d_head * d_state`` dimension)."""
+    return _mamba2_fwd_cost(
+        op, has_dt_bias=_supplied(op, "dt_bias"), has_initial_states=_supplied(op, "initial_states")
+    )
+
+
+def _nsa_request_lens(data: dict[str, Any], c_seq_len: int, seq_num: int) -> list[int]:
+    """Token count per request, read off ``offsets`` when the call supplied it.
+
+    The manifest path has only the aggregate, so it falls back to an even split; the
+    benchmark path has the tensor and gets the lengths that were actually run.
+    """
+    offsets = data.get("offsets")
+    if offsets is not None:
+        values = [int(x) for x in offsets.detach().cpu().tolist()]
+        return [values[i + 1] - values[i] for i in range(len(values) - 1)]
+    return _distribute_total(c_seq_len, seq_num, c_seq_len)
+
+
+def _nsa_ragged_index_bytes(seq_num: int, c_seq_len: int, chunk_offsets: bool = True) -> int:
+    """The int32 metadata every NSA pass reads to walk a packed batch.
+
+    ``offsets`` and ``token_indices`` always; ``chunk_offsets`` for the two passes that
+    index the compressed chunks.
+    """
+    bounds = 2 * (seq_num + 1) if chunk_offsets else seq_num + 1
+    return (bounds + c_seq_len * 2) * 4
+
+
+def _nsa_closed_chunks(length: int, block_size: int) -> int:
+    """``sum(t // block_size for t in range(length))``, in closed form."""
+    full, rest = divmod(length, block_size)
+    return block_size * full * (full - 1) // 2 + rest * full
+
+
+def nsa_cmp_fwd_varlen_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:
+    """Roofline for the NSA compression forward over a packed batch.
+
+    Each token attends to its own request's closed chunks. In: q and the compressed
+    k/v. Out: the attention output and the lse the top-k pass scores against.
+    """
+    data = _shape_or_attrs(op, kwargs)
+    if "q_shape" in data:
+        c_seq_len, heads, dim_k = data["q_shape"]
+        chunk_num, head_kv, _ = data["k_cmp_shape"]
+        dim_v = data["v_cmp_shape"][2]
+        seq_num = data["offsets_shape"][0] - 1
+    else:
+        c_seq_len, heads, dim_k = data["c_seq_len"], data["heads"], data["dim_k"]
+        chunk_num, head_kv = data["chunk_num"], data["head_kv"]
+        dim_v, seq_num = data["dim_v"], data["seq_num"]
+    block_size = int(data["bs"])
+    elem_bytes = _dtype_itemsize(data.get("dtype", data.get("dtypes", "float16")))
+
+    lens = _nsa_request_lens(data, c_seq_len, seq_num)
+    # The kernel scores `(t + 1) // bs` chunks for the token at position `t`.
+    pairs = sum(_nsa_closed_chunks(length + 1, block_size) for length in lens)
+    flops = 2 * pairs * heads * (dim_k + dim_v)
+    nbytes = (
+        c_seq_len * heads * (dim_k + dim_v + 1) + chunk_num * head_kv * (dim_k + dim_v)
+    ) * elem_bytes
+    nbytes += _nsa_ragged_index_bytes(seq_num, c_seq_len)
+    return int(flops), int(nbytes)
+
+
+def nsa_topk_varlen_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:
+    """Roofline for the NSA block selection over a packed batch.
+
+    Two QK passes over the compressed chunks, no PV. Out: one int32 block id per
+    token, KV head and kept block.
+    """
+    data = _shape_or_attrs(op, kwargs)
+    if "q_shape" in data:
+        c_seq_len, heads, dim = data["q_shape"]
+        chunk_num, head_kv, _ = data["k_cmp_shape"]
+        seq_num = data["offsets_shape"][0] - 1
+    else:
+        c_seq_len, heads, dim = data["c_seq_len"], data["heads"], data["dim"]
+        chunk_num, head_kv, seq_num = data["chunk_num"], data["head_kv"], data["seq_num"]
+    block_size = int(data["bs"])
+    selected = int(data["selected_block_num"])
+    elem_bytes = _dtype_itemsize(data.get("dtype", data.get("dtypes", "float16")))
+
+    lens = _nsa_request_lens(data, c_seq_len, seq_num)
+    # Two QK passes over slightly different chunk counts: the lse pass scores
+    # `(t + 1) // bs` chunks for the token at position `t`, the selection pass `t // bs + 1`.
+    pairs = sum(
+        _nsa_closed_chunks(length + 1, block_size) + _nsa_closed_chunks(length, block_size) + length
+        for length in lens
+    )
+    flops = 2 * pairs * heads * dim
+    # FIXME(staged-rollout): `lse_in` is declared and passed but never read.
+    #
+    # Broken invariant: every manifest input is read once, and this one is not counted.
+    # Why: the top-k kernel recomputes the lse itself and discards the argument, so
+    #   charging it would price traffic that does not happen.
+    # Cleanup: drop `lse_in` from the signature, or make the kernel read it.
+    nbytes = (c_seq_len * heads * dim + chunk_num * head_kv * dim) * elem_bytes
+    nbytes += c_seq_len * head_kv * selected * 4
+    nbytes += _nsa_ragged_index_bytes(seq_num, c_seq_len)
+    return int(flops), int(nbytes)
+
+
+def _nsa_selected_block_loads(
+    data: dict[str, Any], c_seq_len: int, head_kv: int, selected: int, block_size: int
+) -> int:
+    """Block tiles the sparse forward loads, summed over tokens and KV heads.
+
+    The kernel walks ``block_counts`` entries and skips a block starting past the token.
+    The manifest path has only shapes, so it takes the ``selected``-per-token bound.
+    """
+    counts = data.get("block_counts")
+    indices = data.get("block_indices")
+    token_indices = data.get("token_indices")
+    if counts is None or indices is None or token_indices is None:
+        return c_seq_len * head_kv * selected
+
+    # Read as lists, not reduced on device: this module imports where torch does not.
+    kept = counts.reshape(-1).tolist()
+    blocks = indices.reshape(-1, selected).tolist()
+    positions = token_indices[:, 1].tolist()
+    return sum(
+        sum(1 for start in row[:n] if 0 <= start * block_size <= positions[i // head_kv])
+        for i, (n, row) in enumerate(zip(kept, blocks, strict=True))
+    )
+
+
+def nsa_fwd_varlen_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:
+    """Roofline for the NSA sparse forward over a packed batch.
+
+    Each token attends to the blocks of ``block_size`` tokens its selection kept, so the
+    score count comes from that selection rather than from the sequence length. In: q and
+    the gathered k/v of those blocks, plus the selection. Out: the attention output.
+    """
+    data = _shape_or_attrs(op, kwargs)
+    if "q_shape" in data:
+        c_seq_len, heads, dim = data["q_shape"]
+        head_kv = data["k_shape"][1]
+        selected = data["block_indices_shape"][2]
+    else:
+        c_seq_len, heads, dim = data["c_seq_len"], data["heads"], data["dim"]
+        head_kv, selected = data["head_kv"], data["selected_blocks"]
+    block_size = int(data["block_size"])
+    elem_bytes = _dtype_itemsize(data.get("dtype", data.get("dtypes", "float16")))
+
+    loads = _nsa_selected_block_loads(data, c_seq_len, head_kv, selected, block_size)
+    rows = loads * block_size
+    flops = 4 * rows * (heads // head_kv) * dim
+    nbytes = (2 * c_seq_len * heads * dim + 2 * rows * dim) * elem_bytes
+    nbytes += c_seq_len * head_kv * (selected + 1) * 4
+    batch = int(data["offsets_shape"][0]) - 1 if "q_shape" in data else int(data["batch"])
+    nbytes += _nsa_ragged_index_bytes(batch, c_seq_len, chunk_offsets=False)
+    return int(flops), int(nbytes)

@@ -1,73 +1,17 @@
-
 import pytest
 import torch
 
 from tests.test_base import FixtureBase, TestBase
-from tileops.ops.grouped_gemm import GroupedGemmOp
+from tileops.kernels.grouped_gemm import GroupedGemmCall, GroupedGemmKernel
+from tileops.ops.gemm.grouped_gemm import GroupedGemmFwdOp
+from tileops.utils import get_sm_version
 from workloads.grouped_gemm import (
-    GroupedGemmTest as _GroupedGemmTestWorkload,
+    GroupedGemmWorkload,
 )
 
 
-class GroupedGemmTest(_GroupedGemmTestWorkload, TestBase):
-    def ref_program(self, A: torch.Tensor, B: torch.Tensor, batch_sizes: torch.Tensor,
-                    batch_offsets: torch.Tensor,
-                    batch_padded_offsets: torch.Tensor) -> torch.Tensor:
-        if not self.transpose_a:
-            # NT / NN: output is (batch_sum, N)
-            if self.transpose_b:
-                # NT: A @ B^T
-                assert A.shape[0] == sum(batch_sizes)
-                assert B.shape[0] == len(batch_sizes)
-                output = torch.empty((sum(batch_sizes), B.shape[1]), device=A.device, dtype=A.dtype)
-                start = 0
-                for i, size in enumerate(batch_sizes):
-                    size = int(size.item())
-                    end = start + size
-                    output[start:end] = torch.mm(A[start:end], B[i].transpose(0, 1).contiguous())
-                    start = end
-            else:
-                # NN: A @ B
-                assert A.shape[0] == sum(batch_sizes)
-                assert B.shape[0] == len(batch_sizes)
-                output = torch.empty((sum(batch_sizes), B.shape[2]), device=A.device, dtype=A.dtype)
-                start = 0
-                for i, size in enumerate(batch_sizes):
-                    size = int(size.item())
-                    end = start + size
-                    output[start:end] = torch.mm(A[start:end], B[i])
-                    start = end
-        else:
-            # TN / TT: output is (batch_count, N, K)
-            total_batch = int(batch_sizes.sum().item())
-            assert A.shape[0] == total_batch
-            N = A.shape[1]
-            batch_count = len(batch_sizes)
-
-            if self.transpose_b:
-                # TT: A^T @ B^T
-                K = B.shape[0]
-                assert B.shape[1] == total_batch
-                output = torch.zeros((batch_count, N, K), device=A.device, dtype=A.dtype)
-                start = 0
-                for i, size in enumerate(batch_sizes):
-                    size = int(size.item())
-                    end = start + size
-                    output[i] = torch.mm(A[start:end].transpose(0, 1),
-                                         B[:, start:end].transpose(0, 1))
-                    start = end
-            else:
-                # TN: A^T @ B
-                K = B.shape[1]
-                assert B.shape[0] == total_batch
-                output = torch.zeros((batch_count, N, K), device=A.device, dtype=A.dtype)
-                start = 0
-                for i, size in enumerate(batch_sizes):
-                    size = int(size.item())
-                    end = start + size
-                    output[i] = torch.mm(A[start:end].transpose(0, 1), B[start:end])
-                    start = end
-        return output
+class GroupedGemmTest(GroupedGemmWorkload, TestBase):
+    pass
 
 
 # Shared helper
@@ -75,46 +19,177 @@ class GroupedGemmTest(_GroupedGemmTestWorkload, TestBase):
 
 # Parametrized grouped GEMM test
 
+
 class GroupedGemmFixture(FixtureBase):
     PARAMS = [
-        ("batch_sum, batch_count, N, K, dtype, transpose_a, transpose_b, tune", [
-            pytest.param(
-                16384, 4, 4864, 4096, torch.float16, False, True, False,
-                marks=pytest.mark.smoke,
-            ),
-            pytest.param(
-                16384, 4, 4864, 4096, torch.float16, False, False, False,
-                marks=pytest.mark.full,
-            ),
-            pytest.param(
-                16384, 4, 4864, 4096, torch.float16, True, False, False,
-                marks=pytest.mark.full,
-            ),
-            pytest.param(
-                16384, 4, 4864, 4096, torch.float16, True, True, False,
-                marks=pytest.mark.full,
-            ),
-        ]),
+        (
+            "batch_sum, batch_count, N, K, dtype, transpose_a, transpose_b, tune",
+            [
+                pytest.param(
+                    16384,
+                    4,
+                    4864,
+                    4096,
+                    torch.float16,
+                    False,
+                    True,
+                    False,
+                    marks=pytest.mark.smoke,
+                ),
+                pytest.param(
+                    4099,
+                    6,
+                    4000,
+                    4096,
+                    torch.float16,
+                    False,
+                    True,
+                    False,
+                    marks=pytest.mark.smoke,
+                    id="uneven-unaligned",
+                ),
+                pytest.param(
+                    4099,
+                    6,
+                    4000,
+                    4096,
+                    torch.float16,
+                    False,
+                    False,
+                    False,
+                    marks=pytest.mark.smoke,
+                    id="nn-uneven-unaligned",
+                ),
+                pytest.param(
+                    16384,
+                    4,
+                    4864,
+                    4096,
+                    torch.float16,
+                    False,
+                    False,
+                    False,
+                    marks=pytest.mark.full,
+                ),
+                pytest.param(
+                    16384,
+                    4,
+                    4864,
+                    4096,
+                    torch.float16,
+                    True,
+                    False,
+                    False,
+                    marks=pytest.mark.full,
+                ),
+                pytest.param(
+                    16384,
+                    4,
+                    4864,
+                    4096,
+                    torch.float16,
+                    True,
+                    True,
+                    False,
+                    marks=pytest.mark.full,
+                ),
+            ],
+        ),
     ]
 
 
 @GroupedGemmFixture
-def test_grouped_gemm(batch_sum: int, batch_count: int, N: int, K: int, dtype: torch.dtype,
-                      transpose_a: bool, transpose_b: bool, tune: bool) -> None:
+def test_grouped_gemm(
+    batch_sum: int,
+    batch_count: int,
+    N: int,
+    K: int,
+    dtype: torch.dtype,
+    transpose_a: bool,
+    transpose_b: bool,
+    tune: bool,
+) -> None:
     test = GroupedGemmTest(batch_sum, batch_count, N, K, dtype, transpose_a, transpose_b)
-    op = GroupedGemmOp(transpose_a=transpose_a, transpose_b=transpose_b, tune=tune)
+    op = GroupedGemmFwdOp(transpose_a=transpose_a, transpose_b=transpose_b, tune=tune)
     test.check(op, *test.gen_inputs(), atol=1e-2, rtol=1e-2)
 
 
-# Complete variant: forward (NT) + backward dA (NN) + backward dB (TN)
+# What `tune=True` measures
 
-class GroupedGemmCompleteFixture(FixtureBase):
-    PARAMS = [
-        ("batch_sum, batch_count, N, K, dtype, tune", [
-            pytest.param(16384, 4, 4864, 4096, torch.float16, False, marks=pytest.mark.smoke),
-        ]),
+
+class _FakeKernelParam:
+    """The part of TileLang's ``KernelParam`` its tensor supplier reads."""
+
+    def __init__(self, dtype: str, shape: list[int]) -> None:
+        self.dtype = dtype
+        self.shape = shape
+
+    def torch_dtype(self):
+        return getattr(torch, self.dtype)
+
+    def __getattr__(self, name):  # is_unsigned / is_float8 / is_float4 / is_boolean
+        return lambda: False
+
+
+@pytest.mark.smoke
+def test_supply_prog_keeps_every_row_in_the_k_loop():
+    """Random int32 metadata drops the NT/NN guard sum to ~0 and every tile skips the K-loop."""
+    batch_sum, batch_count, n, k = 64, 8, 32, 32
+    kernel = GroupedGemmKernel(batch_sum, batch_count, n, k, torch.float16)
+    # TileLang supplies inputs only, so the ``out_idx=[2]`` output is absent.
+    params = [
+        _FakeKernelParam("float16", [batch_sum, k]),
+        _FakeKernelParam("float16", [batch_count, n, k]),
+        *(_FakeKernelParam("int32", [batch_count]) for _ in range(3)),
     ]
+    supplied = kernel.autotune_supply_prog(params)
+
+    assert [list(t.shape) for t in supplied] == [p.shape for p in params]
+    sizes, offsets, padded_offsets = supplied[2:]
+    assert int(sizes.sum()) == batch_sum
+    assert int(offsets[0]) == 0 and int(offsets[-1]) == batch_sum - int(sizes[-1])
+    assert int(padded_offsets[-1]) + int(sizes[-1]) == batch_sum
+
+    # A fourth such parameter must fail rather than silently receive the offsets.
+    with pytest.raises(RuntimeError, match="expects 3 int32"):
+        kernel.autotune_supply_prog(params + [_FakeKernelParam("int32", [batch_count])])
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-vvs"])
+# Which kernel serves which call
+
+
+@pytest.mark.parametrize(
+    "numel, n, k, transpose_a, transpose_b, expected",
+    [
+        (4096, 4096, 4096, False, True, "grouped_gemm_persistent"),
+        (
+            4096,
+            4000,
+            4096,
+            False,
+            True,
+            "grouped_gemm_persistent",
+        ),  # N off the tile grid still runs
+        (4096, 4096, 4096, False, False, "grouped_gemm_persistent"),  # NN
+        (4096, 4096, 4096, True, False, "grouped_gemm_persistent"),  # TN
+        (4099, 4096, 4096, True, True, "grouped_gemm_kernel"),  # TT: b's row pitch is the K sum
+        (4096, 4096, 4100, False, True, "grouped_gemm_kernel"),  # K TMA cannot address
+    ],
+)
+@pytest.mark.smoke
+def test_s2_selection_uses_general_kernel_for_all_original_layouts(
+    numel: int, n: int, k: int, transpose_a: bool, transpose_b: bool, expected: str
+):
+    """The migrated selector preserves each layout-specific kernel region."""
+    op = GroupedGemmFwdOp(transpose_a=transpose_a, transpose_b=transpose_b)
+    call = GroupedGemmCall(
+        arch=get_sm_version(),
+        numel=numel,
+        num_experts=16,
+        n=n,
+        k=k,
+        dtype=torch.float16,
+        transpose_a=transpose_a,
+        transpose_b=transpose_b,
+    )
+    assert op.select_kernel_key(op._KERNEL_KEYS, call) == expected
