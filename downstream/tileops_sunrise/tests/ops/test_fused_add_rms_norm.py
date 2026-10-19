@@ -2,45 +2,42 @@ import pytest
 import torch
 
 from tests.test_base import FixtureBase, TestBase
+from tileops.kernels.norm import FusedAddRMSNormKernel
 from tileops.ops.norm.fused_add_rms_norm import FusedAddRMSNormFwdOp
-from workloads.normalization import FusedAddRMSNormTest as _FusedAddRMSNormTestWorkload
+from workloads.normalization import FusedAddRMSNormWorkload
 
 
-class FusedAddRMSNormTest(_FusedAddRMSNormTestWorkload, TestBase):
-    def ref_program(
-        self,
-        x: torch.Tensor,
-        residual: torch.Tensor,
-        weight: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        x_cpu = x.cpu() if x.device.type == "ptpu" else x
-        residual_cpu = residual.cpu() if residual.device.type == "ptpu" else residual
-        weight_cpu = weight.cpu() if weight.device.type == "ptpu" else weight
-        add_result = (x_cpu.float() + residual_cpu.float()).to(x_cpu.dtype)
-        add_f32 = add_result.float()
-        rms = torch.sqrt(add_f32.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        y = ((add_f32 / rms) * weight_cpu.float()).to(x_cpu.dtype)
-        return y.ptpu(), add_result.ptpu()
+class FusedAddRMSNormTest(FusedAddRMSNormWorkload, TestBase):
+    pass
 
 
 class FusedAddRMSNormFixture(FixtureBase):
     PARAMS = [
-        ("m, n, dtype, tune", [
-            # Standard aligned shapes -- fp16
-            pytest.param(1024, 4096, torch.float16, False, marks=pytest.mark.smoke),
-            pytest.param(1024, 4096, torch.bfloat16, False, marks=pytest.mark.smoke),
-            pytest.param(4096, 4096, torch.float16, False, marks=pytest.mark.full),
-            # Standard aligned shapes -- bf16
-            pytest.param(4096, 4096, torch.bfloat16, False, marks=pytest.mark.full),
-            # Non-aligned N
-            pytest.param(1024, 3000, torch.float16, False, marks=pytest.mark.full),
-            pytest.param(1024, 3000, torch.bfloat16, False, marks=pytest.mark.full),
-            pytest.param(2048, 5120, torch.float16, False, marks=pytest.mark.full),
-            pytest.param(2048, 5120, torch.bfloat16, False, marks=pytest.mark.full),
-            # Tail-M: M not divisible by block_m
-            pytest.param(1025, 4096, torch.float16, False, marks=pytest.mark.full),
-            pytest.param(1025, 4096, torch.bfloat16, False, marks=pytest.mark.full),
-        ]),
+        (
+            "m, n, dtype, tune",
+            [
+                # Standard aligned shapes -- fp16
+                pytest.param(1024, 4096, torch.float16, False, marks=pytest.mark.smoke),
+                pytest.param(1024, 4096, torch.bfloat16, False, marks=pytest.mark.smoke),
+                pytest.param(4096, 4096, torch.float16, False, marks=pytest.mark.full),
+                # Standard aligned shapes -- bf16
+                pytest.param(4096, 4096, torch.bfloat16, False, marks=pytest.mark.full),
+                # Non-aligned N
+                pytest.param(1024, 3000, torch.float16, False, marks=pytest.mark.full),
+                pytest.param(1024, 3000, torch.bfloat16, False, marks=pytest.mark.full),
+                pytest.param(2048, 5120, torch.float16, False, marks=pytest.mark.full),
+                pytest.param(2048, 5120, torch.bfloat16, False, marks=pytest.mark.full),
+                # Tail-M: M not divisible by block_m
+                pytest.param(1025, 4096, torch.float16, False, marks=pytest.mark.full),
+                pytest.param(1025, 4096, torch.bfloat16, False, marks=pytest.mark.full),
+                # A row long enough for the split path, at the row counts
+                # around which it turns on: one row takes it, a few rows do
+                # not, and a full grid does not.
+                pytest.param(1, 16384, torch.bfloat16, False, marks=pytest.mark.full),
+                pytest.param(2, 16384, torch.bfloat16, False, marks=pytest.mark.full),
+                pytest.param(4, 16384, torch.float16, False, marks=pytest.mark.full),
+            ],
+        ),
     ]
 
 
@@ -54,17 +51,20 @@ def _get_tolerances(dtype: torch.dtype) -> tuple[float, float]:
 @FusedAddRMSNormFixture
 def test_fused_add_rms_norm_op(m: int, n: int, dtype: torch.dtype, tune: bool) -> None:
     test = FusedAddRMSNormTest(m, n, dtype)
-    op = FusedAddRMSNormFwdOp(dtype=dtype, tune=tune)
+    op = FusedAddRMSNormFwdOp(tune=tune)
     atol, rtol = _get_tolerances(dtype)
     test.check(op, *test.gen_inputs(), atol=atol, rtol=rtol)
 
 
 class FusedAddRMSNormNonContigFixture(FixtureBase):
     PARAMS = [
-        ("m, n, dtype", [
-            pytest.param(1024, 4096, torch.float16, marks=pytest.mark.smoke),
-            pytest.param(1024, 4096, torch.bfloat16, marks=pytest.mark.smoke),
-        ]),
+        (
+            "m, n, dtype",
+            [
+                pytest.param(1024, 4096, torch.float16, marks=pytest.mark.smoke),
+                pytest.param(1024, 4096, torch.bfloat16, marks=pytest.mark.smoke),
+            ],
+        ),
     ]
 
 
@@ -79,29 +79,36 @@ def test_fused_add_rms_norm_non_contiguous(m: int, n: int, dtype: torch.dtype) -
     x = x_full[:, :n].ptpu()
     residual = r_full[:, :n].ptpu()
 
-    op = FusedAddRMSNormFwdOp(M=m, N=n, dtype=dtype)
+    op = FusedAddRMSNormFwdOp()
 
     # Reference on CPU
     test = FusedAddRMSNormTest(m, n, dtype)
     y_ref, add_ref = test.ref_program(
-        x_full[:, :n].contiguous(), r_full[:, :n].contiguous(), weight_cpu,
+        x_full[:, :n].contiguous(),
+        r_full[:, :n].contiguous(),
+        weight_cpu,
     )
 
     y, residual_out = op(x, residual, weight_cpu.ptpu())
     torch.ptpu.synchronize()
     atol, rtol = _get_tolerances(dtype)
-    assert torch.allclose(y.cpu(), y_ref.cpu(), atol=atol, rtol=rtol), \
+    assert torch.allclose(y.cpu(), y_ref.cpu(), atol=atol, rtol=rtol), (
         f"Non-contiguous y test failed, max err: {(y.cpu() - y_ref.cpu()).abs().max()}"
-    assert torch.allclose(residual_out.cpu(), add_ref.cpu(), atol=atol, rtol=rtol), \
+    )
+    assert torch.allclose(residual_out.cpu(), add_ref.cpu(), atol=atol, rtol=rtol), (
         f"Non-contiguous residual_out test failed, max err: {(residual_out.cpu() - add_ref.cpu()).abs().max()}"
+    )
 
 
 class FusedAddRMSNorm3DFixture(FixtureBase):
     PARAMS = [
-        ("batch, seq, hidden, dtype", [
-            pytest.param(2, 512, 4096, torch.float16, marks=pytest.mark.smoke),
-            pytest.param(2, 512, 4096, torch.bfloat16, marks=pytest.mark.smoke),
-        ]),
+        (
+            "batch, seq, hidden, dtype",
+            [
+                pytest.param(2, 512, 4096, torch.float16, marks=pytest.mark.smoke),
+                pytest.param(2, 512, 4096, torch.bfloat16, marks=pytest.mark.smoke),
+            ],
+        ),
     ]
 
 
@@ -116,7 +123,7 @@ def test_fused_add_rms_norm_3d(batch: int, seq: int, hidden: int, dtype: torch.d
     residual = residual_cpu.ptpu()
 
     M = batch * seq
-    op = FusedAddRMSNormFwdOp(dtype=dtype)
+    op = FusedAddRMSNormFwdOp()
 
     # Reference on CPU
     test = FusedAddRMSNormTest(M, hidden, dtype)
@@ -125,11 +132,20 @@ def test_fused_add_rms_norm_3d(batch: int, seq: int, hidden: int, dtype: torch.d
     y, residual_out = op(x, residual, weight_cpu.ptpu())
     torch.ptpu.synchronize()
     atol, rtol = _get_tolerances(dtype)
-    assert torch.allclose(y.cpu(), y_ref.cpu(), atol=atol, rtol=rtol), \
+    assert torch.allclose(y.cpu(), y_ref.cpu(), atol=atol, rtol=rtol), (
         f"3D y test failed, max err: {(y.cpu() - y_ref.cpu()).abs().max()}"
-    assert torch.allclose(residual_out.cpu(), add_ref.cpu(), atol=atol, rtol=rtol), \
+    )
+    assert torch.allclose(residual_out.cpu(), add_ref.cpu(), atol=atol, rtol=rtol), (
         f"3D residual_out test failed, max err: {(residual_out.cpu() - add_ref.cpu()).abs().max()}"
+    )
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-vvs"])
+@pytest.mark.smoke
+def test_fused_add_rms_norm_rejects_partial_access_width() -> None:
+    """A width leaving a partial 16-byte access is refused at construction.
+
+    It truncates the kernel's per-CTA loop bounds to zero, so the row comes back
+    untouched rather than wrong in a way a tolerance would catch.
+    """
+    with pytest.raises(ValueError, match="whole 16-byte accesses"):
+        FusedAddRMSNormKernel(4096, 1e-6, torch.bfloat16, config={"threads": 768})

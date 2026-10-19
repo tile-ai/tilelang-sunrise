@@ -1,15 +1,15 @@
 import pytest
 import torch
 
-from tests.ops.test_gated_deltanet_fwd import (
+from tests.test_base import FixtureBase, TestBase
+from tileops.kernels.linear_attention.gated_deltanet.prefill import cp_fwd
+from tileops.ops import GatedDeltaNetPrefillBHTDFwdOp, GatedDeltaNetPrefillBTHDFwdOp
+from tileops.perf.formulas import gated_deltanet_prefill_fwd_roofline
+from workloads.linear_attention import (
+    GatedDeltaNetPrefillFwdWorkload,
     compute_w_u_torch,
     kernel2_gated_deltanet_torch,
     prepare_wy_repr_gated_torch,
-)
-from tests.test_base import FixtureBase, TestBase
-from tileops.ops import GatedDeltaNetPrefillFwdOp
-from workloads.linear_attention import (
-    GatedDeltaNetPrefillFwdTest as _GatedDeltaNetPrefillFwdTestWorkload,
 )
 
 
@@ -173,9 +173,8 @@ def compose_structured_transition_torch(
     alpha = next_alpha * prev_alpha
     cross = torch.einsum("bhkr,bhks->bhrs", prev_U, next_V)
     prev_V_part = next_alpha.view(*next_alpha.shape, 1, 1) * prev_V
-    next_V_part = (
-        prev_alpha.view(*prev_alpha.shape, 1, 1) * next_V
-        + torch.einsum("bhkr,bhrs->bhks", prev_V, cross)
+    next_V_part = prev_alpha.view(*prev_alpha.shape, 1, 1) * next_V + torch.einsum(
+        "bhkr,bhrs->bhks", prev_V, cross
     )
     U = torch.cat([prev_U, next_U], dim=-1)
     V = torch.cat([prev_V_part, next_V_part], dim=-1)
@@ -197,41 +196,20 @@ def butterfly_prefix_structured_transitions_torch(
 ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
     """Hillis-Steele inclusive scan over structured chunk transitions."""
     num_chunks = alpha.shape[2]
-    prefix = [
-        (alpha[:, :, c], U[:, :, c], V[:, :, c], bias[:, :, c])
-        for c in range(num_chunks)
-    ]
+    prefix = [(alpha[:, :, c], U[:, :, c], V[:, :, c], bias[:, :, c]) for c in range(num_chunks)]
 
     offset = 1
     while offset < num_chunks:
         prev_prefix = prefix.copy()
         for c in range(offset, num_chunks):
-            prefix[c] = compose_structured_transition_torch(
-                prev_prefix[c - offset], prev_prefix[c]
-            )
+            prefix[c] = compose_structured_transition_torch(prev_prefix[c - offset], prev_prefix[c])
         offset *= 2
 
     return prefix
 
 
-class GatedDeltaNetPrefillFwdTest(_GatedDeltaNetPrefillFwdTestWorkload, TestBase):
-    def ref_program(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        B, H, S, DK = k.shape
-        _, _, _, DV = v.shape
-        BC = self.chunk_size
-        g_cum = g.float().reshape(B, H, S // BC, BC).cumsum(-1).reshape(B, H, S).to(g.dtype)
-        Aw, Au = prepare_wy_repr_gated_torch(k, g_cum, beta, BC)
-        w, u = compute_w_u_torch(Aw, Au, k, v, beta, BC)
-        S_0 = torch.zeros(B, H, DK, DV, dtype=torch.float32, device=q.device)
-        final_state, o = kernel2_gated_deltanet_torch(q, k, g_cum, w, u, S_0, BC)
-        return o.to(self.dtype), final_state.to(self.dtype)
+class GatedDeltaNetPrefillFwdTest(GatedDeltaNetPrefillFwdWorkload, TestBase):
+    pass
 
 
 def _get_tolerances(dtype: torch.dtype) -> dict:
@@ -244,13 +222,16 @@ def _get_tolerances(dtype: torch.dtype) -> dict:
 
 class GatedDeltaNetPrefillFwdFixture(FixtureBase):
     PARAMS = [
-        ("batch, seq_len, heads, dim_k, dim_v, chunk_size, dtype, tune", [
-            pytest.param(1, 64, 2, 64, 64, 32, torch.float32, False, marks=pytest.mark.smoke),
-            pytest.param(1, 64, 2, 64, 64, 32, torch.float16, False, marks=pytest.mark.smoke),
-            pytest.param(1, 64, 2, 64, 64, 32, torch.bfloat16, False, marks=pytest.mark.smoke),
-            pytest.param(1, 128, 4, 64, 64, 32, torch.float16, False, marks=pytest.mark.full),
-            pytest.param(1, 128, 4, 64, 64, 64, torch.float16, False, marks=pytest.mark.full),
-        ]),
+        (
+            "batch, seq_len, heads, dim_k, dim_v, chunk_size, dtype, tune",
+            [
+                pytest.param(1, 64, 2, 64, 64, 32, torch.float32, False, marks=pytest.mark.smoke),
+                pytest.param(1, 64, 2, 64, 64, 32, torch.float16, False, marks=pytest.mark.smoke),
+                pytest.param(1, 64, 2, 64, 64, 32, torch.bfloat16, False, marks=pytest.mark.smoke),
+                pytest.param(1, 128, 4, 64, 64, 32, torch.float16, False, marks=pytest.mark.full),
+                pytest.param(1, 128, 4, 64, 64, 64, torch.float16, False, marks=pytest.mark.full),
+            ],
+        ),
     ]
 
 
@@ -267,7 +248,7 @@ def test_gated_deltanet_prefill_fwd(
 ) -> None:
     torch.manual_seed(42)
     test = GatedDeltaNetPrefillFwdTest(batch, heads, seq_len, dim_k, dim_v, chunk_size, dtype)
-    op = GatedDeltaNetPrefillFwdOp(chunk_size=chunk_size, layout="bhtd", tune=tune)
+    op = GatedDeltaNetPrefillBHTDFwdOp(chunk_size=chunk_size, tune=tune)
     test.check(op, *test.gen_inputs(), **_get_tolerances(dtype))
 
 
@@ -280,8 +261,8 @@ def test_gated_deltanet_prefill_bthd_layout_matches_bhtd() -> None:
     test = GatedDeltaNetPrefillFwdTest(B, H, S, DK, DV, BC, dtype)
     q, k, v, g, beta = test.gen_inputs()
 
-    bhtd_op = GatedDeltaNetPrefillFwdOp(chunk_size=BC, layout="bhtd", tune=False)
-    bthd_op = GatedDeltaNetPrefillFwdOp(chunk_size=BC, tune=False)
+    bhtd_op = GatedDeltaNetPrefillBHTDFwdOp(chunk_size=BC, tune=False)
+    bthd_op = GatedDeltaNetPrefillBTHDFwdOp(chunk_size=BC, tune=False)
 
     o_bhtd, state_bhtd = bhtd_op(q, k, v, g, beta)
     q_bthd = q.permute(0, 2, 1, 3)
@@ -318,8 +299,8 @@ def test_gated_deltanet_prefill_bthd_blocksolve_path_matches_bhtd(
     test = GatedDeltaNetPrefillFwdTest(B, H, S, DK, DV, BC, dtype)
     q, k, v, g, beta = test.gen_inputs()
 
-    bhtd_op = GatedDeltaNetPrefillFwdOp(chunk_size=BC, layout="bhtd", tune=False)
-    bthd_op = GatedDeltaNetPrefillFwdOp(chunk_size=BC, tune=False, layout="bthd")
+    bhtd_op = GatedDeltaNetPrefillBHTDFwdOp(chunk_size=BC, tune=False)
+    bthd_op = GatedDeltaNetPrefillBTHDFwdOp(chunk_size=BC, tune=False)
 
     o_bhtd, state_bhtd = bhtd_op(q, k, v, g, beta)
     o_bthd, state_bthd = bthd_op(
@@ -343,7 +324,7 @@ def test_gated_deltanet_prefill_dense_transition_reference() -> None:
     torch.manual_seed(42)
     B, H, S, DK, DV, BC = 1, 2, 64, 16, 16, 16
     dtype = torch.float32
-    device = torch.device("cuda")
+    device = torch.device("cpu")
 
     test = GatedDeltaNetPrefillFwdTest(B, H, S, DK, DV, BC, dtype)
     q, k, v, g, beta = test.gen_inputs()
@@ -368,17 +349,15 @@ def test_gated_deltanet_prefill_dense_transition_reference() -> None:
     structured_alpha, structured_U, structured_V, structured_bias = (
         structured_chunk_transitions_torch(k, g_cum, w, u, BC)
     )
-    structured_A = materialize_structured_A_torch(
-        structured_alpha, structured_U, structured_V
-    )
+    structured_A = materialize_structured_A_torch(structured_alpha, structured_U, structured_V)
     structured_prefix = butterfly_prefix_structured_transitions_torch(
         structured_alpha, structured_U, structured_V, structured_bias
     )
     final_alpha, final_U, final_V, final_bias = structured_prefix[-1]
     structured_final_A = materialize_structured_A_torch(final_alpha, final_U, final_V)
-    scan_final_state = torch.einsum(
-        "bhij,bhjv->bhiv", prefix_A[:, :, -1], S_0
-    ) + prefix_bias[:, :, -1]
+    scan_final_state = (
+        torch.einsum("bhij,bhjv->bhiv", prefix_A[:, :, -1], S_0) + prefix_bias[:, :, -1]
+    )
 
     torch.testing.assert_close(structured_A, A, atol=5e-4, rtol=5e-4)
     torch.testing.assert_close(structured_bias, bias, atol=5e-4, rtol=5e-4)
@@ -389,5 +368,112 @@ def test_gated_deltanet_prefill_dense_transition_reference() -> None:
     torch.testing.assert_close(scan_final_state, serial_final_state, atol=5e-4, rtol=5e-4)
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-vvs"])
+# ----------------------------------------------------------------------
+# Cross-layout contract for the Gated DeltaNet prefill roofline.
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.smoke
+def test_gated_deltanet_prefill_roofline_layout_equivalence() -> None:
+    """bthd and bhtd bindings of the same problem yield identical costs."""
+    bthd = gated_deltanet_prefill_fwd_roofline(
+        q_shape=[1, 512, 16, 128],
+        v_shape=[1, 512, 16, 128],
+        chunk_size=64,
+        layout="bthd",
+        dtype="float16",
+    )
+    bhtd = gated_deltanet_prefill_fwd_roofline(
+        q_shape=[1, 16, 512, 128],
+        v_shape=[1, 16, 512, 128],
+        chunk_size=64,
+        layout="bhtd",
+        dtype="float16",
+    )
+    assert bthd == bhtd
+    assert bthd[0] > 0 and bthd[1] > 0
+
+
+# ----------------------------------------------------------------------
+# Initial state of every partition on the CP path.
+#
+# At the kernel entry, not through the op: an unwritten partition reads as zero on
+# a clean allocator, so the op only disagrees on a dirty one — not a state a test
+# can ask for.
+# ----------------------------------------------------------------------
+
+
+CP_H, CP_DK, CP_DV = 4, 64, 64
+PARTITIONS_PER_SEQUENCE = 2
+RAW_BATCH = 2
+
+
+@pytest.fixture
+def poisoned_empty(monkeypatch):
+    """Hand `correct_initial_states` an output full of NaN instead of a fresh block."""
+    real_empty = torch.empty
+
+    def _empty(*args, **kwargs):
+        out = real_empty(*args, **kwargs)
+        if out.device.type == "ptpu" and out.is_floating_point():
+            out.fill_(float("nan"))
+        return out
+
+    monkeypatch.setattr(cp_fwd.torch, "empty", _empty)
+    yield
+    # Without this the NaN returns to the allocator and reaches whatever runs next.
+    torch.ptpu.empty_cache()
+
+
+def _inputs(fallback: bool):
+    cp_batch = RAW_BATCH * PARTITIONS_PER_SEQUENCE
+    ht = torch.randn(cp_batch, CP_H, CP_DK, CP_DV, dtype=torch.float16, device="ptpu")
+    mt = torch.randn(cp_batch, CP_H, CP_DK, CP_DK, dtype=torch.float16, device="ptpu")
+    mask = torch.full((cp_batch, CP_H), fallback, dtype=torch.bool, device="ptpu")
+    seq_map_r2c = torch.tensor(
+        [i * PARTITIONS_PER_SEQUENCE for i in range(RAW_BATCH + 1)],
+        dtype=torch.int32,
+        device="ptpu",
+    )
+    return ht, mt, mask, seq_map_r2c
+
+
+@pytest.mark.parametrize(
+    "fallback",
+    [
+        pytest.param(False, marks=pytest.mark.smoke),
+        pytest.param(True, marks=pytest.mark.full),
+    ],
+)
+def test_every_partition_is_written_without_a_raw_initial_state(poisoned_empty, fallback):
+    """The loop writes `seq_start_idx + i_s + 1` only, so the first partition is the
+    one at risk; with no incoming state it must be zero."""
+    ht, mt, mask, seq_map_r2c = _inputs(fallback)
+    cp_h0 = cp_fwd.correct_initial_states(None, ht, mt, mask, seq_map_r2c)
+
+    unwritten = torch.isnan(cp_h0.cpu()).flatten(1).any(dim=1).nonzero().flatten().tolist()
+    assert not unwritten, f"partitions left as allocated: {unwritten}"
+
+    first_of_each = seq_map_r2c[:-1].tolist()
+    for partition in first_of_each:
+        assert torch.equal(cp_h0[partition], torch.zeros_like(cp_h0[partition]))
+
+
+@pytest.mark.parametrize(
+    "fallback",
+    [
+        pytest.param(False, marks=pytest.mark.smoke),
+        pytest.param(True, marks=pytest.mark.full),
+    ],
+)
+def test_every_partition_is_written_with_a_raw_initial_state(poisoned_empty, fallback):
+    """With an incoming state, each sequence's first partition carries it verbatim."""
+    ht, mt, mask, seq_map_r2c = _inputs(fallback)
+    raw_h0 = torch.randn(RAW_BATCH, CP_H, CP_DK, CP_DV, dtype=torch.float32, device="ptpu")
+    cp_h0 = cp_fwd.correct_initial_states(raw_h0, ht, mt, mask, seq_map_r2c)
+
+    unwritten = torch.isnan(cp_h0.cpu()).flatten(1).any(dim=1).nonzero().flatten().tolist()
+    assert not unwritten, f"partitions left as allocated: {unwritten}"
+
+    for raw_index, partition in enumerate(seq_map_r2c[:-1].tolist()):
+        torch.testing.assert_close(cp_h0[partition], raw_h0[raw_index])

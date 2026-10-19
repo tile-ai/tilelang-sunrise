@@ -10,13 +10,12 @@ import torch
 
 # BatchNormFwdOp input validation
 
+
 @pytest.mark.smoke
-
-
 class TestBatchNormFwdValidation:
-
     def _make_op(self):
         from tileops.ops.norm.batch_norm import BatchNormFwdOp
+
         return BatchNormFwdOp()
 
     def _make_inputs(self, device="ptpu", dtype=torch.float16):
@@ -28,14 +27,15 @@ class TestBatchNormFwdValidation:
         return x, weight, bias, rm, rv
 
     def test_rejects_cpu_tensor(self):
+        """The op layer is device-agnostic; the requirement belongs to these kernels."""
         op = self._make_op()
-        x_cpu = torch.randn(4, 8, 4, 4, dtype=torch.float16)
-        _, weight, bias, rm, rv = self._make_inputs()
-        with pytest.raises(ValueError, match="CUDA"):
-            op(x_cpu, rm, rv, weight, bias)
+        x, weight, bias, rm, rv = self._make_inputs(device="cpu")
+        with pytest.raises(ValueError, match="requires a GPU tensor"):
+            op(x, rm, rv, weight, bias)
 
     def test_rejects_wrong_dtype(self):
         from tileops.ops.norm.batch_norm import BatchNormFwdOp
+
         op = BatchNormFwdOp()
         x_wrong = torch.zeros(4, 8, 4, 4, device="ptpu", dtype=torch.int32)
         _, weight, bias, rm, rv = self._make_inputs()
@@ -52,12 +52,13 @@ class TestBatchNormFwdValidation:
 
 # BatchNorm torch.compile smoke tests
 
+
 @pytest.mark.smoke
 @pytest.mark.usefixtures("isolated_dynamo")
 class TestBatchNormCustomOp:
-
     def test_fwd_torch_compile_smoke(self):
         from tileops.ops.norm.batch_norm import BatchNormFwdOp
+
         op = BatchNormFwdOp(training=True)
         x = torch.randn(4, 8, 4, 4, device="ptpu", dtype=torch.float16)
         weight = torch.randn(8, device="ptpu", dtype=torch.float32)
@@ -72,6 +73,7 @@ class TestBatchNormCustomOp:
 
     def test_bwd_torch_compile_smoke(self):
         from tileops.ops.norm.batch_norm import BatchNormBwdOp
+
         N, C, H, W = 4, 8, 4, 4
         op = BatchNormBwdOp()
         grad_out = torch.randn(N, C, H, W, device="ptpu", dtype=torch.float16)
@@ -86,7 +88,3 @@ class TestBatchNormCustomOp:
         compiled = torch.compile(op, fullgraph=False, backend="eager")
         gx, gw, gb = compiled(grad_out, x, weight, mean, rstd)
         assert gx.shape == x.shape
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-vvs"])

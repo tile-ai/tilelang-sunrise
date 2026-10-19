@@ -1,13 +1,17 @@
 """Tests for packed GQA prefill with paged KV cache append."""
 
-from itertools import accumulate
-
 import pytest
 import torch
 
-from tileops.ops import (
-    GroupedQueryAttentionPrefillPagedWithKVCacheFwdOp,
-    RopeNeoxPositionIdsOp,
+from tileops.manifest import load_workloads
+from tileops.ops import GroupedQueryAttentionPrefillPagedWithKVCacheFwdOp
+from tileops.perf.formulas import gqa_prefill_paged_with_kv_cache_fwd_roofline
+from workloads.attention.gqa import (
+    fill_paged_cache_from_logical,
+    make_cu_seqlens,
+    make_interleaved_block_table,
+    make_unit_cache_scales,
+    paged_cache_row,
 )
 
 _PREFILL_PAGED_TOLERANCE = {
@@ -16,58 +20,26 @@ _PREFILL_PAGED_TOLERANCE = {
 }
 
 
-def _make_cu_seqlens(lengths: list[int]) -> torch.Tensor:
-    return torch.tensor([0, *accumulate(lengths)], device="cuda", dtype=torch.int32)
-
-
-def _physical_pos(block_table: torch.Tensor, batch_idx: int, logical_pos: int,
-                  page_size: int) -> int:
-    logical_page = logical_pos // page_size
-    page_offset = logical_pos % page_size
-    physical_page = int(block_table[batch_idx, logical_page].item())
-    return physical_page * page_size + page_offset
-
-
-def _make_block_table(batch: int, max_pages_per_req: int) -> torch.Tensor:
-    rows = []
-    for b in range(batch):
-        start = b * max_pages_per_req
-        pages = list(range(start, start + max_pages_per_req))
-        rows.append(pages[::2] + pages[1::2])
-    return torch.tensor(rows, device="cuda", dtype=torch.int32).contiguous()
-
-
-def _ones_cache_scales() -> tuple[torch.Tensor, torch.Tensor]:
-    scale = torch.ones((1,), device="cuda", dtype=torch.float32)
-    return scale, scale.clone()
-
-
-def _fill_paged_cache_from_logical(
-    k_pages: torch.Tensor,
-    v_pages: torch.Tensor,
-    k_old: list[torch.Tensor],
-    v_old: list[torch.Tensor],
-    block_table: torch.Tensor,
-    page_size: int,
-) -> None:
-    for b, (k_b, v_b) in enumerate(zip(k_old, v_old, strict=True)):
-        for pos in range(k_b.shape[0]):
-            physical_pos = _physical_pos(block_table, b, pos, page_size)
-            k_pages[physical_pos].copy_(k_b[pos])
-            v_pages[physical_pos].copy_(v_b[pos])
-
-
 def _apply_neox_rope_position_ids(
     x: torch.Tensor,
     position_ids: torch.Tensor,
     max_position: int,
     rotary_dim: int | None = None,
 ) -> torch.Tensor:
-    op = RopeNeoxPositionIdsOp(
-        max_position=max_position,
-        rotary_dim=rotary_dim,
-    )
-    return op(x, position_ids)
+    """GPT-NeoX RoPE on ``[tokens, heads, head_dim]``, in torch."""
+    rotary_dim = x.shape[-1] if rotary_dim is None else rotary_dim
+    half = rotary_dim // 2
+    inv_freq = 1.0 / (10000.0 ** (torch.arange(half, device=x.device, dtype=torch.float32) / half))
+    positions = torch.arange(max_position, device=x.device, dtype=torch.float32)
+    angles = torch.outer(positions, inv_freq)
+    # Rounded to x's dtype as the kernel's table is, then rotated in f32 as it rotates.
+    cos = angles.cos().to(x.dtype)[position_ids].float().unsqueeze(1)
+    sin = angles.sin().to(x.dtype)[position_ids].float().unsqueeze(1)
+
+    low = x[..., :half].float()
+    high = x[..., half:rotary_dim].float()
+    rotated = torch.cat([low * cos - high * sin, high * cos + low * sin], dim=-1)
+    return torch.cat([rotated.to(x.dtype), x[..., rotary_dim:]], dim=-1).contiguous()
 
 
 def _gqa_prefill_paged_ref(
@@ -84,6 +56,11 @@ def _gqa_prefill_paged_ref(
     is_causal: bool,
     softcap: float | None = None,
 ) -> torch.Tensor:
+    device = q.device
+    q, k_new, v_new = q.cpu(), k_new.cpu(), v_new.cpu()
+    k_old = [x.cpu() for x in k_old]
+    v_old = [x.cpu() for x in v_old]
+    cu_seqlens_q = cu_seqlens_q.cpu()
     groups = heads // heads_kv
     dim = q.shape[-1]
     scale = dim**-0.5
@@ -111,27 +88,102 @@ def _gqa_prefill_paged_ref(
             scores = scores.masked_fill(~mask.view(1, q_len, total_len), float("-inf"))
         probs = torch.softmax(scores, dim=-1).nan_to_num()
         outputs.append(torch.matmul(probs, v_bhsd).transpose(0, 1).to(q.dtype).contiguous())
-    return torch.cat(outputs, dim=0)
+    return torch.cat(outputs, dim=0).to(device)
 
 
-@pytest.mark.parametrize("q_lens, old_lens, heads, heads_kv, dim, is_causal, dtype", [
-    pytest.param([64, 96], [80, 128], 8, 2, 64, True, torch.float16,
-                 marks=pytest.mark.smoke, id="gqa_ratio4_mixed_fp16"),
-    pytest.param([17, 33], [37, 100], 8, 2, 64, True, torch.float16,
-                 marks=pytest.mark.smoke, id="gqa_unaligned_old_len_fp16"),
-    pytest.param([1], [511], 8, 2, 64, True, torch.float16,
-                 marks=pytest.mark.smoke, id="gqa_decode_len_capacity_boundary_fp16"),
-    pytest.param([1, 17], [511, 37], 8, 2, 64, True, torch.float16,
-                 marks=pytest.mark.smoke, id="gqa_mixed_capacity_boundary_fp16"),
-    pytest.param([64, 64], [64, 128], 8, 8, 64, True, torch.float16,
-                 marks=pytest.mark.smoke, id="mha_fp16"),
-    pytest.param([32, 64], [96, 160], 8, 1, 64, True, torch.float16,
-                 marks=pytest.mark.smoke, id="mqa_fp16"),
-    pytest.param([64, 96], [80, 128], 8, 2, 64, False, torch.float16,
-                 marks=pytest.mark.smoke, id="gqa_noncausal_fp16"),
-    pytest.param([64, 96], [80, 128], 8, 2, 64, True, torch.bfloat16,
-                 marks=pytest.mark.smoke, id="gqa_ratio4_bf16"),
-])
+@pytest.mark.parametrize(
+    "q_lens, old_lens, heads, heads_kv, dim, is_causal, dtype",
+    [
+        pytest.param(
+            [64, 96],
+            [80, 128],
+            8,
+            2,
+            64,
+            True,
+            torch.float16,
+            marks=pytest.mark.smoke,
+            id="gqa_ratio4_mixed_fp16",
+        ),
+        pytest.param(
+            [17, 33],
+            [37, 100],
+            8,
+            2,
+            64,
+            True,
+            torch.float16,
+            marks=pytest.mark.smoke,
+            id="gqa_unaligned_old_len_fp16",
+        ),
+        pytest.param(
+            [1],
+            [511],
+            8,
+            2,
+            64,
+            True,
+            torch.float16,
+            marks=pytest.mark.smoke,
+            id="gqa_decode_len_capacity_boundary_fp16",
+        ),
+        pytest.param(
+            [1, 17],
+            [511, 37],
+            8,
+            2,
+            64,
+            True,
+            torch.float16,
+            marks=pytest.mark.smoke,
+            id="gqa_mixed_capacity_boundary_fp16",
+        ),
+        pytest.param(
+            [64, 64],
+            [64, 128],
+            8,
+            8,
+            64,
+            True,
+            torch.float16,
+            marks=pytest.mark.smoke,
+            id="mha_fp16",
+        ),
+        pytest.param(
+            [32, 64],
+            [96, 160],
+            8,
+            1,
+            64,
+            True,
+            torch.float16,
+            marks=pytest.mark.smoke,
+            id="mqa_fp16",
+        ),
+        pytest.param(
+            [64, 96],
+            [80, 128],
+            8,
+            2,
+            64,
+            False,
+            torch.float16,
+            marks=pytest.mark.smoke,
+            id="gqa_noncausal_fp16",
+        ),
+        pytest.param(
+            [64, 96],
+            [80, 128],
+            8,
+            2,
+            64,
+            True,
+            torch.bfloat16,
+            marks=pytest.mark.smoke,
+            id="gqa_ratio4_bf16",
+        ),
+    ],
+)
 def test_gqa_prefill_paged_with_kv_cache_fwd(
     q_lens: list[int],
     old_lens: list[int],
@@ -146,24 +198,25 @@ def test_gqa_prefill_paged_with_kv_cache_fwd(
     max_pages_per_req = 8
     num_pages = batch * max_pages_per_req
     total_q = sum(q_lens)
-    block_table = _make_block_table(batch, max_pages_per_req)
-    cu_seqlens_q = _make_cu_seqlens(q_lens)
-    cache_seqlens = torch.tensor(old_lens, device="cuda", dtype=torch.int32)
-    q = torch.randn(total_q, heads, dim, device="cuda", dtype=dtype).contiguous()
-    k_new = torch.randn(total_q, heads_kv, dim, device="cuda", dtype=dtype).contiguous()
-    v_new = torch.randn(total_q, heads_kv, dim, device="cuda", dtype=dtype).contiguous()
-    k_pages = torch.zeros(num_pages * page_size, heads_kv, dim, device="cuda",
-                          dtype=dtype).contiguous()
+    block_table = make_interleaved_block_table(batch, max_pages_per_req)
+    cu_seqlens_q = make_cu_seqlens(q_lens)
+    cache_seqlens = torch.tensor(old_lens, device="ptpu", dtype=torch.int32)
+    q = torch.randn(total_q, heads, dim, device="ptpu", dtype=dtype).contiguous()
+    k_new = torch.randn(total_q, heads_kv, dim, device="ptpu", dtype=dtype).contiguous()
+    v_new = torch.randn(total_q, heads_kv, dim, device="ptpu", dtype=dtype).contiguous()
+    k_pages = torch.zeros(
+        num_pages * page_size, heads_kv, dim, device="ptpu", dtype=dtype
+    ).contiguous()
     v_pages = torch.zeros_like(k_pages)
     k_old = [
-        torch.randn(old_len, heads_kv, dim, device="cuda", dtype=dtype).contiguous()
+        torch.randn(old_len, heads_kv, dim, device="ptpu", dtype=dtype).contiguous()
         for old_len in old_lens
     ]
     v_old = [
-        torch.randn(old_len, heads_kv, dim, device="cuda", dtype=dtype).contiguous()
+        torch.randn(old_len, heads_kv, dim, device="ptpu", dtype=dtype).contiguous()
         for old_len in old_lens
     ]
-    _fill_paged_cache_from_logical(k_pages, v_pages, k_old, v_old, block_table, page_size)
+    fill_paged_cache_from_logical(k_pages, v_pages, k_old, v_old, block_table, page_size)
     k_pages_before = k_pages.clone()
     v_pages_before = v_pages.clone()
     ref = _gqa_prefill_paged_ref(
@@ -186,14 +239,22 @@ def test_gqa_prefill_paged_with_kv_cache_fwd(
         page_size=page_size,
         dim=dim,
         is_causal=is_causal,
-        dtype=dtype,
     )
-    k_scale, v_scale = _ones_cache_scales()
+    k_scale, v_scale = make_unit_cache_scales()
 
     output = op(
-        q, k_new, v_new, k_pages, v_pages, k_scale, v_scale, cu_seqlens_q, cache_seqlens,
+        q,
+        k_new,
+        v_new,
+        k_pages,
+        v_pages,
+        k_scale,
+        v_scale,
+        cu_seqlens_q,
+        cache_seqlens,
         block_table,
-        max(q_lens))
+        max(q_lens),
+    )
     assert isinstance(output, torch.Tensor)
     atol, rtol = _PREFILL_PAGED_TOLERANCE[dtype]
     torch.testing.assert_close(output, ref, atol=atol, rtol=rtol)
@@ -201,26 +262,30 @@ def test_gqa_prefill_paged_with_kv_cache_fwd(
     for b, (q_len, old_len) in enumerate(zip(q_lens, old_lens, strict=True)):
         q_start = int(cu_seqlens_q[b].item())
         for i in range(q_len):
-            physical_pos = _physical_pos(block_table, b, old_len + i, page_size)
-            torch.testing.assert_close(k_pages[physical_pos], k_new[q_start + i])
-            torch.testing.assert_close(v_pages[physical_pos], v_new[q_start + i])
+            row = paged_cache_row(block_table, b, old_len + i, page_size)
+            torch.testing.assert_close(k_pages[row], k_new[q_start + i])
+            torch.testing.assert_close(v_pages[row], v_new[q_start + i])
 
     for b, old_len in enumerate(old_lens):
         for pos in range(old_len):
-            physical_pos = _physical_pos(block_table, b, pos, page_size)
-            torch.testing.assert_close(k_pages[physical_pos], k_pages_before[physical_pos])
-            torch.testing.assert_close(v_pages[physical_pos], v_pages_before[physical_pos])
+            row = paged_cache_row(block_table, b, pos, page_size)
+            torch.testing.assert_close(k_pages[row], k_pages_before[row])
+            torch.testing.assert_close(v_pages[row], v_pages_before[row])
 
 
+@pytest.mark.skip(reason="FP8/S3 is outside the S2-only upgrade scope")
 @pytest.mark.smoke
-@pytest.mark.parametrize("is_causal, softcap, dtype, page_size", [
-    pytest.param(True, None, torch.float16, 64, id="causal-fp16-page64"),
-    pytest.param(False, None, torch.float16, 64, id="noncausal-fp16-page64"),
-    pytest.param(True, 2.0, torch.float16, 64, id="causal-softcap-fp16-page64"),
-    pytest.param(True, None, torch.bfloat16, 64, id="causal-bf16-page64"),
-    pytest.param(True, None, torch.float16, 16, id="causal-fp16-page16"),
-    pytest.param(True, None, torch.float16, 128, id="causal-fp16-page128"),
-])
+@pytest.mark.parametrize(
+    "is_causal, softcap, dtype, page_size",
+    [
+        pytest.param(True, None, torch.float16, 64, id="causal-fp16-page64"),
+        pytest.param(False, None, torch.float16, 64, id="noncausal-fp16-page64"),
+        pytest.param(True, 2.0, torch.float16, 64, id="causal-softcap-fp16-page64"),
+        pytest.param(True, None, torch.bfloat16, 64, id="causal-bf16-page64"),
+        pytest.param(True, None, torch.float16, 16, id="causal-fp16-page16"),
+        pytest.param(True, None, torch.float16, 128, id="causal-fp16-page128"),
+    ],
+)
 def test_gqa_prefill_paged_with_fp8_kv_cache_fwd(
     is_causal: bool,
     softcap: float | None,
@@ -234,36 +299,44 @@ def test_gqa_prefill_paged_with_fp8_kv_cache_fwd(
     max_pages_per_req = 8
     num_pages = batch * max_pages_per_req
     total_q = sum(q_lens)
-    block_table = _make_block_table(batch, max_pages_per_req)
-    cu_seqlens_q = _make_cu_seqlens(q_lens)
-    cache_seqlens = torch.tensor(old_lens, device="cuda", dtype=torch.int32)
-    k_scale = torch.tensor([0.02], device="cuda", dtype=torch.float32)
-    v_scale = torch.tensor([0.02], device="cuda", dtype=torch.float32)
+    block_table = make_interleaved_block_table(batch, max_pages_per_req)
+    cu_seqlens_q = make_cu_seqlens(q_lens)
+    cache_seqlens = torch.tensor(old_lens, device="ptpu", dtype=torch.int32)
+    k_scale = torch.tensor([0.02], device="ptpu", dtype=torch.float32)
+    v_scale = torch.tensor([0.02], device="ptpu", dtype=torch.float32)
 
-    q = torch.randn(total_q, heads, dim, device="cuda", dtype=dtype).contiguous()
-    k_new = (torch.randn(total_q, heads_kv, dim, device="cuda", dtype=dtype) *
-             0.5).contiguous()
-    v_new = (torch.randn(total_q, heads_kv, dim, device="cuda", dtype=dtype) *
-             0.5).contiguous()
-    k_pages = torch.zeros(num_pages * page_size, heads_kv, dim, device="cuda",
-                          dtype=cache_dtype).contiguous()
+    q = torch.randn(total_q, heads, dim, device="ptpu", dtype=dtype).contiguous()
+    k_new = (torch.randn(total_q, heads_kv, dim, device="ptpu", dtype=dtype) * 0.5).contiguous()
+    v_new = (torch.randn(total_q, heads_kv, dim, device="ptpu", dtype=dtype) * 0.5).contiguous()
+    k_pages = torch.zeros(
+        num_pages * page_size, heads_kv, dim, device="ptpu", dtype=cache_dtype
+    ).contiguous()
     v_pages = torch.zeros_like(k_pages)
     k_old = [
-        (torch.randn(old_len, heads_kv, dim, device="cuda", dtype=dtype) * 0.5).contiguous()
+        (torch.randn(old_len, heads_kv, dim, device="ptpu", dtype=dtype) * 0.5).contiguous()
         for old_len in old_lens
     ]
     v_old = [
-        (torch.randn(old_len, heads_kv, dim, device="cuda", dtype=dtype) * 0.5).contiguous()
+        (torch.randn(old_len, heads_kv, dim, device="ptpu", dtype=dtype) * 0.5).contiguous()
         for old_len in old_lens
     ]
-    k_old_quant = [(k_b.float() / k_scale[0]).to(cache_dtype).contiguous() for k_b in k_old]
-    v_old_quant = [(v_b.float() / v_scale[0]).to(cache_dtype).contiguous() for v_b in v_old]
-    _fill_paged_cache_from_logical(
-        k_pages, v_pages, k_old_quant, v_old_quant, block_table, page_size)
+    k_old_quant = [
+        (k_b.cpu().float() / k_scale.cpu()[0]).to(cache_dtype).ptpu().contiguous() for k_b in k_old
+    ]
+    v_old_quant = [
+        (v_b.cpu().float() / v_scale.cpu()[0]).to(cache_dtype).ptpu().contiguous() for v_b in v_old
+    ]
+    fill_paged_cache_from_logical(
+        k_pages, v_pages, k_old_quant, v_old_quant, block_table, page_size
+    )
     k_pages_before = k_pages.clone()
     v_pages_before = v_pages.clone()
-    k_old_dequant = [(k_b.float() * k_scale[0]).to(dtype).contiguous() for k_b in k_old_quant]
-    v_old_dequant = [(v_b.float() * v_scale[0]).to(dtype).contiguous() for v_b in v_old_quant]
+    k_old_dequant = [
+        (k_b.cpu().float() * k_scale.cpu()[0]).to(dtype).contiguous() for k_b in k_old_quant
+    ]
+    v_old_dequant = [
+        (v_b.cpu().float() * v_scale.cpu()[0]).to(dtype).contiguous() for v_b in v_old_quant
+    ]
     ref = _gqa_prefill_paged_ref(
         q,
         k_new,
@@ -285,42 +358,60 @@ def test_gqa_prefill_paged_with_fp8_kv_cache_fwd(
         page_size=page_size,
         dim=dim,
         is_causal=is_causal,
-        dtype=dtype,
         cache_dtype=cache_dtype,
         softcap=softcap,
     )
 
     output = op(
-        q, k_new, v_new, k_pages, v_pages, k_scale, v_scale, cu_seqlens_q, cache_seqlens,
-        block_table, max(q_lens))
+        q,
+        k_new,
+        v_new,
+        k_pages,
+        v_pages,
+        k_scale,
+        v_scale,
+        cu_seqlens_q,
+        cache_seqlens,
+        block_table,
+        max(q_lens),
+    )
     assert isinstance(output, torch.Tensor)
     torch.testing.assert_close(output, ref, atol=8e-2, rtol=2e-2)
 
     for b, (q_len, old_len) in enumerate(zip(q_lens, old_lens, strict=True)):
         q_start = int(cu_seqlens_q[b].item())
         for i in range(q_len):
-            physical_pos = _physical_pos(block_table, b, old_len + i, page_size)
-            expected_k = (k_new[q_start + i].float() / k_scale[0]).to(cache_dtype).float()
-            expected_v = (v_new[q_start + i].float() / v_scale[0]).to(cache_dtype).float()
-            torch.testing.assert_close(k_pages[physical_pos].float(), expected_k, atol=0, rtol=0)
-            torch.testing.assert_close(v_pages[physical_pos].float(), expected_v, atol=0, rtol=0)
+            row = paged_cache_row(block_table, b, old_len + i, page_size)
+            expected_k = (
+                (k_new[q_start + i].cpu().float() / k_scale.cpu()[0]).to(cache_dtype).float()
+            )
+            expected_v = (
+                (v_new[q_start + i].cpu().float() / v_scale.cpu()[0]).to(cache_dtype).float()
+            )
+            torch.testing.assert_close(k_pages[row].cpu().float(), expected_k, atol=0, rtol=0)
+            torch.testing.assert_close(v_pages[row].cpu().float(), expected_v, atol=0, rtol=0)
 
     for b, old_len in enumerate(old_lens):
         for pos in range(old_len):
-            physical_pos = _physical_pos(block_table, b, pos, page_size)
+            row = paged_cache_row(block_table, b, pos, page_size)
             torch.testing.assert_close(
-                k_pages[physical_pos].float(), k_pages_before[physical_pos].float())
+                k_pages[row].cpu().float(), k_pages_before[row].cpu().float()
+            )
             torch.testing.assert_close(
-                v_pages[physical_pos].float(), v_pages_before[physical_pos].float())
+                v_pages[row].cpu().float(), v_pages_before[row].cpu().float()
+            )
 
 
 @pytest.mark.smoke
-@pytest.mark.parametrize("scale_name,bad_value", [
-    pytest.param("k_scale", 0.0, id="k_zero"),
-    pytest.param("k_scale", -0.01, id="k_negative"),
-    pytest.param("k_scale", float("inf"), id="k_inf"),
-    pytest.param("v_scale", float("nan"), id="v_nan"),
-])
+@pytest.mark.parametrize(
+    "scale_name,bad_value",
+    [
+        pytest.param("k_scale", 0.0, id="k_zero"),
+        pytest.param("k_scale", -0.01, id="k_negative"),
+        pytest.param("k_scale", float("inf"), id="k_inf"),
+        pytest.param("v_scale", float("nan"), id="v_nan"),
+    ],
+)
 def test_gqa_prefill_paged_with_fp8_kv_cache_rejects_invalid_scales(
     scale_name: str,
     bad_value: float,
@@ -328,20 +419,20 @@ def test_gqa_prefill_paged_with_fp8_kv_cache_rejects_invalid_scales(
     batch, heads, heads_kv, dim = 1, 8, 2, 64
     q_lens = [1]
     page_size, max_pages_per_req = 64, 1
-    q = torch.randn(sum(q_lens), heads, dim, device="cuda", dtype=torch.float16).contiguous()
-    k_new = torch.randn(sum(q_lens), heads_kv, dim, device="cuda",
-                        dtype=torch.float16).contiguous()
+    q = torch.randn(sum(q_lens), heads, dim, device="ptpu", dtype=torch.float16).contiguous()
+    k_new = torch.randn(sum(q_lens), heads_kv, dim, device="ptpu", dtype=torch.float16).contiguous()
     v_new = torch.randn_like(k_new)
-    k_pages = torch.zeros(max_pages_per_req * page_size, heads_kv, dim, device="cuda",
-                          dtype=torch.float8_e4m3fn).contiguous()
+    k_pages = torch.zeros(
+        max_pages_per_req * page_size, heads_kv, dim, device="ptpu", dtype=torch.float8_e4m3fn
+    ).contiguous()
     v_pages = torch.zeros_like(k_pages)
-    k_scale = torch.tensor([0.02], device="cuda", dtype=torch.float32)
-    v_scale = torch.tensor([0.02], device="cuda", dtype=torch.float32)
+    k_scale = torch.tensor([0.02], device="ptpu", dtype=torch.float32)
+    v_scale = torch.tensor([0.02], device="ptpu", dtype=torch.float32)
     if scale_name == "k_scale":
-        k_scale = torch.tensor([bad_value], device="cuda", dtype=torch.float32)
+        k_scale = torch.tensor([bad_value], device="ptpu", dtype=torch.float32)
     else:
-        v_scale = torch.tensor([bad_value], device="cuda", dtype=torch.float32)
-    block_table = torch.tensor([[0]], device="cuda", dtype=torch.int32)
+        v_scale = torch.tensor([bad_value], device="ptpu", dtype=torch.float32)
+    block_table = torch.tensor([[0]], device="ptpu", dtype=torch.int32)
     op = GroupedQueryAttentionPrefillPagedWithKVCacheFwdOp(
         batch=batch,
         heads=heads,
@@ -349,24 +440,35 @@ def test_gqa_prefill_paged_with_fp8_kv_cache_rejects_invalid_scales(
         max_pages_per_req=max_pages_per_req,
         page_size=page_size,
         dim=dim,
-        dtype=torch.float16,
         cache_dtype=torch.float8_e4m3fn,
     )
 
     with pytest.raises(ValueError, match=f"{scale_name}.*finite positive"):
         op(
-            q, k_new, v_new, k_pages, v_pages, k_scale, v_scale,
-            _make_cu_seqlens(q_lens), torch.tensor([0], device="cuda", dtype=torch.int32),
-            block_table, max(q_lens))
+            q,
+            k_new,
+            v_new,
+            k_pages,
+            v_pages,
+            k_scale,
+            v_scale,
+            make_cu_seqlens(q_lens),
+            torch.tensor([0], device="ptpu", dtype=torch.int32),
+            block_table,
+            max(q_lens),
+        )
 
 
 @pytest.mark.smoke
-@pytest.mark.parametrize("rotary_dim, is_causal, softcap", [
-    pytest.param(None, True, None, id="full-causal"),
-    pytest.param(32, True, None, id="partial-causal"),
-    pytest.param(32, False, None, id="partial-noncausal"),
-    pytest.param(32, True, 2.0, id="partial-causal-softcap"),
-])
+@pytest.mark.parametrize(
+    "rotary_dim, is_causal, softcap",
+    [
+        pytest.param(None, True, None, id="full-causal"),
+        pytest.param(32, True, None, id="partial-causal"),
+        pytest.param(32, False, None, id="partial-noncausal"),
+        pytest.param(32, True, 2.0, id="partial-causal-softcap"),
+    ],
+)
 def test_gqa_prefill_paged_with_kv_cache_fused_rope(
     rotary_dim: int | None,
     is_causal: bool,
@@ -381,44 +483,49 @@ def test_gqa_prefill_paged_with_kv_cache_fused_rope(
     num_pages = batch * max_pages_per_req
     total_q = sum(q_lens)
     max_position = max(old + new for old, new in zip(old_lens, q_lens, strict=True)) + 1
-    block_table = _make_block_table(batch, max_pages_per_req)
-    cu_seqlens_q = _make_cu_seqlens(q_lens)
-    cache_seqlens = torch.tensor(old_lens, device="cuda", dtype=torch.int32)
+    block_table = make_interleaved_block_table(batch, max_pages_per_req)
+    cu_seqlens_q = make_cu_seqlens(q_lens)
+    cache_seqlens = torch.tensor(old_lens, device="ptpu", dtype=torch.int32)
 
-    q_raw = torch.randn(total_q, heads, dim, device="cuda", dtype=dtype).contiguous()
-    k_new_raw = torch.randn(total_q, heads_kv, dim, device="cuda", dtype=dtype).contiguous()
-    v_new = torch.randn(total_q, heads_kv, dim, device="cuda", dtype=dtype).contiguous()
-    k_pages = torch.zeros(num_pages * page_size, heads_kv, dim, device="cuda",
-                          dtype=dtype).contiguous()
+    q_raw = torch.randn(total_q, heads, dim, device="ptpu", dtype=dtype).contiguous()
+    k_new_raw = torch.randn(total_q, heads_kv, dim, device="ptpu", dtype=dtype).contiguous()
+    v_new = torch.randn(total_q, heads_kv, dim, device="ptpu", dtype=dtype).contiguous()
+    k_pages = torch.zeros(
+        num_pages * page_size, heads_kv, dim, device="ptpu", dtype=dtype
+    ).contiguous()
     v_pages = torch.zeros_like(k_pages)
 
-    new_positions = torch.cat([
-        torch.arange(old_len, old_len + q_len, device="cuda", dtype=torch.int32)
-        for old_len, q_len in zip(old_lens, q_lens, strict=True)
-    ])
-    old_positions = torch.cat([
-        torch.arange(old_len, device="cuda", dtype=torch.int32)
-        for old_len in old_lens
-    ])
-    q_rot = _apply_neox_rope_position_ids(
-        q_raw, new_positions, max_position, rotary_dim=rotary_dim)
+    new_positions = torch.cat(
+        [
+            torch.arange(old_len, old_len + q_len, device="ptpu", dtype=torch.int32)
+            for old_len, q_len in zip(old_lens, q_lens, strict=True)
+        ]
+    )
+    old_positions = torch.cat(
+        [torch.arange(old_len, device="ptpu", dtype=torch.int32) for old_len in old_lens]
+    )
+    q_rot = _apply_neox_rope_position_ids(q_raw, new_positions, max_position, rotary_dim=rotary_dim)
     k_new_rot = _apply_neox_rope_position_ids(
-        k_new_raw, new_positions, max_position, rotary_dim=rotary_dim)
+        k_new_raw, new_positions, max_position, rotary_dim=rotary_dim
+    )
     k_old_raw = [
-        torch.randn(old_len, heads_kv, dim, device="cuda", dtype=dtype).contiguous()
+        torch.randn(old_len, heads_kv, dim, device="ptpu", dtype=dtype).contiguous()
         for old_len in old_lens
     ]
     v_old = [
-        torch.randn(old_len, heads_kv, dim, device="cuda", dtype=dtype).contiguous()
+        torch.randn(old_len, heads_kv, dim, device="ptpu", dtype=dtype).contiguous()
         for old_len in old_lens
     ]
-    k_old = list(torch.split(
-        _apply_neox_rope_position_ids(
-            torch.cat(k_old_raw, dim=0), old_positions, max_position, rotary_dim=rotary_dim),
-        old_lens,
-        dim=0,
-    ))
-    _fill_paged_cache_from_logical(k_pages, v_pages, k_old, v_old, block_table, page_size)
+    k_old = list(
+        torch.split(
+            _apply_neox_rope_position_ids(
+                torch.cat(k_old_raw, dim=0), old_positions, max_position, rotary_dim=rotary_dim
+            ),
+            old_lens,
+            dim=0,
+        )
+    )
+    fill_paged_cache_from_logical(k_pages, v_pages, k_old, v_old, block_table, page_size)
     k_pages_before = k_pages.clone()
     v_pages_before = v_pages.clone()
 
@@ -443,30 +550,40 @@ def test_gqa_prefill_paged_with_kv_cache_fused_rope(
         page_size=page_size,
         dim=dim,
         is_causal=is_causal,
-        dtype=dtype,
         softcap=softcap,
         fuse_rope=True,
         max_position=max_position,
         rotary_dim=rotary_dim,
     )
-    k_scale, v_scale = _ones_cache_scales()
+    k_scale, v_scale = make_unit_cache_scales()
 
     output = op(
-        q_raw, k_new_raw, v_new, k_pages, v_pages, k_scale, v_scale, cu_seqlens_q,
+        q_raw,
+        k_new_raw,
+        v_new,
+        k_pages,
+        v_pages,
+        k_scale,
+        v_scale,
+        cu_seqlens_q,
         cache_seqlens,
-        block_table, max(q_lens))
-    torch.testing.assert_close(output, ref, atol=5e-3, rtol=1e-5)
+        block_table,
+        max(q_lens),
+    )
+    atol, rtol = _PREFILL_PAGED_TOLERANCE[dtype]
+    torch.testing.assert_close(output, ref, atol=atol, rtol=rtol)
 
     for b, (q_len, old_len) in enumerate(zip(q_lens, old_lens, strict=True)):
         q_start = int(cu_seqlens_q[b].item())
         for i in range(q_len):
-            physical_pos = _physical_pos(block_table, b, old_len + i, page_size)
-            torch.testing.assert_close(k_pages[physical_pos], k_new_rot[q_start + i])
-            torch.testing.assert_close(v_pages[physical_pos], v_new[q_start + i])
+            row = paged_cache_row(block_table, b, old_len + i, page_size)
+            # Two rotations of the same input, not a copy: the kernel's against the reference.
+            torch.testing.assert_close(k_pages[row], k_new_rot[q_start + i], atol=atol, rtol=rtol)
+            torch.testing.assert_close(v_pages[row], v_new[q_start + i])
         for pos in range(old_len):
-            physical_pos = _physical_pos(block_table, b, pos, page_size)
-            torch.testing.assert_close(k_pages[physical_pos], k_pages_before[physical_pos])
-            torch.testing.assert_close(v_pages[physical_pos], v_pages_before[physical_pos])
+            row = paged_cache_row(block_table, b, pos, page_size)
+            torch.testing.assert_close(k_pages[row], k_pages_before[row])
+            torch.testing.assert_close(v_pages[row], v_pages_before[row])
 
 
 @pytest.mark.smoke
@@ -475,14 +592,14 @@ def test_gqa_prefill_paged_with_kv_cache_validates_capacity() -> None:
     page_size, max_pages_per_req = 64, 2
     q_lens = [65]
     old_lens = [64]
-    q = torch.randn(sum(q_lens), heads, dim, device="cuda", dtype=torch.float16).contiguous()
-    k_new = torch.randn(sum(q_lens), heads_kv, dim, device="cuda",
-                        dtype=torch.float16).contiguous()
+    q = torch.randn(sum(q_lens), heads, dim, device="ptpu", dtype=torch.float16).contiguous()
+    k_new = torch.randn(sum(q_lens), heads_kv, dim, device="ptpu", dtype=torch.float16).contiguous()
     v_new = torch.randn_like(k_new)
-    k_pages = torch.zeros(max_pages_per_req * page_size, heads_kv, dim, device="cuda",
-                          dtype=torch.float16).contiguous()
+    k_pages = torch.zeros(
+        max_pages_per_req * page_size, heads_kv, dim, device="ptpu", dtype=torch.float16
+    ).contiguous()
     v_pages = torch.zeros_like(k_pages)
-    block_table = torch.tensor([[0, 1]], device="cuda", dtype=torch.int32)
+    block_table = torch.tensor([[0, 1]], device="ptpu", dtype=torch.int32)
     op = GroupedQueryAttentionPrefillPagedWithKVCacheFwdOp(
         batch=batch,
         heads=heads,
@@ -490,14 +607,23 @@ def test_gqa_prefill_paged_with_kv_cache_validates_capacity() -> None:
         max_pages_per_req=max_pages_per_req,
         page_size=page_size,
         dim=dim,
-        dtype=torch.float16,
     )
-    k_scale, v_scale = _ones_cache_scales()
+    k_scale, v_scale = make_unit_cache_scales()
 
     with pytest.raises(ValueError, match="capacity"):
         op(
-            q, k_new, v_new, k_pages, v_pages, k_scale, v_scale, _make_cu_seqlens(q_lens),
-            torch.tensor(old_lens, device="cuda", dtype=torch.int32), block_table, max(q_lens))
+            q,
+            k_new,
+            v_new,
+            k_pages,
+            v_pages,
+            k_scale,
+            v_scale,
+            make_cu_seqlens(q_lens),
+            torch.tensor(old_lens, device="ptpu", dtype=torch.int32),
+            block_table,
+            max(q_lens),
+        )
 
 
 @pytest.mark.smoke
@@ -510,15 +636,17 @@ def test_gqa_prefill_paged_with_kv_cache_requires_power_of_two_page_size() -> No
             max_pages_per_req=8,
             page_size=24,
             dim=64,
-            dtype=torch.float16,
         )
 
 
-@pytest.mark.parametrize("page_size", [
-    pytest.param(16, marks=pytest.mark.smoke, id="page16_multi_page_per_block"),
-    pytest.param(32, marks=pytest.mark.smoke, id="page32_multi_page_per_block"),
-    pytest.param(128, marks=pytest.mark.smoke, id="page128_blocks_per_page"),
-])
+@pytest.mark.parametrize(
+    "page_size",
+    [
+        pytest.param(16, marks=pytest.mark.smoke, id="page16_multi_page_per_block"),
+        pytest.param(32, marks=pytest.mark.smoke, id="page32_multi_page_per_block"),
+        pytest.param(128, marks=pytest.mark.smoke, id="page128_blocks_per_page"),
+    ],
+)
 def test_gqa_prefill_paged_with_kv_cache_page_sizes(page_size: int) -> None:
     q_lens = [32, 64]
     old_lens = [48, 80]
@@ -527,24 +655,25 @@ def test_gqa_prefill_paged_with_kv_cache_page_sizes(page_size: int) -> None:
     max_pages_per_req = 16
     num_pages = batch * max_pages_per_req
     total_q = sum(q_lens)
-    block_table = _make_block_table(batch, max_pages_per_req)
-    cu_seqlens_q = _make_cu_seqlens(q_lens)
-    cache_seqlens = torch.tensor(old_lens, device="cuda", dtype=torch.int32)
-    q = torch.randn(total_q, heads, dim, device="cuda", dtype=dtype).contiguous()
-    k_new = torch.randn(total_q, heads_kv, dim, device="cuda", dtype=dtype).contiguous()
-    v_new = torch.randn(total_q, heads_kv, dim, device="cuda", dtype=dtype).contiguous()
-    k_pages = torch.zeros(num_pages * page_size, heads_kv, dim, device="cuda",
-                          dtype=dtype).contiguous()
+    block_table = make_interleaved_block_table(batch, max_pages_per_req)
+    cu_seqlens_q = make_cu_seqlens(q_lens)
+    cache_seqlens = torch.tensor(old_lens, device="ptpu", dtype=torch.int32)
+    q = torch.randn(total_q, heads, dim, device="ptpu", dtype=dtype).contiguous()
+    k_new = torch.randn(total_q, heads_kv, dim, device="ptpu", dtype=dtype).contiguous()
+    v_new = torch.randn(total_q, heads_kv, dim, device="ptpu", dtype=dtype).contiguous()
+    k_pages = torch.zeros(
+        num_pages * page_size, heads_kv, dim, device="ptpu", dtype=dtype
+    ).contiguous()
     v_pages = torch.zeros_like(k_pages)
     k_old = [
-        torch.randn(old_len, heads_kv, dim, device="cuda", dtype=dtype).contiguous()
+        torch.randn(old_len, heads_kv, dim, device="ptpu", dtype=dtype).contiguous()
         for old_len in old_lens
     ]
     v_old = [
-        torch.randn(old_len, heads_kv, dim, device="cuda", dtype=dtype).contiguous()
+        torch.randn(old_len, heads_kv, dim, device="ptpu", dtype=dtype).contiguous()
         for old_len in old_lens
     ]
-    _fill_paged_cache_from_logical(k_pages, v_pages, k_old, v_old, block_table, page_size)
+    fill_paged_cache_from_logical(k_pages, v_pages, k_old, v_old, block_table, page_size)
     ref = _gqa_prefill_paged_ref(
         q,
         k_new,
@@ -564,12 +693,131 @@ def test_gqa_prefill_paged_with_kv_cache_page_sizes(page_size: int) -> None:
         max_pages_per_req=max_pages_per_req,
         page_size=page_size,
         dim=dim,
-        dtype=dtype,
     )
-    k_scale, v_scale = _ones_cache_scales()
+    k_scale, v_scale = make_unit_cache_scales()
 
     output = op(
-        q, k_new, v_new, k_pages, v_pages, k_scale, v_scale, cu_seqlens_q, cache_seqlens,
+        q,
+        k_new,
+        v_new,
+        k_pages,
+        v_pages,
+        k_scale,
+        v_scale,
+        cu_seqlens_q,
+        cache_seqlens,
         block_table,
-        max(q_lens))
+        max(q_lens),
+    )
     torch.testing.assert_close(output, ref, atol=5e-3, rtol=1e-5)
+
+
+@pytest.mark.smoke
+def test_gqa_prefill_paged_serves_two_dtypes_from_one_instance() -> None:
+    """One instance answers both element types, each on its own kernel."""
+    q_lens = [32, 64]
+    old_lens = [48, 80]
+    batch, heads, heads_kv, dim = 2, 8, 2, 64
+    page_size, max_pages_per_req = 64, 8
+    num_pages = batch * max_pages_per_req
+    total_q = sum(q_lens)
+    block_table = make_interleaved_block_table(batch, max_pages_per_req)
+    cu_seqlens_q = make_cu_seqlens(q_lens)
+    cache_seqlens = torch.tensor(old_lens, device="ptpu", dtype=torch.int32)
+    k_scale, v_scale = make_unit_cache_scales()
+    op = GroupedQueryAttentionPrefillPagedWithKVCacheFwdOp(
+        batch=batch,
+        heads=heads,
+        heads_kv=heads_kv,
+        max_pages_per_req=max_pages_per_req,
+        page_size=page_size,
+        dim=dim,
+    )
+
+    for dtype in (torch.float16, torch.bfloat16):
+        q = torch.randn(total_q, heads, dim, device="ptpu", dtype=dtype).contiguous()
+        k_new = torch.randn(total_q, heads_kv, dim, device="ptpu", dtype=dtype).contiguous()
+        v_new = torch.randn(total_q, heads_kv, dim, device="ptpu", dtype=dtype).contiguous()
+        k_pages = torch.zeros(
+            num_pages * page_size, heads_kv, dim, device="ptpu", dtype=dtype
+        ).contiguous()
+        v_pages = torch.zeros_like(k_pages)
+        k_old = [
+            torch.randn(old_len, heads_kv, dim, device="ptpu", dtype=dtype).contiguous()
+            for old_len in old_lens
+        ]
+        v_old = [
+            torch.randn(old_len, heads_kv, dim, device="ptpu", dtype=dtype).contiguous()
+            for old_len in old_lens
+        ]
+        fill_paged_cache_from_logical(k_pages, v_pages, k_old, v_old, block_table, page_size)
+        ref = _gqa_prefill_paged_ref(
+            q,
+            k_new,
+            v_new,
+            k_old,
+            v_old,
+            cu_seqlens_q,
+            batch=batch,
+            heads=heads,
+            heads_kv=heads_kv,
+            is_causal=True,
+        )
+        output = op(
+            q,
+            k_new,
+            v_new,
+            k_pages,
+            v_pages,
+            k_scale,
+            v_scale,
+            cu_seqlens_q,
+            cache_seqlens,
+            block_table,
+            max(q_lens),
+        )
+        assert output.dtype == dtype
+        atol, rtol = _PREFILL_PAGED_TOLERANCE[dtype]
+        torch.testing.assert_close(output, ref, atol=atol, rtol=rtol)
+
+    assert set(op.built_kernels("gqa_prefill_paged_with_kv_cache_fwd_kernel")) == {
+        torch.float16,
+        torch.bfloat16,
+    }
+
+
+# ----------------------------------------------------------------------
+# Roofline contract
+# ----------------------------------------------------------------------
+
+
+_PAGED_PREFILL_OP = "GroupedQueryAttentionPrefillPagedWithKVCacheFwdOp"
+_MIXED_QWEN_LABEL = "qwen35-9b-prefill-paged-fullattn-mixed-b8-p64-partial-rope64"
+_BENCH_Q_LENS = [256, 512, 768, 1024, 384, 640, 896, 128]
+_BENCH_CACHE_LENS = [4096, 8192, 16384, 32768, 12288, 24576, 30720, 2048]
+
+
+def _workload_by_label(label: str) -> dict:
+    for workload in load_workloads(_PAGED_PREFILL_OP):
+        if workload.get("label") == label:
+            return workload
+    raise AssertionError(f"workload {label!r} not found")
+
+
+@pytest.mark.smoke
+def test_gqa_prefill_paged_mixed_manifest_matches_benchmark_lengths() -> None:
+    workload = _workload_by_label(_MIXED_QWEN_LABEL)
+
+    assert workload["q_lens"] == _BENCH_Q_LENS
+    assert workload["cache_lens"] == _BENCH_CACHE_LENS
+    assert sum(workload["q_lens"]) == workload["total_q"]
+
+
+@pytest.mark.smoke
+def test_gqa_prefill_paged_roofline_accepts_mixed_manifest_workload() -> None:
+    workload = _workload_by_label(_MIXED_QWEN_LABEL)
+
+    flops, nbytes = gqa_prefill_paged_with_kv_cache_fwd_roofline(**workload)
+
+    assert flops > 0
+    assert nbytes > 0

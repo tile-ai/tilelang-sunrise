@@ -1,0 +1,199 @@
+"""Which implementation each non-attention family lands on.
+
+One row per region the family's own predicates used to draw, including the
+boundaries they turned on: element type, dimensions, layout, and architecture.
+Selection is asserted through ``select_kernel_key``, which resolves the key
+without compiling anything.
+"""
+
+import itertools
+
+import pytest
+import torch
+
+from tileops.kernels.gemm.call_spec import GemmCall
+from tileops.kernels.linear_attention.deltanet_call import DeltaNetDecodeCall
+from tileops.ops.gemm.gemm import _GEMM_KEYS, GemmFwdOp
+from tileops.ops.linear_attention.deltanet_recurrence import (
+    DELTANET_DECODE_KEYS,
+    DeltaNetDecodeFwdOp,
+)
+from tileops.ops.linear_attention.gated_deltanet import (
+    GATED_DELTANET_DECODE_KEYS,
+    GatedDeltaNetDecodeFwdOp,
+)
+
+pytestmark = pytest.mark.skipif(
+    not torch.ptpu.is_available(), reason="selection reads the device architecture"
+)
+
+
+@pytest.fixture(autouse=True)
+def explicit_cuda_predicates(request, monkeypatch):
+    """Synthetic SM call records test CUDA predicates without launching CUDA work."""
+    if request.node.originalname in {
+        "test_gemm_dispatch",
+        "test_gemv_kernel_claims_the_layouts_it_was_written_for",
+        "test_gated_deltanet_decode_dispatch",
+    }:
+        import tileops.kernels.gemm.dense as dense
+        import tileops.utils as utils
+
+        monkeypatch.setattr(dense, "get_device", lambda: "cuda")
+        monkeypatch.setattr(utils, "get_device", lambda: "cuda")
+
+
+_SM90 = 90
+_SM80 = 80
+
+
+# --- GEMM: a vector operand picks the GEMV kernel, but only in the two layouts
+# it is written for. Non-SM90 falls back to the pipelined mainloop.
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    ("m", "n", "trans_a", "trans_b", "expected"),
+    [
+        pytest.param(1, 8, False, True, "gemv_kernel", id="lhs-row"),
+        pytest.param(8, 1, False, False, "gemv_kernel", id="rhs-col"),
+        pytest.param(1, 8, False, False, "gemm_kernel", id="lhs-row-wrong-layout"),
+        pytest.param(8, 1, False, True, "gemm_kernel", id="rhs-col-wrong-layout"),
+        pytest.param(8, 8, False, False, "gemm_kernel", id="neither-is-a-vector"),
+        pytest.param(1, 1, False, False, "gemv_kernel", id="both-are-vectors"),
+    ],
+)
+def test_gemm_dispatch(m: int, n: int, trans_a: bool, trans_b: bool, expected: str) -> None:
+    op = GemmFwdOp(trans_a=trans_a, trans_b=trans_b)
+    call = GemmCall(
+        arch=_SM90, m=m, n=n, k=64, dtype=torch.float16, trans_a=trans_a, trans_b=trans_b
+    )
+
+    assert op.select_kernel_key(_GEMM_KEYS, call) == expected
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    ("m", "n", "trans_a", "trans_b", "dim"),
+    [
+        pytest.param(1, 8, True, True, "m=1", id="lhs-row-trans-a"),
+        pytest.param(8, 1, True, False, "n=1", id="rhs-col-trans-a"),
+    ],
+)
+def test_gemm_vector_on_a_transposed_operand_is_refused(
+    m: int, n: int, trans_a: bool, trans_b: bool, dim: str
+) -> None:
+    """A ``trans_a`` layout puts the vector on an operand's TMA-loaded innermost
+    dimension, where the descriptor needs a multiple of 8 fp16 elements — and the
+    GEMV kernel has no form for these layouts. Selection refuses, naming the
+    dimension; it used to hand these to the general kernel, whose build then died
+    inside TileLang (``T.tma_copy() ... TMA is not available``).
+    """
+    op = GemmFwdOp(trans_a=trans_a, trans_b=trans_b)
+    call = GemmCall(
+        arch=_SM90, m=m, n=n, k=64, dtype=torch.float16, trans_a=trans_a, trans_b=trans_b
+    )
+
+    with pytest.raises(ValueError, match=f"multiple of 8 .*and {dim}"):
+        op.select_kernel_key(_GEMM_KEYS, call)
+
+
+@pytest.mark.smoke
+def test_gemm_uses_basic_mainloop_off_sm90() -> None:
+    op = GemmFwdOp()
+    call = GemmCall(arch=_SM80, m=1, n=8, k=64, dtype=torch.float16, trans_b=True)
+
+    assert op.select_kernel_key(_GEMM_KEYS, call) == "gemm_basic_kernel"
+
+
+# --- DeltaNet decode: fp32 has its own kernel; the raw-CUDA one serves 16-bit
+# at dim 128 on SM90; everything else is the general kernel.
+
+_DELTANET_ROWS = [
+    (torch.float32, 128, 128, _SM90, "DeltaNetDecodeFP32Kernel", "fp32"),
+    (torch.float32, 64, 64, _SM80, "DeltaNetDecodeFP32Kernel", "fp32-any-dim-any-arch"),
+    (torch.float16, 128, 128, _SM90, "DeltaNetDecodeRawCudaFlaStyleKernel", "fp16-raw"),
+    (torch.bfloat16, 128, 128, _SM90, "DeltaNetDecodeRawCudaFlaStyleKernel", "bf16-raw"),
+    (torch.float16, 64, 128, _SM90, "DeltaNetDecodeKernel", "dim-k-off"),
+    (torch.float16, 128, 64, _SM90, "DeltaNetDecodeKernel", "dim-v-off"),
+    (torch.float16, 128, 128, _SM80, "DeltaNetDecodeKernel", "arch-off"),
+]
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    ("dtype", "dim_k", "dim_v", "arch", "expected"),
+    [pytest.param(*row[:5], id=row[5]) for row in _DELTANET_ROWS],
+)
+def test_deltanet_decode_dispatch(
+    dtype: torch.dtype, dim_k: int, dim_v: int, arch: int, expected: str
+) -> None:
+    op = DeltaNetDecodeFwdOp()
+    call = DeltaNetDecodeCall(arch=arch, batch=1, heads=4, dim_k=dim_k, dim_v=dim_v, dtype=dtype)
+
+    assert op.select_kernel_key(DELTANET_DECODE_KEYS, call) == expected
+
+
+# --- Gated DeltaNet decode: the same shape, and the raw-CUDA kernel additionally
+# declines when the caller asked to autotune, having no knobs to tune.
+
+_GATED_ROWS = [
+    (torch.float32, 128, 128, _SM90, "GatedDeltaNetDecodeFP32Kernel", "fp32"),
+    (torch.bfloat16, 128, 128, _SM90, "GatedDeltaNetDecodeRawCudaFlaStyleKernel", "bf16-raw"),
+    (torch.float16, 128, 128, _SM90, "GatedDeltaNetDecodeKernel", "fp16-not-raw"),
+    (torch.bfloat16, 64, 128, _SM90, "GatedDeltaNetDecodeKernel", "dim-k-off"),
+    (torch.bfloat16, 128, 64, _SM90, "GatedDeltaNetDecodeKernel", "dim-v-off"),
+    (torch.bfloat16, 128, 128, _SM80, "GatedDeltaNetDecodeKernel", "arch-off"),
+]
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    ("dtype", "dim_k", "dim_v", "arch", "expected"),
+    [pytest.param(*row[:5], id=row[5]) for row in _GATED_ROWS],
+)
+def test_gated_deltanet_decode_dispatch(
+    dtype: torch.dtype, dim_k: int, dim_v: int, arch: int, expected: str
+) -> None:
+    op = GatedDeltaNetDecodeFwdOp()
+    call = DeltaNetDecodeCall(arch=arch, batch=1, heads=4, dim_k=dim_k, dim_v=dim_v, dtype=dtype)
+
+    assert op.select_kernel_key(GATED_DELTANET_DECODE_KEYS, call) == expected
+
+
+@pytest.mark.smoke
+def test_gated_deltanet_raw_cuda_declines_when_asked_to_autotune() -> None:
+    """It has no tunable knobs, so a caller asking to tune wants the other one.
+
+    Nothing is autotuned here: only the key is resolved.
+    """
+    op = GatedDeltaNetDecodeFwdOp(tune=True)
+    call = DeltaNetDecodeCall(
+        arch=_SM90, batch=1, heads=4, dim_k=128, dim_v=128, dtype=torch.bfloat16, tune=True
+    )
+
+    assert op.select_kernel_key(GATED_DELTANET_DECODE_KEYS, call) == ("GatedDeltaNetDecodeKernel")
+
+
+@pytest.mark.smoke
+def test_every_family_call_record_reads_the_device_when_unstated() -> None:
+    """A record built without an architecture resolves one; a stated one wins."""
+    from tileops.utils import get_sm_version
+
+    for record in (GemmCall(), DeltaNetDecodeCall()):
+        assert record.arch == get_sm_version()
+    assert GemmCall(arch=_SM80).arch == _SM80
+    assert DeltaNetDecodeCall(arch=_SM80).arch == _SM80
+
+
+@pytest.mark.smoke
+def test_gemv_kernel_claims_the_layouts_it_was_written_for() -> None:
+    """The predicate the op used to carry, over every (m, n, layout) combination."""
+    from tileops.kernels.gemm import GemvKernel
+
+    for m, n, trans_a, trans_b in itertools.product([1, 8], [1, 8], [False, True], [False, True]):
+        expected = (m == 1 and not trans_a and trans_b) or (n == 1 and not trans_a and not trans_b)
+        call = GemmCall(
+            arch=_SM90, m=m, n=n, k=64, dtype=torch.float16, trans_a=trans_a, trans_b=trans_b
+        )
+        assert GemvKernel.applies(call) is expected, (m, n, trans_a, trans_b)

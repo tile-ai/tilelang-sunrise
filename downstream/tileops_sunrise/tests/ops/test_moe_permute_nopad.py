@@ -11,8 +11,8 @@ import pytest
 import torch
 
 from tests.test_base import FixtureBase, TestBase
-from tileops.ops.moe import MoePermuteNopadFwdOp
-from workloads.moe import MoePermuteTest as _MoePermuteTestWorkload
+from tileops.ops.moe import ContiguousLayoutSpec, MoePrePermuteFwdOp
+from workloads.moe import MoePermuteWorkload as _MoePermuteTestWorkload
 
 
 def _ref_moe_permute_nopad(
@@ -63,7 +63,10 @@ class MoePermuteNopadTest(_MoePermuteTestWorkload, TestBase):
 
 
 def _compare(hidden_states, topk_ids, outputs, outputs_ref, num_experts):
-    perm_h, true_offsets, true_sizes, offsets, fwd_idx = outputs
+    perm_h, ends, fwd_idx = outputs
+    offsets = torch.cat((ends.new_zeros(1), ends)).to(torch.int64)
+    true_offsets = offsets[:-1].to(torch.int32)
+    true_sizes = (offsets[1:] - offsets[:-1]).to(torch.int32)
     _, ref_true_offsets, ref_true_sizes, ref_offsets, _ = outputs_ref
 
     K = topk_ids.shape[1]
@@ -98,23 +101,28 @@ def _compare(hidden_states, topk_ids, outputs, outputs_ref, num_experts):
 
 class MoePermuteNopadFixture(FixtureBase):
     PARAMS = [
-        ("total_tokens, top_k, num_experts, hidden_size, dtype", [
-            pytest.param(4,  2, 4, 64,  torch.bfloat16, marks=pytest.mark.smoke, id="tiny-bf16"),
-            pytest.param(4,  2, 4, 64,  torch.float16,  marks=pytest.mark.smoke, id="tiny-fp16"),
-            pytest.param(16, 2, 8, 128, torch.bfloat16, marks=pytest.mark.full,  id="small"),
-            # numel = total_tokens * top_k = 10 is NOT a multiple of the gather
-            # kernel's ROWS_PER_BLOCK (8), so the last block's `if slot < numel`
-            # out-of-bounds guard is actually exercised — every other shape here
-            # has numel divisible by 8 and never hits the partial tail.
-            pytest.param(5,  2, 4, 64,  torch.bfloat16, marks=pytest.mark.full,  id="partial-tail-numel10"),
-        ]),
+        (
+            "total_tokens, top_k, num_experts, hidden_size, dtype",
+            [
+                pytest.param(4, 2, 4, 64, torch.bfloat16, marks=pytest.mark.smoke, id="tiny-bf16"),
+                pytest.param(4, 2, 4, 64, torch.float16, marks=pytest.mark.smoke, id="tiny-fp16"),
+                pytest.param(16, 2, 8, 128, torch.bfloat16, marks=pytest.mark.full, id="small"),
+                # numel = total_tokens * top_k = 10 is NOT a multiple of the gather
+                # kernel's ROWS_PER_BLOCK (8), so the last block's `if slot < numel`
+                # out-of-bounds guard is actually exercised — every other shape here
+                # has numel divisible by 8 and never hits the partial tail.
+                pytest.param(
+                    5, 2, 4, 64, torch.bfloat16, marks=pytest.mark.full, id="partial-tail-numel10"
+                ),
+            ],
+        ),
     ]
 
 
 @MoePermuteNopadFixture
 def test_moe_permute_nopad_op(total_tokens, top_k, num_experts, hidden_size, dtype):
     test = MoePermuteNopadTest(total_tokens, top_k, num_experts, hidden_size, dtype)
-    op = MoePermuteNopadFwdOp(num_experts=num_experts, dtype=dtype)
+    op = MoePrePermuteFwdOp(ContiguousLayoutSpec.tight_physical_psum(), num_experts)
     hidden_states, topk_ids = test.gen_inputs()
 
     outputs = op(hidden_states, topk_ids)
@@ -128,16 +136,10 @@ def test_moe_permute_nopad_op(total_tokens, top_k, num_experts, hidden_size, dty
 
 @pytest.mark.smoke
 def test_moe_permute_nopad_explicit_shape_mismatch_raises() -> None:
-    hidden_states = torch.randn(4, 16, dtype=torch.float16, device="ptpu")
-    topk_ids = torch.randint(0, 4, (4, 2), dtype=torch.int32, device="ptpu")
-    op = MoePermuteNopadFwdOp(
-        total_tokens=5,
-        top_k=2,
-        num_experts=4,
-        hidden_size=16,
-        dtype=torch.float16,
-    )
-    with pytest.raises(ValueError, match="Expected total_tokens"):
+    hidden_states = torch.randn(5, 16, dtype=torch.float16, device="ptpu")
+    topk_ids = torch.zeros(4, 2, dtype=torch.int32, device="ptpu")
+    op = MoePrePermuteFwdOp(ContiguousLayoutSpec.tight_physical_psum(), 4)
+    with pytest.raises(ValueError, match="shape"):
         op(hidden_states, topk_ids)
 
 
@@ -145,8 +147,8 @@ def test_moe_permute_nopad_explicit_shape_mismatch_raises() -> None:
 def test_moe_permute_nopad_cpu_input_raises() -> None:
     hidden_states = torch.randn(4, 16, dtype=torch.float16)
     topk_ids = torch.randint(0, 4, (4, 2), dtype=torch.int32)
-    op = MoePermuteNopadFwdOp(num_experts=4)
-    with pytest.raises(ValueError, match="hidden_states must be a CUDA or PTPU tensor"):
+    op = MoePrePermuteFwdOp(ContiguousLayoutSpec.tight_physical_psum(), 4)
+    with pytest.raises(ValueError, match="requires GPU tensors"):
         op(hidden_states, topk_ids)
 
 
@@ -154,8 +156,8 @@ def test_moe_permute_nopad_cpu_input_raises() -> None:
 def test_moe_permute_nopad_invalid_dtype_raises() -> None:
     hidden_states = torch.randn(4, 16, dtype=torch.float32, device="ptpu")
     topk_ids = torch.randint(0, 4, (4, 2), dtype=torch.int32, device="ptpu")
-    op = MoePermuteNopadFwdOp(num_experts=4)
-    with pytest.raises(ValueError, match="Expected hidden_states.dtype"):
+    op = MoePrePermuteFwdOp(ContiguousLayoutSpec.tight_physical_psum(), 4)
+    with pytest.raises(TypeError, match="BF16 or FP16"):
         op(hidden_states, topk_ids)
 
 

@@ -2,26 +2,26 @@
 
 import torch
 
-from workloads.workload_base import RandnTest, WorkloadBase
+from workloads.workload_base import RandnWorkload, WorkloadBase
 
 
-class SumTest(RandnTest):
+class SumWorkload(RandnWorkload):
     """Workload definition for SumFwdOp."""
 
 
-class MeanTest(RandnTest):
+class MeanWorkload(RandnWorkload):
     """Workload definition for MeanFwdOp."""
 
 
-class AmaxTest(RandnTest):
+class AmaxWorkload(RandnWorkload):
     """Workload definition for AmaxFwdOp."""
 
 
-class AminTest(RandnTest):
+class AminWorkload(RandnWorkload):
     """Workload definition for AminFwdOp."""
 
 
-class ProdTest(WorkloadBase):
+class ProdWorkload(WorkloadBase):
     """Workload definition for ProdFwdOp.
 
     Uses small-range values (0.99..1.0) to avoid overflow in product reduction.
@@ -35,52 +35,55 @@ class ProdTest(WorkloadBase):
         x = torch.rand(*self.shape, dtype=self.dtype, device="ptpu") * 0.01 + 0.99
         return (x,)
 
+    def ref_program(self, x: torch.Tensor) -> torch.Tensor:
+        return x.float().prod(dim=-1).to(x.dtype)
 
-class StdTest(RandnTest):
+
+class StdWorkload(RandnWorkload):
     """Workload definition for StdFwdOp."""
 
 
-class VarTest(RandnTest):
+class VarWorkload(RandnWorkload):
     """Workload definition for VarFwdOp."""
 
 
-class VarMeanTest(RandnTest):
+class VarMeanWorkload(RandnWorkload):
     """Workload definition for VarMeanFwdOp."""
 
 
-class ArgmaxTest(RandnTest):
+class ArgmaxWorkload(RandnWorkload):
     """Workload definition for ArgmaxFwdOp."""
 
 
-class ArgminTest(RandnTest):
+class ArgminWorkload(RandnWorkload):
     """Workload definition for ArgminFwdOp."""
 
 
-class SoftmaxTest(RandnTest):
+class SoftmaxWorkload(RandnWorkload):
     """Workload definition for SoftmaxFwdOp (spec interface: shape + dtype)."""
 
 
-class LogSoftmaxTest(RandnTest):
+class LogSoftmaxWorkload(RandnWorkload):
     """Workload definition for LogSoftmaxFwdOp (spec interface: shape + dtype)."""
 
 
-class LogSumExpTest(RandnTest):
+class LogSumExpWorkload(RandnWorkload):
     """Workload definition for LogSumExpFwdOp (spec interface: shape + dtype)."""
 
 
-class L1NormTest(RandnTest):
+class L1NormWorkload(RandnWorkload):
     """Workload definition for L1NormFwdOp."""
 
 
-class L2NormTest(RandnTest):
+class L2NormWorkload(RandnWorkload):
     """Workload definition for L2NormFwdOp."""
 
 
-class InfNormTest(RandnTest):
+class InfNormWorkload(RandnWorkload):
     """Workload definition for InfNormFwdOp."""
 
 
-class _LogicalTest(WorkloadBase):
+class _LogicalWorkload(WorkloadBase):
     """Shared workload base for logical reduce ops (any, all, count_nonzero).
 
     Generates inputs with a mix of zeros and non-zeros for meaningful
@@ -96,15 +99,15 @@ class _LogicalTest(WorkloadBase):
         return (_make_logical_input(self.shape, self.dtype),)
 
 
-class AnyTest(_LogicalTest):
+class AnyWorkload(_LogicalWorkload):
     """Workload definition for AnyFwdOp."""
 
 
-class AllTest(_LogicalTest):
+class AllWorkload(_LogicalWorkload):
     """Workload definition for AllFwdOp."""
 
 
-class CountNonzeroTest(_LogicalTest):
+class CountNonzeroWorkload(_LogicalWorkload):
     """Workload definition for CountNonzeroFwdOp."""
 
 
@@ -145,4 +148,31 @@ def _make_logical_input(shape: tuple, dtype: torch.dtype) -> torch.Tensor:
             x[0] = 0.0
             x[1] = 1.0
 
-    return x
+    return x.to("ptpu")
+
+
+class CumulativeWorkload(WorkloadBase):
+    """Inputs for cumsum / cumprod over the last dimension.
+
+    ``cumprod`` defaults to a narrow band around 1.0 so a long scan stays in
+    range; pass ``use_small_range`` explicitly to override.
+    """
+
+    def __init__(
+        self,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        op_kind: str,
+        use_small_range: bool | None = None,
+    ):
+        self.shape = tuple(shape)
+        self.dtype = dtype
+        self.op_kind = op_kind
+        self.use_small_range = op_kind == "cumprod" if use_small_range is None else use_small_range
+
+    def gen_inputs(self) -> tuple[torch.Tensor]:
+        if self.use_small_range:
+            x = torch.rand(*self.shape, dtype=self.dtype, device="ptpu") * 0.01 + 0.99
+        else:
+            x = torch.randn(*self.shape, dtype=self.dtype, device="ptpu")
+        return (x,)

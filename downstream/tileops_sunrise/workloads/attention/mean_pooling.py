@@ -6,12 +6,21 @@ from workloads.workload_base import WorkloadBase
 
 
 class MeanPoolingTest(WorkloadBase):
-
-    def __init__(self, batch_size: int, seq_len: int, heads: int, dim: int, chunk_size: int,
-                 chunks_per_bacth: int, seq_num: int, use_offsets: int,
-                 dtype: torch.dtype, accum_dtype: torch.dtype,
-                 offsets: Optional[torch.Tensor] = None,
-                 indices: Optional[torch.Tensor] = None):
+    def __init__(
+        self,
+        batch_size: int,
+        seq_len: int,
+        heads: int,
+        dim: int,
+        chunk_size: int,
+        chunks_per_bacth: int,
+        seq_num: int,
+        use_offsets: int,
+        dtype: torch.dtype,
+        accum_dtype: torch.dtype,
+        offsets: Optional[torch.Tensor] = None,
+        indices: Optional[torch.Tensor] = None,
+    ):
         self.batch_size = batch_size
         self.seq_len = seq_len
         self.heads = heads

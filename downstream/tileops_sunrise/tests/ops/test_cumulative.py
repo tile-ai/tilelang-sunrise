@@ -8,13 +8,16 @@ Output has the same shape as input.
 import pytest
 import torch
 
+from tests.compile_contract import compile_fullgraph
 from tests.test_base import FixtureBase, TestBase
+from workloads.reduction import CumulativeWorkload
 
 
 def _run_on_ptpu(op, x: torch.Tensor) -> torch.Tensor:
     output = op(x.ptpu())
     torch.ptpu.synchronize()
     return output.cpu()
+
 
 # Fixtures
 
@@ -88,28 +91,8 @@ class Cumulative1DFixture(FixtureBase):
     ]
 
 
-# TestBase helpers
-
-
-class CumulativeTest(TestBase):
+class CumulativeTest(CumulativeWorkload, TestBase):
     """Parameterized test helper for cumulative ops."""
-
-    def __init__(
-        self, m: int, n: int, dtype: torch.dtype, op_kind: str, use_small_range: bool = False
-    ):
-        self.m = m
-        self.n = n
-        self.dtype = dtype
-        self.op_kind = op_kind
-        self.use_small_range = use_small_range
-
-    def gen_inputs(self) -> tuple[torch.Tensor]:
-        if self.use_small_range:
-            # For cumprod, use small values to avoid overflow
-            x = torch.rand(self.m, self.n, dtype=self.dtype, device="ptpu") * 0.01 + 0.99
-        else:
-            x = torch.randn(self.m, self.n, dtype=self.dtype, device="ptpu")
-        return (x,)
 
     def ref_program(self, x: torch.Tensor) -> torch.Tensor:
         x_f32 = x.float()
@@ -136,15 +119,12 @@ def _cumprod_tol(dtype: torch.dtype) -> dict:
     return {"atol": 5e-2, "rtol": 5e-2}
 
 
-# CumsumFwdOp tests
-
-
 @CumulativeBasicFixture
 def test_cumsum_op(m: int, n: int, dtype: torch.dtype) -> None:
     from tileops.ops.reduction.cumulative import CumsumFwdOp
 
-    test = CumulativeTest(m, n, dtype, "cumsum")
-    op = CumsumFwdOp(dtype=dtype)
+    test = CumulativeTest((m, n), dtype, "cumsum")
+    op = CumsumFwdOp()
     test.check(op, *test.gen_inputs(), **_tol(dtype))
 
 
@@ -154,7 +134,7 @@ def test_cumsum_non_contiguous(m: int, n: int, dtype: torch.dtype) -> None:
 
     x_full = torch.randn(m, n * 2, dtype=dtype)
     x = x_full[:, :n]
-    op = CumsumFwdOp(dtype=dtype)
+    op = CumsumFwdOp()
     ref = x.contiguous().float().cumsum(dim=-1).to(dtype)
     y = _run_on_ptpu(op, x)
     tol = _tol(dtype)
@@ -166,7 +146,7 @@ def test_cumsum_3d(batch: int, seq: int, hidden: int, dtype: torch.dtype) -> Non
     from tileops.ops.reduction.cumulative import CumsumFwdOp
 
     x = torch.randn(batch, seq, hidden, dtype=dtype)
-    op = CumsumFwdOp(dtype=dtype)
+    op = CumsumFwdOp()
     ref = x.float().cumsum(dim=-1).to(dtype)
     y = _run_on_ptpu(op, x)
     tol = _tol(dtype)
@@ -178,7 +158,7 @@ def test_cumsum_4d(b0: int, b1: int, b2: int, n: int, dtype: torch.dtype) -> Non
     from tileops.ops.reduction.cumulative import CumsumFwdOp
 
     x = torch.randn(b0, b1, b2, n, dtype=dtype)
-    op = CumsumFwdOp(dtype=dtype)
+    op = CumsumFwdOp()
     ref = x.float().cumsum(dim=-1).to(dtype)
     y = _run_on_ptpu(op, x)
     tol = _tol(dtype)
@@ -190,7 +170,7 @@ def test_cumsum_1d(n: int, dtype: torch.dtype) -> None:
     from tileops.ops.reduction.cumulative import CumsumFwdOp
 
     x = torch.randn(n, dtype=dtype)
-    op = CumsumFwdOp(dtype=dtype)
+    op = CumsumFwdOp()
     ref = x.float().cumsum(dim=-1).to(dtype)
     y = _run_on_ptpu(op, x)
     tol = _tol(dtype)
@@ -206,22 +186,19 @@ def test_cumsum_dynamic_shape_kernel_cache() -> None:
     x2 = torch.randn(5, 8, dtype=torch.float16, device="ptpu")
 
     op(x1)
-    assert len(op._kernel_cache) == 1
+    assert len(list(op.iter_kernels())) == 1
     op(x1)
-    assert len(op._kernel_cache) == 1
+    assert len(list(op.iter_kernels())) == 1
     op(x2)
-    assert len(op._kernel_cache) == 2
-
-
-# CumprodFwdOp tests
+    assert len(list(op.iter_kernels())) == 2
 
 
 @CumulativeBasicFixture
 def test_cumprod_op(m: int, n: int, dtype: torch.dtype) -> None:
     from tileops.ops.reduction.cumulative import CumprodFwdOp
 
-    test = CumulativeTest(m, n, dtype, "cumprod", use_small_range=True)
-    op = CumprodFwdOp(dtype=dtype)
+    test = CumulativeTest((m, n), dtype, "cumprod", use_small_range=True)
+    op = CumprodFwdOp()
     test.check(op, *test.gen_inputs(), **_cumprod_tol(dtype))
 
 
@@ -231,7 +208,7 @@ def test_cumprod_non_contiguous(m: int, n: int, dtype: torch.dtype) -> None:
 
     x_full = torch.rand(m, n * 2, dtype=dtype) * 0.01 + 0.99
     x = x_full[:, :n]
-    op = CumprodFwdOp(dtype=dtype)
+    op = CumprodFwdOp()
     ref = x.contiguous().float().cumprod(dim=-1).to(dtype)
     y = _run_on_ptpu(op, x)
     tol = _cumprod_tol(dtype)
@@ -243,7 +220,7 @@ def test_cumprod_3d(batch: int, seq: int, hidden: int, dtype: torch.dtype) -> No
     from tileops.ops.reduction.cumulative import CumprodFwdOp
 
     x = torch.rand(batch, seq, hidden, dtype=dtype) * 0.01 + 0.99
-    op = CumprodFwdOp(dtype=dtype)
+    op = CumprodFwdOp()
     ref = x.float().cumprod(dim=-1).to(dtype)
     y = _run_on_ptpu(op, x)
     tol = _cumprod_tol(dtype)
@@ -255,7 +232,7 @@ def test_cumprod_4d(b0: int, b1: int, b2: int, n: int, dtype: torch.dtype) -> No
     from tileops.ops.reduction.cumulative import CumprodFwdOp
 
     x = torch.rand(b0, b1, b2, n, dtype=dtype) * 0.01 + 0.99
-    op = CumprodFwdOp(dtype=dtype)
+    op = CumprodFwdOp()
     ref = x.float().cumprod(dim=-1).to(dtype)
     y = _run_on_ptpu(op, x)
     tol = _cumprod_tol(dtype)
@@ -267,7 +244,7 @@ def test_cumprod_1d(n: int, dtype: torch.dtype) -> None:
     from tileops.ops.reduction.cumulative import CumprodFwdOp
 
     x = torch.rand(n, dtype=dtype) * 0.01 + 0.99
-    op = CumprodFwdOp(dtype=dtype)
+    op = CumprodFwdOp()
     ref = x.float().cumprod(dim=-1).to(dtype)
     y = _run_on_ptpu(op, x)
     tol = _cumprod_tol(dtype)
@@ -276,45 +253,152 @@ def test_cumprod_1d(n: int, dtype: torch.dtype) -> None:
 
 class CumulativeDimAxis1Fixture(FixtureBase):
     PARAMS = [
-        ("batch, hidden, seq, dtype", [
-            pytest.param(2, 512, 256, torch.float16, marks=pytest.mark.smoke),
-            pytest.param(2, 512, 256, torch.bfloat16, marks=pytest.mark.smoke),
-        ]),
+        (
+            "batch, hidden, seq, dtype",
+            [
+                pytest.param(2, 512, 256, torch.float16, marks=pytest.mark.smoke),
+                pytest.param(2, 512, 256, torch.bfloat16, marks=pytest.mark.smoke),
+            ],
+        ),
     ]
 
 
 @CumulativeDimAxis1Fixture
-def test_cumsum_dim_axis1(
-    batch: int, hidden: int, seq: int, dtype: torch.dtype
-) -> None:
+def test_cumsum_dim_axis1(batch: int, hidden: int, seq: int, dtype: torch.dtype) -> None:
     """Cumsum along dim=1 (3D) — exercises movedim choreography in `_run`."""
     from tileops.ops.reduction.cumulative import CumsumFwdOp
 
     x = torch.randn(batch, hidden, seq, dtype=dtype)
-    op = CumsumFwdOp(dtype=dtype, dim=1)
+    op = CumsumFwdOp(dim=1)
     ref = x.float().cumsum(dim=1).to(dtype)
     y = _run_on_ptpu(op, x)
     atol = 1e-2 if dtype == torch.float16 else 1.6e-2
-    assert torch.allclose(y, ref, atol=atol, rtol=atol), \
+    assert torch.allclose(y, ref, atol=atol, rtol=atol), (
         f"cumsum dim=1 max err: {(y - ref).abs().max()}"
+    )
 
 
 @CumulativeDimAxis1Fixture
-def test_cumprod_dim_axis1(
-    batch: int, hidden: int, seq: int, dtype: torch.dtype
-) -> None:
+def test_cumprod_dim_axis1(batch: int, hidden: int, seq: int, dtype: torch.dtype) -> None:
     """Cumprod along dim=1 (3D) — exercises movedim choreography in `_run`."""
     from tileops.ops.reduction.cumulative import CumprodFwdOp
 
     # Values close to 1 to avoid over/underflow in cumprod over hidden dim.
     x = torch.rand(batch, hidden, seq, dtype=dtype) * 0.01 + 0.99
-    op = CumprodFwdOp(dtype=dtype, dim=1)
+    op = CumprodFwdOp(dim=1)
     ref = x.float().cumprod(dim=1).to(dtype)
     y = _run_on_ptpu(op, x)
     tol = _cumprod_tol(dtype)
-    assert torch.allclose(y, ref, **tol), \
-        f"cumprod dim=1 max err: {(y - ref).abs().max()}"
+    assert torch.allclose(y, ref, **tol), f"cumprod dim=1 max err: {(y - ref).abs().max()}"
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-vvs"])
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "M, N, dtype, backend",
+    [
+        (64, 16384, torch.float32, "row_scan"),
+        (64, 32768, torch.bfloat16, "row_scan"),
+        (64, 8200, torch.float32, "parallel_scan"),  # a padded width the row scan declines
+        (64, 8200, torch.bfloat16, "parallel_scan"),  # same, at the other element width
+        # 65 elements per thread is not a whole number of vector accesses
+        (64, 16640, torch.bfloat16, "parallel_scan"),
+    ],
+)
+def test_cumsum_backend_dispatch(M: int, N: int, dtype: torch.dtype, backend: str) -> None:
+    """All original long and unaligned widths use the retained S2 tiled scan."""
+    from tileops.ops.reduction.cumulative import CumsumFwdOp
+
+    x = torch.randn(M, N, dtype=dtype, device="ptpu")
+    op = CumsumFwdOp(dim=-1)
+    y = op(x)
+
+    ref = x.cpu().float().cumsum(dim=-1).to(dtype)
+    y = y.cpu()
+    assert torch.allclose(y, ref, **_tol(dtype)), (
+        f"({M}, {N}) {dtype}: max_diff={torch.abs(y - ref).max()}"
+    )
+
+    (kernel,) = op.built_kernels("cumulative_fwd").values()
+    assert (kernel.M, kernel.N) == (M, N)
+    assert kernel.config == kernel.default_config
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "name, marks",
+    [
+        ("nan", [(100, float("nan"))]),
+        ("both_infinities", [(100, float("inf")), (200, -float("inf"))]),
+        ("signed_zero", [(100, -0.0), (200, 0.0)]),
+    ],
+)
+def test_scan_nonfinite_and_signed_zero_match_torch(name: str, marks: list) -> None:
+    """A scan carries non-finite values and signed zero the way torch does.
+
+    The whole-row backend combines per-thread chunk totals rather than accumulating left
+    to right, so a NaN or an inf has to still reach every later element.
+    """
+    from tileops.ops.reduction.cumulative import CumprodFwdOp, CumsumFwdOp
+
+    n = 4096
+    x = torch.ones(2, n, dtype=torch.float32, device="ptpu")
+    for index, value in marks:
+        x[:, index] = value
+
+    for op, ref in ((CumsumFwdOp(dim=-1), torch.cumsum), (CumprodFwdOp(dim=-1), torch.cumprod)):
+        torch.testing.assert_close(
+            op(x).cpu(), ref(x.cpu(), dim=-1), rtol=1e-5, atol=1e-5, equal_nan=True
+        )
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("M, N", [(1, 32768), (127, 16384)])
+def test_cumsum_parallel_scan_row_ownership(M: int, N: int) -> None:
+    """Carry propagation stays per-row across tiles and partial row blocks."""
+    from tileops.ops.reduction.cumulative import CumsumFwdOp
+
+    row_values = torch.arange(1, M + 1, dtype=torch.float32, device="ptpu").unsqueeze(1)
+    x = row_values.expand(-1, N).contiguous()
+
+    y = CumsumFwdOp(dim=-1)(x)
+
+    # Row r holds the constant r + 1, so its cumsum is (r + 1) * [1, ..., N].
+    expected = row_values * torch.arange(1, N + 1, dtype=torch.float32, device="ptpu")
+    assert torch.allclose(y, expected, atol=1e-3, rtol=1e-3), (
+        f"({M}, {N}): max_diff={torch.abs(y - expected).max()}"
+    )
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "M, N, dtype",
+    [
+        pytest.param(64, 512, torch.float16),  # sequential custom_op
+        pytest.param(64, 16384, torch.float16),  # parallel custom_op
+    ],
+)
+def test_cumsum_compile_fullgraph_warm_cache(M: int, N: int, dtype: torch.dtype) -> None:
+    """torch.compile(fullgraph=True) must succeed on a warm kernel cache.
+
+    Guards the custom_op boundary: tracing the raw JIT callables instead
+    raises 'unsupported Function.call'.
+
+    Not compile-contract evidence (see tests/compile_contract.py) — that
+    contract covers a *cold* compile, which would trace kernel construction
+    inside the graph. Pre-warming here sidesteps it, so CumsumFwdOp must not
+    declare ``torch_compile_fullgraph`` on this test's strength.
+    """
+    from tileops.ops.reduction.cumulative import CumsumFwdOp
+
+    op = CumsumFwdOp(dim=-1)
+    x = torch.randn(M, N, dtype=dtype, device="ptpu")
+    op(x)
+
+    compiled = compile_fullgraph(op, fullgraph=True)
+    y = compiled(x)
+
+    ref = x.cpu().float().cumsum(dim=-1).to(dtype)
+    y = y.cpu()
+    assert torch.allclose(y, ref, **_tol(dtype)), (
+        f"Compiled output mismatch for shape ({M},{N}): max_diff={torch.abs(y - ref).max()}"
+    )
