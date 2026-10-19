@@ -945,6 +945,9 @@ ci_set_tilelang_build_env () {
     # Its environment list uses semicolons, preserving spaces inside paths.
     local ptcc_cmake_args="-DCMAKE_TANG_COMPILER=${PTCC_PATH};-DCMAKE_TANG_FLAGS=--tang-gpu-arch=stcu"
     ptcc_cmake_args+=";-DTANG_TOOLKIT_ROOT_DIR=${TANGRT_PATH};-DTANG_DIR=${TANG_CMAKE_PACKAGE_DIR};-DTANGRT_DIR=${TANGRT_CMAKE_PACKAGE_DIR}"
+    # The generic Linux backend defaults include ROCm and Ascend. This wheel
+    # targets TANG, including the embedded TVM configured by scikit-build-core.
+    ptcc_cmake_args+=";-DUSE_TANG=ON;-DUSE_CUDA=OFF;-DUSE_ROCM=OFF;-DUSE_ASCEND=OFF;-DUSE_METAL=OFF;-DUSE_LLVM=OFF"
     export SKBUILD_CMAKE_ARGS="${SKBUILD_CMAKE_ARGS:+${SKBUILD_CMAKE_ARGS};}${ptcc_cmake_args}"
 }
 
