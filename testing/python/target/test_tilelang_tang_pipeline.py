@@ -307,7 +307,8 @@ def test_tang_pipeline_lowers_stcu_tmma_gemm():
     assert "tl::gemm_tang<64, 64, 32, 2, 2" in source
 
 
-def test_tang_pipeline_lowers_strided_stcu_tmma_from_region_base():
+@pytest.mark.parametrize("clear_accum", [False, True])
+def test_tang_pipeline_lowers_strided_stcu_tmma_from_region_base(clear_accum):
     @T.prim_func
     def main(
         A: T.Tensor((32, 32), "float16"),
@@ -323,7 +324,7 @@ def test_tang_pipeline_lowers_strided_stcu_tmma_from_region_base():
             T.copy(A, a_shared[:, 32:])
             T.copy(B, b_shared[:, :32])
             T.clear(c_local)
-            T.gemm(a_shared[:, 32:], b_shared[:, :32], c_local, clear_accum=False)
+            T.gemm(a_shared[:, 32:], b_shared[:, :32], c_local, clear_accum=clear_accum)
             T.copy(c_local, C)
 
     source = _lower_tang_source(main)
@@ -331,7 +332,7 @@ def test_tang_pipeline_lowers_strided_stcu_tmma_from_region_base():
     # Four 8x8 atoms with eight padding elements each place A[:, 32:] at 4 * 72 = 288.
     # The physical pointer carries that origin, so neither template offset repeats it.
     assert (
-        "tl::gemm_tang<32, 32, 32, 2, 2, 64, 64, 0, 0, 0, 0, 1>"
+        f"tl::gemm_tang<32, 32, 32, 2, 2, 64, 64, 0, 0, 0, 0, {int(clear_accum)}>"
         "((&(((__fp16*)a_shared)[288])), (&(((__fp16*)b_shared)[0])), (&(c_local[0])));"
     ) in source
     assert "A_shared[-" not in source
