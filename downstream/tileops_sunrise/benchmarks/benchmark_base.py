@@ -1,29 +1,90 @@
-import contextlib
-import logging
-import sys
-import threading
+"""The benchmark a bench file writes: a workload in, a recorded result out.
+
+Timing lives in :mod:`benchmarks.timing`, reporting in :mod:`benchmarks.report`. Both
+are re-exported here, so a bench file keeps importing what it always did.
+"""
+
+import statistics
 from abc import ABC, abstractmethod
-from datetime import datetime
-from typing import (
-    Any,
-    Callable,
-    Generic,
-    Optional,
-    Protocol,
-    TypeVar,
-    runtime_checkable,
-)
+from collections.abc import Callable
+from typing import Any, Generic, Optional, TypeVar
 
 import pytest
 import torch
-from torch.autograd.profiler import DeviceType
 
+from benchmarks.report import BenchmarkReport
+from benchmarks.timing import (
+    _MAX_ITERS,
+    _MIN_ITERS,
+    DRY_RUN_MS,
+    REPEAT_MS,
+    CUPTIError,
+    Sample,
+    _capture_bench_meta,
+    _sample_spread_ms,
+    bench_kernel,
+    median_busy_ms,
+)
 from tileops.manifest import (
     WORKLOAD_RESERVED_KEYS,
     load_manifest,
     load_workloads,
+    manifest_key,
     single_input_workload_contract,
 )
+
+__all__ = [
+    "BenchmarkBase",
+    "BenchmarkReport",
+    "CUPTIError",
+    "ManifestBenchmark",
+    "OpBenchmark",
+    "backward_of",
+    "bench_kernel",
+    "fields",
+    "then_dtype",
+    "workload_params",
+    "workloads_to_params",
+]
+
+W = TypeVar("W")
+
+
+def backward_of(output: torch.Tensor) -> Any:
+    """Return a callable running *output*'s backward on the thread that calls it.
+
+    How a baseline reaches its gradients: ``Tensor.backward`` hands the graph to
+    autograd's engine thread, whose kernels carry no iteration id for the timer to
+    attribute them to, and charges the baseline for engine overhead a tileops backward
+    op never pays. Takes one gradient per output of the op that produced *output*, so
+    one returning ``(out, lse)`` is driven with ``(grad, None)``.
+    """
+    node = output.grad_fn
+    if node is None:
+        raise ValueError(
+            f"{type(output).__name__} has no grad_fn; build the graph under "
+            "enable_grad on inputs that require grad before timing its backward."
+        )
+    # A Python autograd.Function's node exposes apply() and is not callable; a node
+    # built in C++ is callable and has no apply(). Neither offers the other's form.
+    return getattr(node, "apply", None) or node
+
+
+def _run_on_cpu(fn: Callable) -> Callable:
+    """Wrap *fn* to run on CPU when the ptpu backend lacks its op.
+
+    torch_ptpu implements only a subset of aten operators; a torch baseline or
+    compiled reference for an unsupported op raises NotImplementedError on the
+    ptpu backend. This wrapper moves tensor args to CPU so the same callable
+    still runs and the row records. Its device_busy_ms reads near zero because
+    no ptpu kernel is launched.
+    """
+
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        cpu_args = tuple(a.cpu() if isinstance(a, torch.Tensor) else a for a in args)
+        return fn(*cpu_args, **kwargs)
+
+    return wrapped
 
 
 def _workload_contract(op_name: str) -> tuple[str, frozenset[str]]:
@@ -38,319 +99,12 @@ def _workload_contract(op_name: str) -> tuple[str, frozenset[str]]:
     return contract
 
 
-# Benchmark capability protocols
-
-
-@runtime_checkable
-class ShapeDtypeWorkload(Protocol):
-    """Structural type for workloads that carry shape and dtype metadata.
-
-    Any object with ``shape`` and ``dtype`` satisfies this protocol.
-    Used by helpers that only need tensor metadata, not input generation
-    capability.
-    """
-
-    shape: tuple[int, ...]
-    dtype: torch.dtype
-
-
-@runtime_checkable
-class InputGeneratingWorkload(Protocol):
-    """Structural type for workloads that can generate benchmark inputs."""
-
-    def gen_inputs(self) -> tuple[Any, ...]: ...
-
-
-@runtime_checkable
-class BenchmarkWorkload(ShapeDtypeWorkload, InputGeneratingWorkload, Protocol):
-    """Full benchmark workload: shape/dtype metadata + input generation.
-
-    This is the standard contract for benchmark workloads that need both
-    roofline metadata extraction and input tensor generation.
-    Workloads satisfy this protocol when they define ``shape`` and ``dtype``
-    metadata in addition to implementing ``gen_inputs()``.
-    """
-
-    ...
-
-
-W = TypeVar("W")
-
-
-_logger = logging.getLogger("tileops.bench")
-
-# Thread-local storage for conftest hook to pick up per-test bench results.
-# A single test function may call record() multiple times (tileops + baseline).
-_bench_results = threading.local()
-
-# Latest bench_kernel measurement metadata; deviations from the default
-# protocol are surfaced in results by BenchmarkBase._build_result.
-_bench_meta = threading.local()
-
-
-class _ProfilerProjectionError(Exception):
-    """Profiler trace lacked a projected annotation window for every repeat."""
-
-
-# Name of the ``record_function`` annotation wrapping the timed call. Kineto
-# projects this scope onto the device timeline. The L2-flush ``cache.zero_()``
-# is synchronized to completion before the window opens (see ``bench_kernel``),
-# so its device event cannot fall inside a window regardless of how the
-# projection behaves; kernels the timed call launches do.
-_KERNEL_REGION = "tileops_bench_kernel"
-
-
-def _sum_kernel_time_us(kineto_results):
-    """Sum device time of the kernels the timed call launched.
-
-    Sums only kernels inside a :data:`_KERNEL_REGION` annotation window, so the
-    L2-flush fill is excluded and the kernel under test is counted regardless of
-    its name. A call launching several kernels contributes all of them.
-
-    Iterates the C++ Kineto events directly to bypass ``key_averages()``, which
-    is ~16x slower (~130ms of Python parsing/tree-building) for large traces.
-
-    Returns:
-        ``(total_us, n_regions)``: summed kernel time in microseconds and the
-        number of annotation windows. The caller checks ``n_regions ==
-        n_repeat`` to confirm the scope projected on every iteration.
-    """
-    import bisect
-
-    windows: list[tuple[int, int]] = []
-    kernels: list[tuple[int, int]] = []  # (start_ns, duration_ns)
-    for evt in kineto_results.events():
-        if evt.device_type() != DeviceType.PrivateUse1:
-            continue
-        if evt.is_user_annotation():
-            if evt.name() == _KERNEL_REGION:
-                windows.append((evt.start_ns(), evt.end_ns()))
-            continue
-        kernels.append((evt.start_ns(), evt.duration_ns()))
-
-    windows.sort()
-    starts = [w[0] for w in windows]
-    ends = [w[1] for w in windows]
-    total_us = 0.0
-    for start_ns, dur_ns in kernels:
-        # Count only kernels that fall inside a timed-call window; everything
-        # outside (notably the L2-flush fill) is excluded.
-        idx = bisect.bisect_right(starts, start_ns) - 1
-        if idx >= 0 and start_ns < ends[idx]:
-            total_us += dur_ns / 1000.0
-    return total_us, len(windows)
-
-
-# L2 cache flush buffer (sized to actual L2, allocated lazily)
-
-_l2_flush_cache: Optional[torch.Tensor] = None
-
-
-def _get_l2_flush_cache() -> torch.Tensor:
-    global _l2_flush_cache
-    if _l2_flush_cache is None:
-        device_properties = torch.ptpu.get_device_properties(0)
-        l2_bytes = getattr(device_properties, "L2_cache_size", 0)
-        if l2_bytes <= 0:
-            _logger.warning(
-                "L2 cache size is unavailable or non-positive (%d); "
-                "flushing a 256 MB buffer instead",
-                l2_bytes,
-            )
-            l2_bytes = int(256e6)
-        _l2_flush_cache = torch.empty(l2_bytes // 4, dtype=torch.int, device="ptpu")
-    return _l2_flush_cache
-
-
-def _native_output_suppressor():
-    """Return an fd-level output suppressor that is safe under pytest capture.
-
-    tilelang's ``suppress_stdout_stderr`` dup2's ``/dev/null`` over
-    ``sys.stdout.fileno()``; under pytest fd capture that fileno is the
-    capture tmpfile and the redirect corrupts it (``EBADF`` on later reads).
-    Suppress only when stdout/stderr are the process fds 1/2.
-    """
-    try:
-        native = sys.stdout.fileno() == 1 and sys.stderr.fileno() == 2
-    except (AttributeError, OSError, ValueError):
-        # Streams without a real descriptor (io.StringIO, capsys) or with
-        # fileno() unsupported: fd-level suppression is impossible.
-        native = False
-    if not native:
-        return contextlib.nullcontext()
-    from tilelang.profiler.bench import suppress_stdout_stderr
-    return suppress_stdout_stderr()
-
-
-# TANG SOL-ExecBench–style benchmark
-
-def bench_kernel(
-    fn: Callable,
-    args: tuple[Any, ...] = (),
-    n_warmup: int = 10,
-    n_repeat: int = 50,
-    n_trials: int = 3,
-) -> float:
-    """Benchmark a GPU kernel with pure kernel timing via PrivateUse1 profiler.
-
-    Protocol (adapted from TANG SOL-ExecBench, arxiv.org/abs/2603.19173):
-      1. Hold the device clock policy constant across compared runs.
-      2. Run *n_warmup* un-timed iterations with L2 flush.
-      3. For each of *n_trials* trials, profile *n_repeat* iterations
-         under PrivateUse1 profiler to get pure kernel execution time (no launch overhead).
-         L2 is flushed before every iteration.  Input tensors are cloned
-         each iteration so the kernel always sees fresh addresses.
-      4. Report the median trial mean (robust to outlier trials).
-
-    Uses PrivateUse1 profiler via torch.profiler for accurate kernel-only timing, with
-    direct Kineto C++ event iteration to avoid Python parsing overhead.
-    Falls back to PTPU events if PrivateUse1 profiling is unavailable.
-
-    Args:
-        fn: Callable to benchmark.  If *args* is provided, called as
-            ``fn(*cloned_args)``; otherwise called as ``fn()``.
-        args: Tensor arguments to clone each iteration.  Non-tensor
-            values are passed through unchanged.
-        n_warmup: Warmup iterations (default 10).
-        n_repeat: Timed iterations per trial (default 50).
-        n_trials: Independent trials (default 3).
-
-    Returns:
-        Kernel latency in **milliseconds**.
-    """
-    if not isinstance(args, tuple):
-        raise TypeError(
-            f"bench_kernel expects a tuple of args, got {type(args).__name__}. "
-            "Check that gen_inputs() returns a tuple."
-        )
-
-    cache = _get_l2_flush_cache()
-    has_args = len(args) > 0
-
-    # Pre-clone a small pool of input tensors so the kernel sees different
-    # addresses across iterations.  Skip cloning if total tensor memory
-    # exceeds 1 GB to avoid OOM on large workloads.
-    _N_CLONES = 3
-    _MAX_CLONE_BYTES = 1 << 30  # 1 GB
-    if has_args:
-        tensor_mask = tuple(isinstance(a, torch.Tensor) for a in args)
-        total_bytes = sum(a.nelement() * a.element_size()
-                          for a, m in zip(args, tensor_mask, strict=True) if m)
-        if total_bytes * _N_CLONES <= _MAX_CLONE_BYTES:
-            arg_pool = [
-                tuple(a.clone() if m else a for a, m in zip(args, tensor_mask, strict=True))
-                for _ in range(_N_CLONES)
-            ]
-            def _run(i):
-                return fn(*arg_pool[i % _N_CLONES])
-        else:
-            _logger.warning(
-                "bench_kernel: inputs total %.2f GiB; skipping per-iteration "
-                "cloning (kernel sees identical addresses)",
-                total_bytes / (1 << 30),
-            )
-            arg_pool = None
-            def _run(i):
-                return fn(*args)
-    else:
-        arg_pool = None
-        def _run(i):
-            return fn()
-    _bench_meta.inputs_cloned = arg_pool is not None or not has_args
-
-    # Warmup (no profiling)
-    for i in range(n_warmup):
-        cache.zero_()
-        _run(i)
-    torch.ptpu.synchronize()
-
-    # One plain profiler context per trial; torch.profiler.schedule is avoided
-    # because queued launches leak across its warmup/active boundary.
-    # Kineto's window projection may include a flush merely enqueued before
-    # the window, so the flush is drained (sync) before the timed call and
-    # the call is drained before the next flush; the syncs add host-side
-    # latency only.
-    trial_means: list[float] = []
-    try:
-        with _native_output_suppressor():
-            for _ in range(n_trials):
-                with torch.profiler.profile(
-                    # CPU activity is required for Kineto to project the
-                    # annotation window; it never adds device time.
-                    activities=[
-                        torch.profiler.ProfilerActivity.CPU,
-                        torch.profiler.ProfilerActivity.PrivateUse1,
-                    ],
-                ) as profiler:
-                    for i in range(n_repeat):
-                        cache.zero_()
-                        torch.ptpu.synchronize()
-                        with torch.profiler.record_function(_KERNEL_REGION):
-                            _run(i)
-                        torch.ptpu.synchronize()
-                total_us, n_regions = _sum_kernel_time_us(profiler.profiler.kineto_results)
-                # Untrustworthy trace → PTPU-events fallback; genuine PTPU
-                # errors and OOM propagate.
-                if n_regions != n_repeat:
-                    raise _ProfilerProjectionError(
-                        f"{n_regions}/{n_repeat} annotation windows projected"
-                    )
-                trial_means.append((total_us / n_repeat) * 1e-3)
-        _bench_meta.timing = "privateuse1-profiler"
-    except _ProfilerProjectionError as exc:
-        _logger.warning(
-            "PrivateUse1 profiler projection failed (%s); falling back to PTPU-events "
-            "timing, which includes launch overhead", exc,
-        )
-        trial_means = []
-
-    # Fall back to PTPU events if PrivateUse1 profiling failed.
-    if not trial_means:
-        _bench_meta.timing = "ptpu-events"
-        for _ in range(n_trials):
-            start_events = [torch.ptpu.Event(enable_timing=True) for _ in range(n_repeat)]
-            end_events = [torch.ptpu.Event(enable_timing=True) for _ in range(n_repeat)]
-            for i in range(n_repeat):
-                cache.zero_()
-                start_events[i].record()
-                _run(i)
-                end_events[i].record()
-            torch.ptpu.synchronize()
-            times = [s.elapsed_time(e) for s, e in zip(start_events, end_events, strict=True)]
-            trial_means.append(sum(times) / len(times))
-
-    # Free the arg pool and release cached GPU memory to prevent
-    # accumulation across hundreds of benchmark calls.
-    if arg_pool is not None:
-        del arg_pool
-    torch.ptpu.empty_cache()
-
-    trial_means.sort()
-    return trial_means[len(trial_means) // 2]
-
-
-def _get_env_metadata() -> list[str]:
-    """Collect the Torch version and visible PTPU model."""
-    lines = []
-    lines.append(f"- **Torch version**: {torch.__version__}")
-
-    if torch.ptpu.is_available():
-        gpu_name = torch.ptpu.get_device_name(0)
-        lines.append(f"- **PTPU model**: {gpu_name}")
-    else:
-        lines.append("- **PTPU model**: N/A (no PTPU device)")
-
-    return lines
-
-
 class BenchmarkBase(Generic[W], ABC):
-    """Abstract base class for op benchmarking.
+    """Turns measured latency into roofline-relative metrics.
 
-    Generic over workload type so subclasses can declare the exact
-    capability they need.  ``WorkloadBase`` remains the typical in-repo
-    implementation, but the public contract is the type parameter.
-
-    Subclass must implement calculate_flops() and calculate_memory().
+    It times and reports; it does not publish. A row of the report is one op's
+    measurement, and this class holds no op — a benchmark that publishes is an
+    :class:`OpBenchmark`.
     """
 
     def __init__(self, workload: W):
@@ -358,49 +112,84 @@ class BenchmarkBase(Generic[W], ABC):
 
     @abstractmethod
     def calculate_flops(self) -> Optional[float]:
+        """Total FLOPs of one call, or ``None`` to leave TFLOPS out of the row."""
         raise NotImplementedError
 
     @abstractmethod
     def calculate_memory(self) -> Optional[float]:
+        """Bytes moved by one call, or ``None`` to leave bandwidth out of the row."""
         raise NotImplementedError
 
-    def profile(self,
-                functor: Any,
-                *inputs: Any) -> dict:
-        """Profile a callable and return structured results.
+    def compute_roof(self) -> Optional[str]:
+        """GPU-profile key pricing the FLOPs, or ``None`` to leave it out of the row.
 
-        Uses the TANG SOL-ExecBench protocol: PrivateUse1 profiler kernel timing,
-        10 warmup, 50 repeats × 3 trials, L2 flush sized to actual
-        cache, input tensors cloned each iteration.
+        ``ManifestBenchmark`` reads it off ``op.compute_roof()``; a benchmark
+        without an Op instance has no roof to declare.
         """
+        return None
+
+    def case_params(self) -> dict:
+        """What distinguishes this case, read off the workload it was built for.
+
+        The workload holds the case: the shapes and the dtype it was built with.
+        Reading them here keeps the row's columns a property of the workload
+        class rather than of which locals a bench function happened to have in
+        scope. Stored fields only — a workload's computed attributes build data
+        (a dequantized weight, say), and a row must not pay to print a column.
+        """
+        return {
+            name: value for name, value in vars(self.workload).items() if not name.startswith("_")
+        }
+
+    def profile(self, functor: Any, *inputs: Any) -> dict:
+        """Profile a callable and return its structured result."""
         with torch.no_grad():
-            latency = bench_kernel(functor, args=inputs)
-        return self._build_result(latency)
+            return self._build_result(bench_kernel(functor, args=inputs))
 
-    def profile_autograd(self, functor: Any) -> dict:
-        """Profile a callable that requires autograd (e.g. fwd+bwd).
+    def _build_result(self, samples: list[Sample], meta: Optional[dict] = None) -> dict:
+        """Turn per-iteration samples into the row a report records.
 
-        Same as profile() but without torch.no_grad(), so the callable
-        can build autograd graphs and call .backward() internally.
-        The functor must be a zero-arg closure that captures its inputs.
+        ``device_busy_ms`` carries the conclusions; the rest are diagnostics. See
+        :class:`~benchmarks.timing.Sample` for what each one counts.
         """
-        latency = bench_kernel(functor)
-        return self._build_result(latency)
-
-    def _build_result(self, latency: float) -> dict:
-        result = {"latency_ms": latency}
-        # Deviations from the default protocol must be visible in reports.
-        timing = getattr(_bench_meta, "timing", None)
-        if timing is not None and timing != "privateuse1-profiler":
-            result["timing"] = timing
-        if getattr(_bench_meta, "inputs_cloned", True) is False:
-            result["inputs_cloned"] = False
+        if not samples:
+            raise ValueError("bench_kernel returned no samples")
+        busy = median_busy_ms(samples)
+        latency = statistics.median(s.latency_ms for s in samples)
+        result = {
+            "device_busy_ms": busy,
+            "latency_ms": latency,
+            "gap_ms": latency - busy,
+            "n_samples": len(samples),
+        }
+        copy_ms = statistics.median(s.uncounted_copy_ms for s in samples)
+        if copy_ms > 0:
+            # A row whose reading omits work says so in the row, next to the number.
+            result["uncounted_copy_ms"] = copy_ms
+        counts = [s.n_kernels for s in samples]
+        if all(c is not None for c in counts):
+            # The largest count observed: a median would round a call that varies
+            # between one and two kernels to a number it never launched.
+            result["n_kernels"] = max(counts)
+        p10, p90 = _sample_spread_ms([s.device_busy_ms for s in samples])
+        if p10 is not None:
+            result["device_busy_p10_ms"], result["device_busy_p90_ms"] = p10, p90
+        # How the number was measured must travel with it: a run that fell back
+        # to CUDA events is not comparable with a CUPTI-timed one.
+        result.update(meta if meta is not None else _capture_bench_meta())
+        # Roofline describes throughput reached while the device was executing, so the
+        # denominator excludes the gaps.
         flops = self.calculate_flops()
         if flops is not None:
-            result["tflops"] = flops / latency * 1e-9
+            result["flops"] = flops
+            result["tflops"] = flops / busy * 1e-9
         memory = self.calculate_memory()
         if memory is not None:
-            result["bandwidth_tbs"] = memory / latency * 1e-9
+            result["bytes"] = memory
+            result["bandwidth_tbs"] = memory / busy * 1e-9
+        roof = self.compute_roof()
+        if roof is not None:
+            result["compute_roof"] = roof
         return result
 
 
@@ -417,16 +206,78 @@ def _workload_extra_params(w: dict, shape_key: str) -> dict[str, Any]:
     }
 
 
-def workloads_to_params(op_name: str, include_extra: bool = False) -> list:
-    """Convert manifest workload dicts for *op_name* to pytest params.
+def workload_params(
+    workloads: list,
+    build_args: "Callable[[dict, torch.dtype], tuple]",
+    *,
+    smoke_first: bool = False,
+    marks: "Callable[[dict, torch.dtype, int], tuple] | None" = None,
+) -> list:
+    """The one place a manifest workload row becomes a pytest case.
 
-    Each entry becomes ``pytest.param(shape, dtype, id=...)``; with
-    ``include_extra=True`` a third element carries the op-call params
-    declared on the workload entry (e.g. ``{"dim": 0}``).
+    One case per (row, dtype in its ``dtypes``), ided ``f"{label}-{dtype}"`` so a
+    label never has to spell a dtype. *build_args* maps a row and that dtype to
+    the case's positional args — the one thing that differs per family; compose
+    it with :func:`fields` and :func:`then_dtype`. *marks* takes
+    ``(row, dtype, row_index)`` for marks that depend on the dtype, and
+    *smoke_first* marks the first row ``smoke`` and the rest ``full``.
     """
-    workloads = load_workloads(op_name)  # canonical not-found error
+    params: list = []
+    for index, w in enumerate(workloads):
+        # A row the manifest says to skip is skipped whichever else applies.
+        skip = (
+            (pytest.mark.skip(reason=w["bench_skip_reason"]),) if w.get("bench_skip_reason") else ()
+        )
+        smoke = (pytest.mark.smoke if index == 0 else pytest.mark.full,) if smoke_first else ()
+        label = w.get("label", "manifest")
+        for dtype_str in w["dtypes"]:
+            dtype = getattr(torch, dtype_str)
+            case_marks = skip or (tuple(marks(w, dtype, index)) if marks else smoke)
+            params.append(
+                pytest.param(
+                    *build_args(w, dtype),
+                    id=f"{label}-{dtype_str}",
+                    marks=case_marks,
+                )
+            )
+    return params
+
+
+def fields(*keys: str, dtype_last: bool = False) -> "Callable[[dict, torch.dtype], tuple]":
+    """Row values under *keys*, positionally; a key ending in ``dtype`` resolves to
+    the ``torch.dtype`` it names, and *dtype_last* appends the case's dtype for a
+    test whose signature ends in one the row does not name."""
+
+    def build(w: dict, dtype: torch.dtype) -> tuple:
+        values = tuple(getattr(torch, w[k]) if k.endswith("dtype") else w[k] for k in keys)
+        return (*values, dtype) if dtype_last else values
+
+    return build
+
+
+def then_dtype(
+    row_args: "Callable[[dict], tuple]",
+    *,
+    tune: bool | None = None,
+) -> "Callable[[dict, torch.dtype], tuple]":
+    """Append the case's dtype to what *row_args* returns, and *tune* after it when
+    the test takes one. *row_args* reads the row only."""
+
+    def build(w: dict, dtype: torch.dtype) -> tuple:
+        tail = (dtype,) if tune is None else (dtype, tune)
+        return (*row_args(w), *tail)
+
+    return build
+
+
+def workloads_to_params(op: "str | type", include_extra: bool = False) -> list:
+    """Single-tensor-input wrapper over :func:`workload_params`: reads the manifest
+    entry of *op* (an Op class or its manifest key), checks each row against the
+    signature, and yields ``pytest.param(shape, dtype)``; with *include_extra* a
+    third element carries the row's op-call params (e.g. ``{"dim": 0}``)."""
+    workloads = load_workloads(op)  # canonical not-found error
+    op_name = manifest_key(op)
     shape_key, allowed = _workload_contract(op_name)
-    params = []
     for w in workloads:
         if shape_key not in w:
             raise KeyError(
@@ -434,7 +285,8 @@ def workloads_to_params(op_name: str, include_extra: bool = False) -> list:
                 f"{shape_key!r} (derived from the signature's input name)."
             )
         unknown = sorted(
-            repr(k) for k in w
+            repr(k)
+            for k in w
             if not isinstance(k, str) or (k not in allowed and not k.startswith("__"))
         )
         if unknown:
@@ -442,52 +294,48 @@ def workloads_to_params(op_name: str, include_extra: bool = False) -> list:
                 f"workload {w.get('label', w)!r} of {op_name!r} has unknown "
                 f"keys {unknown}; allowed: {sorted(allowed)}."
             )
+
+    def build(w: dict, dtype: torch.dtype) -> tuple:
         shape = tuple(w[shape_key])
-        label = w.get("label", "x".join(str(s) for s in shape))
-        extra = _workload_extra_params(w, shape_key) if include_extra else {}
-        for dtype_str in w["dtypes"]:
-            dtype = getattr(torch, dtype_str)
-            # Copy ``extra`` per parametrization so mutation in one test case
-            # cannot leak into later cases sharing the workload entry.
-            param_args = (
-                (shape, dtype, dict(extra))
-                if include_extra
-                else (shape, dtype)
-            )
-            params.append(pytest.param(*param_args, id=f"{label}-{dtype_str}"))
-    return params
+        if not include_extra:
+            return (shape, dtype)
+        # Copy the extras per case so mutation in one cannot leak into a later
+        # case sharing the row.
+        return (shape, dtype, dict(_workload_extra_params(w, shape_key)))
+
+    # Name a copy: an unlabelled row is named by its shape, as the reports did
+    # before, and the rows are the manifest's own dicts.
+    rows = [
+        w if "label" in w else {**w, "label": "x".join(str(s) for s in w[shape_key])}
+        for w in workloads
+    ]
+    return workload_params(rows, build)
 
 
-class ManifestBenchmark(BenchmarkBase[ShapeDtypeWorkload]):
-    """Generic benchmark that reads FLOP/memory counts from an Op instance.
+class OpBenchmark(BenchmarkBase[W]):
+    """A benchmark of one op, which is what a row of the report is.
 
-    Accepts an op name, an instantiated Op, and any workload satisfying
-    :class:`ShapeDtypeWorkload`.  The op must implement ``eval_roofline()``.
-    Dynamic-shape ops may bind roofline variables during ``forward()``, so
-    this helper calls ``op.eval_roofline()`` only while building a result
-    after profiling has executed the op.
-
-    Usage::
-
-        op = SumFwdOp(dtype=dtype, dim=0)
-        bm = ManifestBenchmark("SumFwdOp", op, workload)
-        result = bm.profile(op, *inputs)
+    The op is named once, here, and every row the benchmark publishes carries
+    it. A comparison whose subject is not an op — a kernel strategy, a field of
+    library implementations — decides something rather than tracking it, and
+    stays on :class:`BenchmarkBase`, which cannot record.
     """
 
-    def __init__(
-        self,
-        op_name: str,
-        op: Any,
-        workload: ShapeDtypeWorkload,
-    ):
+    def __init__(self, op: Any, workload: W):
         super().__init__(workload)
-        self._op_name = op_name
-        self._op = op
+        self.op = op
         self._roofline_cache: Optional[tuple[float, float]] = None
 
     def _get_roofline(self) -> tuple[float, float]:
+        """The op's own count of the work, read once.
+
+        Read lazily, because an op whose shapes are dynamic binds its roofline
+        variables during ``forward()``, and every tag is timed before any result
+        is built. An op that models no roofline says so, and its benchmark
+        overrides the two methods below.
+        """
         if self._roofline_cache is None:
-            flops, mem_bytes = self._op.eval_roofline()
+            flops, mem_bytes = self.op.eval_roofline()
             self._roofline_cache = (float(flops), float(mem_bytes))
         return self._roofline_cache
 
@@ -497,187 +345,132 @@ class ManifestBenchmark(BenchmarkBase[ShapeDtypeWorkload]):
     def calculate_memory(self) -> Optional[float]:
         return self._get_roofline()[1]
 
+    def compare(
+        self,
+        functors: dict[str, Any],
+        *inputs: Any,
+        count_copies: bool = False,
+    ) -> dict[str, dict]:
+        """Time several implementations forward then reversed, and record them.
 
-def _extract_op_config(op: object) -> Optional[dict]:
-    """Return the kernel config for an Op instance, or None if unavailable.
+        Every tag is recorded under the op this benchmark was built for: the row
+        names what ran, so no call site can put one op's numbers under another's
+        name.
 
-    Handles the three Op patterns currently used in tileops:
+        Timing each one twice in opposite orders keeps drift across the case
+        from landing on whichever ran last. A value is a callable timed on
+        *inputs*, or a ``(callable, args)`` pair. Every callable runs under
+        ``no_grad``: a graph built inside the timed region is host work, and a
+        backward reached through autograd runs where the timer cannot attribute
+        it. A backward baseline is timed by applying its node directly.
 
-      1. **Eager-init** (e.g. ``GemmOp``): ``op.kernel`` is a Kernel
-         instance set in ``__init__``.
-      2. **Lazy with dummy kernel** (e.g. ``FFTC2COp``): ``op.kernel`` is a
-         default Kernel and ``op._kernel_cache`` may hold others.
-      3. **Pure lazy cache** (e.g. ``_SoftmaxBaseOp`` and the spec-conformant
-         reduction ops): ``op._kernel_cache`` is the only source; ``op.kernel``
-         is unset.
-
-    A direct ``op.config`` attribute (legacy / explicit override) takes
-    precedence over kernel introspection.
-    """
-    op_config = getattr(op, "config", None)
-    if op_config:
-        return op_config
-
-    kernel = getattr(op, "kernel", None)
-    op_config = getattr(kernel, "config", None) if kernel is not None else None
-    if op_config:
-        return op_config
-
-    # Pure lazy-cache pattern: pick any cached kernel's config. All cached
-    # kernels for a given op share dtype/op_kind, so taking the first is
-    # sufficient for the benchmark report (which records one entry per call).
-    cache = getattr(op, "_kernel_cache", None)
-    if cache:
-        try:
-            first_kernel = next(iter(cache.values()))
-        except StopIteration:
-            first_kernel = None
-        if first_kernel is not None:
-            op_config = getattr(first_kernel, "config", None)
-            if op_config:
-                return op_config
-
-    return None
-
-
-class BenchmarkReport:
-    """Collects benchmark results and dumps a markdown report.
-
-    All methods are static — use as BenchmarkReport.record(...).
-    Call clear() at session start, dump() at session end.
-    """
-    _records: dict = {}
-
-    @staticmethod
-    def record(op_or_name, params: dict, result: dict, tag: str = "tileops") -> None:
-        """Record a benchmark result.
-
-        Args:
-            op_or_name: Op instance or benchmark group name string.
-                If an Op instance, class name and module are extracted automatically.
-            params: Parameter dict (typically from locals())
-            result: Dict with latency_ms, tflops, bandwidth_tbs
-            tag: Label to distinguish implementations (e.g. "tileops", "FA3", "fla")
+        ``count_copies`` puts device-to-device copies into every tag's reading, for a
+        case where an implementation computes part of the result with one. It belongs to
+        the case rather than the tag: reading one side with copies and the other without
+        compares two instruments.
         """
-        if isinstance(op_or_name, str):
-            name = op_or_name
-            op_module = None
-            op_config = None
-        else:
-            name = op_or_name.__class__.__name__
-            op_module = op_or_name.__class__.__module__
-            op_config = _extract_op_config(op_or_name)
-
-        # Filter params to only include serializable benchmark parameters.
-        # Tuples of primitives (e.g. ``shape=(4096, 4096)``) are preserved
-        # verbatim so the profile log carries the original input geometry
-        # rather than a flattened element count.
-        def _is_serializable(v: Any) -> bool:
-            if isinstance(v, (int, float, bool, str, torch.dtype)):
-                return True
-            if isinstance(v, tuple):
-                return all(_is_serializable(x) for x in v)
-            return False
-
-        filtered_params = {
-            k: v for k, v in params.items()
-            if k not in ("test", "bm", "op", "inputs", "result", "result_bl",
-                         "baseline_fn", "tune")
-            and not k.startswith("_")
-            and _is_serializable(v)
+        plan = {
+            tag: value if isinstance(value, tuple) else (value, inputs)
+            for tag, value in functors.items()
         }
-        record_entry = {
-            "params": filtered_params,
-            "result": result,
-            "tag": tag,
+        tags = list(plan)
+        order = tags + tags[::-1]
+        # Split the budget across the two passes rather than spending it twice:
+        # the point is symmetry, not more samples.
+        passes = 2
+        samples: dict[str, list[Sample]] = {tag: [] for tag in tags}
+        meta: dict[str, dict] = {}
+        skipped: set[str] = set()
+        for tag in order:
+            functor, args = plan[tag]
+            with torch.no_grad():
+                try:
+                    samples[tag].extend(
+                        bench_kernel(
+                            functor,
+                            args=args,
+                            dry_run_ms=DRY_RUN_MS / passes,
+                            repeat_ms=REPEAT_MS / passes,
+                            max_iters=_MAX_ITERS // passes,
+                            min_iters=max(1, _MIN_ITERS // passes),
+                            count_copies=count_copies,
+                        )
+                    )
+                except Exception:
+                    if tag == "tileops":
+                        raise
+                    # Reference baselines (torch, compiled reference, library
+                    # kernels) may be unavailable on the ptpu backend: the op is
+                    # missing, the library is not installed, or dynamo cannot
+                    # trace it. Fall back to CPU, then skip the tag when CPU
+                    # also fails, so the tileops row still records.
+                    try:
+                        samples[tag].extend(
+                            bench_kernel(
+                                _run_on_cpu(functor),
+                                args=args,
+                                dry_run_ms=DRY_RUN_MS / passes,
+                                repeat_ms=REPEAT_MS / passes,
+                                max_iters=_MAX_ITERS // passes,
+                                min_iters=max(1, _MIN_ITERS // passes),
+                                count_copies=count_copies,
+                            )
+                        )
+                    except Exception:
+                        skipped.add(tag)
+                        continue
+            pass_meta = _capture_bench_meta()
+            previous = meta.get(tag)
+            if previous is not None and previous["timing"] != pass_meta["timing"]:
+                raise RuntimeError(
+                    f"{tag}: the two passes timed with different methods "
+                    f"({previous['timing']} then {pass_meta['timing']}); pooling "
+                    "them would report one median over two kinds of measurement. "
+                    "Only reachable with TILEOPS_ALLOW_CUDA_EVENTS_FALLBACK=1."
+                )
+            meta[tag] = pass_meta
+        results = {
+            tag: self._build_result(samples[tag], meta[tag]) for tag in tags if tag not in skipped
         }
-        if op_config:
-            record_entry["config"] = op_config
-        BenchmarkReport._records.setdefault(name, []).append(record_entry)
+        params = self.case_params()
+        for tag in tags:
+            if tag not in skipped:
+                BenchmarkReport.record(self.op, params, results[tag], tag=tag)
+        return results
 
-        # Accumulate in thread-local for conftest hook.
-        if not hasattr(_bench_results, "entries"):
-            _bench_results.entries = []
-        entry = {"tag": tag, "op": name, **result}
-        if op_module:
-            entry["op_module"] = op_module
-        _bench_results.entries.append(entry)
 
-        _logger.info("op=%s module=%s tag=%s latency_ms=%.4f tflops=%.2f",
-                      name, op_module or "N/A", tag,
-                      result.get("latency_ms", 0),
-                      result.get("tflops", 0))
+class ManifestBenchmark(OpBenchmark[Any]):
+    """Reads the roofline off ``op.eval_roofline()``, never off the workload.
 
-    @staticmethod
-    def dump(path: str) -> None:
-        """Write all collected results to a markdown-formatted log file."""
-        if not BenchmarkReport._records:
-            return
+    Called lazily while building a result, because a dynamic-shape op binds its
+    roofline variables during ``forward()``.
 
-        lines = [
-            "# TileOPs Benchmark Report",
-            f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            "",
-            "## Environment",
-            "",
-        ]
-        lines.extend(_get_env_metadata())
-        lines.append("")
+    The benchmark reads its op's name off the instance: ``self.op_name`` is the
+    wrapped class's name, which every manifest key equals by validator rule.
+    """
 
-        default_result_keys = ["latency_ms", "tflops", "bandwidth_tbs"]
+    def __init__(self, op: Any, workload: Any):
+        super().__init__(op, workload)
+        self.op_name = type(op).__name__
+        if self.op_name not in load_manifest():
+            raise KeyError(
+                f"{self.op_name} is not a manifest op; a benchmark reports under the name the "
+                "manifest declares, so a wrapper or a subclass cannot stand in for one"
+            )
 
-        for name, entries in BenchmarkReport._records.items():
-            if not entries:
-                continue
+    def case_params(self) -> dict:
+        """The workload's fields, and the parameters the manifest declares for the op.
 
-            lines.append(f"## {name}")
-            lines.append("")
+        A reduce over ``dim=0`` and one over ``dim=-1`` share a workload and are
+        different cases; the manifest says which parameters an op has, and the op
+        holds their values.
+        """
+        params = super().case_params()
+        declared = (load_manifest()[self.op_name].get("signature") or {}).get("params") or {}
+        for name in declared:
+            if hasattr(self.op, name):
+                params[name] = getattr(self.op, name)
+        return params
 
-            # Group by tag
-            tag_entries = {}
-            for entry in entries:
-                tag_entries.setdefault(entry["tag"], []).append(entry)
-            result_keys = list(default_result_keys)
-            for entry in entries:
-                for key in entry["result"]:
-                    if key not in result_keys:
-                        result_keys.append(key)
-
-            for tag, tag_group in tag_entries.items():
-                lines.append(f"### {tag}")
-                lines.append("")
-
-                param_keys = list(tag_group[0]["params"].keys())
-                has_config = any("config" in e for e in tag_group)
-                header_parts = param_keys + result_keys
-                if has_config:
-                    header_parts.append("config")
-                lines.append("| " + " | ".join(header_parts) + " |")
-                lines.append("| " + " | ".join(["---"] * len(header_parts)) + " |")
-
-                for entry in tag_group:
-                    row = [str(entry["params"].get(k, "")) for k in param_keys]
-                    for rk in result_keys:
-                        val = entry["result"].get(rk)
-                        if val is None:
-                            row.append("N/A")
-                        elif isinstance(val, (int, float)) and not isinstance(val, bool):
-                            row.append(f"{val:.4f}")
-                        else:
-                            row.append(str(val))
-                    if has_config:
-                        cfg = entry.get("config")
-                        row.append(str(cfg) if cfg else "")
-                    lines.append("| " + " | ".join(row) + " |")
-
-                lines.append("")
-
-        with open(path, "w") as f:
-            f.write("\n".join(lines))
-
-        print(f"Benchmark report saved to {path}")
-
-    @staticmethod
-    def clear() -> None:
-        """Clear all collected records."""
-        BenchmarkReport._records.clear()
+    def compute_roof(self) -> Optional[str]:
+        return self.op.compute_roof()

@@ -535,7 +535,6 @@ def test_reduce(op, dtype, M, N, src_scope, dst_scope, threads, batch):
     ("op", "packed_op"),
     [("sum", "add2"), ("max", "max2"), ("min", "min2")],
 )
-@tilelang.testing.requires_cuda
 def test_reduce_local_packed_codegen(op, packed_op):
     @T.prim_func
     def main(A: T.Tensor((8,), T.float16), B: T.Tensor((1,), T.float16)):
@@ -558,7 +557,6 @@ def test_reduce_local_packed_codegen(op, packed_op):
     ("op", "packed_op"),
     [("sum", "add2"), ("max", "max2"), ("min", "min2")],
 )
-@tilelang.testing.requires_cuda
 def test_reduce_local_noncontiguous_dim_packed_codegen(op, packed_op):
     @T.prim_func
     def main(A: T.Tensor((8, 4), T.float16), B: T.Tensor((4,), T.float16)):
@@ -583,7 +581,6 @@ def test_reduce_local_noncontiguous_dim_packed_codegen(op, packed_op):
     ("op", "packed_op"),
     [("sum", "add2"), ("max", "max2"), ("min", "min2")],
 )
-@tilelang.testing.requires_cuda
 def test_reduce_local_to_var_packed_codegen(op, packed_op):
     @T.prim_func
     def main(A: T.Tensor((8,), T.float16), B: T.Tensor((1,), T.float16)):
@@ -601,7 +598,6 @@ def test_reduce_local_to_var_packed_codegen(op, packed_op):
     assert f"tl::{packed_op}" in artifact.kernel_source
 
 
-@tilelang.testing.requires_cuda
 @pytest.mark.parametrize("op", ["sum", "max", "min"])
 def test_reduce_local_packed_correctness(op):
     @tilelang.jit(out_idx=-1)
@@ -621,7 +617,10 @@ def test_reduce_local_packed_correctness(op):
     jit_kernel = kernel()
     A = torch.randn((8,), dtype=torch.float16, device=get_current_device())
     B = jit_kernel(A)
-    torch.testing.assert_close(B[0], _ref(A.reshape(1, 8), op)[0], atol=1e-1, rtol=1e-1)
+    # Build the reference on the CPU copy: _ref goes through torch ops the ptpu
+    # backend does not implement (min/max reach aten::masked_select), and
+    # _assert_close moves ptpu results off-device before comparing anyway.
+    _assert_close(B[0], _ref(A.reshape(1, 8).cpu(), op)[0], atol=1e-1, rtol=1e-1)
 
 
 # ---------------------------------------------------------------------------
@@ -1035,7 +1034,6 @@ def test_reduce_absmax_bf16_noncontiguous_packed_layout_regression():
     torch.testing.assert_close(B.cpu(), ref, atol=0, rtol=0)
 
 
-@tilelang.testing.requires_cuda
 def test_reduce_sum_reshape_straddle_layout_regression():
     tile_m = 2
     hidden = 192
@@ -1073,6 +1071,14 @@ def test_reduce_sum_reshape_straddle_layout_regression():
 
 
 def _compile(prim_func):
+    """Compile with the target the current run mode selects.
+
+    ``env.get_default_target()`` is what ``TILELANG_DEFAULT_TARGET`` /
+    ``TANG_ARCH`` resolve to, so this helper serves both TANG modes without any
+    per-test pin: S2 mode passes ``tang/stcu`` (real hardware, tvm_ffi backend),
+    S3 mode passes ``tang/stcuv2`` and ``TANG_SIMULATOR=1`` makes the simulator
+    the auto-selected execution backend.
+    """
     return tilelang.compile(prim_func, out_idx=-1, target=tilelang.env.get_default_target())
 
 
@@ -1089,13 +1095,16 @@ def _make_allreduce_width_kernel(reduce_fn, M, width, threads):
     return kernel
 
 
-def _make_allreduce_dim0_scale_kernel(reduce_fn, logical_width, scale):
+def _make_allreduce_dim0_scale_kernel(reduce_fn, logical_width, scale, threads=None):
+    if threads is None:
+        threads = logical_width * scale
+
     @T.prim_func
     def kernel(
         A: T.Tensor((logical_width, scale), T.float32),
         B: T.Tensor((scale,), T.float32),
     ):
-        with T.Kernel(1, threads=logical_width * scale):
+        with T.Kernel(1, threads=threads):
             src = T.alloc_fragment((logical_width, scale), T.float32)
             dst = T.alloc_fragment((scale,), T.float32)
             T.copy(A, src)
@@ -1105,7 +1114,6 @@ def _make_allreduce_dim0_scale_kernel(reduce_fn, logical_width, scale):
     return kernel
 
 
-@tilelang.testing.requires_cuda
 @pytest.mark.parametrize("reduce_fn", [T.reduce_sum, T.reduce_max], ids=["sum", "max"])
 @pytest.mark.parametrize("width", [48, 96])
 def test_allreduce_rejects_non_power_of_two_logical_width(reduce_fn, width):
@@ -1113,7 +1121,6 @@ def test_allreduce_rejects_non_power_of_two_logical_width(reduce_fn, width):
         _compile(_make_allreduce_width_kernel(reduce_fn, 1, width, width))
 
 
-@tilelang.testing.requires_cuda
 @pytest.mark.parametrize("reduce_fn", [T.reduce_sum, T.reduce_max], ids=["sum", "max"])
 @pytest.mark.parametrize("width", [32, 64, 128])
 def test_allreduce_power_of_two_width_runtime(reduce_fn, width):
@@ -1125,7 +1132,6 @@ def test_allreduce_power_of_two_width_runtime(reduce_fn, width):
     _assert_close(B, ref, atol=1e-2, rtol=1e-2)
 
 
-@tilelang.testing.requires_cuda
 @pytest.mark.parametrize(("logical_width", "scale"), [(32, 2), (64, 2)])
 def test_allreduce_scale_greater_than_one_valid_runtime(logical_width, scale):
     k = _compile(_make_allreduce_dim0_scale_kernel(T.reduce_sum, logical_width, scale))
@@ -1134,11 +1140,39 @@ def test_allreduce_scale_greater_than_one_valid_runtime(logical_width, scale):
     _assert_close(B, A.sum(dim=0), atol=1e-2, rtol=1e-2)
 
 
-@tilelang.testing.requires_cuda
 @pytest.mark.parametrize("reduce_fn", [T.reduce_sum, T.reduce_max], ids=["sum", "max"])
 def test_allreduce_scale_greater_than_one_rejects_non_power_of_two(reduce_fn):
     with pytest.raises(Exception, match=r"logical_width.*positive power of two"):
         _compile(_make_allreduce_dim0_scale_kernel(reduce_fn, 48, 2))
+
+
+@pytest.mark.parametrize(
+    "execution_target",
+    [
+        pytest.param("cuda", marks=tilelang.testing.requires_cuda.marks()),
+        pytest.param("tang", marks=pytest.mark.skipif(not tilelang.testing.is_tang_target(), reason="Requires TANG target")),
+    ],
+)
+@pytest.mark.parametrize("reduce_fn", [T.reduce_sum, T.reduce_max], ids=["sum", "max"])
+@pytest.mark.parametrize(
+    ("logical_width", "scale", "threads"),
+    [
+        # Exactly one replica: t ^ 48 reads past the 96-entry workspace.
+        (32, 3, 96),
+        # Two replicas over 192 of 256 threads: the layout inferred for a
+        # (32, 3) fragment, silently mixes columns and replicas.
+        (32, 3, 256),
+        # Shuffle-only width: shfl_xor(12/6/3) still straddles columns.
+        (8, 3, 128),
+    ],
+)
+def test_allreduce_rejects_non_power_of_two_scale(reduce_fn, logical_width, scale, threads, execution_target):
+    # The XOR butterfly only addresses the reduce coordinate when the thread
+    # stride between consecutive participants is a power of two; a stride-3
+    # reduce must fail loudly instead of returning a wrong result.
+    target = "cuda" if execution_target == "cuda" else tilelang.env.get_default_target()
+    with pytest.raises(Exception, match=r"scale .*power of two"):
+        tilelang.compile(_make_allreduce_dim0_scale_kernel(reduce_fn, logical_width, scale, threads), out_idx=-1, target=target)
 
 
 def _make_nan_reduce_kernel(reduce_fn, M, N, dtype, threads, *, nan_propagate):
@@ -1154,8 +1188,14 @@ def _make_nan_reduce_kernel(reduce_fn, M, N, dtype, threads, *, nan_propagate):
     return kernel
 
 
-@tilelang.testing.requires_cuda
-@tilelang.testing.requires_cuda_compute_version_ge(8, 9)
+# S3-only: the fp8 kernel needs the fp8 header that only the S3 toolchain ships,
+# and ptcc selects that toolchain for `arch=stcuv2` alone (see
+# tilelang/contrib/ptcc.py). Both halves come from the run mode, so the shared
+# ``_compile`` helper is enough here:
+#   S3 mode: TILELANG_DEFAULT_TARGET/TANG_ARCH = stcuv2 (the target) and
+#            TANG_SIMULATOR=1 auto-selects the ISS execution backend;
+#   S2 mode: this test skips via @requires_stcuv2.
+@tilelang.testing.requires_stcuv2
 def test_reduce_packed_fp8_to_float16_absmax_runtime():
     if not hasattr(torch, "float8_e4m3fn"):
         pytest.skip("torch.float8_e4m3fn is not available")
@@ -1173,13 +1213,15 @@ def test_reduce_packed_fp8_to_float16_absmax_runtime():
     source = k.get_kernel_source()
     assert "from_uint1<__half2>(*(fp8" not in source
 
-    base = torch.linspace(-2.0, 2.0, 128, device=get_current_device(), dtype=torch.float16).reshape(4, 32)
+    # Build the input on the CPU and hand the simulator a ptpu copy: the ptpu
+    # backend implements neither aten::linspace nor an fp8 cast.
+    base = torch.linspace(-2.0, 2.0, 128, dtype=torch.float16).reshape(4, 32)
     base[0, 3] = -7.0
     base[1, 17] = 5.5
     base[2, 31] = -3.25
     base[3, 0] = 4.0
     A = base.to(torch.float8_e4m3fn)
-    B = k(A)
+    B = k(A.ptpu())
     ref = A.to(torch.float16).abs().amax(dim=1)
     _assert_close(B, ref, atol=0, rtol=0)
 
@@ -1188,7 +1230,7 @@ def test_reduce_packed_max_nan_propagate_uses_nan_intrinsics():
     k = _compile(_make_nan_reduce_kernel(T.reduce_max, 128, 128, T.float16, threads=256, nan_propagate=True))
     src = k.get_kernel_source()
     assert "tl::MaxOpNan" in src
-    if str(tilelang.env.get_default_target()).lower().startswith("cuda"):
+    if tilelang.testing.is_cuda_target():
         assert "max2_nan" in src
     else:
         assert "max2_nan" not in src
@@ -1198,7 +1240,7 @@ def test_reduce_packed_min_nan_propagate_uses_nan_intrinsics():
     k = _compile(_make_nan_reduce_kernel(T.reduce_min, 128, 128, T.bfloat16, threads=256, nan_propagate=True))
     src = k.get_kernel_source()
     assert "tl::MinOpNan" in src
-    if str(tilelang.env.get_default_target()).lower().startswith("cuda"):
+    if tilelang.testing.is_cuda_target():
         assert "min2_nan" in src
     else:
         assert "min2_nan" not in src
@@ -1208,7 +1250,7 @@ def test_reduce_packed_absmax_nan_propagate_uses_nan_intrinsics():
     k = _compile(_make_nan_reduce_kernel(T.reduce_absmax, 128, 128, T.float16, threads=256, nan_propagate=True))
     src = k.get_kernel_source()
     assert "tl::MaxOpNan" in src
-    if str(tilelang.env.get_default_target()).lower().startswith("cuda"):
+    if tilelang.testing.is_cuda_target():
         assert "max2_nan" in src
     else:
         assert "max2_nan" not in src

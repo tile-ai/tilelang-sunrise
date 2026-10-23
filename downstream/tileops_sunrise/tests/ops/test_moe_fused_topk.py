@@ -16,7 +16,7 @@ import torch
 
 from tests.test_base import FixtureBase
 from tileops.ops.moe import FusedTopKOp
-from workloads.moe import FusedTopKTest
+from workloads.moe import FusedTopKWorkload
 
 
 def fused_topk_torch(
@@ -38,43 +38,155 @@ def fused_topk_torch(
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
     return topk_weights, topk_ids.int()
 
-# Reference implementation
-
-
-# Test fixture
-
 
 class FusedTopKFixture(FixtureBase):
     PARAMS = [
-        ("num_tokens, num_experts, top_k, scoring_func, renormalize, dtype", [
-            # smoke cases must be first
-            pytest.param(32,   128, 8, "softmax", False, torch.bfloat16, marks=pytest.mark.smoke, id="smoke-softmax-bf16"),
-            pytest.param(32,   128, 8, "softmax", False, torch.float16,  marks=pytest.mark.smoke, id="smoke-softmax-fp16"),
-            pytest.param(32,   256, 8, "sigmoid", True,  torch.bfloat16, marks=pytest.mark.smoke, id="smoke-sigmoid-renorm"),
-            # E not divisible by 32 — exercises padding path (expert_idx >= num_experts)
-            pytest.param(32,   100, 4, "softmax", False, torch.bfloat16, marks=pytest.mark.smoke, id="smoke-e100-pad"),
-            pytest.param(32,    33, 2, "sigmoid", False, torch.bfloat16, marks=pytest.mark.smoke, id="smoke-e33-pad"),
-            # softmax, no renorm (Qwen3-MoE style)
-            pytest.param(512,  128, 8, "softmax", False, torch.bfloat16, marks=pytest.mark.full, id="qwen3-small"),
-            pytest.param(2048, 128, 8, "softmax", False, torch.bfloat16, marks=pytest.mark.full, id="qwen3-medium"),
-            pytest.param(4096, 128, 8, "softmax", False, torch.bfloat16, marks=pytest.mark.full, id="qwen3-large"),
-            # softmax + renorm (Qwen3.5-MoE style)
-            pytest.param(512,  256, 8, "softmax", True,  torch.bfloat16, marks=pytest.mark.full, id="qwen35-small"),
-            pytest.param(2048, 256, 8, "softmax", True,  torch.bfloat16, marks=pytest.mark.full, id="qwen35-medium"),
-            # sigmoid, no renorm
-            pytest.param(512,  256, 8, "sigmoid", False, torch.bfloat16, marks=pytest.mark.full, id="sigmoid-no-renorm"),
-            # sigmoid + renorm (DeepSeek-V3/GLM-4 style)
-            pytest.param(512,  256, 8, "sigmoid", True,  torch.bfloat16, marks=pytest.mark.full, id="sigmoid-renorm"),
-            # top_k=1
-            pytest.param(512,   64, 1, "softmax", False, torch.bfloat16, marks=pytest.mark.full, id="top-k-1"),
-        ]),
+        (
+            "num_tokens, num_experts, top_k, scoring_func, renormalize, dtype",
+            [
+                # smoke cases must be first
+                pytest.param(
+                    32,
+                    128,
+                    8,
+                    "softmax",
+                    False,
+                    torch.bfloat16,
+                    marks=pytest.mark.smoke,
+                    id="smoke-softmax-bf16",
+                ),
+                pytest.param(
+                    32,
+                    128,
+                    8,
+                    "softmax",
+                    False,
+                    torch.float16,
+                    marks=pytest.mark.smoke,
+                    id="smoke-softmax-fp16",
+                ),
+                pytest.param(
+                    32,
+                    256,
+                    8,
+                    "sigmoid",
+                    True,
+                    torch.bfloat16,
+                    marks=pytest.mark.smoke,
+                    id="smoke-sigmoid-renorm",
+                ),
+                # E not divisible by 32 — exercises padding path (expert_idx >= num_experts)
+                pytest.param(
+                    32,
+                    100,
+                    4,
+                    "softmax",
+                    False,
+                    torch.bfloat16,
+                    marks=pytest.mark.smoke,
+                    id="smoke-e100-pad",
+                ),
+                pytest.param(
+                    32,
+                    33,
+                    2,
+                    "sigmoid",
+                    False,
+                    torch.bfloat16,
+                    marks=pytest.mark.smoke,
+                    id="smoke-e33-pad",
+                ),
+                # softmax, no renorm (Qwen3-MoE style)
+                pytest.param(
+                    512,
+                    128,
+                    8,
+                    "softmax",
+                    False,
+                    torch.bfloat16,
+                    marks=pytest.mark.full,
+                    id="qwen3-small",
+                ),
+                pytest.param(
+                    2048,
+                    128,
+                    8,
+                    "softmax",
+                    False,
+                    torch.bfloat16,
+                    marks=pytest.mark.full,
+                    id="qwen3-medium",
+                ),
+                pytest.param(
+                    4096,
+                    128,
+                    8,
+                    "softmax",
+                    False,
+                    torch.bfloat16,
+                    marks=pytest.mark.full,
+                    id="qwen3-large",
+                ),
+                # softmax + renorm (Qwen3.5-MoE style)
+                pytest.param(
+                    512,
+                    256,
+                    8,
+                    "softmax",
+                    True,
+                    torch.bfloat16,
+                    marks=pytest.mark.full,
+                    id="qwen35-small",
+                ),
+                pytest.param(
+                    2048,
+                    256,
+                    8,
+                    "softmax",
+                    True,
+                    torch.bfloat16,
+                    marks=pytest.mark.full,
+                    id="qwen35-medium",
+                ),
+                # sigmoid, no renorm
+                pytest.param(
+                    512,
+                    256,
+                    8,
+                    "sigmoid",
+                    False,
+                    torch.bfloat16,
+                    marks=pytest.mark.full,
+                    id="sigmoid-no-renorm",
+                ),
+                # sigmoid + renorm (DeepSeek-V3/GLM-4 style)
+                pytest.param(
+                    512,
+                    256,
+                    8,
+                    "sigmoid",
+                    True,
+                    torch.bfloat16,
+                    marks=pytest.mark.full,
+                    id="sigmoid-renorm",
+                ),
+                # top_k=1
+                pytest.param(
+                    512,
+                    64,
+                    1,
+                    "softmax",
+                    False,
+                    torch.bfloat16,
+                    marks=pytest.mark.full,
+                    id="top-k-1",
+                ),
+            ],
+        ),
     ]
 
 
-# Tests
-
-
-def _check(test: FusedTopKTest) -> None:
+def _check(test: FusedTopKWorkload) -> None:
     (gating,) = test.gen_inputs()
     op = FusedTopKOp(
         top_k=test.top_k,
@@ -83,6 +195,8 @@ def _check(test: FusedTopKTest) -> None:
     )
     ref_w, ref_ids = fused_topk_torch(gating.cpu(), test.top_k, test.scoring_func, test.renormalize)
     out_w, out_ids = op(gating)
+    torch.ptpu.synchronize()
+    out_w, out_ids = out_w.cpu(), out_ids.cpu()
 
     assert out_w.shape == (test.num_tokens, test.top_k), f"weights shape mismatch: {out_w.shape}"
     assert out_ids.shape == (test.num_tokens, test.top_k), f"ids shape mismatch: {out_ids.shape}"
@@ -91,12 +205,13 @@ def _check(test: FusedTopKTest) -> None:
 
     # weights must match (sorted, handles tie-breaking differences in expert ordering)
     ref_w_sorted = ref_w.sort(dim=-1).values
-    out_w_sorted = out_w.cpu().sort(dim=-1).values
-    torch.testing.assert_close(out_w_sorted, ref_w_sorted, rtol=1e-3, atol=1e-3)
+    out_w_sorted = out_w.sort(dim=-1).values
+    torch.testing.assert_close((out_w_sorted).cpu(), (ref_w_sorted).cpu(), rtol=1e-3, atol=1e-3)
 
     # topk_ids must select experts whose scores are valid top-k scores.
-    # When two experts have identical scores (fp32 ties), either is a valid selection;
-    # we verify that each selected weight >= the (K+1)-th largest weight.
+    # When two experts have identical scores (fp32 ties), either is a valid
+    # selection, so the assertion is that each selected weight >= the
+    # (K+1)-th largest weight.
     gating_f32 = gating.cpu().to(torch.float32)
     if test.scoring_func == "softmax":
         all_scores = torch.softmax(gating_f32, dim=-1)
@@ -107,7 +222,7 @@ def _check(test: FusedTopKTest) -> None:
     raw_ref_w = all_scores.gather(1, ref_ids.long())
     raw_ref_w_sorted = raw_ref_w.sort(dim=-1).values
     for i in range(test.num_tokens):
-        sel_ids = out_ids.cpu()[i].tolist()
+        sel_ids = out_ids[i].tolist()
         assert len(set(sel_ids)) == test.top_k, (
             f"token {i}: duplicate expert ids: {sorted(sel_ids)}"
         )
@@ -117,26 +232,14 @@ def _check(test: FusedTopKTest) -> None:
             for eid in sel_ids:
                 got_score = all_scores[i, eid].item()
                 assert got_score >= kth_val - 1e-4, (
-                    f"token {i}: expert {eid} score {got_score:.6f} < min ref score "
-                    f"{kth_val:.6f}"
+                    f"token {i}: expert {eid} score {got_score:.6f} < min ref score {kth_val:.6f}"
                 )
 
 
-
 @FusedTopKFixture
-def test_fused_topk(
-    num_tokens, num_experts, top_k, scoring_func, renormalize, dtype
-) -> None:
-    test = FusedTopKTest(num_tokens, num_experts, top_k, scoring_func, renormalize, dtype)
+def test_fused_topk(num_tokens, num_experts, top_k, scoring_func, renormalize, dtype) -> None:
+    test = FusedTopKWorkload(num_tokens, num_experts, top_k, scoring_func, renormalize, dtype)
     _check(test)
-
-
-@pytest.mark.smoke
-def test_fused_topk_explicit_shape_mismatch_raises() -> None:
-    gating = torch.randn(4, 8, dtype=torch.float16, device="ptpu")
-    op = FusedTopKOp(num_tokens=5, num_experts=8, top_k=2)
-    with pytest.raises(ValueError, match="Expected num_tokens"):
-        op(gating)
 
 
 @pytest.mark.smoke
@@ -157,29 +260,35 @@ def test_fused_topk_invalid_dtype_raises() -> None:
 
 @pytest.mark.smoke
 def test_fused_topk_correction_bias_requires_sigmoid() -> None:
+    op = FusedTopKOp(top_k=2, scoring_func="softmax")
+    gating = torch.randn(4, 8, dtype=torch.float32, device="ptpu")
+    bias = torch.randn(8, dtype=torch.float32, device="ptpu")
     with pytest.raises(ValueError, match="requires scoring_func='sigmoid'"):
-        FusedTopKOp(top_k=2, scoring_func="softmax", with_correction_bias=True)
+        op(gating, bias)
 
 
 @pytest.mark.smoke
 def test_fused_topk_correction_bias_device_check() -> None:
     gating = torch.randn(4, 8, dtype=torch.float32, device="ptpu")
     correction_bias = torch.randn(8, dtype=torch.float32)
-    op = FusedTopKOp(top_k=2, scoring_func="sigmoid", with_correction_bias=True)
+    op = FusedTopKOp(top_k=2, scoring_func="sigmoid")
     with pytest.raises(ValueError, match="correction_bias must be a CUDA tensor"):
         op(gating, correction_bias)
 
 
 @pytest.mark.smoke
-def test_fused_topk_dynamic_shape_kernel_cache() -> None:
+def test_fused_topk_kernel_cache_specializations() -> None:
     op = FusedTopKOp(top_k=2)
     gating1 = torch.randn(4, 8, dtype=torch.float16, device="ptpu")
     gating2 = torch.randn(5, 8, dtype=torch.float16, device="ptpu")
+    gating3 = gating1.to(torch.bfloat16)
 
     op(gating1)
     assert op.dtype == torch.float16
-    assert len(op._kernel_cache) == 1
+    assert len(list(op.iter_kernels())) == 1
     op(gating1)
-    assert len(op._kernel_cache) == 1
+    assert len(list(op.iter_kernels())) == 1
     op(gating2)
-    assert len(op._kernel_cache) == 2
+    assert len(list(op.iter_kernels())) == 2
+    op(gating3)
+    assert len(list(op.iter_kernels())) == 3

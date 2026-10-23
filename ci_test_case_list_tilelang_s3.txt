@@ -1,19 +1,44 @@
 
 # ===================== S3 tests ======================
-python testing/python/s3/test_tang_language_dialect.py
-python testing/python/s3/test_tang_tcgen5_gemm_atmem.py
-python testing/python/s3/test_tang_tcgen05_ldst.py
-python testing/python/s3/test_tang_tcgen05_cpt2s.py
-python testing/python/s3/test_tang_tcgen05_fence.py
-python testing/python/s3/test_tang_mbarrier.py
-python testing/python/s3/test_tang_tcgen05_warp_specialize.py
-python testing/python/s3/test_tang_tmem_alloc.py
-python testing/python/s3/test_tang_ldst_matrix.py
-python testing/python/s3/test_tang_tcgen05_multiwarp_copy.py
-python testing/python/s3/test_tang_tcgen05_multiwarp_drain.py
-python testing/python/s3/test_tang_gs_copy.py
-python testing/python/s3/test_tang_vectorized_cast.py
+# Same entry form as ci_test_case_list_tilelang.txt: a bare path runs under pytest.
+testing/python/s3/test_tang_language_dialect.py
+testing/python/s3/test_tang_tcgen5_gemm_atmem.py
+testing/python/s3/test_tang_tcgen05_ldst.py
+testing/python/s3/test_tang_tcgen05_cpt2s.py
+testing/python/s3/test_tang_tcgen05_fence.py
+testing/python/s3/test_tang_mbarrier.py
+testing/python/s3/test_tang_tcgen05_warp_specialize.py
+testing/python/s3/test_tang_tmem_alloc.py
+testing/python/s3/test_tang_ldst_matrix.py
+testing/python/s3/test_tang_tcgen05_multiwarp_copy.py
+testing/python/s3/test_tang_tcgen05_multiwarp_drain.py
+testing/python/s3/test_tang_gs_copy.py
+testing/python/s3/test_tang_vectorized_cast.py
+testing/python/s3/test_tang_inject_tcgen05_fence.py
+testing/python/s3/test_tang_promote_tmem_accumulator.py
+# testing/python/s3/test_tang_persistent_cluster.py
 
+
+# ===================== upstream files (also in the main list) =====================
+# Same paths as ci_test_case_list_tilelang.txt. The S2/S3 test mode decides which
+# tests inside them execute (tilelang.testing.requires_stcu / requires_stcuv2), so
+# one file serves both jobs: in S3 mode the stcuv2-only tests run and the stcu-only
+# ones skip. Each file below was verified to pass as a whole in S3 mode.
+testing/python/language/test_tilelang_language_get_warp_info.py
+testing/python/language/test_tilelang_language_isfinite_codegen.py
+testing/python/target/test_tilelang_tang_pipeline.py
+testing/python/transform/test_tilelang_transform_lower_shared_tmem.py
+
+# --- S3-first entries: the arch-agnostic tests of these files are not triaged
+# --- for S3 yet, so the entry carries " -m tang_s3" and only the requires_stcuv2
+# --- tests inside them run (that decorator emits the marker). Re-run the whole
+# --- file in S3 mode once the remaining failures are fixed, then drop the
+# --- " -m tang_s3" suffix to enlist it whole
+# --- (docs/s3_list_s3_only_selection_design.md).
+# --- 现状（2026-09-24，S3 档整文件）：reduce 3 failed / atomic 与 vectorize 未 triage；
+testing/python/language/test_tilelang_language_atomic.py -m tang_s3
+testing/python/language/test_tilelang_language_reduce.py -m tang_s3
+testing/python/language/test_tilelang_language_vectorize.py -m tang_s3
 
 # =====================  TODO: tilelang CI test cases on S3
 # testing/python/cuda/test_tma_dsmem.py
@@ -22,6 +47,7 @@ python testing/python/s3/test_tang_vectorized_cast.py
 # testing/python/issue/test_tilelang_issue_tma_no_ws.py
 # testing/python/kernel/test_tilelang_kernel_bf16_gemm_tcgen5_ts.py
 # testing/python/kernel/test_tilelang_kernel_int8_gemm_tcgen5.py
+# testing/python/language/test_tilelang_language_cluster.py
 # testing/python/language/test_tilelang_language_float4_e2m1_unpacked_dtype.py
 # testing/python/language/test_tilelang_language_pdl.py
 # testing/python/language/test_tilelang_language_tcgen05_gemm.py

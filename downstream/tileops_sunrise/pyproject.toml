@@ -1,24 +1,29 @@
 [project]
 name = "tileops"
-version = "0.0.1.dev2"
+dynamic = ["version"]
 description = "TileOPs kernels for efficient LLM inference."
 readme = "README.md"
 authors = [{ name="Tile-AI"}]
 dependencies = [
-    "torch>=2.1.0,<2.11.0",
+    "torch>=2.1.0,<2.14.0",
+    # tilelang as a compatibility range, not a source or exact pin. CI does not resolve tilelang
+    # from this range: the runner image bakes a specific tilelang build and CI installs tileops
+    # with --no-deps against it. constraints.txt pins tilelang's runtime deps (torch, triton,
+    # apache-tvm-ffi, ...) for reproducibility but intentionally does NOT pin tilelang itself.
+    # Downstream `pip install tileops` resolves a compatible tilelang release; apache-tvm-ffi
+    # comes in transitively via tilelang's own metadata — no manual cap here.
     "tilelang-sunrise>=0.1.13,<0.2.0",
-    "apache-tvm-ffi>=0.1.11,<0.1.12",
     "einops",
     "pyyaml>=6.0",
 ]
 requires-python = ">=3.10"
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
 keywords = ["llm", "inference", "gpu", "kernel", "tiling"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -36,28 +41,42 @@ dev = [
     "ruff==0.14.13",
     "codespell==2.4.1",
     "pytest>=8.0",
+    "pytest-cov>=5.0",
     "pytest-xdist>=3.0",
     "pyyaml>=6.0",
 ]
 bench = [
     "flash-attn==2.8.3",
     "flash-attn-interface>=2.8.3",
-    "flash-linear-attention==0.4.2",
+    "flash-linear-attention==0.5.2",
     "flashinfer>=0.6.6",
-    "vllm==0.18.0",
+    "vllm==0.27.1",
     "sgl-kernel==0.3.21",
+    "nvmath-python==1.0.0",
 ]
 
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+# setuptools>=77 is the floor for SPDX `license = "MIT"` expressions.
+requires = ["setuptools>=77", "setuptools-scm>=8", "wheel"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools_scm]
+# Used when there is no git metadata (sdist tarballs, vendored copies). It must
+# not carry a `.devN` suffix: setuptools-scm derives the dev distance from the
+# commit count, and errors out rather than accept a pre-set one.
+fallback_version = "0.0.0"
+
 [tool.setuptools.packages.find]
-where = ["."]
-exclude = ["tests", "tests.*", "benchmarks", "benchmarks.*"]
+# src layout: a new top-level directory cannot reach the wheel by being forgotten
+# in an exclude list, and the repo root stays off sys.path, so tests import the
+# installed package rather than the source tree.
+where = ["src"]
 
 [tool.setuptools.package-data]
-tileops = ["kernels/moe/_atomic_helper.h", "manifest/*.yaml"]
+# Kernel headers and YAML data are opened at run time by path relative to
+# __file__, so all of them must ship. Stated by extension, not by name, so a new
+# resource is covered on arrival. Enforced by scripts/ci/check_dist_contents.py.
+tileops = ["**/*.h", "**/*.yaml"]
 
 [tool.codespell]
 ignore-words-list = "nd, te, ist, LOD, offen, NotIn, HSA"
@@ -69,10 +88,15 @@ skip = [
 
 [tool.ruff]
 line-length = 100
+# Markdown belongs to mdformat; ruff reads a fenced fragment as a whole file and de-indents it.
+extend-exclude = ["*.md"]
 
 # NOTE: Please gradually tighten static code checks and other validations in the future.
 # The current exemptions are in place to ensure normal project development.
 [tool.ruff.lint]
+# DOC102 is in preview; opt into that one rule, not preview behaviour at large.
+preview = true
+explicit-preview-rules = true
 select = [
     # pycodestyle
     "E",
@@ -90,25 +114,36 @@ select = [
     # "D",
     # pep8-naming (naming conventions)
     "N",
-    # ruff-specific: sort __all__
-    "RUF022",
+    # pydoclint: a documented parameter the signature does not have
+    "DOC102",
+    # flake8-tidy-imports: banned APIs only. Selected as the exact rule, not the
+    # whole TID family, because TID252 (relative imports) has standing violations.
+    "TID251",
     # flake8-annotations (type hints) — enable when codebase has sufficient coverage
     # "ANN",
 ]
 ignore = [
-    # ambiguous name
+    # E741 (ambiguous variable name): single-letter tensor-dimension names
+    # (l, I) mirror the math notation in kernel signatures.
     "E741",
-    # line too long (allow some flexibility)
+    # E501 (line too long): line-length is already capped at 100 by the
+    # formatter; long kernel launch expressions may exceed it deliberately.
     "E501",
-    # key in dict.keys()
+    # SIM118 (key in dict.keys()): explicit .keys() is kept where it clarifies
+    # that only names, not values, are consumed.
     "SIM118",
-    # memory leaks
+    # B019 (lru_cache on methods can leak memory): kernel builders are cached
+    # by design — the cache holding compiled kernels alive is the point.
     "B019",
-    # No such file or directory
+    # E902 (I/O error while linting a path): environment noise (broken
+    # symlinks, transient files), not a property of the source.
     "E902",
-    # pep8-naming: allow 'import as T'
+    # N812 (lowercase imported as non-lowercase): the TileLang idiom is
+    # `import tilelang.language as T`.
     "N812",
-    # pep8-naming: ignore naming convention violations (common in ML/kernel code)
+    # N801/N802/N803/N806 (PEP 8 naming): kernel code names classes, functions,
+    # arguments, and locals after math symbols and hardware terms (Q, K, V,
+    # block_M), which are case-significant.
     "N801",  # Class name should use CapWords convention
     "N802",  # Function name should be lowercase
     "N803",  # Argument name should be lowercase
@@ -118,14 +153,13 @@ ignore = [
 [tool.ruff.lint.isort]
 known-first-party = ["tileops"]
 
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+# Resolved through the import graph, so an alias other than the usual `T` is
+# caught too.
+"tilelang.language.Buffer".msg = "deprecated; use T.Tensor(shape, dtype)"
+
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
-"bench_*.py" = ["F401"]
-# __all__ intentionally grouped by category, not alphabetical
-"tileops/kernels/elementwise.py" = ["RUF022"]
-"tileops/ops/__init__.py" = ["RUF022"]
-"tileops/ops/elementwise.py" = ["RUF022"]
-"tileops/ops/reduction/__init__.py" = ["RUF022"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "benchmarks/tests"]
@@ -135,4 +169,5 @@ markers = [
     "full: standard correctness coverage",
     "nightly: exhaustive or long-running coverage",
     "packaging: minimal wheel-install sanity check (one case per op family)",
+    "hopper: needs compute capability 9.x; skipped elsewhere, never skipped on Hopper",
 ]

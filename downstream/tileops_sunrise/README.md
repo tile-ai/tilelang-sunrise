@@ -1,98 +1,137 @@
 <div align="center">
-  <img src="https://raw.githubusercontent.com/tile-ai/TileOPs/main/assets/logo.png" width="350"/>
-  <h1>TileOPs</h1>
-  <p><strong>Spec-driven GPU operator library for LLMs — designed for AI agents to build, evaluate, and optimize</strong></p>
-  <p>Built on <a href="https://github.com/tile-ai/tilelang">TileLang</a></p>
-  <!-- <p>
-    <a href="https://pypi.org/project/tileops/"><img src="https://img.shields.io/badge/PyPI-tileops-1E90FF" alt="PyPI version" height="20"></a>
-  </p> -->
-  <p>
-    <a href="https://github.com/tile-ai/TileOPs/tree/main/tileops/manifest"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Ftile-ai%2FTileOPs%2Fstats%2Fmanifest-implemented.json" alt="Spec coverage"></a>
-    <a href="https://github.com/tile-ai/TileOPs/tree/main/benchmarks"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Ftile-ai%2FTileOPs%2Fstats%2Fmanifest-benchmark.json" alt="Bench coverage"></a>
+  <img src="https://raw.githubusercontent.com/tile-ai/TileOPs/main/assets/logo.png" width="360"/>
+
+<h3>Spec-driven LLM operators across backends — built by agents</h3>
+
+<p>The spec is the source; kernels are derived from it and judged against it.</p>
+
+<p>
+    <a href="https://tile-ai.github.io/TileOPs.github.io/manifest/"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Ftile-ai%2FTileOPs%2Fstats%2Fmanifest-implemented.json" alt="Spec coverage"></a>
+    <a href="https://tile-ai.github.io/TileOPs.github.io/benchmarks/"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Ftile-ai%2FTileOPs%2Fstats%2Fmanifest-benchmark.json" alt="Bench coverage"></a>
+    <a href="https://github.com/tile-ai/TileFoundry"><img src="https://img.shields.io/github/issues-search/tile-ai/TileOPs?query=is%3Apr%20is%3Amerged%20label%3Afoundry&label=Forged%20by%20TileFoundry&color=0891b2&logo=github" alt="Kernels forged by TileFoundry"></a>
+    <!-- <a href="https://pypi.org/project/src/tileops/"><img src="https://img.shields.io/badge/PyPI-tileops-1E90FF" alt="PyPI version"></a> -->
   </p>
-  <p>
-    <a href="#installation"><b>Installation</b></a> |
-    <a href="#quick-start"><b>Quick Start</b></a> |
-    <a href="#documentation"><b>Docs</b></a>
+
+<p>
+    <a href="#quick-start"><b>Quick Start</b></a> ·
+    <a href="#built-for-agents"><b>Why it's different</b></a> ·
+    <a href="#how-it-works"><b>How it works</b></a> ·
+    <a href="#installation"><b>Installation</b></a> ·
+    <a href="https://tile-ai.github.io/TileOPs.github.io/benchmarks/"><b>Benchmarks</b></a> ·
+    <a href="https://tile-ai.github.io/TileOPs.github.io/"><b>Docs</b></a>
   </p>
 </div>
-
-> **Status**: TileOPs is under active development. APIs may change.
-
-## Overview
-
-TileOPs is a GPU operator library for LLM training and inference, built on [TileLang](https://github.com/tile-ai/tilelang). Beyond providing a growing collection of production-quality operators, TileOPs explores a **spec-driven development model** where AI agents can read declarative operator specifications, generate kernel implementations, and evaluate them against hardware-theoretical performance bounds — with minimal human scaffolding.
-
-### Architecture
-
-Every operator is split into two layers with a strict boundary:
-
-- **Op** (L2) — stateless Python entry point. Handles validation, dtype casting, and memory layout. CUDA-Graph compatible; `torch.compile(fullgraph=True)` support is declared per op in the manifest.
-- **Kernel** (L1) — TileLang GPU implementation with hardware-specific optimizations (Hopper).
-
-This separation keeps user-facing behavior independent of GPU strategy, allowing agents and developers to modify either layer without side effects on the other.
-
-### Key Properties
-
-- **Spec-driven** — each operator is declared in a machine-readable manifest (`tileops/manifest/`) that specifies signatures, workloads, and roofline formulas, serving as the entry point for both agent code generation and automated validation
-- **Roofline-evaluated** — kernel performance is measured against Speed-of-Light hardware bounds, not relative baselines
-- **Auto-tuning** — built-in search over tile sizes, pipelines, and scheduling parameters
-- **Lightweight** — depends only on TileLang, PyTorch, and einops
-
-## Installation
-
-TileOPs is under active development and is installed from source; PyPI releases will begin with the first stable release. A CUDA-capable GPU is required.
-
-### Prerequisites
-
-- Python >= 3.10
-- PyTorch >= 2.1, < 2.11 (CI validates 2.10)
-- CUDA Toolkit 12.x
-- NVIDIA GPU: **Hopper** (SM_90)
-- [TileLang](https://github.com/tile-ai/tilelang) >= 0.1.9, < 0.2.0 (CI validates 0.1.11)
-
-### From source
-
-```bash
-git clone https://github.com/tile-ai/TileOPs
-cd TileOPs
-make install    # dev dependencies + pre-commit hooks
-```
-
-> [!NOTE]
-> If CUDA and TileLang are already installed system-wide and you encounter build issues:
-> `PIP_NO_BUILD_ISOLATION=1 pip install -e '.[dev]' -v && pre-commit install`
-
-Verify:
-
-```bash
-python -m pytest tests/ -q    # requires a CUDA GPU
-```
 
 ## Quick Start
 
 ```python
 import torch
-from tileops.ops import GemmOp
+from tileops.gemm import GemmFwdOp
 
-M, N, K = 1024, 1024, 512
-dtype = torch.float16
+gemm = GemmFwdOp()  # shapes and dtype are inferred at call time
 
-gemm = GemmOp()  # shapes and dtype are inferred at call time
-
-a = torch.randn(M, K, device="cuda", dtype=dtype)
-b = torch.randn(N, K, device="cuda", dtype=dtype)  # trans_b=True by default
+a = torch.randn(1024, 512, device="cuda", dtype=torch.float16)
+b = torch.randn(1024, 512, device="cuda", dtype=torch.float16)
 
 d = gemm(a, b)  # equals a @ b.T
 ```
 
+Operators are auto-tuned on first use, CUDA-Graph compatible, and declare their
+`torch.compile(fullgraph=True)` support per op.
+
+## Built for agents
+
+An implementation can be regenerated from its spec; a spec cannot be recovered from an
+implementation. The project is organised around the spec rather than around the kernels:
+
+- **The spec is self-contained.** Generation reads it and nothing else, so every constraint on
+  the implementation is declared rather than assumed.
+- **Acceptance is decidable.** Correctness settles against a declared reference, performance
+  against a modelled bound — neither is a judgement call.
+- **The operator/kernel split is enforced.** The boundary is checked rather than agreed, because
+  an unenforced convention does not survive automated edits.
+- **Conformance is validated at every stage.** Spec, generated code, tests and benchmarks each
+  answer to a validator, so an operator is certified as it is produced rather than reviewed once
+  at the end.
+
+## How it works
+
+Each operator is declared in [`src/tileops/manifest/`](src/tileops/manifest/) before it is implemented.
+The entry drives code generation, testing, and benchmarking:
+
+```yaml
+GemmFwdOp:
+  ref_api: "torch.matmul"
+  signature: {inputs: {a: {dtype: "float16 | bfloat16"}, b: {dtype: "same_as(a)"}}, ...}
+  workloads: [{m: 1024, n: 1024, k: 1024, dtypes: [float16, bfloat16]}]
+  roofline: {func: tileops.perf.formulas.gemm_fwd_roofline}
+  source: {kernel: ..., op: ..., test: ..., bench: ..., kernel_map: ...}
+```
+
+| Field       | Role                                                                            |
+| ----------- | ------------------------------------------------------------------------------- |
+| `ref_api`   | Reference implementation the tests compare outputs against.                     |
+| `signature` | Tensor contract, shape rules, and dtype combinations; enforced at the op layer. |
+| `workloads` | Shapes and dtypes the tests and benchmarks cover.                               |
+| `roofline`  | Performance model. Efficiency is achieved throughput over the modelled bound.   |
+| `source`    | Paths to the kernel, op, test, and benchmark, and the slot-to-kernel map.       |
+
+A validator checks every entry against its implementation in CI, so the declaration and the
+code stay in step.
+
+The implementation is split in two layers. **L2**, the Python entry point, owns the
+caller-facing contract: validation, dtype casting, and memory layout. **L1**, the TileLang
+kernel, owns the GPU implementation. [trust-model.md](docs/design/trust-model.md) defines the
+boundary between them.
+
+## Installation
+
+TileOPs installs from source; a PyPI release lands with the first stable version. A
+CUDA-capable GPU is required.
+
+**Prerequisites**
+
+- Python >= 3.10 (CI validates 3.12)
+- PyTorch >= 2.1, < 2.14 (CI validates 2.13)
+- CUDA Toolkit 13.2
+- NVIDIA Hopper (SM_90)
+- [TileLang](https://github.com/tile-ai/tilelang) >= 0.1.9, < 0.2.0 (CI validates 0.1.11 at a
+  pinned main snapshot — see [development.md](docs/development.md#dev-docker-image))
+
+```bash
+git clone https://github.com/tile-ai/TileOPs
+cd TileOPs
+pip install -e '.[dev]' -c constraints.txt   # constraints.txt pins what CI validates
+pre-commit install
+
+python -m pytest -q tests -m smoke           # verify; requires a CUDA GPU
+```
+
+A prebuilt Docker image carries the whole stack and is the environment CI runs in — see
+[development.md](docs/development.md#dev-docker-image), along with test tiers, benchmarks, and
+build troubleshooting.
+
 ## Documentation
 
-Design docs and development guides are in [`docs/`](docs/). The full API reference and performance tables are published at [TileOPs.github.io](https://github.com/tile-ai/TileOPs.github.io).
+|                                                |                                                  |
+| ---------------------------------------------- | ------------------------------------------------ |
+| [CONTRIBUTING.md](CONTRIBUTING.md)             | Naming, PR shape, what a review checks           |
+| [development.md](docs/development.md)          | Build, test, benchmark, dev image                |
+| [architecture.md](docs/design/architecture.md) | Module map and the agent production loop         |
+| [manifest.md](docs/design/manifest.md)         | The spec format every operator starts from       |
+| [ops-design.md](docs/design/ops-design.md)     | Adding an operator, step by step                 |
+| [roofline.md](docs/design/roofline.md)         | How performance is scored against Speed-of-Light |
+| [trust-model.md](docs/design/trust-model.md)   | What each layer may assume about the others      |
+
+The rendered site carries what this table cannot: the
+[API reference](https://tile-ai.github.io/TileOPs.github.io/api/) generated from the operator
+signatures, and the [performance tables](https://tile-ai.github.io/TileOPs.github.io/benchmarks/)
+from the nightly run, each operator against the tuned libraries it competes with.
 
 ## Contributing
 
-See [docs/](docs/) for design docs. Branch and commit conventions are in [`.claude/conventions/types.sh`](.claude/conventions/types.sh).
+Operators are added through the loop above — start from [ops-design.md](docs/design/ops-design.md),
+which walks the path from a manifest entry to a merged kernel.
 
 ## License
 

@@ -11,8 +11,6 @@
 #define TANGRT_INF __longlong_as_double(0x7ff0000000000000ULL)
 #define TANGRT_NAN __longlong_as_double(0xfff8000000000000ULL)
 
-#define hpow powf
-
 #define uint unsigned int
 #define uchar unsigned char
 #define ushort unsigned short
@@ -43,7 +41,39 @@
     }                                                                          \
   } while (0)
 
-// PTCC exposes half/BF16 math helpers but no htanh overloads.
+// Bridge half/BF16 operations that PTCC exposes only for float32.
+TL_DEVICE half hpow(half x, half y) { return half(powf(float(x), float(y))); }
+
+TL_DEVICE __bf16 hpow(__bf16 x, __bf16 y) {
+  return __bf16(powf(float(x), float(y)));
+}
+
+TL_DEVICE half hfmod(half x, half y) { return half(fmodf(float(x), float(y))); }
+
+TL_DEVICE __bf16 hfmod(__bf16 x, __bf16 y) {
+  return __bf16(fmodf(float(x), float(y)));
+}
+
+TL_DEVICE half hsinh(half x) { return half(sinhf(float(x))); }
+
+TL_DEVICE __bf16 hsinh(__bf16 x) { return __bf16(sinhf(float(x))); }
+
+TL_DEVICE half hcosh(half x) { return half(coshf(float(x))); }
+
+TL_DEVICE __bf16 hcosh(__bf16 x) { return __bf16(coshf(float(x))); }
+
+TL_DEVICE half hatan(half x) { return half(atanf(float(x))); }
+
+TL_DEVICE __bf16 hatan(__bf16 x) { return __bf16(atanf(float(x))); }
+
+TL_DEVICE half herf(half x) { return half(erff(float(x))); }
+
+TL_DEVICE __bf16 herf(__bf16 x) { return __bf16(erff(float(x))); }
+
+TL_DEVICE half hnearbyint(half x) { return half(nearbyintf(float(x))); }
+
+TL_DEVICE __bf16 hnearbyint(__bf16 x) { return __bf16(nearbyintf(float(x))); }
+
 TL_DEVICE half htanh(half x) { return half(tanhf(float(x))); }
 
 TL_DEVICE __bf16 htanh(__bf16 x) { return __bf16(tanhf(float(x))); }

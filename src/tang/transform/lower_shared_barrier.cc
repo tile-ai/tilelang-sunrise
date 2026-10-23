@@ -18,6 +18,7 @@
 
 #include "cuda/op/builtin.h"
 #include "support/check.h"
+#include "tang/op/builtin.h"
 
 #include <tvm/ir/type.h>
 #include <tvm/tirx/builtin.h>
@@ -145,11 +146,23 @@ private:
                                   init_calls.size() == 1 ? init_calls.back()
                                                          : SeqStmt(init_calls),
                                   Stmt()));
-    // On TANG the fence is a no-op (mbarrier_init already ends in fence.mem);
-    // what actually publishes the init to the other threads is the storage
-    // sync, and no thread may reach an arrive or a wait before it.
+    // TANG's fence is a real CTA-scope release: fence.mem, the vendor's
+    // documented CTA-scope primitive. TANG has no fence.mbarrier_init, so this
+    // is the closest instruction to CUDA's fence of the same purpose.
+    //
+    // mbarrier_init already ends in a fence.mem of its own, but that lives in
+    // the compiler's builtin header (__clang_tang_builtin_vars.h) and only on
+    // the non-sreg path: under -fstpu-sreg-mbarrier the wrapper is a bare call
+    // to __sreg_mbarrier_init with no fence in its body. Rather than depend on
+    // the fence being present in both modes, the pass that knows a barrier was
+    // just initialised owns the ordering here.
+    //
+    // This does not stand in for the storage sync below. A fence orders; it
+    // does not rendezvous. Publishing the init to the rest of the block is
+    // still that sync's job, and no thread may reach an arrive or await before
+    // it.
     new_body.push_back(
-        Evaluate(Call(DataType::Handle(), ptx_fence_barrier_init(), {})));
+        Evaluate(Call(DataType::Handle(), tang_fence_barrier_init(), {})));
     new_body.push_back(
         Evaluate(Call(DataType::Handle(), builtin::tvm_storage_sync(),
                       {StringImm("shared")})));

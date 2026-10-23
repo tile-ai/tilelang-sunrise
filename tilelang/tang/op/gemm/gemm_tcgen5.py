@@ -8,7 +8,8 @@ from tilelang import language as T
 from tilelang.layout import Layout
 from tilelang.tang.op.gemm.gemm_tmma import _as_const_int, _make_tang_ab_layout
 from tilelang.tang.op.gemm.gemm_tcgen05_descriptors import is_any_fp4, is_unpacked_fp4
-from tilelang.tileop.gemm.gemm_base import GemmBase
+from tilelang.tang.op.gemm.gemm_base import TangGemmBase
+from tilelang.tileop.gemm_blockscaled.gemm_blockscaled_base import GemmBlockScaledMixin
 from tvm import tirx
 from tvm.ir import Range
 from tvm.target import Target
@@ -136,7 +137,7 @@ def _completion_mbarrier(mbar):
     return mbar
 
 
-class GemmTangTCGEN5(GemmBase):
+class GemmTangTCGEN5(TangGemmBase):
     """Lower STCUV2 TCGEN5 template calls."""
 
     @property
@@ -381,7 +382,7 @@ class GemmTangTCGEN5(GemmBase):
                     "0)."
                 )
             return self._lower_ts_python_emitter(a_ptr, b_ptr, c_ptr, mbar, thread_var, mbar_phase_expr)
-        elif _annotation_int(annotations, "tang_legacy_blockscaled", 0):
+        elif isinstance(self, GemmBlockScaledMixin):
             if self.SFARegion is None or self.SFBRegion is None or self.SFTmemRegion is None:
                 raise ValueError("TANG block-scaled GEMM requires scale_a, scale_b and scale_tmem regions")
             return self._lower_blockscaled_python_emitter(a_ptr, b_ptr, c_ptr, mbar, thread_var, mbar_phase_expr)
@@ -400,7 +401,25 @@ class GemmTangTCGEN5(GemmBase):
         raise NotImplementedError("STCUV2 GEMM is not supported")
 
 
-class GemmTangWGMMA(GemmBase):
+class GemmTangTCGEN5BlockScaled(GemmBlockScaledMixin, GemmTangTCGEN5):
+    """TANG scale staging on the common block-scaled GEMM contract."""
+
+    @property
+    def SFTmemRegion(self):
+        return getattr(self.gemm_node, "scaleWorkspaceRegion", None)
+
+    def _check_operand_scopes(self):
+        super()._check_operand_scopes()
+        if self.A.scope() not in ("shared", "shared.dyn"):
+            raise ValueError("TANG block-scaled GEMM requires A in shared memory")
+        if _as_const_int(self.sf_k_start, "k_start") != 0:
+            raise ValueError("TANG block-scaled GEMM requires scale regions sliced to the tile and k_start=0")
+        block = _annotation_int(self.annotations, "tang_scale_block", self.sf_a_granularity_k)
+        if self.sf_a_granularity_k != block or self.sf_b_granularity_k != block:
+            raise ValueError("TANG block-scaled GEMM requires equal A/B scale granularity matching scale_block")
+
+
+class GemmTangWGMMA(TangGemmBase):
     """Reject the unvalidated STCUV2 WGMMA dispatch path."""
 
     def infer_layout(self, target: Target, thread_nums: int):

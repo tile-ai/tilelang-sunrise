@@ -262,6 +262,10 @@ markers = [
     "llvm: Mark a test as using LLVM",
     "metal: Mark a test as using Metal",
     "rocm: Mark a test as using ROCm",
+    # Emitted by tilelang.testing.requires_stcuv2 so a CI list entry can select
+    # only the TANG S3 (stcuv2) cases of a file (see
+    # docs/s3_list_s3_only_selection_design.md).
+    "tang_s3: Mark a test as gated to the TANG S3 (stcuv2) run mode",
 ]
 
 [tool.cibuildwheel]

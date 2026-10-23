@@ -2,6 +2,7 @@ import torch
 import argparse
 import tilelang
 import tilelang.language as T
+from tilelang.utils.device import get_current_device
 import math
 
 
@@ -131,7 +132,7 @@ def run_tilelang_grouped_gemm(batch_sizes_list, K, M, block_M, block_N, block_K,
     padding_M = block_M
     batch_sum = sum(batch_sizes_list)
 
-    device = torch.device("ptpu")
+    device = get_current_device()
     dtype = torch.float16
 
     A, B, batch_sizes, batch_offsets, batch_padded_offsets = construct_inputs(batch_sizes_list, K, M, trans_b, padding_M, device, dtype)
@@ -151,10 +152,8 @@ def run_tilelang_grouped_gemm(batch_sizes_list, K, M, block_M, block_N, block_K,
     )
     ref_output = torch_gmm(A.cpu(), B.cpu(), batch_sizes.cpu(), batch_offsets.cpu(), trans_b).to(device)
 
-    if torch.allclose(out.cpu(), ref_output.cpu(), rtol=0.01, atol=0.01):
-        print("✅ Tilelang and Torch match")
-    else:
-        print("❌ Tilelang and Torch mismatch")
+    torch.testing.assert_close(out.cpu(), ref_output.cpu(), rtol=0.01, atol=0.01)
+    print("✅ Tilelang and Torch match")
 
     if profile:
         from tilelang.profiler import do_bench

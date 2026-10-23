@@ -36,6 +36,52 @@ CMAKE_PATH="${CMAKE_PATH:-/usr/local/tangrt/cmake}"
 CMAKE_ROOT="${CMAKE_ROOT:-/usr/local/bin/cmake}"
 TANG_CMAKE_PACKAGE_DIR="${TANG_CMAKE_PACKAGE_DIR:-${TANGRT_PATH}/targets/linux-x86_64/lib/cmake/TANG}"
 TANGRT_CMAKE_PACKAGE_DIR="${TANGRT_CMAKE_PACKAGE_DIR:-${TANGRT_PATH}/targets/linux-x86_64/lib/cmake/TANGRT}"
+# S3 (stcuv2) ISS simulator toolchain paths. Shared by both CI jobs on purpose:
+# the S2 job runs the tilelang list, which also carries stcuv2/simulator cases
+# ("... + simulator" helpers in four upstream test files), and the S3 job runs
+# the s3 list. What a run *targets* is not decided here -- see
+# ci_apply_test_mode below.
+TANG_S3_PTCC_PATH="${TANG_S3_PTCC_PATH:-}"
+TANG_S3_ISS_PATH="${TANG_S3_ISS_PATH:-}"
+TANG_S3_LOADER_PATH="${TANG_S3_LOADER_PATH:-}"
+
+# -------------------- Test mode (S2 / S3) --------------------
+# One switch decides what "the default target" means for a whole test run, so the
+# same test files can be pointed at either TANG arch without editing them:
+#
+#   s2 -> tang/stcu on real hardware (tvm_ffi backend), the historical behaviour
+#   s3 -> tang/stcuv2 through the ISS simulator; TANG_SIMULATOR=1 makes the
+#         simulator the auto-selected execution backend for stcuv2
+#         (tilelang/tang/execution_backend.py) and never matches stcu, so the S2
+#         mode is unaffected by it
+#
+# Tests express "I only make sense on arch X" with tilelang.testing.requires_stcu
+# / requires_stcuv2, which read this same default target. ci/run.sh --arch <mode>
+# applies it locally; the CI entry scripts call it with their own mode
+# (ci/test.sh -> s2, ci/s3/test_s3.sh -> s3).
+ci_apply_test_mode () {
+    local mode="${1:-s2}"
+    # NOTE: a JSON target cannot be inlined into ${VAR:-...}: its closing brace
+    # would terminate the parameter expansion, so stage it in a local first.
+    local s3_target='{"kind": "tang", "arch": "stcuv2"}'
+    case "$mode" in
+    s2)
+        export TILELANG_DEFAULT_TARGET="${TILELANG_DEFAULT_TARGET:-tang}"
+        export TANG_ARCH="${TANG_ARCH:-stcu}"
+        unset TANG_SIMULATOR
+        ;;
+    s3)
+        export TILELANG_DEFAULT_TARGET="${TILELANG_DEFAULT_TARGET:-$s3_target}"
+        export TANG_ARCH="${TANG_ARCH:-stcuv2}"
+        export TANG_SIMULATOR=1
+        ;;
+    *)
+        echo "ERROR: ci_apply_test_mode expects s2 or s3 (got '$mode')" >&2
+        return 1
+        ;;
+    esac
+    echo "TANG test mode: $mode (target=$TILELANG_DEFAULT_TARGET, TANG_ARCH=$TANG_ARCH, TANG_SIMULATOR=${TANG_SIMULATOR:-0})"
+}
 
 # -------------------- Helpers --------------------
 ci_configure_ptcc () {
@@ -650,7 +696,7 @@ ci_init_state () {
     CI_RUN_KEY="${CI_JOB_ID:-local-$$}"
     CI_STATE_ROOT="${base}/.ci-state/${CI_RUN_KEY}-${role}"
     CONDA_ENV_PREFIX="${CI_STATE_ROOT}/conda"
-    TILELANG_CACHE_DIR="${CI_STATE_ROOT}/tilelang-cache"
+    export TILELANG_CACHE_DIR="${CI_STATE_ROOT}/tilelang-cache"
     CI_TMP_DIR="${CI_STATE_ROOT}/tmp"
     export TMPDIR="$CI_TMP_DIR"
     CI_TEST_PID=""
@@ -772,8 +818,7 @@ ci_create_conda_env () {
         exit 1
     fi
     python -m pip install --upgrade pip
-    # Keep this aligned with pyproject.toml: the wheel targets the Python 3.8
-    # Limited API, which Cython 3.3 no longer supports.
+    # Match the Cython range used by the wheel build.
     conda install numpy psutil "cython>=3.1.0,<3.3" pytest -y
     pip install einops cloudpickle tqdm scipy matplotlib pytest-instafail
     pip install torch=="$TARGET_TORCH_VERSION" --index-url "$TARGET_TORCH_PKG_URL"
@@ -820,6 +865,7 @@ ci_export_tang_env () {
     fi
     export LLVM_VERSION_MAJOR LLVM_VERSION_MINOR
     export TANGRT_PATH STPU_TANGRT_PATH VENDOR_INCLUDE_DIRS PTCC_PATH CMAKE_PATH CMAKE_ROOT
+    export TANG_S3_PTCC_PATH TANG_S3_ISS_PATH TANG_S3_LOADER_PATH
     # Prefer the physical target prefix over /usr/local/tangrt-* symlinks.  The
     # vendor package computes imported library paths relative to its config
     # file, so resolving the symlink first would incorrectly produce /usr/targets.
@@ -899,6 +945,9 @@ ci_set_tilelang_build_env () {
     # Its environment list uses semicolons, preserving spaces inside paths.
     local ptcc_cmake_args="-DCMAKE_TANG_COMPILER=${PTCC_PATH};-DCMAKE_TANG_FLAGS=--tang-gpu-arch=stcu"
     ptcc_cmake_args+=";-DTANG_TOOLKIT_ROOT_DIR=${TANGRT_PATH};-DTANG_DIR=${TANG_CMAKE_PACKAGE_DIR};-DTANGRT_DIR=${TANGRT_CMAKE_PACKAGE_DIR}"
+    # The generic Linux backend defaults include ROCm and Ascend. This wheel
+    # targets TANG, including the embedded TVM configured by scikit-build-core.
+    ptcc_cmake_args+=";-DUSE_TANG=ON;-DUSE_CUDA=OFF;-DUSE_ROCM=OFF;-DUSE_ASCEND=OFF;-DUSE_METAL=OFF;-DUSE_LLVM=OFF"
     export SKBUILD_CMAKE_ARGS="${SKBUILD_CMAKE_ARGS:+${SKBUILD_CMAKE_ARGS};}${ptcc_cmake_args}"
 }
 
@@ -1057,18 +1106,40 @@ ci_parse_list_into () {
                     CI_LABELS+=("$(echo "$line" | awk '{print $2}')")
                     CI_CASE_MODES+=("command")
                 else
-                    # Accept a bare .py path or a pytest nodeid (path.py::...).
-                    [[ $line =~ \.py(::|$) ]] || { _ci_warn_unparsable "$line" "$list_file"; continue; }
-                    local file_part="${line%%::*}" node_suffix=""
-                    [[ "$line" == *::* ]] && node_suffix="::${line#*::}"
+                    # Accept "<selector> [-m <marker>]", where the selector is a
+                    # bare .py path or a pytest nodeid (path.py::...). "-m
+                    # <marker>" narrows the entry to the tests carrying that
+                    # marker: a file that is still being triaged for S3 can be
+                    # enlisted as "file.py -m tang_s3" so that only its S3-only
+                    # cases run until the rest of the file is ready.
+                    local selector="${line%%[[:space:]]*}"
+                    local extra="${line#"$selector"}"
+                    extra="${extra#"${extra%%[![:space:]]*}"}"
+                    extra="${extra%"${extra##*[![:space:]]}"}"
+                    [[ $selector =~ \.py(::|$) ]] || { _ci_warn_unparsable "$line" "$list_file"; continue; }
+                    if [[ -n $extra ]]; then
+                        # Hard error rather than a warning: an unsupported
+                        # modifier must not silently drop the case from the run.
+                        if [[ ! $extra =~ ^-m[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)$ ]]; then
+                            echo "ERROR: ci_parse_list_into: unsupported modifier in ${list_file}: ${line} (only '-m <marker>' is accepted)" >&2
+                            return 1
+                        fi
+                        if [[ -n "${TEST_MARKER:-}" ]]; then
+                            echo "ERROR: ci_parse_list_into: ${list_file}: '${selector}' sets '-m ${BASH_REMATCH[1]}' but TEST_MARKER=${TEST_MARKER} is already set" >&2
+                            return 1
+                        fi
+                        extra=" -m ${BASH_REMATCH[1]}"
+                    fi
+                    local file_part="${selector%%::*}" node_suffix=""
+                    [[ "$selector" == *::* ]] && node_suffix="::${selector#*::}"
                     [[ "$file_part" != /* ]] && file_part="$list_root/$file_part"
                     local case_path="${file_part}${node_suffix}"
                     if [ -n "${TEST_MARKER:-}" ]; then
                         CI_CMDS+=("python -m pytest -v -ra --instafail --import-mode=importlib ${PYTEST_AUDIT_PLUGIN_ARGS:-} -m ${TEST_MARKER} $case_path")
-                    elif [ "$line" = "tests/test_base.py" ]; then
+                    elif [ "$selector" = "tests/test_base.py" ]; then
                         CI_CMDS+=("python $case_path")
                     else
-                        CI_CMDS+=("python -m pytest -v -ra --instafail --import-mode=importlib ${PYTEST_AUDIT_PLUGIN_ARGS:-} $case_path")
+                        CI_CMDS+=("python -m pytest -v -ra --instafail --import-mode=importlib ${PYTEST_AUDIT_PLUGIN_ARGS:-}${extra} $case_path")
                     fi
                     CI_LABELS+=("$line")
                     CI_CASE_MODES+=("pytest")
@@ -1082,8 +1153,12 @@ ci_parse_list_into () {
 }
 
 # Canonical selector identity shared by list overrides and run.sh's merged plan.
+# A label may carry a trailing pytest modifier ("file.py -m tang_s3"); the
+# modifier is not part of the identity, so a case keeps its timeout TSV entry
+# when the modifier is added or removed.
 ci_timeout_key () {
-    local label="$1" root="$2" file_part="${1%%::*}" suffix=""
+    local label="${1%%[[:space:]]*}"
+    local root="$2" file_part="${label%%::*}" suffix=""
     [[ "$label" == *::* ]] && suffix="::${label#*::}"
     [[ "$file_part" == /* ]] || file_part="$root/$file_part"
     local resolved

@@ -23,7 +23,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         action="store_true",
         default=False,
         help="Build instrumented kernels with in-kernel tracing and dump their "
-             "timeline (HTML + Chrome JSON) for the trace-dump tests.",
+        "timeline (HTML + Chrome JSON) for the trace-dump tests.",
     )
 
 
@@ -99,6 +99,7 @@ TILELANG_019_KNOWN_FAILING_NODEIDS = set()
 
 TILELANG_019_KNOWN_FAILING_PREFIXES = ()
 
+
 def _get_callspec_params(item: pytest.Item) -> dict | None:
     callspec = getattr(item, "callspec", None)
     if callspec is None:
@@ -122,11 +123,46 @@ def _without_dtype(params: dict) -> tuple[tuple[str, object], ...]:
     )
 
 
+def _is_hopper() -> bool:
+    """Whether this machine's first CUDA device is compute capability 9.x."""
+    if not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_capability()[0] == 9
+
+
+_hopper_skipped: list[str] = []
+
+
+def pytest_runtest_logreport(report: pytest.TestReport) -> None:
+    """Record a `hopper` test that was skipped, so a Hopper run can refuse it."""
+    if report.when == "setup" and report.skipped and "hopper" in report.keywords:
+        _hopper_skipped.append(report.nodeid)
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """On Hopper, a `hopper` test that was skipped is a failed run, not a pass.
+
+    The mark exists because the kernel needs Hopper. On the hardware it needs,
+    skipping it would leave the only evidence for that kernel unexercised while
+    the run still reported green. Collection-time skips are covered too: they
+    surface as setup reports. Deselecting the mark outright (``-m "not hopper"``)
+    is not covered, and is not meant to be — that is the operator saying which
+    tests to run, not a run losing its evidence.
+    """
+    if _hopper_skipped and _is_hopper():
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+        raise pytest.UsageError(
+            "hopper-marked tests were skipped on a Hopper device: " + ", ".join(_hopper_skipped)
+        )
+
+
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     """Validate explicit test tier assignments."""
     tier_errors: list[str] = []
     tier_names = ("smoke", "full", "nightly")
     tilelang_019_skip = pytest.mark.skip(reason=TILELANG_019_SKIP_REASON)
+    non_hopper_skip = pytest.mark.skip(reason="needs compute capability 9.x")
+    on_hopper = _is_hopper()
 
     for item in items:
         path = str(item.path)
@@ -135,11 +171,12 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
         if (
             item.nodeid in TILELANG_019_KNOWN_FAILING_NODEIDS
             or any(path.endswith(suffix) for suffix in TILELANG_019_KNOWN_FAILING_PATH_SUFFIXES)
-            or any(
-                item.nodeid.startswith(prefix) for prefix in TILELANG_019_KNOWN_FAILING_PREFIXES
-            )
+            or any(item.nodeid.startswith(prefix) for prefix in TILELANG_019_KNOWN_FAILING_PREFIXES)
         ):
             item.add_marker(tilelang_019_skip)
+
+        if item.get_closest_marker("hopper") is not None and not on_hopper:
+            item.add_marker(non_hopper_skip)
 
         tiers = [name for name in tier_names if item.get_closest_marker(name) is not None]
         if len(tiers) != 1:
@@ -159,12 +196,8 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
         if any(_path.endswith(path) for path in NON_RUNTIME_OPS_TIER_FILES):
             continue
 
-        non_xfail_items = [
-            item for item in group if item.get_closest_marker("xfail") is None
-        ]
-        smoke_items = [
-            item for item in group if item.get_closest_marker("smoke") is not None
-        ]
+        non_xfail_items = [item for item in group if item.get_closest_marker("xfail") is None]
+        smoke_items = [item for item in group if item.get_closest_marker("smoke") is not None]
 
         # Smoke cases must never be xfail (checked before tune gate)
         for item in smoke_items:

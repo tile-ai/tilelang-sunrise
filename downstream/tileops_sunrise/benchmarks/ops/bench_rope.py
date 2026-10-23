@@ -1,110 +1,267 @@
-"""Benchmarks for 5 RoPE variants (1D layout).
+"""Benchmarks for the RoPE op family.
 
-Profiles TileOPs RoPE vs manual PyTorch reference on DNN-realistic shapes.
-Tests neox variant as representative; all variants share the same kernel.
+Workload shapes, dtypes, layouts, and roofline formulas are loaded from the
+ops manifest (``src/tileops/manifest/position_encoding.yaml``); nothing about a
+workload is hard-coded here.
+
+One ``test_*_bench`` per op, so every op this file is declared the benchmark
+of records a row of its own.
+
+Baselines build their cos/sin tables outside the timed window, so only the
+rotation itself is measured.
 """
-
-from typing import Optional
 
 import pytest
 import torch
 
-from benchmarks.benchmark_base import BenchmarkBase, BenchmarkReport
-from tileops.ops.rope import RopeNeoxOp
-from workloads.workload_base import FixtureBase
+from benchmarks.baselines import (
+    TORCH_COMPILE_TAG,
+    VLLM_TAG,
+    compiled_reference,
+    vllm_op,
+)
+from benchmarks.benchmark_base import ManifestBenchmark, workload_params
+from tileops.manifest import load_workloads
+from tileops.ops.rope import (
+    RopeLlama31FwdOp,
+    RopeLongRopeFwdOp,
+    RopeNeoxFwdOp,
+    RopeNeoxPositionIdsFwdOp,
+    RopeNonNeoxFwdOp,
+    RopeYarnFwdOp,
+)
 
-# DNN-realistic: (seq_len, head_dim) — typical attention head sizes.
-# Includes a non-pow2 seq_len (3000) to exercise tail handling.
-_SHAPES = [(2048, 64), (2048, 128), (4096, 128), (3000, 128)]
-_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+# Bench-local: manifest workload entries carry no ``base``; the ops and the
+# baseline both use the manifest signature default (``base: 10000.0``).
+_BASE = 10000.0
 
 
-class RopeBenchCase:
-    def __init__(self, shape: tuple[int, int], dtype: torch.dtype):
+class RopeWorkload:
+    """Minimal shape/dtype descriptor for the RoPE family.
+
+    Holds ``shape`` and ``dtype`` so :class:`ManifestBenchmark` can call
+    ``op.eval_roofline()`` after ``forward()`` has bound the dynamic vars.
+    """
+
+    def __init__(self, shape: tuple[int, ...], dtype: torch.dtype):
         self.shape = shape
-        self.seq_len, self.head_dim = shape
-        self.n_total = self.seq_len * self.head_dim
         self.dtype = dtype
 
-    def gen_inputs(self) -> tuple[torch.Tensor, ...]:
-        return (torch.randn(*self.shape, device="ptpu", dtype=self.dtype),)
+
+def _layout_args(w: dict, dtype: torch.dtype) -> tuple:
+    """``(shape, dtype, layout)`` for the 1d/2d RoPE variants."""
+    if w["layout"] == "1d":
+        shape = (w["seq_len"], w["head_dim"])
+    else:
+        shape = (w["batch"], w["seq_len"], w["num_heads"], w["head_dim"])
+    return (shape, dtype, w["layout"])
 
 
-class RopeBenchmark(BenchmarkBase[RopeBenchCase]):
-    def calculate_flops(self) -> Optional[float]:
-        # 4 ops per element: 2 muls + 1 add + 1 negate/select
-        return self.workload.n_total * 4
-
-    def calculate_memory(self) -> Optional[float]:
-        t = self.workload
-        elem = t.dtype.itemsize
-        # Read x + cos + sin + write y
-        cos_sin_elems = t.seq_len * (t.head_dim // 2) * 2
-        return (2 * t.n_total + cos_sin_elems) * elem
+def _position_ids_args(w: dict, dtype: torch.dtype) -> tuple:
+    return ((w["num_tokens"], w["num_heads"], w["head_dim"]), dtype, w["max_position"])
 
 
-def _precompute_rope_neox_cos_sin(
-    seq_len: int, head_dim: int, dtype: torch.dtype, base: float = 10000.0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pre-compute cos/sin tables (matches RopeNeoxOp caching behavior)."""
+# Bench-local PyTorch baselines
+
+
+def _rope_tables(seq_len: int, head_dim: int, dtype: torch.dtype):
+    """Half-split cos/sin tables, shape ``(seq_len, head_dim)``.
+
+    Frequency values are variant-specific, but the timed rotation cost depends
+    only on table geometry, which every RoPE variant shares — so one baseline
+    serves all of them.
+    """
     half = head_dim // 2
-    freqs = 1.0 / (base ** (torch.arange(0, half, device="ptpu", dtype=torch.float32) / half))
-    t = torch.arange(seq_len, device="ptpu", dtype=torch.float32)
-    angles = torch.outer(t, freqs)
-    cos_full = torch.cat([torch.cos(angles), torch.cos(angles)], dim=-1).to(dtype)
-    sin_full = torch.cat([torch.sin(angles), torch.sin(angles)], dim=-1).to(dtype)
-    return cos_full, sin_full
+    freqs = 1.0 / (_BASE ** (torch.arange(0, half, device="ptpu", dtype=torch.float32) / half))
+    angles = torch.outer(
+        torch.arange(seq_len, device="ptpu", dtype=torch.float32),
+        freqs,
+    )
+    return (
+        torch.cat([torch.cos(angles)] * 2, dim=-1).to(dtype),
+        torch.cat([torch.sin(angles)] * 2, dim=-1).to(dtype),
+    )
 
 
-def _rope_neox_apply(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """Apply neox RoPE rotation with pre-computed cos/sin."""
+def _rotate(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     half = x.shape[-1] // 2
     x1, x2 = x[..., :half], x[..., half:]
-    rotated = torch.cat((-x2, x1), dim=-1)
-    return x * cos + rotated * sin
+    return x * cos + torch.cat((-x2, x1), dim=-1) * sin
 
 
-def _rope_params():
-    params = []
-    smoke_shape = _SHAPES[0]
-    for shape in _SHAPES:
-        for dtype in _DTYPES:
-            mark = (
-                pytest.mark.smoke
-                if (shape == smoke_shape and dtype == torch.float16)
-                else pytest.mark.full
-            )
-            params.append(pytest.param(
-                shape, dtype,
-                id=f"{shape[0]}x{shape[1]}-{dtype}",
-                marks=mark,
-            ))
-    return params
+def _vllm_rope(
+    x: torch.Tensor,
+    position_ids: torch.Tensor,
+    head_dim: int,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+):
+    """Return vllm's rotary_embedding and the arguments it rotates.
+
+    It rewrites its query in place and takes it flattened to
+    ``[num_tokens, num_heads * head_dim]``, so it gets its own copy; its cache is
+    the half-width cos and sin concatenated, not the doubled tables the reference
+    indexes; and ``is_neox=True`` is the same half-split rotation.
+    """
+    fn = vllm_op("rotary_embedding")
+    num_tokens = x.shape[0]
+    half = head_dim // 2
+    cache = torch.cat([cos[:, :half], sin[:, :half]], dim=-1).contiguous()
+    positions = position_ids.long()
+    query = x.reshape(num_tokens, -1).clone()
+
+    def baseline_fn(positions_i, query_i):
+        fn(positions_i, query_i, None, head_dim, cache, True)
+        return query_i
+
+    return baseline_fn, (positions, query)
 
 
-class RopeBenchFixture(FixtureBase):
-    PARAMS = [("shape, dtype", _rope_params())]
+def _profile_rope(
+    op, bm: ManifestBenchmark, shape: tuple[int, ...], dtype: torch.dtype, layout: str
+) -> None:
+    """Profile op and the torch rotation baseline on the same input."""
+    x = torch.randn(shape, device="ptpu", dtype=dtype)
+
+    seq_len = shape[0] if layout == "1d" else shape[1]
+    cos, sin = _rope_tables(seq_len, shape[-1], dtype)
+    if layout != "1d":
+        cos, sin = (t.view(1, seq_len, 1, shape[-1]) for t in (cos, sin))
+
+    def baseline_fn(t):
+        return _rotate(t, cos, sin)
+
+    bm.compare(
+        {
+            "tileops": op,
+            "torch-ref": baseline_fn,
+            TORCH_COMPILE_TAG: compiled_reference(baseline_fn),
+        },
+        x,
+    )
 
 
-@RopeBenchFixture
-def test_rope_bench(shape: tuple[int, int], dtype: torch.dtype) -> None:
-    test = RopeBenchCase(shape, dtype)
-    bm = RopeBenchmark(test)
-    (x,) = test.gen_inputs()
-
-    seq_len, head_dim = shape
-    op = RopeNeoxOp()
-    result = bm.profile(op, x)
-    BenchmarkReport.record(op, locals(), result, tag="tileops")
-
-    cos, sin = _precompute_rope_neox_cos_sin(seq_len, head_dim, dtype)
-
-    def baseline_fn(x):
-        return _rope_neox_apply(x, cos, sin)
-
-    result_bl = bm.profile(baseline_fn, x)
-    BenchmarkReport.record(op, locals(), result_bl, tag="torch-ref")
+# Per-op tests — one block per manifest entry.
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-vvs"])
+@pytest.mark.parametrize(
+    "shape, dtype, layout",
+    workload_params(load_workloads(RopeNeoxFwdOp), _layout_args, smoke_first=True),
+)
+def test_rope_neox_bench(
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    layout: str,
+) -> None:
+    op = RopeNeoxFwdOp(layout=layout, base=_BASE)
+    bm = ManifestBenchmark(op, RopeWorkload(shape, dtype))
+    _profile_rope(op, bm, shape, dtype, layout)
+
+
+@pytest.mark.parametrize(
+    "shape, dtype, layout",
+    workload_params(load_workloads(RopeNonNeoxFwdOp), _layout_args, smoke_first=True),
+)
+def test_rope_non_neox_bench(
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    layout: str,
+) -> None:
+    op = RopeNonNeoxFwdOp(layout=layout, base=_BASE)
+    bm = ManifestBenchmark(op, RopeWorkload(shape, dtype))
+    _profile_rope(op, bm, shape, dtype, layout)
+
+
+@pytest.mark.parametrize(
+    "shape, dtype, layout",
+    workload_params(load_workloads(RopeLlama31FwdOp), _layout_args, smoke_first=True),
+)
+def test_rope_llama31_bench(
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    layout: str,
+) -> None:
+    op = RopeLlama31FwdOp(layout=layout, base=_BASE)
+    bm = ManifestBenchmark(op, RopeWorkload(shape, dtype))
+    _profile_rope(op, bm, shape, dtype, layout)
+
+
+@pytest.mark.parametrize(
+    "shape, dtype, layout",
+    workload_params(load_workloads(RopeYarnFwdOp), _layout_args, smoke_first=True),
+)
+def test_rope_yarn_bench(
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    layout: str,
+) -> None:
+    op = RopeYarnFwdOp(layout=layout, base=_BASE)
+    bm = ManifestBenchmark(op, RopeWorkload(shape, dtype))
+    _profile_rope(op, bm, shape, dtype, layout)
+
+
+@pytest.mark.parametrize(
+    "shape, dtype, layout",
+    workload_params(load_workloads(RopeLongRopeFwdOp), _layout_args, smoke_first=True),
+)
+def test_rope_longrope_bench(
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    layout: str,
+) -> None:
+    op = RopeLongRopeFwdOp(layout=layout, base=_BASE)
+    bm = ManifestBenchmark(op, RopeWorkload(shape, dtype))
+    _profile_rope(op, bm, shape, dtype, layout)
+
+
+@pytest.mark.parametrize(
+    "shape, dtype, max_position",
+    workload_params(load_workloads(RopeNeoxPositionIdsFwdOp), _position_ids_args, smoke_first=True),
+)
+def test_rope_neox_position_ids_bench(
+    shape: tuple[int, int, int],
+    dtype: torch.dtype,
+    max_position: int,
+) -> None:
+    num_tokens, _, head_dim = shape
+    x = torch.randn(shape, device="ptpu", dtype=dtype)
+    position_ids = (
+        torch.arange(
+            num_tokens,
+            device="ptpu",
+            dtype=torch.int32,
+        )
+        % max_position
+    )
+
+    op = RopeNeoxPositionIdsFwdOp(max_position=max_position, base=_BASE)
+    bm = ManifestBenchmark(op, RopeWorkload(shape, dtype))
+
+    cos, sin = _rope_tables(max_position, head_dim, dtype)
+
+    def baseline_fn(t: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        idx = pos.long()
+        return _rotate(t, cos[idx].unsqueeze(1), sin[idx].unsqueeze(1))
+
+    # vllm rotates in fp32 and rounds once, the reference in the storage dtype, so they
+    # agree to one rounding step of the storage dtype, which is what the default
+    # tolerances allow.
+    check_fn, check_args = _vllm_rope(x, position_ids, head_dim, cos, sin)
+    torch.testing.assert_close(
+        check_fn(*check_args).view(x.shape),
+        baseline_fn(x, position_ids),
+        rtol=1e-2,
+        atol=2e-2,
+    )
+    vllm_fn, vllm_args = _vllm_rope(x, position_ids, head_dim, cos, sin)
+
+    bm.compare(
+        {
+            "tileops": op,
+            VLLM_TAG: (vllm_fn, vllm_args),
+            "torch-ref": baseline_fn,
+            TORCH_COMPILE_TAG: compiled_reference(baseline_fn),
+        },
+        x,
+        position_ids,
+    )

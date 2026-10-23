@@ -8,11 +8,11 @@ from tilelang.utils.device import get_current_device
 def test_tensor_annot_mul():
     device = get_current_device()
 
-    # There is a known issue where the cython execution backend fails to build with T.symbolic.
+    # There is a known issue where the cython execution backend fails to build with T.dynamic.
     # Forcing the TVM FFI execution backend to avoid the issue on HIP.
     @tilelang.jit(execution_backend="tvm_ffi")
     def example_tensor_annot():
-        n = T.symbolic("n")
+        n = T.dynamic("n")
 
         @T.prim_func
         def kernel(
@@ -34,11 +34,11 @@ def test_tensor_annot_mul():
 def test_tensor_annot_add():
     device = get_current_device()
 
-    # There is a known issue where the cython execution backend fails to build with T.symbolic.
+    # There is a known issue where the cython execution backend fails to build with T.dynamic.
     # Forcing the TVM FFI execution backend to avoid the issue on HIP.
     @tilelang.jit(execution_backend="tvm_ffi")
     def example_tensor_annot():
-        n = T.symbolic("n")
+        n = T.dynamic("n")
 
         @T.prim_func
         def kernel(
@@ -60,11 +60,11 @@ def test_tensor_annot_add():
 def test_tensor_annot_mul_add():
     device = get_current_device()
 
-    # There is a known issue where the cython execution backend fails to build with T.symbolic.
+    # There is a known issue where the cython execution backend fails to build with T.dynamic.
     # Forcing the TVM FFI execution backend to avoid the issue on HIP.
     @tilelang.jit(execution_backend="tvm_ffi")
     def example_tensor_annot():
-        n = T.symbolic("n")
+        n = T.dynamic("n")
 
         @T.prim_func
         def kernel(

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from tilelang.cuda.language import *  # noqa: F401,F403
 from tilelang.cuda.language import __all__ as _CUDA_ALL
+from tilelang.tang.language.gemm_op import gemm, gemm_blockscaled  # noqa: F401
 
 # Single-warp (warp_group_size=32) WarpSpecialize is a TANG/stcuv2-only need
 # (warp-specialized TMEM ldt/stt drains), so it shadows the CUDA dialect's `ws`

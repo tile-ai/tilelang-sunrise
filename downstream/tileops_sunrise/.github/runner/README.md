@@ -1,157 +1,110 @@
 # CI runner image
 
-Multi-stage image for the self-hosted GPU runner. It bakes a tilelang wheel (compiled once
-from a pinned commit, or installed from a PyPI release) plus the test/benchmark stack onto a
-public CUDA base, so CI never recompiles tilelang per PR.
+Multi-stage image for the self-hosted GPU runner. It bakes a tilelang wheel plus the
+test/benchmark stack onto a public CUDA base, so CI never recompiles tilelang per PR.
 
-Built **manually on a GPU host** (needs `nvcc`), then pushed to `ghcr.io`. It is **not**
-built in CI.
+Built **manually on a GPU host** — never in CI. One package, two tags from the same tilelang
+commit, both naming the three versions that decide what the image can run:
 
-## Prerequisites
-
-- An NVIDIA GPU host with a CUDA 12.9-capable driver and `nvcc`.
-- Docker with BuildKit enabled (`DOCKER_BUILDKIT=1`).
-- Run from the **repository root** — the build context must contain `constraints.txt`,
-  `scripts/ci/verify_runtime_stack.py`, and `.github/runner/entrypoint.sh` (the Dockerfile
-  copies all three).
-
-## Build
-
-Provide tilelang one of two ways — pass **exactly one** of these build-args:
-
-- **main commit**: `--build-arg TILELANG_GIT_SHA=<commit>` — shallow-fetches and compiles that
-  commit. The Dockerfile carries no commit literal; the commit you pass is the single source
-  of truth, and the image tag records it.
-- **release**: `--build-arg TILELANG_VERSION=<version>` — `pip install tilelang==<version>`.
-
-```bash
-# from the repository root (main-commit mode)
-DOCKER_BUILDKIT=1 docker build \
-  -f .github/runner/Dockerfile \
-  --target final \
-  --build-arg TILELANG_GIT_SHA=65dbc9837beedf6882a40a08e18ea571d92fd6a5 \
-  -t ghcr.io/tile-ai/tileops-runner:65dbc98 \
-  .
+```
+cu<cuda-minor>-torch<major.minor>-tl-<tilelang-short-sha>[-dev]
 ```
 
-Tag with the tilelang commit's **short SHA** (`:65dbc98`). If you rebuild the same commit,
-add a numeric suffix (`:65dbc98-2`).
+`--target final` takes the bare tag: the CI runners, with the Actions agent. `--target tilelang`
+takes the `-dev` suffix: local development, no agent. Rebuilding the same three versions appends
+a numeric suffix, `…-tl-<sha>-2`.
 
-## Roll out an updated runner image
+The Dockerfile carries no commit literal. Pass **exactly one** tilelang source —
+`TILELANG_GIT_SHA=<commit>` compiles that main commit, `TILELANG_VERSION=<version>` installs
+that release — and the tag records what you passed. The build fails fast if neither is set.
+The `ARG` block in the Dockerfile lists the rest, with defaults.
 
-Changes to this Dockerfile are not picked up by CI automatically. After a Dockerfile change
-lands, rebuild and tag the image from a GPU host using the build command above, then push it:
+## Build and roll out
 
-```bash
-docker push ghcr.io/tile-ai/tileops-runner:<new-tag>
-```
-
-Then redeploy the self-hosted runner launcher to use the new tag (maintainer task, done
-outside this repository). Merging the TileOPs PR only changes the image recipe; the live
-self-hosted runners keep using their existing image until that manual rollout is done.
-
-### Build args
-
-| Arg                | Default                                    | Purpose                                                                   |
-| ------------------ | ------------------------------------------ | ------------------------------------------------------------------------- |
-| `TILELANG_GIT_SHA` | *(none)*                                   | tilelang commit to shallow-clone and compile (main mode).                 |
-| `TILELANG_VERSION` | *(none)*                                   | tilelang PyPI version to `pip install` (release mode).                    |
-| `BASE_IMAGE`       | `nvidia/cuda:12.9.1-devel-ubuntu22.04`     | Public CUDA `devel` base (Python 3.12 via deadsnakes).                    |
-| `MAX_JOBS`         | `64`                                       | Parallelism for the tilelang / FA2 / FA3 source builds.                   |
-| `NVCC_THREADS`     | `4`                                        | Per-`nvcc` threads.                                                       |
-| `DEEPGEMM_GIT_SHA` | `c9f8b34dcdacc20aa746b786f983492c51072870` | DeepGEMM commit for the grouped-GEMM benchmark baseline (`v2.1.1.post3`). |
-| `RUNNER_VERSION`   | `2.334.0`                                  | GitHub Actions runner version baked into `final`.                         |
-
-Set exactly one of `TILELANG_GIT_SHA` / `TILELANG_VERSION`; the build fails fast if neither is set.
-
-### Stages (`--target`)
-
-| Stage       | Contents                                                                                                                                                                                                                         |
-| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `runtime`   | Python 3.12 + torch / torchvision / torchaudio `2.10.0 / 0.25.0 / 2.10.0 +cu129` + triton `3.6.0` + tilelang build/runtime deps (incl. `apache-tvm-ffi 0.1.11`). **No tilelang itself.**                                         |
-| `post-fa3`  | `runtime` + pytest / pytest-xdist / ruff + FlashAttention-3 (built from the `hopper/` source).                                                                                                                                   |
-| `fa2`       | `post-fa3` + FlashAttention-2 (`flash-attn 2.8.3`, source-built in its own layer so changes to the bench loop never recompile it).                                                                                               |
-| `fullstack` | `fa2` + flash-linear-attention `0.4.2` + vLLM `0.19.1` + mamba-ssm `2.3.1` + DeepGEMM `2.1.1.post3`, then flashinfer-python/-cubin upgraded to `0.6.11.post2` (`--no-deps`, so torch stays +cu129). sgl-kernel is not installed. |
-| `tilelang`  | `fullstack` + the tilelang wheel (`--no-deps`), then the build-time guard. Built **last** so a SHA bump rebuilds only this layer.                                                                                                |
-| `final`     | `tilelang` + the GitHub Actions runner (no TileOPs source baked).                                                                                                                                                                |
-
-Build an earlier stage for debugging with `--target runtime` (etc.).
-
-The `tilelang` stage ends by running `scripts/ci/verify_runtime_stack.py` (GPU-free): it fails
-the build unless tilelang imports, the installed `apache-tvm-ffi` sits inside the tilelang
-wheel's declared range, and torch is still the cu129 build.
-
-## Verify the built image
+Needs a GPU host with a CUDA 13.2-capable driver and `nvcc`, and Docker with BuildKit. Run from
+the repository root; the context must contain `constraints.txt`, `constraints-runner-lock.txt`,
+`scripts/ci/`, and `.github/runner/entrypoint.sh`.
 
 ```bash
-docker run --rm --gpus all ghcr.io/tile-ai/tileops-runner:65dbc98 python - <<'PY'
-import torch
-print("torch", torch.__version__, "cuda", torch.version.cuda)   # expect 2.10.0+cu129, cuda 12.9
-import tilelang; print("tilelang", tilelang.__version__)
-import flashinfer, flashinfer_cubin
-print("flashinfer", flashinfer.__version__)
-from pathlib import Path
-cubin_dir = Path(flashinfer_cubin.get_cubin_dir())
-probe_dir = cubin_dir / "flashinfer" / "trtllm" / "gemm" / "_tileops_write_probe"
-probe_dir.mkdir(parents=True, exist_ok=True)
-(probe_dir / "probe.txt").write_text("ok")
-print("flashinfer cubin write OK")
+IMG=ghcr.io/tile-ai/tileops-runner:cu132-torch2.13-tl-<short-sha>
 
-import selective_scan_cuda
-import mamba_ssm
-from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
-assert mamba_chunk_scan_combined is not None
-print("mamba", mamba_ssm.__version__)
+# 1. Build. --target tilelang for the dev tag, otherwise the same command.
+DOCKER_BUILDKIT=1 docker build -f .github/runner/Dockerfile --target final \
+  --provenance=false --sbom=false \
+  --build-arg TILELANG_GIT_SHA=<commit> \
+  --build-arg TILEOPS_RUNNER_IMAGE="$IMG" -t "$IMG" .
 
-import deep_gemm
-print("deep_gemm", deep_gemm.__version__)
+# 2. Verify on GPU (the build already ran the GPU-free stack check).
+docker run --rm --gpus all -v "$PWD:/src" "$IMG" python /src/scripts/ci/verify_runner_image.py
 
-# cuBLAS probe: matmul / bmm / einsum on the GPU
-a = torch.randn(512, 512, device="cuda", dtype=torch.float16)
-b = torch.randn(512, 512, device="cuda", dtype=torch.float16)
-assert torch.matmul(a, b).isfinite().all()
-ab = torch.randn(8, 128, 128, device="cuda", dtype=torch.float16)
-assert torch.bmm(ab, ab).isfinite().all()
-assert torch.einsum("bik,bkj->bij", ab, ab).isfinite().all()
-print("cuBLAS probe OK")
-PY
-```
-
-Then run the smoke tests against a checkout of this repo:
-
-```bash
-docker run --rm --gpus all -v "$PWD:/src" -w /src \
-  ghcr.io/tile-ai/tileops-runner:65dbc98 \
+# 3. Smoke-test against a checkout.
+docker run --rm --gpus all -v "$PWD:/src" -w /src --user root "$IMG" \
   bash -c 'scripts/ci/install_tileops.sh && pytest -m smoke'
+
+# 4. Push, then repeat 1 and 4 with --target tilelang and -t "$IMG-dev".
+docker push "$IMG"
 ```
 
-`install_tileops.sh` installs TileOPs `--no-deps` against the baked stack; it fails fast if
-tilelang is missing (the image provides it).
+**Point the runners at the new tag** — a maintainer task outside this repository. Merging a
+TileOPs PR only changes the recipe; the live runners keep their image until this happens.
 
-## Run as a self-hosted runner
-
-`entrypoint.sh` registers an ephemeral runner (one job per container), then deregisters on
-exit. Provide a registration token and the target URL; bind-mount the host cache. The
-entrypoint removes `RUNNER_TOKEN` from the environment before the runner starts, so jobs
-cannot read the registration token.
+**Pass the digest to the runner.** The tag is a moving name; the digest is what identifies the
+image a night's numbers were produced on, and a container cannot read its own. The host that
+starts the runner reads it once and passes it in:
 
 ```bash
-docker run -d --gpus all \
-  -e RUNNER_URL=https://github.com/tile-ai/TileOPs \
-  -e RUNNER_TOKEN=<registration-token> \
-  -e RUNNER_LABELS=self-hosted,tile-ops,venv \
-  -v <host-cache-dir>:/ci-cache \
-  ghcr.io/tile-ai/tileops-runner:65dbc98
+DIGEST="$(docker image inspect "$IMG" --format '{{index .RepoDigests 0}}')"
+docker run ... -e TILEOPS_RUNNER_IMAGE="$IMG" -e TILEOPS_RUNNER_IMAGE_DIGEST="${DIGEST#*@}" ...
 ```
 
-The image sets cache env vars (`TILELANG_CACHE_DIR`, `TRITON_CACHE_DIR`, `PIP_CACHE_DIR`, …)
-under `/ci-cache`; the directories are pre-created so the container also works unmounted.
+`scripts/ci/collect_env.py` records it, and the published `meta.json` carries it beside the tag.
+Without it the nightly still publishes; the snapshot simply cannot say which image it ran on.
 
-## Bumping the tilelang commit
+What the flags are for:
 
-A commit (or release) bump always rebuilds, but **never edits the Dockerfile**: rebuild with a
-new `--build-arg TILELANG_GIT_SHA=<commit>` (or `TILELANG_VERSION=<version>`) and a new
-`:<short-sha>` tag, push to `ghcr.io`, then point the runner at the new tag. Because tilelang
-is the last stage, only its layer recompiles — the bench layers (FA2 / FA3 / vLLM / …) stay
-cached. Switching between a release and a main commit is the same — only the build-arg and tag
-change.
+- `--user root` — `final` runs as `ci-runner`, which cannot write the editable install's
+  `src/tileops.egg-info` into a bind mount owned by the host user. `--target tilelang` sets no
+  user and needs no override.
+- `--provenance=false --sbom=false` — keeps the tag one manifest. BuildKit's default
+  attestations add two untagged versions per tag and nothing reads them.
+- `--build-arg TILEOPS_RUNNER_IMAGE` — bakes the tag in, so a run reports which image produced
+  it; the registry cannot answer that later. `-e TILEOPS_RUNNER_IMAGE=<tag>` overrides it for an
+  image built before this. With neither, the nightly reports the image as unknown.
+- `--build-arg FLASH_ATTENTION_FORCE_BUILD=TRUE` — compiles FlashAttention-2 instead of
+  taking the prebuilt wheel from its GitHub releases. Slower; reach for it only where that
+  download keeps failing.
+- `--target runtime`, `--target fa2`, … — build an earlier stage to debug.
+
+## Bump the tilelang commit
+
+Rebuild with the new `--build-arg` and a new tag; **never edit the Dockerfile**. tilelang is the
+last stage, so only its layer recompiles. Then update the tag in the `docker run` line of
+[`docs/development.md`](../../docs/development.md#dev-docker-image) — the one place in the repo
+that echoes it. The two mentions in `src/tileops/kernels/` are frozen records; leave them alone.
+
+## Pinning
+
+Three files. `PIP_CONSTRAINT` hands the latter two to every `pip install` in the build.
+
+| File                          | Written by | Holds                                                    |
+| ----------------------------- | ---------- | -------------------------------------------------------- |
+| `requirements.in`             | by hand    | Direct requirements, for the lock compile alone.         |
+| `constraints.txt`             | by hand    | Chosen versions and why. Also used by the CPU preflight. |
+| `constraints-runner-lock.txt` | generated  | The transitive closure of both.                          |
+
+The lock is what makes a version stick: an install that would move a settled version fails the
+build instead of winning silently. After changing a version or a requirement, regenerate it with
+the `uv pip compile` command in its own header and read the diff. tilelang is excluded there: it
+is source-built in its own stage, and vLLM's exact-release dependency on it is overwritten by
+`--force-reinstall`.
+
+## Runner registration
+
+`entrypoint.sh` registers an ephemeral runner — one job per container — and deregisters on
+exit. It strips `RUNNER_TOKEN` from the environment before the runner starts, so jobs cannot
+read it.
+
+The image expects a cache directory bind-mounted at `/ci-cache`; `TILELANG_CACHE_DIR`,
+`TRITON_CACHE_DIR` and friends point under it and are pre-created, so the container also works
+unmounted. Which labels a runner registers with, and how the pools are provisioned, is a
+maintainer task outside this repository.

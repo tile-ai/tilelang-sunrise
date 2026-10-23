@@ -1,75 +1,73 @@
-
 import pytest
 import torch
-import torch.nn.functional as F
-from einops import einsum, rearrange
 
 from tests.test_base import FixtureBase, TestBase
+from tileops.kernels.attention import MLADecodeKernel
 from tileops.ops import MultiHeadLatentAttentionDecodeWithKVCacheFwdOp
-from workloads.attention.deepseek import MlaDecodeTest as _MlaDecodeTestWorkload
+from workloads.attention.deepseek import MlaDecodeWorkload
 
 
-class MlaDecodeTest(_MlaDecodeTestWorkload, TestBase):
-    def ref_program(self, q: torch.Tensor, q_pe: torch.Tensor, kv: torch.Tensor,
-                    k_pe: torch.Tensor) -> torch.Tensor:
-        """
-        Inputs:
-        - q (Tensor): [batch, heads, dim]
-        - q_pe (Tensor): [batch, heads, dim_pe]
-        - kv (Tensor): [batch, seqlen_kv, heads_kv, dim]
-        - k_pe (Tensor): [batch, seqlen_kv, heads_kv, dim_pe]
-        Outputs:
-        - output (Tensor): [batch, heads, dim]
-        """
-        dim = q.shape[-1]
-        dim_pe = q_pe.shape[-1]
-        num_head_groups = q.shape[1] // kv.shape[2]
-        scale = (dim + dim_pe)**0.5
-        Q = rearrange(
-            q, 'b (h g) d -> b g h d',
-            g=num_head_groups)  # [batch_size, num_head_groups, groups, dim]
-
-        Q_pe = rearrange(
-            q_pe, 'b (h g) d -> b g h d',
-            g=num_head_groups)  # [batch_size, num_head_groups, groups, dim_pe]
-
-        KV = rearrange(kv, 'b n h d -> b h n d')  # [batch_size, groups, seqlen_kv, dim]
-
-        K_pe = rearrange(k_pe,
-                         'b n h d -> b h n d')  # [batch_size, num_head_groups, groups, dim_pe]
-
-        query = torch.concat([Q, Q_pe], dim=-1)
-        key = torch.concat([KV, K_pe], dim=-1)
-
-        scores = einsum(
-            query, key,
-            'b g h d, b h s d -> b g h s')  # [batch_size, num_head_groups, groups, seqlen_kv]
-
-        attention = F.softmax(
-            scores / scale, dim=-1)  # [batch_size, num_head_groups, groups, seqlen_kv]
-
-        out = einsum(attention, KV,
-                     'b g h s, b h s d -> b g h d')  # [batch_size, num_head_groups, groups, dim]
-        out = rearrange(out, 'b g h d -> b (h g) d')  # [batch_size, heads, dim]
-        return out
+class MlaDecodeTest(MlaDecodeWorkload, TestBase):
+    pass
 
 
 class MlaDecodeFixture(FixtureBase):
     PARAMS = [
-        ("batch, heads, heads_kv, seq_len_kv, dim, dim_pe, dtype, tune", [
-            pytest.param(32, 128, 1, 8192, 512, 64, torch.float16, False, marks=pytest.mark.smoke),
-        ]),
+        (
+            "batch, heads, heads_kv, seq_len_kv, dim, dim_pe, dtype, tune",
+            [
+                pytest.param(
+                    32, 128, 1, 8192, 512, 64, torch.float16, False, marks=pytest.mark.smoke
+                ),
+            ],
+        ),
     ]
 
 
 @MlaDecodeFixture
-def test_mla_decode(batch: int, heads: int, heads_kv: int, seq_len_kv: int, dim: int,
-                    dim_pe: int, dtype: torch.dtype, tune: bool):
+def test_mla_decode(
+    batch: int,
+    heads: int,
+    heads_kv: int,
+    seq_len_kv: int,
+    dim: int,
+    dim_pe: int,
+    dtype: torch.dtype,
+    tune: bool,
+):
     test = MlaDecodeTest(batch, heads, heads_kv, seq_len_kv, dim, dim_pe, dtype)
     op = MultiHeadLatentAttentionDecodeWithKVCacheFwdOp(
-        batch, heads, heads_kv, seq_len_kv, dim, dim_pe, dtype, tune=tune)
+        batch, heads, heads_kv, seq_len_kv, dim, dim_pe, tune=tune
+    )
     test.check(op, *test.gen_inputs(), atol=1e-3, rtol=1e-3)
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-vvs"])
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "heads,seq_len,dim,split",
+    [(8, 33, 64, 1), (48, 65, 64, 1), (8, 33, 64, 2), (48, 65, 64, 4), (128, 64, 512, 1)],
+)
+def test_mla_tail_split(heads, seq_len, dim, split):
+    torch.manual_seed(73)
+    q = torch.randn(1, heads, dim, dtype=torch.float16)
+    qp = torch.randn(1, heads, 64, dtype=torch.float16)
+    kv = torch.randn(1, seq_len, 1, dim, dtype=torch.float16)
+    kp = torch.randn(1, seq_len, 1, 64, dtype=torch.float16)
+    scores = (
+        torch.einsum("bhd,bnd->bhn", q.float(), kv[:, :, 0].float())
+        + torch.einsum("bhd,bnd->bhn", qp.float(), kp[:, :, 0].float())
+    ) / (dim + 64) ** 0.5
+    ref = torch.einsum("bhn,bnd->bhd", scores.softmax(-1), kv[:, :, 0].float()).half()
+    kernel = MLADecodeKernel(
+        1,
+        heads,
+        1,
+        seq_len,
+        dim,
+        64,
+        torch.float16,
+        config={"block_H": 32, "block_N": 32, "num_split": split, "num_stages": 1, "threads": 128},
+    )
+    out = kernel(*(t.ptpu() for t in (q, qp, kv, kp)))
+    torch.ptpu.synchronize()
+    torch.testing.assert_close(out.cpu(), ref, rtol=1e-3, atol=1e-3)

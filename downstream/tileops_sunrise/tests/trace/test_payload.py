@@ -1,4 +1,5 @@
 """Unit tests for trace payload support."""
+
 import pytest
 import tilelang
 import tilelang.language as T
@@ -18,7 +19,6 @@ def preserve_trace_state():
     try:
         yield
     finally:
-        # Restore original state
         if original_enabled:
             trace.enable(output=original_output)
         else:
@@ -29,16 +29,15 @@ def test_payload_api_signature(preserve_trace_state):
     """Test that payload parameter is accepted by trace APIs."""
     trace.disable()
 
-    # Test range() accepts payload
     @tilelang.jit(out_idx=trace.out_idx(1))
     def build1():
         @T.prim_func
-        def kernel(out: T.Buffer((16,), "float32")):
+        def kernel(out: T.Tensor((16,), "float32")):
             with T.Kernel(1, threads=16), trace.range("test", payload=0):
                 pass
+
         return trace.finalize(kernel)
 
-    # Should compile without error
     kernel = build1()
     assert kernel is not None
 
@@ -50,10 +49,9 @@ def test_payload_with_range_start_end(preserve_trace_state, tmp_path):
     @tilelang.jit(out_idx=trace.out_idx(1))
     def build():
         @T.prim_func
-        def kernel(out: T.Buffer((16,), "float32")):
+        def kernel(out: T.Tensor((16,), "float32")):
             with T.Kernel(1, threads=16):
                 tx = T.get_thread_binding()
-                # Test range_start accepts payload
                 tok = trace.range_start("test_range", payload=42)
                 out[tx] = T.float32(tx)
                 trace.range_end(tok)
@@ -62,21 +60,17 @@ def test_payload_with_range_start_end(preserve_trace_state, tmp_path):
 
     kernel = build()
 
-    # When tracing is enabled, kernel returns (output, slots)
     result = kernel()
     assert isinstance(result, (tuple, list)), "Expected (output, slots) tuple"
 
     output_tensor, slots = result
 
-    # Verify kernel output
-    expected = torch.arange(16, dtype=torch.float32, device="cuda")
+    expected = torch.arange(16, dtype=torch.float32, device="ptpu")
     assert torch.allclose(output_tensor, expected)
 
-    # Decode and verify payload is 42
     events = trace.decode(kernel, slots)
     slices = [e for e in events if e.name == "test_range"]
 
-    # Should have exactly one slice with payload 42
     assert len(slices) == 1, f"Expected exactly one test_range slice, got {len(slices)}"
     assert slices[0].payload == 42, f"Expected payload 42, got {slices[0].payload}"
 
@@ -88,13 +82,12 @@ def test_payload_backward_compatibility(preserve_trace_state):
     @tilelang.jit(out_idx=trace.out_idx(1))
     def build():
         @T.prim_func
-        def kernel(out: T.Buffer((16,), "float32")):
+        def kernel(out: T.Tensor((16,), "float32")):
             with T.Kernel(1, threads=16):
                 # Old code without payload should still work
                 with trace.range("test"):
                     pass
 
-                # With lane but no payload
                 with trace.range("test2", lane="compute"):
                     pass
 
@@ -122,12 +115,11 @@ def test_implicit_thread_blocks_with_payload_e2e(preserve_trace_state, tmp_path)
     @tilelang.jit(out_idx=trace.out_idx(1))
     def build():
         @T.prim_func
-        def kernel(out: T.Buffer((16,), "float32")):
+        def kernel(out: T.Tensor((16,), "float32")):
             # Use simple T.Kernel(..., threads=16) - no explicit threadIdx.x binding
             # This triggers the __tl_thread_idx_x() writer-election fallback
             with T.Kernel(1, threads=16):
                 tx = T.get_thread_binding()
-                # Explicit payload=42 (user-provided constant)
                 with trace.range("test_range", payload=42):
                     out[tx] = T.float32(tx)
 
@@ -142,11 +134,9 @@ def test_implicit_thread_blocks_with_payload_e2e(preserve_trace_state, tmp_path)
 
     output_tensor, slots = result
 
-    # Verify kernel output
-    expected = torch.arange(16, dtype=torch.float32, device="cuda")
+    expected = torch.arange(16, dtype=torch.float32, device="ptpu")
     assert torch.allclose(output_tensor, expected)
 
-    # Decode and verify payload
     events = trace.decode(kernel, slots)
     slices = [e for e in events if e.name == "test_range"]
 
@@ -171,8 +161,7 @@ def test_dynamic_payload_runtime_expr(preserve_trace_state, tmp_path):
     @tilelang.jit(out_idx=trace.out_idx(1))
     def build():
         @T.prim_func
-        def kernel(out: T.Buffer((4,), "float32")):
-            # Use simple T.Kernel with threads=4
+        def kernel(out: T.Tensor((4,), "float32")):
             with T.Kernel(1, threads=4):
                 tx = T.get_thread_binding()
                 # Explicitly use loop index as payload - this is a user-provided runtime PrimExpr
@@ -189,11 +178,9 @@ def test_dynamic_payload_runtime_expr(preserve_trace_state, tmp_path):
 
     output_tensor, slots = result
 
-    # Verify kernel output
-    expected = torch.tensor([0.0, 1.0, 2.0, 3.0], dtype=torch.float32, device="cuda")
+    expected = torch.tensor([0.0, 1.0, 2.0, 3.0], dtype=torch.float32, device="ptpu")
     assert torch.allclose(output_tensor, expected)
 
-    # Decode and verify payload values
     events = trace.decode(kernel, slots)
     loop_slices = [e for e in events if e.name == "loop_iter"]
 
@@ -202,7 +189,3 @@ def test_dynamic_payload_runtime_expr(preserve_trace_state, tmp_path):
 
     payloads = sorted([s.payload for s in loop_slices[:4]])
     assert payloads == [0, 1, 2, 3], f"Expected payloads [0, 1, 2, 3], got {payloads}"
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])

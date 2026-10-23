@@ -17,7 +17,7 @@ import torch
 def test_rms_norm_accepts_normalized_shape() -> None:
     from tileops.ops.norm.rms_norm import RMSNormFwdOp
 
-    op = RMSNormFwdOp(normalized_shape=(4096,), eps=None, dtype=torch.float16)
+    op = RMSNormFwdOp(normalized_shape=(4096,), eps=None)
     assert op.N == 4096
     assert op.normalized_shape == (4096,)
 
@@ -26,7 +26,7 @@ def test_rms_norm_accepts_normalized_shape() -> None:
 def test_layer_norm_accepts_normalized_shape() -> None:
     from tileops.ops.norm.layer_norm import LayerNormFwdOp
 
-    op = LayerNormFwdOp(normalized_shape=[4096], dtype=torch.float16)
+    op = LayerNormFwdOp(normalized_shape=[4096])
     assert op.N == 4096
     assert op.normalized_shape == (4096,)
 
@@ -36,16 +36,16 @@ def test_rms_norm_accepts_tuple_normalized_shape_runtime() -> None:
     """Multi-axis ``normalized_shape`` is the manifest contract; reduction
     runs over the trailing ``len(normalized_shape)`` axes and ``weight``
     must match ``tuple(normalized_shape)``."""
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required for forward call")
+    if not torch.ptpu.is_available():
+        pytest.skip("PTPU required for forward call")
 
     from tileops.ops.norm.rms_norm import RMSNormFwdOp
 
-    op = RMSNormFwdOp(normalized_shape=(2, 3), dtype=torch.float16)
+    op = RMSNormFwdOp(normalized_shape=(2, 3))
     assert op.N == 6
     assert op.normalized_shape == (2, 3)
-    x = torch.randn(4, 2, 3, dtype=torch.float16, device="cuda")
-    w = torch.randn(2, 3, dtype=torch.float16, device="cuda")
+    x = torch.randn(4, 2, 3, dtype=torch.float16, device="ptpu")
+    w = torch.randn(2, 3, dtype=torch.float16, device="ptpu")
     y = op(x, w)
     assert y.shape == x.shape
 
@@ -54,17 +54,17 @@ def test_rms_norm_accepts_tuple_normalized_shape_runtime() -> None:
 def test_layer_norm_accepts_tuple_normalized_shape_runtime() -> None:
     """Multi-axis ``normalized_shape`` is the manifest contract; weight/bias
     must match ``tuple(normalized_shape)``."""
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required for forward call")
+    if not torch.ptpu.is_available():
+        pytest.skip("PTPU required for forward call")
 
     from tileops.ops.norm.layer_norm import LayerNormFwdOp
 
-    op = LayerNormFwdOp(normalized_shape=(2, 3), dtype=torch.float16)
+    op = LayerNormFwdOp(normalized_shape=(2, 3))
     assert op.N == 6
     assert op.normalized_shape == (2, 3)
-    x = torch.randn(4, 2, 3, dtype=torch.float16, device="cuda")
-    w = torch.randn(2, 3, dtype=torch.float16, device="cuda")
-    b = torch.randn(2, 3, dtype=torch.float16, device="cuda")
+    x = torch.randn(4, 2, 3, dtype=torch.float16, device="ptpu")
+    w = torch.randn(2, 3, dtype=torch.float16, device="ptpu")
+    b = torch.randn(2, 3, dtype=torch.float16, device="ptpu")
     y = op(x, w, b)
     assert y.shape == x.shape
 

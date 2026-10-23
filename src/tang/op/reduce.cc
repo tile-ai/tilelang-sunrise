@@ -16,6 +16,10 @@ using namespace tirx;
 namespace tang {
 
 struct Reduce : backend::ReduceLowerer<Reduce> {
+  static bool AllReduceNeedsWorkspace(int reducing_threads, int, Target) {
+    return reducing_threads > 32;
+  }
+
   static DataType GetReductionDataType(const ReduceOpNode &op, Target) {
     DataType dtype = op.dst->dtype;
     if (((!op.nan_propagate && (op.type->IsMax() || op.type->IsMin())) ||

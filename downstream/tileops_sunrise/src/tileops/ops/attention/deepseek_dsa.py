@@ -1,0 +1,160 @@
+from typing import Dict, Optional
+
+import torch
+
+from tileops.kernels.attention import SparseMlaBasicKernel, SparseMlaKernel
+from tileops.kernels.kernel_base import Kernel
+from tileops.perf.profile import tensor_core_roof
+from tileops.utils import get_sm_version
+
+from ..op_base import Op
+
+__all__ = ["DeepSeekSparseAttentionDecodeWithKVCacheFwdOp"]
+
+
+class DeepSeekSparseAttentionDecodeWithKVCacheFwdOp(Op):
+    """
+    Sparse Attention Decode Operation with Key-Value Cache for DeepSeek.
+
+    This operation is part of a sparse attention mechanism, designed for use in decoding
+    with key-value (KV) caching.
+
+    The layout of the operation is BSHD.
+
+    """
+
+    def __init__(
+        self,
+        batch: int,
+        heads: int,
+        seq_len: int,
+        seq_len_kv: int,
+        dim: int,
+        dim_tail: int,
+        topk: int,
+        stride_kv: int,
+        heads_kv: int,
+        q_start_index_s: int,
+        sm_scale: Optional[float] = None,
+        is_causal: bool = True,
+        kernel_map: Optional[Dict[str, Kernel]] = None,
+        tune: bool = False,
+    ) -> None:
+        """Build the op. Shapes and dtype are taken from the first call.
+
+        Args:
+            batch (int): The batch size.
+            heads (int): The number of attention heads.
+            seq_len (int): The length of the input sequence.
+            seq_len_kv (int): The length of the key-value sequence.
+            dim (int): The dimension of the attention vectors.
+            dim_tail (int): The dimension of the tail portion of the attention vectors.
+            topk (int): The number of top elements to consider in sparse attention.
+            stride_kv (int): The stride for the key-value sequence.
+            heads_kv (int): The number of key-value heads.
+            q_start_index_s (int): The start index for queries in the sequence.
+            sm_scale (Optional[float], default=None): Scaling factor for the softmax function.
+            is_causal (bool, default=True): Whether the attention is causal
+                        (True for causal, False for non-causal).
+            kernel_map (Optional[Dict[str, Kernel]], default=None):
+                        Optional mapping for custom kernels.
+            tune (bool, default=False): Whether to enable kernel tuning.
+        """
+        self.batch = batch
+        self.heads = heads
+        self.seq_len = seq_len
+        self.seq_len_kv = seq_len_kv
+        self.dim = dim
+        self.dim_tail = dim_tail
+        self.topk = topk
+        self.stride_kv = stride_kv
+        self.heads_kv = heads_kv
+        self.sm_scale = sm_scale
+        self.is_causal = is_causal
+
+        if q_start_index_s != 0 and q_start_index_s <= stride_kv:
+            raise ValueError(
+                f"Invalid q_start_index_s={q_start_index_s}:"
+                f"must be > stride_kv={stride_kv}. "
+                "This indicates incorrect cp0 masking."
+                "Ensure queries with pos < stride_kv are masked "
+                "to avoid NaNs in early outputs."
+            )
+
+        cp0 = q_start_index_s == 0
+        self.q_start_index_s = q_start_index_s
+
+        self._cp0 = cp0
+        self.tune = tune
+        self.dispatch_kernel(kernel_map)
+
+    def _get_kernel(self, inputs: "tuple[torch.Tensor | None, ...]", dtype: torch.dtype) -> Kernel:
+        return self.get_or_build_kernel(
+            "sparse_mla_kernel",
+            inputs,
+            key=dtype,
+            build=lambda: self.kernel_map["sparse_mla_kernel"](
+                self.batch,
+                self.seq_len,
+                self.seq_len_kv,
+                self.heads,
+                self.dim,
+                self.dim_tail,
+                dtype,
+                self.topk,
+                self.stride_kv,
+                self.q_start_index_s,
+                self.heads_kv,
+                self.sm_scale,
+                self.is_causal,
+                self._cp0,
+                tune=self.tune,
+            ),
+        )
+
+    @property
+    def default_kernel_map(self) -> Dict[str, Kernel]:
+        """
+        Provides the default kernel map for the operation.
+
+        Returns:
+            Dict[str, Kernel]: A dictionary mapping kernel names to kernel functions.
+            The default map includes the "sparse_mla_kernel": the WGMMA
+            warp-specialized SparseMlaKernel on Hopper, and the
+            architecture-agnostic SparseMlaBasicKernel (plain T.gemm) elsewhere.
+        """
+        return {
+            "sparse_mla_kernel": SparseMlaKernel if get_sm_version() == 90 else SparseMlaBasicKernel
+        }
+
+    def _infer_output_shapes(
+        self,
+        q_shape: tuple[int, ...],
+        kv_shape: tuple[int, ...],
+        indices_shape: tuple[int, ...],
+    ) -> dict[str, tuple[int, ...]]:
+        """Manifest ``shape_rules``: ``o`` drops the tail dims ``q`` carries."""
+        return {"o": tuple(q_shape[:-1]) + (q_shape[-1] - self.dim_tail,)}
+
+    def forward(self, q: torch.Tensor, kv: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+        """
+        Performs the forward pass of the sparse attention operation.
+
+        Args:
+            q (torch.Tensor): The query tensor with shape
+                        (batch, seq_len, heads, dim + dim_tail).
+            kv (torch.Tensor): The key-value tensor with shape
+                        (batch, seq_len_kv, heads_kv, dim + dim_tail).
+            indices (torch.Tensor): Indices tensor for sparse attention.
+
+        Returns:
+            torch.Tensor: The result of applying the sparse attention
+                            operation on the input tensors.
+        """
+        self._validate_dtypes(q, kv, indices)
+        self.dtype = q.dtype
+        return self._get_kernel((q, kv, indices), q.dtype)(q, kv, indices)
+
+    def compute_roof(self) -> str:
+        """FLOPs are matmul contractions; priced on tensor cores."""
+        return tensor_core_roof(self.dtype)

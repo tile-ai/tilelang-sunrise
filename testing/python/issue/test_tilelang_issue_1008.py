@@ -9,7 +9,7 @@ from tilelang.utils.device import get_current_device
     pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True},
 )
 def _fill_with_static_region_kernel():
-    num_tokens = T.symbolic("num_tokens")
+    num_tokens = T.dynamic("num_tokens")
 
     @T.prim_func
     def buggy_kernel(x: T.Tensor[(num_tokens,), "int64"]):  # noqa: F821
@@ -23,7 +23,7 @@ def _fill_with_static_region_kernel():
     pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True},
 )
 def _fill_with_dynamic_region_kernel():
-    num_tokens = T.symbolic("num_tokens")
+    num_tokens = T.dynamic("num_tokens")
 
     @T.prim_func
     def buggy_kernel(x: T.Tensor[(num_tokens,), "int64"]):  # noqa: F821

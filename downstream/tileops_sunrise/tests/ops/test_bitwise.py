@@ -15,8 +15,7 @@ from tileops.ops.elementwise import (
     BitwiseOrFwdOp,
     BitwiseXorFwdOp,
 )
-
-# Shared helpers
+from workloads.elementwise import BitwiseNotWorkload, BitwiseWorkload
 
 
 def _exact_compare(output: torch.Tensor, output_ref: torch.Tensor) -> None:
@@ -28,89 +27,80 @@ def _exact_compare(output: torch.Tensor, output_ref: torch.Tensor) -> None:
     )
 
 
-class BitwiseTest(TestBase):
+class BitwiseTest(BitwiseWorkload, TestBase):
     """Reusable test body for bitwise ops."""
 
     def __init__(self, n_total: int, ref_fn):
-        self.n_total = n_total
-        self.dtype = torch.int32
+        super().__init__(n_total)
         self.ref_fn = ref_fn
-
-    def gen_inputs(self) -> tuple[torch.Tensor, torch.Tensor]:
-        a = torch.randint(-1000, 1000, (self.n_total,), dtype=torch.int32).ptpu()
-        b = torch.randint(-1000, 1000, (self.n_total,), dtype=torch.int32).ptpu()
-        return a, b
 
     def ref_program(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         return self.ref_fn(a.cpu(), b.cpu())
 
 
-# BitwiseAnd op
-
-
 class BitwiseAndFixture(FixtureBase):
     PARAMS = [
-        ("n_total", [
-            pytest.param(4_096, marks=pytest.mark.smoke),
-            pytest.param(16_384, marks=pytest.mark.full),
-        ]),
+        (
+            "n_total",
+            [
+                pytest.param(4_096, marks=pytest.mark.smoke),
+                pytest.param(16_384, marks=pytest.mark.full),
+            ],
+        ),
     ]
 
 
 @BitwiseAndFixture
 def test_bitwise_and_op(n_total: int) -> None:
     test = BitwiseTest(n_total, torch.bitwise_and)
-    shape = (n_total,)
-    op = BitwiseAndFwdOp(a_shape=shape, b_shape=shape, dtype=torch.int32)
+    op = BitwiseAndFwdOp()
     test.check(op, *test.gen_inputs(), compare=_exact_compare)
-
-
-# BitwiseOr op
 
 
 class BitwiseOrFixture(FixtureBase):
     PARAMS = [
-        ("n_total", [
-            pytest.param(4_096, marks=pytest.mark.smoke),
-            pytest.param(16_384, marks=pytest.mark.full),
-        ]),
+        (
+            "n_total",
+            [
+                pytest.param(4_096, marks=pytest.mark.smoke),
+                pytest.param(16_384, marks=pytest.mark.full),
+            ],
+        ),
     ]
 
 
 @BitwiseOrFixture
 def test_bitwise_or_op(n_total: int) -> None:
     test = BitwiseTest(n_total, torch.bitwise_or)
-    shape = (n_total,)
-    op = BitwiseOrFwdOp(a_shape=shape, b_shape=shape, dtype=torch.int32)
+    op = BitwiseOrFwdOp()
     test.check(op, *test.gen_inputs(), compare=_exact_compare)
-
-
-# BitwiseXor op
 
 
 class BitwiseXorFixture(FixtureBase):
     PARAMS = [
-        ("n_total", [
-            pytest.param(4_096, marks=pytest.mark.smoke),
-            pytest.param(16_384, marks=pytest.mark.full),
-        ]),
+        (
+            "n_total",
+            [
+                pytest.param(4_096, marks=pytest.mark.smoke),
+                pytest.param(16_384, marks=pytest.mark.full),
+            ],
+        ),
     ]
 
 
 @BitwiseXorFixture
 def test_bitwise_xor_op(n_total: int) -> None:
     test = BitwiseTest(n_total, torch.bitwise_xor)
-    shape = (n_total,)
-    op = BitwiseXorFwdOp(a_shape=shape, b_shape=shape, dtype=torch.int32)
+    op = BitwiseXorFwdOp()
     test.check(op, *test.gen_inputs(), compare=_exact_compare)
 
 
 # Broadcast pattern tests for binary bitwise ops (L3)
 
 _BROADCAST_PATTERNS = [
-    ((2, 64, 128), (1, 1, 128)),   # bias-add
-    ((2, 64, 128), (2, 64, 1)),    # row broadcast
-    ((64, 128), (1, 1)),           # scalar broadcast
+    ((2, 64, 128), (1, 1, 128)),  # bias-add
+    ((2, 64, 128), (2, 64, 1)),  # row broadcast
+    ((64, 128), (1, 1)),  # scalar broadcast
 ]
 
 _BITWISE_OPS = [
@@ -122,25 +112,37 @@ _BITWISE_OPS = [
 
 class BitwiseBroadcastFixture(FixtureBase):
     PARAMS = [
-        ("op_name, op_cls, ref_fn, a_shape, b_shape", [
-            pytest.param(name, cls, ref, a_s, b_s,
-                         marks=pytest.mark.smoke if i == 0 and j == 0
-                         else pytest.mark.full)
-            for j, (name, cls, ref) in enumerate(_BITWISE_OPS)
-            for i, (a_s, b_s) in enumerate(_BROADCAST_PATTERNS)
-        ]),
+        (
+            "op_name, op_cls, ref_fn, a_shape, b_shape",
+            [
+                pytest.param(
+                    name,
+                    cls,
+                    ref,
+                    a_s,
+                    b_s,
+                    marks=pytest.mark.smoke if i == 0 and j == 0 else pytest.mark.full,
+                )
+                for j, (name, cls, ref) in enumerate(_BITWISE_OPS)
+                for i, (a_s, b_s) in enumerate(_BROADCAST_PATTERNS)
+            ],
+        ),
     ]
 
 
 @BitwiseBroadcastFixture
 def test_bitwise_broadcast(
-    op_name, op_cls, ref_fn, a_shape, b_shape,
+    op_name,
+    op_cls,
+    ref_fn,
+    a_shape,
+    b_shape,
 ) -> None:
     a = torch.randint(-1000, 1000, a_shape, dtype=torch.int32).ptpu()
     b = torch.randint(-1000, 1000, b_shape, dtype=torch.int32).ptpu()
     a_cpu = a.cpu()
     b_cpu = b.cpu()
-    op = op_cls(a_shape=a_shape, b_shape=b_shape, dtype=torch.int32)
+    op = op_cls()
     ref = ref_fn(a_cpu, b_cpu)
     with torch.no_grad():
         out = op(a, b)
@@ -149,27 +151,38 @@ def test_bitwise_broadcast(
 
 class BoolBitwiseFixture(FixtureBase):
     PARAMS = [
-        ("op_name, op_cls, ref_fn, a_shape, b_shape", [
-            pytest.param(
-                name, cls, ref, a_s, b_s,
-                marks=pytest.mark.smoke if a_s == b_s else pytest.mark.full,
-            )
-            for a_s, b_s in [
-                ((2048, 4096), (2048, 4096)),
-                ((2, 512, 768), (1, 1, 768)),
-            ]
-            for name, cls, ref in _BITWISE_OPS
-        ]),
+        (
+            "op_name, op_cls, ref_fn, a_shape, b_shape",
+            [
+                pytest.param(
+                    name,
+                    cls,
+                    ref,
+                    a_s,
+                    b_s,
+                    marks=pytest.mark.smoke if a_s == b_s else pytest.mark.full,
+                )
+                for a_s, b_s in [
+                    ((2048, 4096), (2048, 4096)),
+                    ((2, 512, 768), (1, 1, 768)),
+                ]
+                for name, cls, ref in _BITWISE_OPS
+            ],
+        ),
     ]
 
 
 @BoolBitwiseFixture
 def test_bool_bitwise_fast_path(
-    op_name, op_cls, ref_fn, a_shape, b_shape,
+    op_name,
+    op_cls,
+    ref_fn,
+    a_shape,
+    b_shape,
 ) -> None:
     a = torch.randint(0, 2, a_shape, device="ptpu").bool()
     b = torch.randint(0, 2, b_shape, device="ptpu").bool()
-    op = op_cls(a_shape=a_shape, b_shape=b_shape, dtype=torch.bool)
+    op = op_cls()
     ref = ref_fn(a.cpu(), b.cpu())
     with torch.no_grad():
         out = op(a, b)
@@ -177,56 +190,43 @@ def test_bool_bitwise_fast_path(
     _exact_compare(out, ref)
 
 
-# BitwiseNot op
-
-
 class BitwiseFixture(FixtureBase):
     """Parametrize over torch-supported bitwise_not dtypes."""
 
     PARAMS = [
-        ("n_total, dtype", [
-            pytest.param(1_048_576, torch.bool, marks=pytest.mark.smoke),
-            pytest.param(1_048_576, torch.uint8, marks=pytest.mark.smoke),
-            pytest.param(1_048_576, torch.int8, marks=pytest.mark.smoke),
-            pytest.param(1_048_576, torch.int16, marks=pytest.mark.smoke),
-            pytest.param(1_048_576, torch.int32, marks=pytest.mark.smoke),
-            pytest.param(1_048_576, torch.int64, marks=pytest.mark.smoke),
-        ]),
+        (
+            "n_total, dtype",
+            [
+                pytest.param(1_048_576, torch.bool, marks=pytest.mark.smoke),
+                pytest.param(1_048_576, torch.uint8, marks=pytest.mark.smoke),
+                pytest.param(1_048_576, torch.int8, marks=pytest.mark.smoke),
+                pytest.param(1_048_576, torch.int16, marks=pytest.mark.smoke),
+                pytest.param(1_048_576, torch.int32, marks=pytest.mark.smoke),
+                pytest.param(1_048_576, torch.int64, marks=pytest.mark.smoke),
+            ],
+        ),
     ]
 
 
-class BitwiseNotTest(TestBase):
+class BitwiseNotTest(BitwiseNotWorkload, TestBase):
     """Test fixture for bitwise_not."""
-
-    def __init__(self, n_total: int, dtype: torch.dtype):
-        self.n_total = n_total
-        self.dtype = dtype
-
-    def gen_inputs(self) -> tuple[torch.Tensor]:
-        if self.dtype == torch.bool:
-            x = torch.rand(self.n_total).ptpu() > 0.5
-        elif self.dtype == torch.uint8:
-            x = torch.randint(0, 256, (self.n_total,), dtype=self.dtype).ptpu()
-        else:
-            x = torch.randint(-128, 128, (self.n_total,), dtype=self.dtype).ptpu()
-        return (x,)
-
-    def ref_program(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.bitwise_not(x.cpu())
 
 
 @BitwiseFixture
 def test_bitwise_not(n_total: int, dtype: torch.dtype) -> None:
     test = BitwiseNotTest(n_total, dtype)
-    op = BitwiseNotFwdOp(N_total=n_total, dtype=dtype)
+    op = BitwiseNotFwdOp()
     test.check(op, *test.gen_inputs(), compare=exact_compare)
 
 
-@pytest.mark.parametrize("dtype", [
-    pytest.param(torch.float16, marks=pytest.mark.smoke),
-    pytest.param(torch.bfloat16, marks=pytest.mark.smoke),
-    pytest.param(torch.float32, marks=pytest.mark.smoke),
-])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.float16, marks=pytest.mark.smoke),
+        pytest.param(torch.bfloat16, marks=pytest.mark.smoke),
+        pytest.param(torch.float32, marks=pytest.mark.smoke),
+    ],
+)
 def test_bitwise_not_rejects_float_dtype(dtype: torch.dtype) -> None:
     from tileops.kernels.elementwise import BitwiseNotFwdKernel
 
@@ -239,13 +239,16 @@ def test_bitwise_not_rejects_float_dtype(dtype: torch.dtype) -> None:
 
 class BitwiseBinaryRejectFixture(FixtureBase):
     PARAMS = [
-        ("op_cls, dtype", [
-            pytest.param(BitwiseAndFwdOp, torch.float16, marks=pytest.mark.smoke),
-            pytest.param(BitwiseAndFwdOp, torch.bfloat16, marks=pytest.mark.smoke),
-            pytest.param(BitwiseAndFwdOp, torch.float32, marks=pytest.mark.smoke),
-            pytest.param(BitwiseOrFwdOp, torch.float16, marks=pytest.mark.full),
-            pytest.param(BitwiseXorFwdOp, torch.float16, marks=pytest.mark.full),
-        ]),
+        (
+            "op_cls, dtype",
+            [
+                pytest.param(BitwiseAndFwdOp, torch.float16, marks=pytest.mark.smoke),
+                pytest.param(BitwiseAndFwdOp, torch.bfloat16, marks=pytest.mark.smoke),
+                pytest.param(BitwiseAndFwdOp, torch.float32, marks=pytest.mark.smoke),
+                pytest.param(BitwiseOrFwdOp, torch.float16, marks=pytest.mark.full),
+                pytest.param(BitwiseXorFwdOp, torch.float16, marks=pytest.mark.full),
+            ],
+        ),
     ]
 
 
@@ -253,9 +256,7 @@ class BitwiseBinaryRejectFixture(FixtureBase):
 def test_bitwise_binary_rejects_float_dtype(op_cls, dtype: torch.dtype) -> None:
     """Binary bitwise ops only support integer dtypes; floats must be rejected."""
     shape = (16,)
-    with pytest.raises(ValueError, match="does not support dtype"):
-        op_cls(a_shape=shape, b_shape=shape, dtype=dtype)
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-vvs"])
+    op = op_cls()
+    x = torch.zeros(shape, device="ptpu", dtype=dtype)
+    with pytest.raises(ValueError, match="has dtype|does not support dtype"):
+        op(x, x)

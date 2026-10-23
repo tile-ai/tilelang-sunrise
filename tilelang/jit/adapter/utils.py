@@ -104,6 +104,10 @@ def is_tang_target(target: Target) -> bool:
     return target.kind.name == "tang"
 
 
+def is_ascend_target(target: Target) -> bool:
+    return target.kind.name == "ascend"
+
+
 def is_cutedsl_target(target: Target) -> bool:
     return target.kind.name == "cuda" and "cutedsl" in target.keys
 

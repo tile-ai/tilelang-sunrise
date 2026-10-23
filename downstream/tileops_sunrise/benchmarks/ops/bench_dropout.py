@@ -1,49 +1,44 @@
-"""Benchmarks for DropoutOp.
+"""Benchmarks for DropoutFwdOp.
 
 Profiles TileOPs dropout vs torch.nn.functional.dropout on DNN-realistic shapes.
 Uses p=0.5 (default) as representative drop rate.
-"""
 
-from math import prod
+torch eager and inductor are the two competitors: flag_gems' ``dropout`` raises on
+this torch version.
+"""
 
 import pytest
 import torch
 import torch.nn.functional as F
 
-from benchmarks.benchmark_base import BenchmarkReport, ManifestBenchmark, workloads_to_params
-from tileops.ops.dropout import DropoutOp
-from workloads.workload_base import WorkloadBase
+from benchmarks.baselines import TORCH_COMPILE_TAG, compiled_reference
+from benchmarks.benchmark_base import ManifestBenchmark, workloads_to_params
+from tileops.ops.dropout import DropoutFwdOp
+from workloads.elementwise import ShapedRandnWorkload
 
-_OP_NAME = "DropoutOp"
 
-
-class DropoutBenchCase(WorkloadBase):
-    def __init__(self, shape: tuple, dtype: torch.dtype, p: float = 0.5):
-        self.shape = shape
-        self.n_total = prod(shape)
-        self.dtype = dtype
+class DropoutBenchmarkWorkload(ShapedRandnWorkload):
+    def __init__(self, shape: tuple, dtype, p: float = 0.5):
+        super().__init__(shape, dtype)
         self.p = p
-
-    def gen_inputs(self) -> tuple[torch.Tensor, ...]:
-        return (torch.randn(self.shape, dtype=self.dtype).ptpu(),)
 
     def ref_program(self, x: torch.Tensor) -> torch.Tensor:
         return F.dropout(x, p=self.p, training=True)
 
 
-@pytest.mark.parametrize("shape, dtype", workloads_to_params(_OP_NAME))
+@pytest.mark.parametrize("shape, dtype", workloads_to_params(DropoutFwdOp))
 def test_dropout_bench(shape: tuple, dtype: torch.dtype) -> None:
-    test = DropoutBenchCase(shape, dtype)
+    test = DropoutBenchmarkWorkload(shape, dtype)
     (x,) = test.gen_inputs()
 
-    op = DropoutOp(p=test.p, seed=42)
-    bm = ManifestBenchmark(_OP_NAME, op, test)
-    result = bm.profile(op, x)
-    BenchmarkReport.record(op, locals(), result, tag="tileops")
+    op = DropoutFwdOp(p=test.p, seed=42)
+    bm = ManifestBenchmark(op, test)
 
-    result_bl = bm.profile(test.ref_program, x)
-    BenchmarkReport.record(op, locals(), result_bl, tag="torch")
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-vvs"])
+    bm.compare(
+        {
+            "tileops": op,
+            "torch": test.ref_program,
+            TORCH_COMPILE_TAG: compiled_reference(test.ref_program),
+        },
+        x,
+    )

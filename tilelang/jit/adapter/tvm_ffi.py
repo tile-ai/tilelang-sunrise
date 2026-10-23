@@ -1,16 +1,19 @@
-"""Utilities to adapt TVM FFI kernels to Torch tensors.
+"""Utilities to adapt TVM-FFI kernels to Torch tensors.
 
 This adapter intentionally captures PyTorch's current accelerator stream and device
 via light-weight callables so that, when the wrapped function is invoked,
 the execution observes the same stream context as the active Torch code.
 On builds without PTPU or CUDA, the stream/device fall back to 0/CPU semantics.
+
+TVM-FFI obtains the active work stream through Torch's DLPack Exchange API.
+The Ascend adapter installs TileLang's Torch NPU callback before the first
+tensor reaches an executable.
 """
 
 from __future__ import annotations
 
 from typing import Any
 from collections.abc import Callable
-import contextlib
 import sys
 import threading
 
@@ -21,6 +24,7 @@ from tvm.target import Target
 from tvm.relax import TensorType
 import tvm_ffi
 from tilelang.backend.target import determine_target
+from tilelang.jit.abi import CALLEE_ALLOCATED_OUTPUTS_ATTR
 from tilelang.jit.adapter.base import BaseKernelAdapter, CachedTextSource
 from tilelang.utils.language import retrieve_func_from_module
 from tilelang.engine.param import KernelParam
@@ -39,6 +43,14 @@ elif sys.platform == "win32":
     COMPILE_ARGS["fcompile"] = _msvc_create_shared
 
 
+def _install_torch_stream_exchange() -> None:
+    from tilelang.ascend.torch_exchange import (
+        install_torch_npu_stream_exchange,
+    )
+
+    install_torch_npu_stream_exchange()
+
+
 class TVMFFIKernelAdapter(BaseKernelAdapter):
     """Adapter that runs a TVM runtime.Executable with Torch tensors.
 
@@ -49,6 +61,10 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
       the user's current Torch context (e.g., after a stream guard/switch).
     - The stream pointer returned is a raw PTPU or CUDA stream handle compatible
       with TVM's device API; without an accelerator, we return 0.
+
+    - Torch tensors use TVM-FFI's zero-copy DLPack Exchange API conversion.
+    - Ascend execution installs a Cython callback that reads Torch's current
+      NPU stream for every invocation.
     """
 
     # Class attributes to store compiled kernel information
@@ -69,6 +85,13 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
     rt_mod: tvm.runtime.Module | None = None
     # Maps symbolic variables to their corresponding buffer and shape indices
     dynamic_symbolic_map: dict[tirx.Var, tuple[int, int, int, int]] | None = None
+
+    _torch_npu_stream_exchange_installed: bool = False
+
+    def _prepare_torch_device(self, device: torch.device) -> None:
+        if device.type == "npu" and not self._torch_npu_stream_exchange_installed:
+            _install_torch_stream_exchange()
+            self._torch_npu_stream_exchange_installed = True
 
     # Stream/device functors are inherited from BaseKernelAdapter
     def __init__(
@@ -151,13 +174,14 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         if not self.result_idx:
             return False
 
-        # The native wrapper is currently emitted for CUDA with TileLang's C
-        # host codegen. Other device and host backends retain the preallocated-
-        # output path until they have equivalent result-slot lowering.
-        if self.target.kind.name != "cuda":
+        # The ABI decision is stamped on the PrimFunc at compile time from the
+        # execution backend's declared capability; read it back rather than
+        # re-deriving it from the target, so lowering and dispatch can never
+        # disagree.
+        attrs = getattr(self.prim_func, "attrs", None)
+        if attrs is None or CALLEE_ALLOCATED_OUTPUTS_ATTR not in attrs:
             return False
-        target_host = self.target.host
-        return target_host is not None and target_host.kind.name == "c"
+        return int(attrs[CALLEE_ALLOCATED_OUTPUTS_ATTR]) != 0
 
     def _process_dynamic_symbolic(self) -> dict[tirx.Var, tuple[int, int, int, int]]:
         """Extract information about dynamic shapes from the TIR function.
@@ -175,13 +199,21 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         for i, param in enumerate(params):
             if isinstance(param, tirx.Var) and (param not in dynamic_symbolic_map):
                 dynamic_symbolic_map[param] = (2, i, -1, 1)
-        for i, param in enumerate(params):
+        # Inputs are visited first. An output's shape is resolved from these entries
+        # while that output is being allocated, so a dimension mentioned by both an
+        # input and an output must be owned by the input; owning it on the output
+        # would make the allocation loop read a slot it has not filled yet.
+        ordered = [i for i in range(len(params)) if i not in self.result_idx]
+        ordered += [i for i in range(len(params)) if i in self.result_idx]
+        for i in ordered:
+            param = params[i]
             if param in buffer_map:
                 buffer = buffer_map[param]
                 for j, shape in enumerate(buffer.shape):
                     if isinstance(shape, tirx.Var) and (shape not in dynamic_symbolic_map) and (shape not in params):
                         dynamic_symbolic_map[shape] = (0, i, j, 1)
-        for i, param in enumerate(params):
+        for i in ordered:
+            param = params[i]
             if param in buffer_map:
                 buffer = buffer_map[param]
                 element_bits = buffer.dtype.bits * buffer.dtype.lanes
@@ -195,17 +227,13 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         if getattr(self, "_ffi_callee_allocated_output_abi", False):
             return self._convert_ffi_callee_allocated_output_func()
 
-        # Capture thunks that reflect Torch's current stream and device.
-        # These are evaluated at call time to align TVM execution with the
-        # caller's active PyTorch stream/device.
-        current_stream_functor = self.get_current_stream_functor()
-        current_device_functor = self.get_current_device_functor()
+        current_device_functor = None
 
         # TVM device used to bind the active stream before each launch, so the
         # executable observes the same stream context as the caller's Torch code.
         # ``tvm.device`` accepts the target kind name (e.g. "cuda", "tang").
-        target = self.target if isinstance(self.target, Target) else Target(determine_target(self.target))
-        tvm_device_kind = target.kind.name
+        target = getattr(self, "target", None)
+        tvm_device_kind = target.kind.name if isinstance(target, Target) else str(target)
 
         # Convert TVM types to native Python types during initialization
         # Convert tvm.DataType to torch.dtype for tensor creation
@@ -224,9 +252,8 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                     native_shape.append(dim)
             tl_dtype = param.dtype
             if tl_dtype.bits < 8:
-                stroage_dtype: dtype = dtype(param.torch_dtype())
-                # last dim divide by bits to get the actual shape
-                native_shape[-1] = native_shape[-1] * tl_dtype.bits * tl_dtype.lanes // (stroage_dtype.bits * stroage_dtype.lanes)
+                storage_dtype: dtype = dtype(param.torch_dtype())
+                native_shape[-1] = native_shape[-1] * tl_dtype.bits * tl_dtype.lanes // (storage_dtype.bits * storage_dtype.lanes)
             param_shapes.append(native_shape)
 
         dynamic_symbolic_map = self.dynamic_symbolic_map
@@ -283,6 +310,8 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         _new_empty_template: dict[tuple[str, int, torch.dtype], torch.Tensor] = {}
 
         def func(*inputs: torch.Tensor | Any):
+            nonlocal current_device_functor
+            # Validate input count strictly
             expected_inputs = len(self.params) - len(self.result_idx)
             if len(inputs) != expected_inputs:
                 raise ValueError(f"Kernel expected {expected_inputs} inputs, but {len(inputs)} are provided.")
@@ -294,35 +323,64 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                 None,
             )
 
-            # Single-pass: build tensor_list + launch_list with cached from_dlpack
+            # Stitch the full positional argument list expected by the TVM executable.
+            # Inputs are placed first so that a symbolic dimension owned by an input can
+            # be resolved even when the output that needs it comes earlier in the
+            # signature; the outputs are then allocated in parameter order.
             ins_idx: int = 0
-            tensor_list: list[torch.Tensor] = []
-            launch_list: list[tvm_ffi.Tensor | Any] = []
+            tensor_list: list[torch.Tensor | None] = [None] * len(self.params)
+            for i in range(len(self.params)):
+                if i not in self.result_idx:
+                    tensor_list[i] = inputs[ins_idx]
+                    ins_idx += 1
 
+            # Prepare output tensors
             for i in range(len(self.params)):
                 if i in _result_idx_set:
+                    dtype = param_dtypes[i]
                     info = _static_output_infos[i]
                     if info is not None:
                         shape, dtype = info
                     else:
-                        dtype = param_dtypes[i]
                         shape = []
+                        # Now working with native Python list, no FFI calls needed
                         for s in param_shapes[i]:
                             if isinstance(s, tirx.Var):
                                 for key in dynamic_symbolic_map:
                                     if str(s) == str(key):
                                         ref_id, ref_tensor_idx, ref_shape_idx, stride_scale = dynamic_symbolic_map[key]
+                                        # ref_tensor_idx is a PrimFunc parameter index. `inputs` holds only
+                                        # the non-output parameters, so an output-before-input signature
+                                        # ([out, in, n]) would read the wrong slot or run off the end;
+                                        # `tensor_list` is sized and indexed by parameter position.
+                                        ref_tensor = tensor_list[ref_tensor_idx]
                                         if ref_id == 2:
-                                            shape.append(inputs[ref_tensor_idx])
-                                        elif ref_id == 0:
-                                            shape.append(tensor_list[ref_tensor_idx].shape[ref_shape_idx])
+                                            if ref_tensor is None:
+                                                param_name = self.params[i].name if hasattr(self.params[i], "name") else f"parameter_{i}"
+                                                raise ValueError(
+                                                    f"Cannot resolve symbolic dimension {s} of output parameter {param_name}: "
+                                                    f"it is taken from scalar parameter {ref_tensor_idx}, which has not "
+                                                    f"been supplied."
+                                                )
+                                            shape.append(ref_tensor)
+                                            continue
+                                        if ref_tensor is None:
+                                            param_name = self.params[i].name if hasattr(self.params[i], "name") else f"parameter_{i}"
+                                            raise ValueError(
+                                                f"Cannot resolve symbolic dimension {s} of output parameter {param_name}: "
+                                                f"it is taken from parameter {ref_tensor_idx}, which is an output that has "
+                                                f"not been allocated yet."
+                                            )
+                                        if ref_id == 0:
+                                            shape.append(ref_tensor.shape[ref_shape_idx])
                                         elif ref_id == 1:
-                                            shape.append(tensor_list[ref_tensor_idx].stride()[ref_shape_idx] * stride_scale)
-                            else:
+                                            shape.append(ref_tensor.stride()[ref_shape_idx] * stride_scale)
+                            else:  # Already converted to Python int during initialization
                                 shape.append(s)
-                        shape = tuple(shape)
 
                     if out_device is None:
+                        if current_device_functor is None:
+                            current_device_functor = self.get_current_device_functor()
                         out_device = current_device_functor()
 
                     if len(shape) == 0:
@@ -337,44 +395,22 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                         _tmpl = torch.empty(1, dtype=dtype, device=out_device)
                         _new_empty_template[_tmpl_key] = _tmpl
                     tensor = _tmpl.new_empty(*shape)
-                else:
-                    tensor = inputs[ins_idx]
-                    ins_idx += 1
-                tensor_list.append(tensor)
+                    tensor_list[i] = tensor
 
-                # Pre-convert torch.Tensor to ffi.Tensor (zero-copy via from_dlpack)
-                # to bypass tvm-ffi's torch-fallback arg setter, whose stream guard
-                # overwrites the stream we just bound with a null stream on PTPU,
-                # breaking event-based timing.
-                # Use tvm_ffi.from_dlpack directly (not runtime.from_dlpack) with
-                # require_contiguous=False so that non-contiguous tensors (transpose,
-                # slice) can be passed without an extra memory copy. DLPack itself
-                # supports strides natively — it's only TVM's Python wrapper that
-                # unnecessarily enforces contiguity.
-                if isinstance(tensor, torch.Tensor):
-                    try:
-                        _ffi = tvm_ffi.from_dlpack(tensor, require_alignment=0, require_contiguous=False)
-                    except RuntimeError as e:
-                        _role = "output" if i in _result_idx_set else "input"
-                        raise RuntimeError(
-                            f"from_dlpack failed for param[{i}] ({_role}): "
-                            f"shape={tensor.shape}, strides={tensor.stride()}, "
-                            f"contiguous={tensor.is_contiguous()}, dtype={tensor.dtype}, "
-                            f"device={tensor.device}"
-                        ) from e
-                    launch_list.append(_ffi)
-                else:
-                    launch_list.append(tensor)
-
-            # Bind the caller's stream so the executable launches on the same
-            # stream as surrounding Torch code.
-            launch_device = out_device if out_device is not None else current_device_functor()
-            if launch_device.type in ("cuda", "ptpu"):
-                raw_stream = current_stream_functor()
-                tvm_dev = tvm.device(tvm_device_kind, launch_device.index or 0)
-                with contextlib.suppress(AttributeError):
-                    tvm_dev.set_raw_stream(raw_stream)
-
+            launch_device = out_device
+            if launch_device is None:
+                if current_device_functor is None:
+                    current_device_functor = self.get_current_device_functor()
+                launch_device = current_device_functor()
+            self._prepare_torch_device(launch_device)
+            launch_list = tensor_list
+            if launch_device.type == "ptpu":
+                launch_list = [
+                    tvm_ffi.from_dlpack(value, require_alignment=0, require_contiguous=False) if isinstance(value, torch.Tensor) else value
+                    for value in tensor_list
+                ]
+                stream = self.get_current_stream_functor(launch_device)()
+                tvm.device("tang", launch_device.index or 0).set_raw_stream(stream)
             executable = get_executable(launch_device)
             executable(*launch_list)
 
@@ -387,29 +423,34 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
 
     def _convert_ffi_callee_allocated_output_func(self) -> Callable[..., Any]:
         """Create a Torch callable whose outputs are allocated by TVM-FFI."""
-        current_device_functor = self.get_current_device_functor()
+        current_device_functor = None
         expected_inputs = len(self.params) - len(self.result_idx)
-        cuda_available = torch.cuda.is_available()
-        has_allocator_exchange = hasattr(torch.Tensor, "__dlpack_c_exchange_api__") or hasattr(torch.Tensor, "__c_dlpack_exchange_api__")
 
         def func(*inputs: torch.Tensor | Any):
+            nonlocal current_device_functor
             if len(inputs) != expected_inputs:
                 raise ValueError(f"Kernel expected {expected_inputs} inputs, but {len(inputs)} are provided.")
 
-            if not cuda_available:
-                raise RuntimeError("TVM-FFI callee-allocated outputs require an available CUDA device.")
-            if not has_allocator_exchange:
+            allocator_anchor = next((value for value in inputs if isinstance(value, torch.Tensor)), None)
+            if allocator_anchor is None:
+                if current_device_functor is None:
+                    current_device_functor = self.get_current_device_functor()
+                device = current_device_functor()
+            else:
+                device = allocator_anchor.device
+
+            self._prepare_torch_device(device)
+            if not (hasattr(torch.Tensor, "__dlpack_c_exchange_api__") or hasattr(torch.Tensor, "__c_dlpack_exchange_api__")):
                 raise RuntimeError(
                     "TVM-FFI callee-allocated outputs require Torch's DLPack allocator exchange API. "
                     "Install a compatible torch-c-dlpack-ext or use a supported PyTorch build."
                 )
 
-            allocator_anchor = next((value for value in inputs if isinstance(value, torch.Tensor)), None)
             if allocator_anchor is None:
                 # A Torch tensor argument installs the EnvTensorAllocator in
                 # TVM-FFI's thread-local call context.  Scalar-only kernels use
                 # a zero-element anchor solely for that allocator/device state.
-                allocator_anchor = torch.empty(0, device=current_device_functor())
+                allocator_anchor = torch.empty(0, device=device)
 
             result = self._get_executable()(*inputs, allocator_anchor)
             if len(self.result_idx) == 1:
@@ -456,7 +497,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         adapter.libpath = kernel_lib_path
         adapter.kernel_global_source = device_kernel_source.text
         adapter.rt_mod = None
-        adapter.executable = runtime.load_module(kernel_lib_path)
+        adapter.executable = runtime.Executable(runtime.load_module(kernel_lib_path))
         adapter._ffi_callee_allocated_output_abi = adapter._uses_ffi_callee_allocated_output_abi()
         adapter.dynamic_symbolic_map = None if adapter._ffi_callee_allocated_output_abi else adapter._process_dynamic_symbolic()
         adapter._executable_lock = threading.Lock()

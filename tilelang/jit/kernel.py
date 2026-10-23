@@ -180,6 +180,16 @@ class JITKernel(Generic[_P, _T]):
             backend_context=backend_context,
         )
 
+        if instance.execution_backend == "tvm_ffi" and isinstance(func, PrimFunc):
+            # The cached artifact was compiled with the ABI decision derived
+            # from the same capability flag; re-stamp the loaded PrimFunc so
+            # the adapter reads the identical decision.
+            func, _ = prepare_tvm_ffi_callee_allocated_outputs(
+                func,
+                out_idx,
+                supports_callee_allocated_outputs=instance.execution_backend_spec.supports_callee_allocated_outputs,
+            )
+
         instance.adapter = instance._create_adapter_from_database(
             func_or_mod=func,
             params=params,
@@ -219,11 +229,16 @@ class JITKernel(Generic[_P, _T]):
     ) -> BaseKernelAdapter:
         """Compile one kernel and construct its adapter in one tool session."""
         if self.execution_backend == "tvm_ffi":
-            # MakePackedAPI consumes this attribute to omit all result buffers
-            # from main's packed arguments and replace them with one allocator
-            # anchor.  Use a derived PrimFunc so manual out_idx does not become
-            # a persistent frontend attribute on the user's function.
-            tilelang_func, out_idx = prepare_tvm_ffi_callee_allocated_outputs(tilelang_func, out_idx)
+            # Record out_idx declaratively and, when the execution backend
+            # declares the capability, stamp the callee-allocated ABI decision
+            # that MakePackedAPI and the adapter both honor.  Use a derived
+            # PrimFunc so neither attribute becomes a persistent frontend
+            # attribute on the user's function.
+            tilelang_func, out_idx = prepare_tvm_ffi_callee_allocated_outputs(
+                tilelang_func,
+                out_idx,
+                supports_callee_allocated_outputs=self.execution_backend_spec.supports_callee_allocated_outputs,
+            )
 
         func_name = str(tilelang_func.attrs.get("global_symbol", "<unknown>"))
         timing_tool = create_pass_timing_tool(self.pass_configs)
@@ -242,10 +257,16 @@ class JITKernel(Generic[_P, _T]):
 
             compile_flags = self.compile_flags
             if compile_flags is not None:
+                # Normalize the existing config: it may be absent, a single
+                # string, or an arbitrary sequence.
                 compile_flags_cfg = pass_configs.get(PassConfigKey.TL_DEVICE_COMPILE_FLAGS)
-                pass_configs[PassConfigKey.TL_DEVICE_COMPILE_FLAGS] = (
-                    compile_flags_cfg + compile_flags if compile_flags_cfg is not None else compile_flags
-                )
+                if compile_flags_cfg is None:
+                    compile_flags_cfg = []
+                elif isinstance(compile_flags_cfg, str):
+                    compile_flags_cfg = [compile_flags_cfg]
+                else:
+                    compile_flags_cfg = list(compile_flags_cfg)
+                pass_configs[PassConfigKey.TL_DEVICE_COMPILE_FLAGS] = [*compile_flags_cfg, *compile_flags]
 
             capture_hip_resource_usage = is_hip_target(target)
             if capture_hip_resource_usage:
@@ -366,7 +387,7 @@ class JITKernel(Generic[_P, _T]):
                 device_mod=artifact.device_mod,
                 device_kernel_source=artifact.kernel_source,
                 verbose=self.verbose,
-                pass_configs=pass_configs,
+                pass_configs=self.pass_configs,
                 compile_flags=compile_flags,
             )
         elif execution_backend == "nvrtc":

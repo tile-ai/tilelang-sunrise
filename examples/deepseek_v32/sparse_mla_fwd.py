@@ -4,6 +4,7 @@ import tilelang
 from tilelang import language as T
 from utils import assert_tensors_similar
 from tilelang.utils.target import determine_target, target_is_tang
+from tilelang.utils.device import get_current_device
 
 _IS_TANG = target_is_tang(determine_target(return_object=True))
 
@@ -215,8 +216,8 @@ def ref_sparse_mla_fwd_interface(q, kv, indices, sm_scale=None, is_casual=True):
     b, _, _, dim_v = v.shape
     g_index = g
     h_index = h // g
-    compressed_casual_mask = torch.arange(0, sq, dtype=torch.int32, device="cuda").view(-1, 1) >= torch.arange(
-        1 - 1, sk * 1, 1, dtype=torch.int32, device="cuda"
+    compressed_casual_mask = torch.arange(0, sq, dtype=torch.int32, device=q.device).view(-1, 1) >= torch.arange(
+        1 - 1, sk * 1, 1, dtype=torch.int32, device=q.device
     ).view(1, -1)
 
     mask = q.new_zeros(b, g_index, sq, sk + 1, dtype=torch.bool).scatter(3, indices.long(), 1)
@@ -251,17 +252,26 @@ def test_sparse_mla_fwd(
     block_I=64,
     num_stages=2,
     threads=256,
+    profile=True,
+    indices=None,
 ):
+    """Validate and optionally benchmark sparse MLA forward."""
     torch.random.manual_seed(0)
-    q = torch.randn((B, S, H, DQK), dtype=dtype).ptpu().requires_grad_(True)
-    kv = torch.randn((B, SKV, HKV, DQK), dtype=dtype).ptpu().requires_grad_(True)
+    q = torch.randn((B, S, H, DQK), dtype=dtype).to(get_current_device()).requires_grad_(True)
+    kv = torch.randn((B, SKV, HKV, DQK), dtype=dtype).to(get_current_device()).requires_grad_(True)
 
-    indices = torch.full((B, S, HKV, topk), SKV, dtype=torch.int32, device="ptpu")
-    for b in range(B):
-        for t in range(S):
-            for h in range(HKV):
-                i_i = torch.randperm(max(1, t))[:topk]
-                indices[b, t, h, : len(i_i)] = i_i
+    if indices is None:
+        indices = torch.full((B, S, HKV, topk), SKV, dtype=torch.int32, device=q.device)
+        for b in range(B):
+            for t in range(S):
+                for h in range(HKV):
+                    i_i = torch.randperm(max(1, t))[:topk]
+                    indices[b, t, h, : len(i_i)] = i_i
+    else:
+        expected_prefix = (B, S, HKV)
+        if tuple(indices.shape[:3]) != expected_prefix:
+            raise ValueError(f"indices must start with shape {expected_prefix}, got {tuple(indices.shape)}")
+        topk = indices.shape[-1]
 
     tl_out, tl_lse = sparse_mla_fwd_interface(q, kv, indices, block_I=block_I, num_stages=num_stages, threads=threads)
 
@@ -271,15 +281,17 @@ def test_sparse_mla_fwd(
         assert_tensors_similar(tl_out.cpu(), ref_out.cpu(), eps=1e-2, name="out")
         print("assert_tensors_similar passed")
 
-    def fn():
-        return sparse_mla_fwd_interface(q, kv, indices, block_I=block_I, num_stages=num_stages, threads=threads)
+    if profile:
 
-    from tilelang.profiler import do_bench
+        def fn():
+            return sparse_mla_fwd_interface(q, kv, indices, block_I=block_I, num_stages=num_stages, threads=threads)
 
-    ms = do_bench(fn, warmup=100, rep=250)
-    print(f"Average time: {ms:.3f} ms")
-    print("fwd io bandwidth = ", (B * S * DQK * topk * 2) / (ms * 1e-3) / 1e12)
-    print("fwd tflops = ", (B * S * (DQK + DV) * topk * 2 * H) / (ms * 1e-3) / 1e12)
+        from tilelang.profiler import do_bench
+
+        ms = do_bench(fn, warmup=100, rep=250)
+        print(f"Average time: {ms:.3f} ms")
+        print("fwd io bandwidth = ", (B * S * DQK * topk * 2) / (ms * 1e-3) / 1e12)
+        print("fwd tflops = ", (B * S * (DQK + DV) * topk * 2 * H) / (ms * 1e-3) / 1e12)
 
 
 def run_regression_perf(

@@ -12,13 +12,12 @@ Interface note:
   Tests use padded_batch_sum = T*K (no actual padding) for simplicity.
 """
 
-
 import pytest
 import torch
 
 from tests.test_base import FixtureBase, TestBase
-from tileops.ops.moe import MoeUnpermuteFwdOp
-from workloads.moe import MoeUnpermuteTest as _MoeUnpermuteTestWorkload
+from tileops.ops.moe import ContiguousLayoutSpec, MoePostPermuteFwdOp, RoutingEpilogueSpec
+from workloads.moe import MoeUnpermuteWorkload as _MoeUnpermuteTestWorkload
 
 
 def _ref_moe_unpermute(
@@ -27,6 +26,7 @@ def _ref_moe_unpermute(
     topk_weights: torch.Tensor,
 ) -> torch.Tensor:
     """Pure-PyTorch reference for moe_unpermute."""
+    mm2_pad, fwd_idx, topk_weights = mm2_pad.cpu(), fwd_idx.cpu(), topk_weights.cpu()
     _, H = mm2_pad.shape
     T, K = topk_weights.shape
     dtype = mm2_pad.dtype
@@ -55,23 +55,30 @@ class MoeUnpermuteTest(_MoeUnpermuteTestWorkload, TestBase):
 
 class MoeUnpermuteFixture(FixtureBase):
     PARAMS = [
-        ("total_tokens, top_k, hidden_size, dtype", [
-            pytest.param(4,    2,   64,  torch.bfloat16, marks=pytest.mark.smoke, id="tiny-bf16"),
-            pytest.param(4,    2,   64,  torch.float16,  marks=pytest.mark.smoke, id="tiny-fp16"),
-            pytest.param(16,   2,   128, torch.bfloat16, marks=pytest.mark.full,  id="small"),
-            pytest.param(128,  4,   256, torch.bfloat16, marks=pytest.mark.full,  id="medium"),
-            pytest.param(1024, 8,   128, torch.bfloat16, marks=pytest.mark.full,  id="qwen3-scale"),
-            pytest.param(1,    2,   64,  torch.bfloat16, marks=pytest.mark.full,  id="single-token"),
-            pytest.param(8,    1,   64,  torch.bfloat16, marks=pytest.mark.full,  id="top-k-1"),
-            pytest.param(32,   4,   64,  torch.bfloat16, marks=pytest.mark.full,  id="skewed"),
-            # Large H (8x the next-biggest case) with top_k=8 so the K-loop is
-            # actually pipelined (T.Pipelined num_stages=2): asserts correctness
-            # at a production-scale hidden size, where the framework must
-            # double-buffer the reused `src` fragment to avoid a WAR race
-            # between load(k+1) and accumulate(k). Smaller cases (H<=256) leave
-            # that on the benchmark path only.
-            pytest.param(64,   8,   2048, torch.bfloat16, marks=pytest.mark.full, id="large-h-pipeline"),
-        ]),
+        (
+            "total_tokens, top_k, hidden_size, dtype",
+            [
+                pytest.param(4, 2, 64, torch.bfloat16, marks=pytest.mark.smoke, id="tiny-bf16"),
+                pytest.param(4, 2, 64, torch.float16, marks=pytest.mark.smoke, id="tiny-fp16"),
+                pytest.param(16, 2, 128, torch.bfloat16, marks=pytest.mark.full, id="small"),
+                pytest.param(128, 4, 256, torch.bfloat16, marks=pytest.mark.full, id="medium"),
+                pytest.param(
+                    1024, 8, 128, torch.bfloat16, marks=pytest.mark.full, id="qwen3-scale"
+                ),
+                pytest.param(1, 2, 64, torch.bfloat16, marks=pytest.mark.full, id="single-token"),
+                pytest.param(8, 1, 64, torch.bfloat16, marks=pytest.mark.full, id="top-k-1"),
+                pytest.param(32, 4, 64, torch.bfloat16, marks=pytest.mark.full, id="skewed"),
+                # Large H (8x the next-biggest case) with top_k=8 so the K-loop is
+                # actually pipelined (T.Pipelined num_stages=2): asserts correctness
+                # at a production-scale hidden size, where the framework must
+                # double-buffer the reused `src` fragment to avoid a WAR race
+                # between load(k+1) and accumulate(k). Smaller cases (H<=256) leave
+                # that on the benchmark path only.
+                pytest.param(
+                    64, 8, 2048, torch.bfloat16, marks=pytest.mark.full, id="large-h-pipeline"
+                ),
+            ],
+        ),
     ]
 
 
@@ -84,10 +91,12 @@ class MoeUnpermuteFixture(FixtureBase):
 @MoeUnpermuteFixture
 def test_moe_unpermute_op(total_tokens, top_k, hidden_size, dtype):
     test = MoeUnpermuteTest(total_tokens, top_k, hidden_size, dtype)
-    op = MoeUnpermuteFwdOp(total_tokens, top_k, hidden_size, dtype)
+    op = MoePostPermuteFwdOp(
+        ContiguousLayoutSpec.tight_physical_psum(), RoutingEpilogueSpec(routed_scaling_factor=1.0)
+    )
     mm2_pad, fwd_idx, topk_weights = test.gen_inputs()
 
-    output = op(mm2_pad.ptpu(), fwd_idx.ptpu(), topk_weights.ptpu())
+    output = op(mm2_pad.ptpu(), topk_weights.ptpu(), fwd_idx.ptpu())
     output_ref = test.ref_program(mm2_pad, fwd_idx, topk_weights)
 
     rtol = 1.6e-2 if dtype == torch.bfloat16 else 1e-3
@@ -105,8 +114,10 @@ def test_moe_unpermute_skewed():
     fwd_idx = torch.arange(numel, dtype=torch.int32) % K
     topk_weights = torch.rand(T, K, dtype=torch.float32)
 
-    op = MoeUnpermuteFwdOp(T, K, H, torch.bfloat16, padded_batch_sum=numel)
-    output = op(mm2_pad.ptpu(), fwd_idx.ptpu(), topk_weights.ptpu())
+    op = MoePostPermuteFwdOp(
+        ContiguousLayoutSpec.tight_physical_psum(), RoutingEpilogueSpec(routed_scaling_factor=1.0)
+    )
+    output = op(mm2_pad.ptpu(), topk_weights.ptpu(), fwd_idx.ptpu())
     output_ref = _ref_moe_unpermute(mm2_pad, fwd_idx, topk_weights)
 
     assert torch.allclose(output.cpu().float(), output_ref.float(), atol=1e-2), (
@@ -137,8 +148,10 @@ def test_moe_unpermute_ep_masking():
     mm2_pad = mm2_pad_cpu.to(dev)
     topk_weights = topk_weights_cpu.to(dev)
 
-    op = MoeUnpermuteFwdOp(T, K, H, torch.bfloat16, padded_batch_sum=numel)
-    output = op(mm2_pad, fwd_idx.to(dev), topk_weights)
+    op = MoePostPermuteFwdOp(
+        ContiguousLayoutSpec.tight_physical_psum(), RoutingEpilogueSpec(routed_scaling_factor=1.0)
+    )
+    output = op(mm2_pad, topk_weights, fwd_idx.to(dev))
 
     # Reference on CPU, matching the kernel's -1 semantics: skip non-local slots.
     ref = torch.zeros(T, H, dtype=torch.float32)
@@ -164,15 +177,16 @@ def test_moe_unpermute_out_param():
     # Device principle: random inputs generated on CPU, then moved to device.
     mm2_pad = (torch.randn(numel, H, dtype=torch.bfloat16) * 0.02).to(dev)
     fwd_idx = torch.arange(numel, dtype=torch.int32, device=dev)  # deterministic
-    topk_weights = torch.softmax(
-        torch.randn(T, K, dtype=torch.float32), dim=-1).to(dev)
+    topk_weights = torch.softmax(torch.randn(T, K, dtype=torch.float32), dim=-1).to(dev)
 
-    op = MoeUnpermuteFwdOp(T, K, H, torch.bfloat16, padded_batch_sum=numel)
-    ref = op(mm2_pad, fwd_idx, topk_weights)
+    op = MoePostPermuteFwdOp(
+        ContiguousLayoutSpec.tight_physical_psum(), RoutingEpilogueSpec(routed_scaling_factor=1.0)
+    )
+    ref = op(mm2_pad, topk_weights, fwd_idx)
 
     out = torch.empty((T, H), dtype=torch.bfloat16, device=dev)
-    got = op(mm2_pad, fwd_idx, topk_weights, out=out)
-    assert got.data_ptr() == out.data_ptr()       # wrote into the provided buffer
+    got = op(mm2_pad, topk_weights, fwd_idx, out=out)
+    assert got.data_ptr() == out.data_ptr()  # wrote into the provided buffer
     torch.testing.assert_close(out.float().cpu(), ref.float().cpu(), rtol=1e-2, atol=1e-2)
 
 
@@ -186,16 +200,18 @@ def test_moe_unpermute_scaling():
     # Device principle: random inputs generated on CPU, then moved to device.
     mm2_pad = (torch.randn(numel, H, dtype=torch.bfloat16) * 0.02).to(dev)
     fwd_idx = torch.arange(numel, dtype=torch.int32, device=dev)  # deterministic
-    topk_weights = torch.softmax(
-        torch.randn(T, K, dtype=torch.float32), dim=-1).to(dev)
+    topk_weights = torch.softmax(torch.randn(T, K, dtype=torch.float32), dim=-1).to(dev)
 
     scale = 2.827
-    base = MoeUnpermuteFwdOp(T, K, H, torch.bfloat16, padded_batch_sum=numel)
-    ref = base(mm2_pad, fwd_idx, topk_weights).float() * scale
+    base = MoePostPermuteFwdOp(
+        ContiguousLayoutSpec.tight_physical_psum(), RoutingEpilogueSpec(routed_scaling_factor=1.0)
+    )
+    ref = base(mm2_pad, topk_weights, fwd_idx).float() * scale
 
-    scaled = MoeUnpermuteFwdOp(
-        T, K, H, torch.bfloat16, padded_batch_sum=numel, routed_scaling_factor=scale)
-    got = scaled(mm2_pad, fwd_idx, topk_weights).float()
+    scaled = MoePostPermuteFwdOp(
+        ContiguousLayoutSpec.tight_physical_psum(), RoutingEpilogueSpec(routed_scaling_factor=scale)
+    )
+    got = scaled(mm2_pad, topk_weights, fwd_idx).float()
     torch.testing.assert_close(got.cpu(), ref.cpu(), rtol=2e-2, atol=2e-2)
 
 
@@ -210,27 +226,32 @@ def test_moe_unpermute_out_buffer_validation():
     # Device principle: random inputs generated on CPU, then moved to device.
     mm2_pad = (torch.randn(numel, H, dtype=torch.bfloat16) * 0.02).to(dev)
     fwd_idx = torch.arange(numel, dtype=torch.int32, device=dev)  # deterministic
-    topk_weights = torch.softmax(
-        torch.randn(T, K, dtype=torch.float32), dim=-1).to(dev)
-    op = MoeUnpermuteFwdOp(T, K, H, torch.bfloat16, padded_batch_sum=numel)
+    topk_weights = torch.softmax(torch.randn(T, K, dtype=torch.float32), dim=-1).to(dev)
+    op = MoePostPermuteFwdOp(
+        ContiguousLayoutSpec.tight_physical_psum(), RoutingEpilogueSpec(routed_scaling_factor=1.0)
+    )
 
     with pytest.raises(ValueError, match="contiguous"):
-        op(mm2_pad, fwd_idx, topk_weights,
-           out=torch.empty(H, T, dtype=torch.bfloat16, device=dev).t())
+        op(
+            mm2_pad,
+            topk_weights,
+            fwd_idx,
+            out=torch.empty(H, T, dtype=torch.bfloat16, device=dev).t(),
+        )
     # out overlapping mm2_pad: same storage, overlapping byte intervals.
     ws = torch.empty(numel * H, dtype=torch.bfloat16, device=dev)
-    mm2_alias = ws[:numel * H].view(numel, H)
-    out_alias = ws[:T * H].view(T, H)          # overlaps mm2_alias from byte 0
+    mm2_alias = ws[: numel * H].view(numel, H)
+    out_alias = ws[: T * H].view(T, H)  # overlaps mm2_alias from byte 0
     mm2_alias.copy_(mm2_pad)
     with pytest.raises(ValueError, match="overlap"):
-        op(mm2_alias, fwd_idx, topk_weights, out=out_alias)
+        op(mm2_alias, topk_weights, fwd_idx, out=out_alias)
     # Disjoint slices of one workspace must be ACCEPTED.
-    ref = op(mm2_pad, fwd_idx, topk_weights)
+    ref = op(mm2_pad, topk_weights, fwd_idx)
     ws2 = torch.empty(numel * H + T * H, dtype=torch.bfloat16, device=dev)
-    mm2_ws = ws2[:numel * H].view(numel, H)
-    out_ws = ws2[numel * H:].view(T, H)
+    mm2_ws = ws2[: numel * H].view(numel, H)
+    out_ws = ws2[numel * H :].view(T, H)
     mm2_ws.copy_(mm2_pad)
-    got = op(mm2_ws, fwd_idx, topk_weights, out=out_ws)
+    got = op(mm2_ws, topk_weights, fwd_idx, out=out_ws)
     torch.testing.assert_close(got.float().cpu(), ref.float().cpu(), rtol=1e-2, atol=1e-2)
 
 

@@ -21,6 +21,10 @@ struct Reduce : backend::ReduceLowerer<Reduce> {
     return op.dst->dtype;
   }
 
+  static bool AllReduceNeedsWorkspace(int reducing_threads, int, Target) {
+    return reducing_threads > 32;
+  }
+
   static bool SupportsFp16Bf16NanReduce(Target) { return false; }
 
   static int GetPreferredVectorizedSize(const ReduceOpNode &, Target) {

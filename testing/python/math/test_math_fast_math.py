@@ -237,7 +237,10 @@ def run_fastmath_mathop_test(mathop_name, mathop_func, M=32, N=32, block_M=32, b
 
     # Test numerical correctness
     torch_dtype = dtype.as_torch()
-    a = torch.randn(M, N, device=get_current_device(), dtype=torch_dtype)
+    if cuda_mathop_name == "tan":
+        a = torch.linspace(-1.0, 1.0, M * N, dtype=torch_dtype).reshape(M, N).to(get_current_device())
+    else:
+        a = torch.randn(M, N, device=get_current_device(), dtype=torch_dtype)
 
     # Ensure positive values for functions that need them
     if cuda_mathop_name in ["sqrt", "rsqrt", "log", "log2", "log10"]:
@@ -245,15 +248,30 @@ def run_fastmath_mathop_test(mathop_name, mathop_func, M=32, N=32, block_M=32, b
 
     b_fastmath = kernel_fastmath(a)
 
-    # Compare with reference implementation
-    if cuda_mathop_name == "exp":
-        expected = torch.exp(a)
-    elif cuda_mathop_name == "log":
-        expected = torch.log(a)
-    else:
-        expected = b_fastmath  # Just check compilation works
+    rtol, atol = (1e-2, 1e-2) if cuda_mathop_name == "tan" else (1e-3, 1e-3)
 
-    torch.testing.assert_close(b_fastmath.cpu(), expected.cpu(), rtol=1e-3, atol=1e-3)
+    # PTPU does not implement every PyTorch reference math operator.
+    reference_input = a.cpu() if a.device.type == "ptpu" else a
+    if cuda_mathop_name == "exp":
+        expected = torch.exp(reference_input)
+    elif cuda_mathop_name == "exp10":
+        expected = 10.0**reference_input
+    elif cuda_mathop_name == "log":
+        expected = torch.log(reference_input)
+    elif cuda_mathop_name == "log2":
+        expected = torch.log2(reference_input)
+    elif cuda_mathop_name == "log10":
+        expected = torch.log10(reference_input)
+    elif cuda_mathop_name == "cos":
+        expected = torch.cos(reference_input)
+    elif cuda_mathop_name == "sin":
+        expected = torch.sin(reference_input)
+    elif cuda_mathop_name == "tan":
+        expected = torch.tan(reference_input)
+    else:
+        raise AssertionError(f"No reference implementation for {cuda_mathop_name}")
+
+    torch.testing.assert_close(b_fastmath.cpu(), expected.cpu(), rtol=rtol, atol=atol)
     print(f"✓ {mathop_name} numerical test passed")
 
 

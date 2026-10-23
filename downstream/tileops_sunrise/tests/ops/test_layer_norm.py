@@ -3,48 +3,44 @@ import torch
 import torch.nn.functional as F
 
 from tests.test_base import FixtureBase, TestBase
+from tileops.kernels.norm.layer_norm import LayerNormKernel
 from tileops.ops.norm.layer_norm import LayerNormFwdOp
-from workloads.normalization import LayerNormTest as _LayerNormTestWorkload
+from workloads.normalization import LayerNormWorkload
 
 
-class LayerNormTest(_LayerNormTestWorkload, TestBase):
-    def ref_program(self, x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
-        # Reference uses torch.nn.functional.layer_norm
-        return F.layer_norm(
-            x.float(),
-            (self.n,),
-            weight=weight.float(),
-            bias=bias.float(),
-            eps=self.eps,
-        ).to(x.dtype)
+class LayerNormTest(LayerNormWorkload, TestBase):
+    pass
 
 
 class LayerNormFixture(FixtureBase):
     PARAMS = [
-        ("m, n, dtype, tune", [
-            # Standard aligned shapes -- fp32
-            pytest.param(1024, 4096, torch.float32, False, marks=pytest.mark.smoke),
-            pytest.param(1024, 4096, torch.float16, False, marks=pytest.mark.smoke),
-            pytest.param(1024, 4096, torch.bfloat16, False, marks=pytest.mark.smoke),
-            pytest.param(4096, 4096, torch.float32, False, marks=pytest.mark.full),
-            pytest.param(8192, 8192, torch.float32, False, marks=pytest.mark.full),
-            # Standard aligned shapes -- fp16
-            pytest.param(4096, 4096, torch.float16, False, marks=pytest.mark.full),
-            pytest.param(8192, 8192, torch.float16, False, marks=pytest.mark.full),
-            # Standard aligned shapes -- bf16
-            pytest.param(4096, 4096, torch.bfloat16, False, marks=pytest.mark.full),
-            pytest.param(8192, 8192, torch.bfloat16, False, marks=pytest.mark.full),
-            # Non-power-of-two hidden dims
-            pytest.param(1024, 3000, torch.float32, False, marks=pytest.mark.full),
-            pytest.param(1024, 3000, torch.float16, False, marks=pytest.mark.full),
-            pytest.param(1024, 3000, torch.bfloat16, False, marks=pytest.mark.full),
-            pytest.param(2048, 5120, torch.float32, False, marks=pytest.mark.full),
-            pytest.param(2048, 5120, torch.float16, False, marks=pytest.mark.full),
-            pytest.param(2048, 5120, torch.bfloat16, False, marks=pytest.mark.full),
-            # Tail-M: M not divisible by block_m
-            pytest.param(1025, 4096, torch.float16, False, marks=pytest.mark.full),
-            pytest.param(1025, 4096, torch.bfloat16, False, marks=pytest.mark.full),
-        ]),
+        (
+            "m, n, dtype, tune",
+            [
+                # Standard aligned shapes -- fp32
+                pytest.param(1024, 4096, torch.float32, False, marks=pytest.mark.smoke),
+                pytest.param(1024, 4096, torch.float16, False, marks=pytest.mark.smoke),
+                pytest.param(1024, 4096, torch.bfloat16, False, marks=pytest.mark.smoke),
+                pytest.param(4096, 4096, torch.float32, False, marks=pytest.mark.full),
+                pytest.param(8192, 8192, torch.float32, False, marks=pytest.mark.full),
+                # Standard aligned shapes -- fp16
+                pytest.param(4096, 4096, torch.float16, False, marks=pytest.mark.full),
+                pytest.param(8192, 8192, torch.float16, False, marks=pytest.mark.full),
+                # Standard aligned shapes -- bf16
+                pytest.param(4096, 4096, torch.bfloat16, False, marks=pytest.mark.full),
+                pytest.param(8192, 8192, torch.bfloat16, False, marks=pytest.mark.full),
+                # Non-power-of-two hidden dims
+                pytest.param(1024, 3000, torch.float32, False, marks=pytest.mark.full),
+                pytest.param(1024, 3000, torch.float16, False, marks=pytest.mark.full),
+                pytest.param(1024, 3000, torch.bfloat16, False, marks=pytest.mark.full),
+                pytest.param(2048, 5120, torch.float32, False, marks=pytest.mark.full),
+                pytest.param(2048, 5120, torch.float16, False, marks=pytest.mark.full),
+                pytest.param(2048, 5120, torch.bfloat16, False, marks=pytest.mark.full),
+                # Tail-M: M not divisible by block_m
+                pytest.param(1025, 4096, torch.float16, False, marks=pytest.mark.full),
+                pytest.param(1025, 4096, torch.bfloat16, False, marks=pytest.mark.full),
+            ],
+        ),
     ]
 
 
@@ -60,21 +56,39 @@ def _get_tolerances(dtype: torch.dtype) -> tuple[float, float]:
 @LayerNormFixture
 def test_layer_norm_op(m: int, n: int, dtype: torch.dtype, tune: bool) -> None:
     test = LayerNormTest(m, n, dtype)
-    op = LayerNormFwdOp(normalized_shape=(n,), dtype=dtype)
+    op = LayerNormFwdOp(normalized_shape=(n,))
     atol, rtol = _get_tolerances(dtype)
-    inputs = tuple(
-        x.ptpu() if isinstance(x, torch.Tensor) else x for x in test.gen_inputs()
-    )
+    inputs = tuple(x.ptpu() if isinstance(x, torch.Tensor) else x for x in test.gen_inputs())
     test.check(op, *inputs, atol=atol, rtol=rtol)
+
+
+@pytest.mark.smoke
+def test_layer_norm_kernel_handles_unaligned_shape() -> None:
+    """The retained S2 kernel takes padded storage and normalizes only N values."""
+    m, n = 16, 3000
+    dtype = torch.float16
+    test = LayerNormTest(m, n, dtype)
+    x, weight, bias = test.gen_inputs()
+
+    kernel = LayerNormKernel(n, test.eps, dtype)
+    y = kernel(x, weight, bias)
+    y_ref = test.ref_program(x.cpu(), weight.cpu(), bias.cpu())
+
+    assert y.shape == (m, n)
+    atol, rtol = _get_tolerances(dtype)
+    assert torch.allclose(y.cpu(), y_ref.cpu(), atol=atol, rtol=rtol)
 
 
 class LayerNormNonContigFixture(FixtureBase):
     PARAMS = [
-        ("m, n, dtype", [
-            pytest.param(1024, 4096, torch.float32, marks=pytest.mark.smoke),
-            pytest.param(1024, 4096, torch.float16, marks=pytest.mark.smoke),
-            pytest.param(1024, 4096, torch.bfloat16, marks=pytest.mark.smoke),
-        ]),
+        (
+            "m, n, dtype",
+            [
+                pytest.param(1024, 4096, torch.float32, marks=pytest.mark.smoke),
+                pytest.param(1024, 4096, torch.float16, marks=pytest.mark.smoke),
+                pytest.param(1024, 4096, torch.bfloat16, marks=pytest.mark.smoke),
+            ],
+        ),
     ]
 
 
@@ -86,30 +100,37 @@ def test_layer_norm_non_contiguous(m: int, n: int, dtype: torch.dtype) -> None:
     weight = torch.randn(n, dtype=dtype)
     bias = torch.randn(n, dtype=dtype)
 
-    op = LayerNormFwdOp(normalized_shape=(n,), dtype=dtype)
+    op = LayerNormFwdOp(normalized_shape=(n,))
 
     # Reference using torch.nn.functional.layer_norm
     x_ref = x.contiguous()
     y_ref = F.layer_norm(
-        x_ref.float(), (n,),
-        weight=weight.float(), bias=bias.float(), eps=1e-5,
+        x_ref.float(),
+        (n,),
+        weight=weight.float(),
+        bias=bias.float(),
+        eps=1e-5,
     ).to(dtype)
 
     y = op(x.ptpu(), weight.ptpu(), bias.ptpu())
 
     y = y.cpu()
     atol, rtol = _get_tolerances(dtype)
-    assert torch.allclose(y, y_ref, atol=atol, rtol=rtol), \
+    assert torch.allclose(y.cpu(), y_ref.cpu(), atol=atol, rtol=rtol), (
         f"Non-contiguous test failed, max err: {(y - y_ref).abs().max()}"
+    )
 
 
 class LayerNorm3DFixture(FixtureBase):
     PARAMS = [
-        ("batch, seq, hidden, dtype", [
-            pytest.param(2, 512, 4096, torch.float32, marks=pytest.mark.smoke),
-            pytest.param(2, 512, 4096, torch.float16, marks=pytest.mark.smoke),
-            pytest.param(2, 512, 4096, torch.bfloat16, marks=pytest.mark.smoke),
-        ]),
+        (
+            "batch, seq, hidden, dtype",
+            [
+                pytest.param(2, 512, 4096, torch.float32, marks=pytest.mark.smoke),
+                pytest.param(2, 512, 4096, torch.float16, marks=pytest.mark.smoke),
+                pytest.param(2, 512, 4096, torch.bfloat16, marks=pytest.mark.smoke),
+            ],
+        ),
     ]
 
 
@@ -120,30 +141,37 @@ def test_layer_norm_3d(batch: int, seq: int, hidden: int, dtype: torch.dtype) ->
     weight = torch.randn(hidden, dtype=dtype)
     bias = torch.randn(hidden, dtype=dtype)
 
-    op = LayerNormFwdOp(normalized_shape=(hidden,), dtype=dtype)
+    op = LayerNormFwdOp(normalized_shape=(hidden,))
 
     # Reference using torch.nn.functional.layer_norm
     y_ref = F.layer_norm(
-        x.float(), (hidden,),
-        weight=weight.float(), bias=bias.float(), eps=1e-5,
+        x.float(),
+        (hidden,),
+        weight=weight.float(),
+        bias=bias.float(),
+        eps=1e-5,
     ).to(dtype)
 
     y = op(x.ptpu(), weight.ptpu(), bias.ptpu())
 
     y = y.cpu()
     atol, rtol = _get_tolerances(dtype)
-    assert torch.allclose(y, y_ref, atol=atol, rtol=rtol), \
+    assert torch.allclose(y.cpu(), y_ref.cpu(), atol=atol, rtol=rtol), (
         f"3D test failed, max err: {(y - y_ref).abs().max()}"
+    )
 
 
 class LayerNormLargeOffsetFixture(FixtureBase):
     PARAMS = [
-        ("m, n, dtype", [
-            pytest.param(4, 4096, torch.float32, marks=pytest.mark.smoke),
-            pytest.param(4, 4096, torch.float16, marks=pytest.mark.smoke),
-            pytest.param(4, 4096, torch.bfloat16, marks=pytest.mark.smoke),
-            pytest.param(1024, 4096, torch.float32, marks=pytest.mark.full),
-        ]),
+        (
+            "m, n, dtype",
+            [
+                pytest.param(4, 4096, torch.float32, marks=pytest.mark.smoke),
+                pytest.param(4, 4096, torch.float16, marks=pytest.mark.smoke),
+                pytest.param(4, 4096, torch.bfloat16, marks=pytest.mark.smoke),
+                pytest.param(1024, 4096, torch.float32, marks=pytest.mark.full),
+            ],
+        ),
     ]
 
 
@@ -165,11 +193,14 @@ def test_layer_norm_large_offset(m: int, n: int, dtype: torch.dtype) -> None:
     weight = torch.ones(n, dtype=dtype)
     bias = torch.zeros(n, dtype=dtype)
 
-    op = LayerNormFwdOp(normalized_shape=(n,), dtype=dtype)
+    op = LayerNormFwdOp(normalized_shape=(n,))
 
     y_ref = F.layer_norm(
-        x.float(), (n,),
-        weight=weight.float(), bias=bias.float(), eps=1e-5,
+        x.float(),
+        (n,),
+        weight=weight.float(),
+        bias=bias.float(),
+        eps=1e-5,
     ).to(dtype)
 
     y = op(x.ptpu(), weight.ptpu(), bias.ptpu())
@@ -185,22 +216,21 @@ def test_layer_norm_large_offset(m: int, n: int, dtype: torch.dtype) -> None:
         atol, rtol = _get_tolerances(dtype)
 
     max_err = (y - y_ref).abs().max().item()
-    assert torch.allclose(y, y_ref, atol=atol, rtol=rtol), \
+    assert torch.allclose(y.cpu(), y_ref.cpu(), atol=atol, rtol=rtol), (
         f"Large-offset test failed, max err: {max_err}"
+    )
     # Verify that catastrophic cancellation is NOT happening:
     # with the unstable formula, errors would be > 1.0
-    assert max_err < 1.0, \
-        f"Catastrophic cancellation detected, max err: {max_err}"
+    assert max_err < 1.0, f"Catastrophic cancellation detected, max err: {max_err}"
 
 
 @pytest.mark.smoke
-def test_layer_norm_rebuilds_kernel_on_m_change() -> None:
-    """A second forward with a different leading-dims product must rebuild
-    the kernel rather than reject the call."""
+def test_layer_norm_serves_a_changed_leading_dims_product_from_one_kernel() -> None:
+    """The row count is a fact of the call, so it does not specialize the op's kernel."""
     n = 4096
     dtype = torch.float16
 
-    op = LayerNormFwdOp(normalized_shape=(n,), dtype=dtype)
+    op = LayerNormFwdOp(normalized_shape=(n,))
     weight_cpu = torch.randn(n, dtype=dtype)
     bias_cpu = torch.randn(n, dtype=dtype)
     weight = weight_cpu.ptpu()
@@ -209,23 +239,24 @@ def test_layer_norm_rebuilds_kernel_on_m_change() -> None:
     x1_cpu = torch.randn(512, n, dtype=dtype)
     x1 = x1_cpu.ptpu()
     y1 = op(x1, weight, bias)
-    first_kernel = op.kernel
+    first_kernels = list(op.iter_kernels())
+    assert len(first_kernels) == 1
     assert y1.shape == x1.shape
 
     x2_cpu = torch.randn(1024, n, dtype=dtype)
     x2 = x2_cpu.ptpu()
     y2 = op(x2, weight, bias)
     assert y2.shape == x2.shape
-    # Kernel should have been rebuilt for the new M.
-    assert op.kernel is not first_kernel
+    kernels = list(op.iter_kernels())
+    assert len(kernels) == 1
+    assert kernels[0] is first_kernels[0]
 
     y_ref = F.layer_norm(
-        x2_cpu.float(), (n,),
-        weight=weight_cpu.float(), bias=bias_cpu.float(), eps=1e-5,
+        x2_cpu.float(),
+        (n,),
+        weight=weight_cpu.float(),
+        bias=bias_cpu.float(),
+        eps=1e-5,
     ).to(dtype)
     atol, rtol = _get_tolerances(dtype)
     assert torch.allclose(y2.cpu(), y_ref, atol=atol, rtol=rtol)
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-vvs"])

@@ -1,10 +1,13 @@
 #!/bin/bash
 # Unified test-run entry for TileLang.
 #
-# Usage: ci/run.sh [--fresh] [--list FILE]... [--case SEL]... [--ci] [--dry-run]
+# Usage: ci/run.sh [--fresh] [--list FILE]... [--case SEL]... [--arch s2|s3] [--ci] [--dry-run]
 #   --list FILE   a test-case list file (repeatable)
 #   --case SEL    a single selector (repeatable): a .py path, a "python x.py"
 #                 command, or a pytest nodeid (path.py::Class::test)
+#   --arch MODE   S2/S3 test mode (default s2): s2 = tang/stcu on real hardware,
+#                 s3 = tang/stcuv2 through the ISS simulator (see
+#                 ci_apply_test_mode in ci/lib.sh)
 #   --ci          CI flavor: bring up the isolated conda env, install the wheel,
 #                 export the audit-plugin env, and emit JUnit (self-contained)
 #   --fresh       clear the script-managed tilelang cache before running
@@ -32,16 +35,19 @@ EXIT_CASE_INVALID=4
 EXIT_EMPTY_PLAN=5
 
 usage () {
-    echo "Usage: ci/run.sh [--fresh] [--list FILE]... [--case SEL]... [--ci] [--dry-run]"
+    echo "Usage: ci/run.sh [--fresh] [--list FILE]... [--case SEL]... [--arch s2|s3] [--ci] [--dry-run]"
 }
 
-FRESH=0 CI_MODE=0 DRY_RUN=0
+FRESH=0 CI_MODE=0 DRY_RUN=0 ARCH="s2"
 declare -a SRC_TYPE=() SRC_VAL=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --fresh) FRESH=1; shift ;;
         --ci) CI_MODE=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
+        --arch)
+            [[ -n "${2:-}" ]] || { echo "ERROR: --arch requires s2 or s3" >&2; usage >&2; exit $EXIT_USAGE; }
+            ARCH="$2"; shift 2 ;;
         --list)
             [[ -n "${2:-}" ]] || { echo "ERROR: --list requires a FILE" >&2; usage >&2; exit $EXIT_USAGE; }
             SRC_TYPE+=("list"); SRC_VAL+=("$2"); shift 2 ;;
@@ -58,6 +64,11 @@ if [[ ${#SRC_TYPE[@]} -eq 0 ]]; then
     SRC_TYPE+=("list"); SRC_VAL+=("$DEFAULT_LIST")
 fi
 
+# S2/S3 test mode: sets TILELANG_DEFAULT_TARGET / TANG_ARCH / TANG_SIMULATOR, which
+# both the test files (tilelang.testing.requires_stcu / requires_stcuv2) and the
+# execution-backend auto-selection read.
+ci_apply_test_mode "$ARCH" || exit $EXIT_USAGE
+
 # In CI flavor the built pytest command carries the audit plugin; set it early so
 # --dry-run also previews the real command form.
 [[ $CI_MODE -eq 1 ]] && export PYTEST_AUDIT_PLUGIN_ARGS="-p pytest_node_audit"
@@ -72,18 +83,36 @@ _to_root_rel () {
 }
 
 # Normalize one selector to a plan token (root-relative when under the repo root).
-# Accepted forms: a bare .py path, a `python x.py` command, and a pytest nodeid
-# (path.py::...). A leading `pytest ` is NOT accepted (build_plan would turn it
-# into a bogus path), nor is any other unrecognized shape.
+# Accepted forms: a bare .py path, a `python x.py` command, a pytest nodeid
+# (path.py::...), and any of the pytest forms with a single trailing
+# `-m <marker>` modifier, which narrows the entry to the tests carrying that
+# marker (e.g. "file.py -m tang_s3" while a file is still being triaged for S3).
+# A leading `pytest ` is NOT accepted (build_plan would turn it into a bogus
+# path), nor is any other unrecognized shape.
 # stdout: the token. return: 0 ok, 1 skip (list line the parser also ignores),
 # 2 invalid (message on stderr).
 normalize_selection () {
     local raw="$1" base="$2" origin="$3"
     raw="${raw#./}"
+    local selector="$raw" modifier=""
+    # Split a trailing "-m <marker>" off first: that keeps the selector itself a
+    # single whitespace-free token. Anything else after the selector is invalid
+    # (rc=2, not "skip"): a silently skipped case would just stop running.
+    if [[ ! $raw =~ ^python[[:space:]] && $raw == *[[:space:]]* ]]; then
+        selector="${raw%%[[:space:]]*}"
+        local tail="${raw#"$selector"}"
+        tail="${tail#"${tail%%[![:space:]]*}"}"
+        tail="${tail%"${tail##*[![:space:]]}"}"
+        if [[ ! $tail =~ ^-m[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)$ ]]; then
+            echo "ERROR: unsupported list modifier (only '-m <marker>' is accepted): $raw" >&2
+            return 2
+        fi
+        modifier=" -m ${BASH_REMATCH[1]}"
+    fi
     # Command form: only `python <script.py>`.
-    if [[ $raw =~ ^python[[:space:]] ]]; then
+    if [[ $selector =~ ^python[[:space:]] ]]; then
         local -a parts
-        read -ra parts <<< "$raw"
+        read -ra parts <<< "$selector"
         local script="${parts[1]:-}"
         if [[ ${#parts[@]} -eq 2 && "$script" == *.py ]]; then
             local abs="$script"; [[ "$abs" != /* ]] && abs="$base/$abs"
@@ -96,14 +125,14 @@ normalize_selection () {
         return 1
     fi
     # Bare .py path or pytest nodeid (path.py::...): a single whitespace-free token.
-    if [[ ! $raw =~ [[:space:]] && $raw =~ \.py(::|$) ]]; then
-        local file_part="${raw%%::*}" node_suffix=""
-        [[ "$raw" == *::* ]] && node_suffix="::${raw#*::}"
+    if [[ $selector =~ \.py(::|$) ]]; then
+        local file_part="${selector%%::*}" node_suffix=""
+        [[ "$selector" == *::* ]] && node_suffix="::${selector#*::}"
         local abs="$file_part"; [[ "$abs" != /* ]] && abs="$base/$abs"
         if [[ ! -f "$abs" && "$origin" == "case" ]]; then
             echo "ERROR: --case file not found: $file_part" >&2; return 2
         fi
-        echo "$(_to_root_rel "$abs")${node_suffix}"; return 0
+        echo "$(_to_root_rel "$abs")${node_suffix}${modifier}"; return 0
     fi
     if [[ "$origin" == "case" ]]; then
         echo "ERROR: invalid --case selector: $raw" >&2; return 2

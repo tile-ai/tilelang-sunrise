@@ -757,6 +757,10 @@ void CodeGenTileLangCuTeDSL::VisitExpr_(const MaxNode *op,
  */
 void CodeGenTileLangCuTeDSL::VisitExpr_(const CallNode *op,
                                         std::ostream &os) { // NOLINT(*)
+  if (op->op.same_as(tl::clamp())) {
+    os << PrintExpr_(tl::LowerClamp(GetRef<Call>(op)));
+    return;
+  }
   auto print_extern_call_stmt = [&](std::string name, size_t start = 0,
                                     size_t end = 0) {
     // Cache context into a private ss, otherwise the let node may generate
@@ -1730,6 +1734,48 @@ void CodeGenTileLangCuTeDSL::VisitExpr_(const CallNode *op,
     std::string rounding_mode = Downcast<StringImm>(op->args[2])->value;
     os << "tl.ieee_fdiv(" << PrintExpr_(op->args[0]) << ", "
        << PrintExpr_(op->args[1]) << ", rounding=\"" << rounding_mode << "\")";
+  } else if (op->op.same_as(tl::fma()) || op->op.same_as(tl::fmul())) {
+    // Round-to-nearest fma/mul map onto the IEEE helpers with the fixed
+    // "rn" mode. The CuTeDSL helpers are scalar-only, so vector calls are
+    // expanded per lane through a register tensor.
+    bool is_fma = op->op.same_as(tl::fma());
+    const char *py_func = is_fma ? "tl.ieee_fmaf" : "tl.ieee_fmul";
+    if (op->dtype.is_scalar()) {
+      os << py_func << "(" << PrintExpr_(op->args[0]) << ", "
+         << PrintExpr_(op->args[1]);
+      if (is_fma) {
+        os << ", " << PrintExpr_(op->args[2]);
+      }
+      os << ", rounding=\"rn\")";
+    } else {
+      int lanes = op->dtype.lanes();
+      std::vector<std::string> vec_ids;
+      vec_ids.reserve(op->args.size());
+      for (const PrimExpr &arg : op->args) {
+        ICHECK_EQ(arg.dtype().lanes(), lanes)
+            << "tl." << (is_fma ? "fma" : "fmul")
+            << " expects vectorized arguments to share the call lanes";
+        vec_ids.push_back(SSAGetID(PrintExpr_(arg), arg.dtype()));
+      }
+      std::string sret = name_supply_->FreshName(is_fma ? "_fma" : "_fmul");
+      PrintIndent();
+      stream << sret << " = tl.make_rmem_tensor((" << lanes << ",), ";
+      PrintType(op->dtype.element_of(), stream);
+      stream << ")\n";
+      for (int i = 0; i < lanes; ++i) {
+        std::ostringstream value;
+        value << py_func << "(";
+        for (size_t j = 0; j < vec_ids.size(); ++j) {
+          if (j != 0) {
+            value << ", ";
+          }
+          PrintVecElemLoad_(vec_ids[j], op->args[j].dtype(), i, value);
+        }
+        value << ", rounding=\"rn\")";
+        PrintVecElemStore_(sret, op->dtype, i, value.str());
+      }
+      os << sret << ".load()";
+    }
   } else if (op->op.same_as(tl::warp_reduce_sum())) {
     os << "tl.warp_reduce_sum(" << PrintExpr_(op->args[0]) << ")";
   } else if (op->op.same_as(tl::warp_reduce_max())) {

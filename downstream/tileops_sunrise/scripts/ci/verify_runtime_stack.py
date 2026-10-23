@@ -1,19 +1,12 @@
 #!/usr/bin/env python3
-"""Build-time guard for the runner image: fail the build unless the baked stack is coherent.
+"""Fail the runner-image build unless the baked stack is coherent. Runs GPU-free.
 
-Runs GPU-free, so it works during `docker build` (no GPU attached). Catches the failure
-modes that a plain `import tilelang` smoke check misses:
-
-  1. tilelang imports at all — catches gross ABI breakage that aborts on import (e.g. an
-     apache-tvm-ffi too new for the baked wheel, which double-registers and calls abort()).
-  2. the installed apache-tvm-ffi satisfies tilelang's own declared requirement — catches
-     the case that imports lazily here but crashes the first time a kernel compiles under
-     GPU (apache-tvm-ffi too old: `undefined symbol: tvm::ffi::ReprPrint`). A no-GPU import
-     does not load the compiler library, so only the version range exposes this at build.
-  3. torch is still the cu129 build — a bench baseline that pulls torch from PyPI silently
-     swaps it to cu128, which breaks prebuilt c10-ABI extensions (e.g. vllm's `_C`:
-     `undefined symbol: c10::cuda::c10_cuda_check_implementation`).
+Two checks are not self-evident. The bare `import tilelang` is one: an apache-tvm-ffi too new
+double-registers and calls abort(). The apache-tvm-ffi range check is the other: too old crashes
+only when a kernel first compiles under GPU, which no import here reaches. Each failure below
+names its own fix.
 """
+
 import importlib.metadata as md
 import sys
 
@@ -21,13 +14,26 @@ import tilelang
 import torch
 from packaging.requirements import Requirement
 
-# Matches the cu129 base image; bump together with the base/torch CUDA major.minor.
-EXPECTED_TORCH_CUDA = "12.9"
+
+def _torch_pin(name: str) -> Requirement | None:
+    """Return torch's own requirement on *name*, ignoring environment markers."""
+    for raw in md.requires("torch") or []:
+        req = Requirement(raw)
+        if req.name == name:
+            return req
+    return None
+
+
+# Bump together with the base image's CUDA major.minor.
+EXPECTED_TORCH_CUDA = "13.2"
 
 installed = md.version("apache-tvm-ffi")
 ffi_req = next(
-    (Requirement(r) for r in (md.requires("tilelang") or [])
-     if Requirement(r).name == "apache-tvm-ffi"),
+    (
+        Requirement(r)
+        for r in (md.requires("tilelang") or [])
+        if Requirement(r).name == "apache-tvm-ffi"
+    ),
     None,
 )
 if ffi_req is None:
@@ -40,13 +46,61 @@ if not ffi_req.specifier.contains(installed, prereleases=True):
 
 if torch.version.cuda != EXPECTED_TORCH_CUDA:
     sys.exit(
-        f"FAIL: torch CUDA is {torch.version.cuda}, expected {EXPECTED_TORCH_CUDA} (cu129). "
-        "A bench baseline pulled torch from PyPI; reinstall torch from the cu129 index in "
-        "that layer so the c10 ABI stays consistent."
+        f"FAIL: torch CUDA is {torch.version.cuda}, expected {EXPECTED_TORCH_CUDA} (cu132). "
+        "A bench baseline pulled torch from PyPI; reinstall it from the cu132 index in that layer."
     )
+
+try:
+    cupti_version = md.version("cupti-python")
+except md.PackageNotFoundError:
+    sys.exit("FAIL: cupti-python is missing; the benchmark layer times kernels through it.")
+
+# Not imported: no GPU here, and the check is about the resolver, not the driver.
+bindings_pin = _torch_pin("cuda-bindings")
+bindings_installed = md.version("cuda-bindings")
+if bindings_pin is not None and not bindings_pin.specifier.contains(
+    bindings_installed, prereleases=True
+):
+    sys.exit(
+        f"FAIL: cuda-bindings {bindings_installed} violates torch's requirement "
+        f"{bindings_pin.specifier}. Install cupti-python with --no-deps."
+    )
+
+# install_tileops.sh builds tileops with --no-build-isolation, which resolves no backend itself.
+for dist in ("setuptools", "setuptools-scm", "wheel"):
+    try:
+        md.version(dist)
+    except md.PackageNotFoundError:
+        sys.exit(f"FAIL: {dist} is missing; tileops cannot build with --no-build-isolation.")
+
+# A missing baseline costs the column, not the run, so nothing else notices. FA3 is
+# imported because a returned 0 has meant an installed wrapper with no extension behind
+# it; the rest are checked for presence, since flag_gems and flashinfer want a device.
+try:
+    import flash_attn_interface
+
+    assert flash_attn_interface.flash_attn_func is not None
+except Exception as exc:  # noqa: BLE001 - a half-built FA3 raises several ways
+    sys.exit(
+        f"FAIL: flash_attn_interface does not import ({exc}). Eleven attention "
+        "benchmarks name `fa3` and would silently drop the column."
+    )
+
+for dist, why in (
+    ("flash-attn", "the FA2 columns"),
+    ("flag_gems", "the flaggems columns"),
+    ("flashinfer-python", "the flashinfer columns"),
+    ("flash-linear-attention", "the linear-attention columns"),
+    ("nvmath-python", "the cuBLASLt-search GEMM baseline"),
+):
+    try:
+        md.version(dist)
+    except md.PackageNotFoundError:
+        sys.exit(f"FAIL: {dist} is not installed; {why} would be missing.")
 
 print(
     f"runtime-stack OK: tilelang {tilelang.__version__} | "
     f"torch {torch.__version__} (cuda {torch.version.cuda}) | "
-    f"apache-tvm-ffi {installed} satisfies {ffi_req.specifier}"
+    f"apache-tvm-ffi {installed} satisfies {ffi_req.specifier} | "
+    f"cupti-python {cupti_version} with cuda-bindings {bindings_installed}"
 )

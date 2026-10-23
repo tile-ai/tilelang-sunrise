@@ -1,6 +1,6 @@
 import pytest
 
-import tilelang.language as T
+import tilelang.tang.language as T
 from tilelang.backend import create_backend_context, get_backend
 from tilelang.engine.lower import device_codegen_without_compile, lower_to_host_device_ir
 from tilelang.tang.subtarget import (
@@ -307,7 +307,8 @@ def test_tang_pipeline_lowers_stcu_tmma_gemm():
     assert "tl::gemm_tang<64, 64, 32, 2, 2" in source
 
 
-def test_tang_pipeline_lowers_strided_stcu_tmma_from_region_base():
+@pytest.mark.parametrize("clear_accum", [False, True])
+def test_tang_pipeline_lowers_strided_stcu_tmma_from_region_base(clear_accum):
     @T.prim_func
     def main(
         A: T.Tensor((32, 32), "float16"),
@@ -323,12 +324,17 @@ def test_tang_pipeline_lowers_strided_stcu_tmma_from_region_base():
             T.copy(A, a_shared[:, 32:])
             T.copy(B, b_shared[:, :32])
             T.clear(c_local)
-            T.gemm(a_shared[:, 32:], b_shared[:, :32], c_local, clear_accum=False)
+            T.gemm(a_shared[:, 32:], b_shared[:, :32], c_local, clear_accum=clear_accum)
             T.copy(c_local, C)
 
     source = _lower_tang_source(main)
 
-    assert "tl::gemm_tang<32, 32, 32, 2, 2, 64, 64, 32, 0" in source
+    # Four 8x8 atoms with eight padding elements each place A[:, 32:] at 4 * 72 = 288.
+    # The physical pointer carries that origin, so neither template offset repeats it.
+    assert (
+        f"tl::gemm_tang<32, 32, 32, 2, 2, 64, 64, 0, 0, 0, 0, {int(clear_accum)}>"
+        "((&(((__fp16*)a_shared)[288])), (&(((__fp16*)b_shared)[0])), (&(c_local[0])));"
+    ) in source
     assert "A_shared[-" not in source
     assert " - 480" not in source
 
@@ -355,8 +361,21 @@ def test_tang_pipeline_preserves_stcu_tmma_load_controls():
                 k_step=4,
                 a_local_load_type="load_overlap_mma",
                 b_local_load_type="load_before_mma",
+                wc_interleave=4,
             )
             T.copy(c_local, C)
+
+    gemm_calls = []
+
+    def collect_gemm(node):
+        if isinstance(node, tvm.tirx.Call) and isinstance(node.op, tvm.ir.Op) and node.op.name == "tl.tileop.gemm":
+            gemm_calls.append(node)
+
+    tvm.tirx.stmt_functor.post_order_visit(main.body, collect_gemm)
+    assert len(gemm_calls) == 1
+    # Dense GEMM now carries only the shared 13 slots; k_step is a TANG annotation.
+    assert len(gemm_calls[0].args) == 13
+    assert int(gemm_calls[0].annotations["tang_k_step"]) == 4
 
     source = _lower_tang_source(main)
 
@@ -452,8 +471,7 @@ def test_tang_pipeline_lowers_stcu_tmma_clear_accum():
     assert "tl::gemm_tang<64, 64, 32, 2, 2, 32, 64, 0, 0, 0, 0, 1>" in source
 
 
-@pytest.mark.skip(reason="stcuv2 gemm claim test is S3-specific")
-def test_tang_pipeline_does_not_claim_stcuv2_gemm():
+def test_tang_pipeline_routes_stcuv2_fragment_accumulator_to_tmem():
     @T.prim_func
     def main(
         A: T.Tensor((64, 32), "float16"),
@@ -470,7 +488,17 @@ def test_tang_pipeline_does_not_claim_stcuv2_gemm():
             T.gemm(a_shared, b_shared, c_local, clear_accum=False)
             T.copy(c_local, C)
 
-    with pytest.raises(tvm.error.InternalError, match="no gemm implementation"):
+    # stcuv2 has no tang.tmma implementation and no register-destination MMA at
+    # all, so a fragment accumulator is handled by PromoteTmemAccumulator, which
+    # rewrites it into the tcgen5 tmem form. The plain T.gemm registry lookup
+    # must therefore never be reached with tang.tmma on stcuv2.
+    #
+    # This particular kernel cannot be promoted: fp16 at K=32 is a 64-byte
+    # operand row, half of the 128 bytes one tcgen5 MMA reads, which has no legal
+    # swizzle. What matters here is that the failure names that constraint rather
+    # than surfacing as a registry miss; the promotion success path is covered in
+    # testing/python/s3/test_tang_promote_tmem_accumulator.py.
+    with pytest.raises(Exception, match=r"spans 64 bytes per MMA row.*Use K == 64"):
         _lower_tang_source(main, arch="stcuv2")
 
 
