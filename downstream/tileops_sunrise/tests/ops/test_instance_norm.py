@@ -88,6 +88,31 @@ def test_instance_norm_non_contiguous(n: int, c: int, spatial: tuple, dtype: tor
     compare_outputs(y, y_ref, normalization_verification("InstanceNormFwdOp", x.dtype))
 
 
+@pytest.mark.smoke
+def test_instance_norm_running_stats_fixed_inputs() -> None:
+    """Fixed host inputs exercise cancellation with FP32 running statistics."""
+    generator = torch.Generator(device="cpu").manual_seed(12)
+    x = torch.randn((2, 16, 8, 8), dtype=torch.float16, generator=generator).to(run_device())
+    running_mean = torch.randn(16, dtype=torch.float32, generator=generator).to(run_device())
+    running_var = (torch.rand(16, dtype=torch.float32, generator=generator) + 0.1).to(run_device())
+    y = InstanceNormFwdOp(use_input_stats=False)(x, running_mean, running_var)
+    y_ref = reference_for(
+        lambda x, mean, var: F.instance_norm(
+            x,
+            running_mean=mean,
+            running_var=var,
+            weight=None,
+            bias=None,
+            use_input_stats=False,
+            eps=1e-5,
+        ),
+        x,
+        running_mean,
+        running_var,
+    )
+    compare_outputs(y, y_ref, normalization_verification("InstanceNormFwdOp", x.dtype))
+
+
 class InstanceNormAffineFreeFixture(FixtureBase):
     PARAMS = [
         (

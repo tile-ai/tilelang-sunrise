@@ -1256,6 +1256,7 @@ def _batch_norm_fwd_infer_kernel(
     input_dtype_params: bool = False,
     has_weight: bool = True,
     has_bias: bool = True,
+    ptpu: bool = False,
 ) -> Callable:
     """Return the JIT-compiled inference-forward kernel factory.
 
@@ -1271,13 +1272,15 @@ def _batch_norm_fwd_infer_kernel(
         S: Elements per channel in one batch item, ``product(spatial)``.
         dtype: Input/output data type.
         eps: Numerical stability constant.
-        input_dtype_params: Whether ``weight`` and ``bias`` are in *dtype* and the running
-            statistics are read rounded to it, as ``instance_norm`` reads them.
+        input_dtype_params: Whether ``weight`` and ``bias`` are in *dtype*. CUDA also
+            reads the running statistics rounded to it, as ``instance_norm`` reads them.
         has_weight: With *input_dtype_params*, whether ``weight`` is read; else the scale is one.
         has_bias: With *input_dtype_params*, whether ``bias`` is read; else the shift is zero.
+        ptpu: Whether running statistics retain their declared FP32 dtype.
     """
     accum_dtype = "float32"
     affine_dtype = dtype if input_dtype_params else accum_dtype
+    stats_dtype = accum_dtype if ptpu else dtype
     total = N * C * S
 
     @tilelang.jit(out_idx=[-1], compile_flags=["-O3", "-DENABLE_BF16"])
@@ -1300,8 +1303,8 @@ def _batch_norm_fwd_infer_kernel(
         def _channel_affine(weight, bias, running_mean, running_var, ch, sc, sh):
             """Write channel *ch*'s scale into ``sc[0]`` and its shift into ``sh[0]``."""
             if input_dtype_params:
-                mean_c = T.cast(T.cast(running_mean[ch], dtype), accum_dtype)
-                var_c = T.cast(T.cast(running_var[ch], dtype), accum_dtype)
+                mean_c = T.cast(T.cast(running_mean[ch], stats_dtype), accum_dtype)
+                var_c = T.cast(T.cast(running_var[ch], stats_dtype), accum_dtype)
                 weight_c = T.cast(weight[ch], accum_dtype) if has_weight else T.float32(1.0)
                 bias_c = T.cast(bias[ch], accum_dtype) if has_bias else T.float32(0.0)
                 sc[0] = T.rsqrt(var_c + T.cast(eps, accum_dtype)) * weight_c
@@ -1415,6 +1418,7 @@ class BatchNormFwdInferKernel(Kernel, BatchNormInferFwdInterface, InstanceNormIn
         has_bias: See `_batch_norm_fwd_infer_kernel`.
         config: Optional tile config dict.
         device_index: CUDA device the kernel runs on; ``None`` is the current one.
+        ptpu: Whether running statistics retain their declared FP32 dtype.
     """
 
     devices = frozenset({"cuda", "ptpu"})
@@ -1445,7 +1449,8 @@ class BatchNormFwdInferKernel(Kernel, BatchNormInferFwdInterface, InstanceNormIn
             call.has_bias,
         )
         index = call.device.index if call.device is not None else None
-        return (*args, index), lambda: cls(*args, device_index=index)
+        ptpu = call.device is not None and call.device.type == "ptpu"
+        return (*args, index, ptpu), lambda: cls(*args, device_index=index, ptpu=ptpu)
 
     def __init__(
         self,
@@ -1459,12 +1464,14 @@ class BatchNormFwdInferKernel(Kernel, BatchNormInferFwdInterface, InstanceNormIn
         has_bias: bool = True,
         config: Optional[dict] = None,
         device_index: Optional[int] = None,
+        *,
+        ptpu: bool = False,
     ) -> None:
         super().__init__(device_index=device_index)
         self.total = N * C * S
         self.dtype = dtype
         self.kernel = _batch_norm_fwd_infer_kernel(
-            N, C, S, self.dtype_str, eps, input_dtype_params, has_weight, has_bias
+            N, C, S, self.dtype_str, eps, input_dtype_params, has_weight, has_bias, ptpu
         )
         self.init_config(config)
 

@@ -41,8 +41,8 @@ class BatchNormCall(CallSpec):
 
     The input is ``(n, c, *spatial)``; ``spatial`` is the product of the trailing axes.
     ``eps`` and ``momentum`` are the op's construction parameters, which the programs
-    compile in. ``input_dtype_params`` is set where the affine is in the input dtype and
-    the running statistics are read rounded to it, as ``instance_norm`` reads them;
+    compile in. ``input_dtype_params`` is set where the affine is in the input dtype;
+    CUDA also reads the running statistics rounded to it, while PTPU retains FP32.
     ``has_weight`` and ``has_bias`` say which affine tensors are passed, and
     ``has_running_stats`` whether the running statistics are.
     """
