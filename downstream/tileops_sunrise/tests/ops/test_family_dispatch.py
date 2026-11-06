@@ -1,31 +1,44 @@
-"""Which implementation each non-attention family lands on.
+"""Coverage gaps: inputs inside an op's signature domain that no implementation serves.
 
-One row per region the family's own predicates used to draw, including the
-boundaries they turned on: element type, dimensions, layout, and architecture.
-Selection is asserted through ``select_kernel_key``, which resolves the key
-without compiling anything.
+Each case hands the op's dispatch a call record for this device and asserts the refusal
+and its reason, before anything is built.
 """
-
-import itertools
 
 import pytest
 import torch
 
-from tileops.kernels.gemm.call_spec import GemmCall
-from tileops.kernels.linear_attention.deltanet_call import DeltaNetDecodeCall
-from tileops.ops.gemm.gemm import _GEMM_KEYS, GemmFwdOp
-from tileops.ops.linear_attention.deltanet_recurrence import (
-    DELTANET_DECODE_KEYS,
-    DeltaNetDecodeFwdOp,
+from tileops._kernels.gemm.call_spec import GEMMCall
+from tileops._kernels.linear_attention import (
+    DeltaNetCall,
+    DeltaNetChunkCall,
+    DeltaNetDecodeCall,
+    GDNCall,
+    GLAChunkCall,
+    GLADecodeCall,
 )
-from tileops.ops.linear_attention.gated_deltanet import (
-    GATED_DELTANET_DECODE_KEYS,
-    GatedDeltaNetDecodeFwdOp,
-)
+from tileops._kernels.linear_attention.gla.call_spec import GLACall
+from tileops._kernels.norm.call_spec import FusedQKNormRoPECall
+from tileops._kernels.sampling.call_spec import SamplingCall
+from tileops._ops.gemm.gemm import GEMMFwdOp
+from tileops._ops.linear_attention.deltanet.chunk import DeltaNetChunkBwdOp, DeltaNetChunkFwdOp
+from tileops._ops.linear_attention.deltanet.fwd import DeltaNetFwdOp
+from tileops._ops.linear_attention.deltanet.recurrent import DeltaNetRecurrentFwdOp
+from tileops._ops.linear_attention.gdn import GDNFwdOp
+from tileops._ops.linear_attention.gla.chunk import GLAChunkBwdOp, GLAChunkFwdOp
+from tileops._ops.linear_attention.gla.fwd import GLAFwdOp
+from tileops._ops.linear_attention.gla.recurrent import GLARecurrentFwdOp
+from tileops._ops.norm.fused_qk_norm_rope import FusedQKNormRoPEFwdOp
+from tileops._ops.sampling.chain_speculative_sampling import ChainSpeculativeSamplingFwdOp
+from tileops.backend import OpNotAvailableError
+from workloads.device import run_device_available
 
-pytestmark = pytest.mark.skipif(
-    not torch.ptpu.is_available(), reason="selection reads the device architecture"
-)
+pytestmark = [
+    pytest.mark.sm90,
+    pytest.mark.in_tree_kernels,
+    pytest.mark.skipif(
+        not run_device_available(), reason="selection reads the device architecture"
+    ),
+]
 
 
 @pytest.fixture(autouse=True)
@@ -36,164 +49,380 @@ def explicit_cuda_predicates(request, monkeypatch):
         "test_gemv_kernel_claims_the_layouts_it_was_written_for",
         "test_gated_deltanet_decode_dispatch",
     }:
-        import tileops.kernels.gemm.dense as dense
-        import tileops.utils as utils
+        import tileops._kernels.gemm.dense as dense
+        import tileops._utils as utils
 
         monkeypatch.setattr(dense, "get_device", lambda: "cuda")
         monkeypatch.setattr(utils, "get_device", lambda: "cuda")
 
 
 _SM90 = 90
-_SM80 = 80
-
-
-# --- GEMM: a vector operand picks the GEMV kernel, but only in the two layouts
-# it is written for. Non-SM90 falls back to the pipelined mainloop.
 
 
 @pytest.mark.smoke
-@pytest.mark.parametrize(
-    ("m", "n", "trans_a", "trans_b", "expected"),
-    [
-        pytest.param(1, 8, False, True, "gemv_kernel", id="lhs-row"),
-        pytest.param(8, 1, False, False, "gemv_kernel", id="rhs-col"),
-        pytest.param(1, 8, False, False, "gemm_kernel", id="lhs-row-wrong-layout"),
-        pytest.param(8, 1, False, True, "gemm_kernel", id="rhs-col-wrong-layout"),
-        pytest.param(8, 8, False, False, "gemm_kernel", id="neither-is-a-vector"),
-        pytest.param(1, 1, False, False, "gemv_kernel", id="both-are-vectors"),
-    ],
-)
-def test_gemm_dispatch(m: int, n: int, trans_a: bool, trans_b: bool, expected: str) -> None:
-    op = GemmFwdOp(trans_a=trans_a, trans_b=trans_b)
-    call = GemmCall(
-        arch=_SM90, m=m, n=n, k=64, dtype=torch.float16, trans_a=trans_a, trans_b=trans_b
+def test_gemm_k_too_narrow_to_vectorize_is_refused_during_selection() -> None:
+    """``k = 1`` fp16 spans 2 bytes, under the 4-byte load both mainloops issue.
+
+    Neither implementation can serve it. The refusal states the reason during
+    selection rather than letting a builder be entered and raise.
+    """
+    op = GEMMFwdOp()
+    call = GEMMCall(arch=_SM90, sm_count=132, m=64, n=64, k=1, dtype=torch.float16, trans_b=True)
+
+    with pytest.raises(OpNotAvailableError, match="k must span at least one"):
+        op.key_for("gemm", call)
+
+
+@pytest.mark.smoke
+def test_chain_speculative_sampling_refuses_a_row_past_shared_memory() -> None:
+    """A full batch folds each row of 926463 weights into 28952 float64 entries, which with the
+    block's other shared buffers, each starting at a multiple of 16 bytes, compile to 232464
+    bytes. Counting the entries and only part of the rest admitted it."""
+    call = SamplingCall(
+        arch=_SM90, sm_count=132, batch=132, num_draft=1, vocab=926463, dtype=torch.float32
     )
 
-    assert op.select_kernel_key(_GEMM_KEYS, call) == expected
+    with pytest.raises(OpNotAvailableError, match="shared float64 entries"):
+        ChainSpeculativeSamplingFwdOp().key_for("chain_speculative_sampling", call)
 
 
 @pytest.mark.smoke
-@pytest.mark.parametrize(
-    ("m", "n", "trans_a", "trans_b", "dim"),
-    [
-        pytest.param(1, 8, True, True, "m=1", id="lhs-row-trans-a"),
-        pytest.param(8, 1, True, False, "n=1", id="rhs-col-trans-a"),
-    ],
-)
-def test_gemm_vector_on_a_transposed_operand_is_refused(
-    m: int, n: int, trans_a: bool, trans_b: bool, dim: str
-) -> None:
-    """A ``trans_a`` layout puts the vector on an operand's TMA-loaded innermost
-    dimension, where the descriptor needs a multiple of 8 fp16 elements — and the
-    GEMV kernel has no form for these layouts. Selection refuses, naming the
-    dimension; it used to hand these to the general kernel, whose build then died
-    inside TileLang (``T.tma_copy() ... TMA is not available``).
-    """
-    op = GemmFwdOp(trans_a=trans_a, trans_b=trans_b)
-    call = GemmCall(
-        arch=_SM90, m=m, n=n, k=64, dtype=torch.float16, trans_a=trans_a, trans_b=trans_b
-    )
-
-    with pytest.raises(ValueError, match=f"multiple of 8 .*and {dim}"):
-        op.select_kernel_key(_GEMM_KEYS, call)
-
-
-@pytest.mark.smoke
-def test_gemm_uses_basic_mainloop_off_sm90() -> None:
-    op = GemmFwdOp()
-    call = GemmCall(arch=_SM80, m=1, n=8, k=64, dtype=torch.float16, trans_b=True)
-
-    assert op.select_kernel_key(_GEMM_KEYS, call) == "gemm_basic_kernel"
-
-
-# --- DeltaNet decode: fp32 has its own kernel; the raw-CUDA one serves 16-bit
-# at dim 128 on SM90; everything else is the general kernel.
-
-_DELTANET_ROWS = [
-    (torch.float32, 128, 128, _SM90, "DeltaNetDecodeFP32Kernel", "fp32"),
-    (torch.float32, 64, 64, _SM80, "DeltaNetDecodeFP32Kernel", "fp32-any-dim-any-arch"),
-    (torch.float16, 128, 128, _SM90, "DeltaNetDecodeRawCudaFlaStyleKernel", "fp16-raw"),
-    (torch.bfloat16, 128, 128, _SM90, "DeltaNetDecodeRawCudaFlaStyleKernel", "bf16-raw"),
-    (torch.float16, 64, 128, _SM90, "DeltaNetDecodeKernel", "dim-k-off"),
-    (torch.float16, 128, 64, _SM90, "DeltaNetDecodeKernel", "dim-v-off"),
-    (torch.float16, 128, 128, _SM80, "DeltaNetDecodeKernel", "arch-off"),
-]
-
-
-@pytest.mark.smoke
-@pytest.mark.parametrize(
-    ("dtype", "dim_k", "dim_v", "arch", "expected"),
-    [pytest.param(*row[:5], id=row[5]) for row in _DELTANET_ROWS],
-)
-def test_deltanet_decode_dispatch(
-    dtype: torch.dtype, dim_k: int, dim_v: int, arch: int, expected: str
-) -> None:
-    op = DeltaNetDecodeFwdOp()
-    call = DeltaNetDecodeCall(arch=arch, batch=1, heads=4, dim_k=dim_k, dim_v=dim_v, dtype=dtype)
-
-    assert op.select_kernel_key(DELTANET_DECODE_KEYS, call) == expected
-
-
-# --- Gated DeltaNet decode: the same shape, and the raw-CUDA kernel additionally
-# declines when the caller asked to autotune, having no knobs to tune.
-
-_GATED_ROWS = [
-    (torch.float32, 128, 128, _SM90, "GatedDeltaNetDecodeFP32Kernel", "fp32"),
-    (torch.bfloat16, 128, 128, _SM90, "GatedDeltaNetDecodeRawCudaFlaStyleKernel", "bf16-raw"),
-    (torch.float16, 128, 128, _SM90, "GatedDeltaNetDecodeKernel", "fp16-not-raw"),
-    (torch.bfloat16, 64, 128, _SM90, "GatedDeltaNetDecodeKernel", "dim-k-off"),
-    (torch.bfloat16, 128, 64, _SM90, "GatedDeltaNetDecodeKernel", "dim-v-off"),
-    (torch.bfloat16, 128, 128, _SM80, "GatedDeltaNetDecodeKernel", "arch-off"),
-]
-
-
-@pytest.mark.smoke
-@pytest.mark.parametrize(
-    ("dtype", "dim_k", "dim_v", "arch", "expected"),
-    [pytest.param(*row[:5], id=row[5]) for row in _GATED_ROWS],
-)
-def test_gated_deltanet_decode_dispatch(
-    dtype: torch.dtype, dim_k: int, dim_v: int, arch: int, expected: str
-) -> None:
-    op = GatedDeltaNetDecodeFwdOp()
-    call = DeltaNetDecodeCall(arch=arch, batch=1, heads=4, dim_k=dim_k, dim_v=dim_v, dtype=dtype)
-
-    assert op.select_kernel_key(GATED_DELTANET_DECODE_KEYS, call) == expected
-
-
-@pytest.mark.smoke
-def test_gated_deltanet_raw_cuda_declines_when_asked_to_autotune() -> None:
-    """It has no tunable knobs, so a caller asking to tune wants the other one.
-
-    Nothing is autotuned here: only the key is resolved.
-    """
-    op = GatedDeltaNetDecodeFwdOp(tune=True)
+def test_deltanet_decode_refuses_a_key_dim_no_tile_divides() -> None:
+    """The tile rule the three decode kernels share, which every served row satisfies."""
     call = DeltaNetDecodeCall(
-        arch=_SM90, batch=1, heads=4, dim_k=128, dim_v=128, dtype=torch.bfloat16, tune=True
+        arch=_SM90, batch=1, heads=4, dim_k=72, dim_v=128, dtype=torch.bfloat16
     )
 
-    assert op.select_kernel_key(GATED_DELTANET_DECODE_KEYS, call) == ("GatedDeltaNetDecodeKernel")
+    with pytest.raises(OpNotAvailableError, match="multiple of 16"):
+        DeltaNetRecurrentFwdOp().key_for("deltanet_decode", call)
 
 
 @pytest.mark.smoke
-def test_every_family_call_record_reads_the_device_when_unstated() -> None:
-    """A record built without an architecture resolves one; a stated one wins."""
-    from tileops.utils import get_sm_version
+@pytest.mark.parametrize(
+    ("dim", "rot", "reason"),
+    [
+        pytest.param(63, 62, "must be even", id="odd-head-dim"),
+        pytest.param(1024, 1024, "inside one warp", id="head-past-a-warp"),
+    ],
+)
+def test_fused_qk_norm_rope_refuses_what_no_kernel_serves(dim: int, rot: int, reason: str) -> None:
+    """A lane holds pairs of a head's values and one warp sums their squares, so an odd head
+    dim, or a head of more than 32 lanes, has no kernel."""
+    call = FusedQKNormRoPECall(
+        arch=_SM90,
+        heads=4,
+        kv_heads=1,
+        dim=dim,
+        rot=rot,
+        dtype=torch.bfloat16,
+        cache_dtype=torch.bfloat16,
+    )
 
-    for record in (GemmCall(), DeltaNetDecodeCall()):
-        assert record.arch == get_sm_version()
-    assert GemmCall(arch=_SM80).arch == _SM80
-    assert DeltaNetDecodeCall(arch=_SM80).arch == _SM80
+    with pytest.raises(OpNotAvailableError, match=reason):
+        FusedQKNormRoPEFwdOp(4, 1).key_for("fused_qk_norm_rope", call)
+
+
+def _chunk_call(dim_k: int, dim_v: int, arch: int = _SM90, chunk_size: int = 64) -> GLAChunkCall:
+    return GLAChunkCall(
+        arch=arch,
+        batch=2,
+        seq_len=512,
+        heads=8,
+        dim_k=dim_k,
+        dim_v=dim_v,
+        chunk_size=chunk_size,
+        scale=0.125,
+        dtype=torch.bfloat16,
+    )
 
 
 @pytest.mark.smoke
-def test_gemv_kernel_claims_the_layouts_it_was_written_for() -> None:
-    """The predicate the op used to carry, over every (m, n, layout) combination."""
-    from tileops.kernels.gemm import GemvKernel
+@pytest.mark.parametrize(
+    ("call", "interfaces", "reason"),
+    [
+        pytest.param(
+            _chunk_call(128, 128, chunk_size=48),
+            ("gla_chunk_fwd", "gla_chunk_bwd"),
+            "chunk_size=48 must be",
+            id="chunk-48",
+        ),
+        pytest.param(
+            _chunk_call(128, 16),
+            ("gla_chunk_fwd", "gla_chunk_bwd"),
+            "dim_v=16",
+            id="value-below-a-tile",
+        ),
+        pytest.param(
+            _chunk_call(32, 64),
+            ("gla_chunk_bwd",),
+            "dim_k=32, dim_v=64",
+            id="bwd-narrow-key-half-value",
+        ),
+    ],
+)
+def test_gla_chunked_refuses_what_no_kernel_serves(
+    call: GLAChunkCall, interfaces: tuple, reason: str
+) -> None:
+    ops = {"gla_chunk_fwd": GLAChunkFwdOp, "gla_chunk_bwd": GLAChunkBwdOp}
+    for interface in interfaces:
+        with pytest.raises(OpNotAvailableError, match=reason):
+            ops[interface](chunk_size=call.chunk_size).key_for(interface, call)
 
-    for m, n, trans_a, trans_b in itertools.product([1, 8], [1, 8], [False, True], [False, True]):
-        expected = (m == 1 and not trans_a and trans_b) or (n == 1 and not trans_a and not trans_b)
-        call = GemmCall(
-            arch=_SM90, m=m, n=n, k=64, dtype=torch.float16, trans_a=trans_a, trans_b=trans_b
-        )
-        assert GemvKernel.applies(call) is expected, (m, n, trans_a, trans_b)
+
+@pytest.mark.sm90
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    ("dim_k", "dim_v", "reason"),
+    [
+        pytest.param(128, 256, "shared memory", id="over-the-budget"),
+        pytest.param(64, 160, "dim_v a multiple of 64", id="dims-no-tile-pairs"),
+    ],
+)
+def test_gla_bwd_refuses_what_this_device_cannot_place(dim_k: int, dim_v: int, reason: str) -> None:
+    call = GLAChunkCall(
+        batch=1, seq_len=128, heads=2, dim_k=dim_k, dim_v=dim_v, chunk_size=64, dtype=torch.float32
+    )
+    with pytest.raises(OpNotAvailableError, match=reason):
+        GLAChunkBwdOp(chunk_size=64).key_for("gla_chunk_bwd", call)
+
+
+def _gla_call(
+    seq_len: int, varlen: bool = False, dim: int = 64, heads: int = 4, sequences: int = 1
+) -> GLACall:
+    # Multiprocessors of the board the GLA inference regions are read against.
+    sm_count = 132
+    return GLACall(
+        arch=_SM90,
+        sm_count=sm_count,
+        batch=1,
+        seq_len=seq_len,
+        heads=heads,
+        dim_k=dim,
+        dim_v=dim,
+        dtype=torch.bfloat16,
+        scale=dim**-0.5,
+        varlen=varlen,
+        num_sequences=sequences,
+    )
+
+
+def _gated_call(seq_len: int, has_initial_state: bool, **facts: object) -> GDNCall:
+    return GDNCall(
+        arch=_SM90,
+        batch=1,
+        seq_len=seq_len,
+        heads=facts.pop("heads", 16),
+        value_heads=facts.pop("value_heads", 16),
+        dim_k=facts.pop("dim_k", 128),
+        dim_v=facts.pop("dim_v", 128),
+        dtype=torch.bfloat16,
+        scale=0.088,
+        has_initial_state=has_initial_state,
+        **facts,
+    )
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    ("call", "reason"),
+    [
+        pytest.param(
+            _gated_call(1, True, dim_k=256, dim_v=256),
+            "K and V other than matching 64 or 128",
+            id="decode-wide-state",
+        ),
+    ],
+)
+def test_gdn_refuses_what_no_kernel_serves(call: GDNCall, reason: str) -> None:
+    with pytest.raises(OpNotAvailableError, match=reason):
+        GDNFwdOp().key_for("gdn", call)
+
+
+def _deltanet_call(**facts: object) -> DeltaNetCall:
+    return DeltaNetCall(
+        arch=_SM90,
+        batch=1,
+        seq_len=facts.pop("seq_len", 128),
+        heads=facts.pop("heads", 16),
+        dim_k=facts.pop("dim_k", 128),
+        dim_v=facts.pop("dim_v", 128),
+        dtype=facts.pop("dtype", torch.bfloat16),
+        scale=0.088,
+        **facts,
+    )
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    ("call", "reason"),
+    [
+        pytest.param(_deltanet_call(dim_v=64), "K/V dimensions", id="dim-k-not-dim-v"),
+        pytest.param(_deltanet_call(dtype=torch.float32), "dtype other than", id="fp32"),
+    ],
+)
+def test_deltanet_fwd_refuses_what_the_kernel_does_not_serve(
+    call: DeltaNetCall, reason: str
+) -> None:
+    with pytest.raises(OpNotAvailableError, match=reason):
+        DeltaNetFwdOp().key_for("deltanet", call)
+
+
+def _head_axis_cases(heads: int) -> list[tuple[object, str, object]]:
+    """One ``(op, interface, call)`` per linear-attention implementation, at *heads* heads."""
+    chunk = DeltaNetChunkCall(
+        arch=_SM90,
+        batch=1,
+        heads=heads,
+        seq_len=512,
+        chunk_size=64,
+        dim_k=128,
+        dim_v=128,
+        dtype=torch.bfloat16,
+    )
+    gla_chunk = GLAChunkCall(
+        arch=_SM90,
+        batch=1,
+        seq_len=512,
+        heads=heads,
+        dim_k=128,
+        dim_v=128,
+        chunk_size=64,
+        scale=0.125,
+        dtype=torch.bfloat16,
+    )
+    decode = {"arch": _SM90, "batch": 1, "heads": heads, "dim_k": 128, "dim_v": 128}
+    return [
+        (DeltaNetChunkFwdOp(), "deltanet_chunk_fwd", chunk),
+        (DeltaNetChunkBwdOp(), "deltanet_chunk_bwd", chunk),
+        (DeltaNetFwdOp(), "deltanet", _deltanet_call(heads=heads)),
+        (DeltaNetFwdOp(), "deltanet", _deltanet_call(seq_len=1, heads=heads)),
+        (
+            DeltaNetRecurrentFwdOp(),
+            "deltanet_decode",
+            DeltaNetDecodeCall(dtype=torch.bfloat16, **decode),
+        ),
+        (
+            DeltaNetRecurrentFwdOp(),
+            "deltanet_decode",
+            DeltaNetDecodeCall(dtype=torch.float32, **decode),
+        ),
+        (
+            GDNFwdOp(),
+            "gdn",
+            _gated_call(2048, False, heads=heads, value_heads=2 * heads),
+        ),
+        (
+            GDNFwdOp(),
+            "gdn",
+            _gated_call(1, True, heads=heads, value_heads=2 * heads),
+        ),
+        (GLAChunkFwdOp(), "gla_chunk_fwd", gla_chunk),
+        (GLAChunkBwdOp(), "gla_chunk_bwd", gla_chunk),
+        *(
+            (GLAFwdOp(), "gla", call)
+            for call in (
+                _gla_call(1, heads=heads),
+                _gla_call(2048, heads=heads),
+                _gla_call(100, heads=heads),
+                _gla_call(4096, varlen=True, heads=heads),
+                _gla_call(4096, varlen=True, dim=128, heads=heads, sequences=4),
+            )
+        ),
+        (
+            GLARecurrentFwdOp(),
+            "gla_decode",
+            GLADecodeCall(scale=0.088, dtype=torch.bfloat16, **decode),
+        ),
+        (
+            GLARecurrentFwdOp(),
+            "gla_decode",
+            GLADecodeCall(scale=0.088, dtype=torch.float32, **decode),
+        ),
+    ]
+
+
+@pytest.mark.smoke
+def test_linear_attention_refuses_an_odd_head_count() -> None:
+    for op, interface, call in _head_axis_cases(3):
+        with pytest.raises(OpNotAvailableError, match="even head count or a single head"):
+            op.key_for(interface, call)
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("seq_len", [2048, 1])
+def test_gdn_refuses_an_odd_value_head_count(seq_len: int) -> None:
+    """The value heads are their own axis: one key head can group an odd number of them."""
+    call = _gated_call(seq_len, seq_len == 1, heads=1, value_heads=3)
+
+    with pytest.raises(OpNotAvailableError, match="even head count or a single head"):
+        GDNFwdOp().key_for("gdn", call)
+
+
+_GQA_DENSE_GAPS = [
+    # (dtype, batch, seq_len_q, heads, heads_kv, dim, seq_len_kv, window, rope, softcap)
+    (
+        ("fp8", 1, 1, 32, 4, 128, 2048, (64, 0), False, 0.0),
+        "fp8-window",
+        r"does not serve sliding windows",
+    ),
+    (
+        ("fp8", 1, 1, 32, 4, 128, 2048, (-1, -1), True, 0.0),
+        "fp8-rope",
+        r"does not serve RoPE with one query position",
+    ),
+    (
+        ("fp16", 1, 1, 32, 4, 144, 2048, (-1, -1), False, 0.0),
+        "decode-dim-144",
+        r"multiple of 16 in \[16, 128\]",
+    ),
+    (
+        ("fp16", 1, 4, 32, 4, 128, 2048, (64, 0), False, 0.0),
+        "window-unequal-lengths",
+        r"requires equal Q and KV lengths",
+    ),
+    (
+        ("fp16", 1, 4, 32, 4, 72, 2048, (-1, -1), False, 0.0),
+        "prefill-dim-72",
+        r"requires head dimension a multiple of 16",
+    ),
+]
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    ("row", "reason"), [pytest.param(row, reason, id=name) for row, name, reason in _GQA_DENSE_GAPS]
+)
+def test_gqa_dense_refuses_what_no_kernel_serves(row: tuple, reason: str) -> None:
+    from tileops._kernels.attention.call_spec import AttentionCall
+    from tileops._ops.attention.gqa.dense import GQADenseFwdOp
+
+    dtype_name, batch, seq_q, heads, heads_kv, dim, seq_kv, window, rope, softcap = row
+    dtypes = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp8": torch.float8_e4m3fn}
+    is_fp8 = dtype_name == "fp8"
+    op = GQADenseFwdOp(
+        is_causal=True,
+        window_size_left=window[0],
+        window_size_right=window[1],
+        softcap=softcap,
+        pos_encoding_mode="rope" if rope else "none",
+        out_dtype=torch.float16 if is_fp8 else None,
+    )
+    call = AttentionCall(
+        arch=_SM90,
+        dtype=torch.float16 if is_fp8 else dtypes[dtype_name],
+        batch=batch,
+        heads=heads,
+        heads_kv=heads_kv,
+        dim=dim,
+        max_seqlen_q=seq_q,
+        seqlen_kv=seq_kv,
+        is_causal=True,
+        softcap=softcap,
+        window_size_left=window[0],
+        window_size_right=window[1],
+        is_fp8=is_fp8,
+        fuse_rope=rope,
+    )
+
+    with pytest.raises(OpNotAvailableError, match=reason):
+        op.key_for("gqa_dense", call)

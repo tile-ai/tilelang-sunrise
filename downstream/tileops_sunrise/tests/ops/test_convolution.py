@@ -7,25 +7,17 @@ from tests.compile_contract import (
     compile_fullgraph,
     register_compile_contract,
 )
-from tests.test_base import FixtureBase, TestBase
-from tileops.kernels.convolution import (
-    Conv1dKernel,
-    Conv1dPointwiseKernel,
-    Conv2d1x1Kernel,
-    Conv2dSymmetricKernel,
-    Conv3dKernel,
-    Conv3dNdhwcKernel,
-    GroupConv1dKernel,
-    GroupConv2dKernel,
-    GroupConv3dKernel,
+from tests.workload_test_base import FixtureBase, TestBase
+from tileops.convolution import Conv1dFwdOp, Conv2dFwdOp, Conv3dFwdOp
+from workloads.convolution import (
+    Conv1dWorkload,
+    Conv2dWorkload,
+    Conv3dWorkload,
+    convolution_reference,
+    convolution_verification,
 )
-from tileops.ops import (
-    Conv1dFwdOp,
-    Conv2dFwdOp,
-    Conv3dFwdOp,
-)
-from tileops.ops.convolution import _can_use_conv3d_ndhwc
-from workloads.convolution import Conv1dWorkload, Conv2dWorkload, Conv3dWorkload
+from workloads.device import run_device
+from workloads.numerics import compare_outputs
 
 for _op_cls in (Conv1dFwdOp, Conv2dFwdOp, Conv3dFwdOp):
     register_compile_contract(_op_cls)
@@ -48,7 +40,7 @@ class Conv1dFixture(FixtureBase):
                     1,
                     torch.float16,
                     False,
-                    marks=[pytest.mark.smoke, pytest.mark.packaging],
+                    marks=[pytest.mark.smoke, pytest.mark.packaging(family="convolution")],
                     id="smoke-tcn-k3-s1-fp16",
                 ),
                 pytest.param(
@@ -65,6 +57,21 @@ class Conv1dFixture(FixtureBase):
                     False,
                     marks=pytest.mark.smoke,
                     id="smoke-tcn-k3-s1-bf16",
+                ),
+                pytest.param(
+                    1,
+                    17,
+                    5,
+                    7,
+                    3,
+                    1,
+                    5,
+                    2,
+                    1,
+                    torch.float16,
+                    False,
+                    marks=pytest.mark.smoke,
+                    id="smoke-padding-wider-than-row-fp16",
                 ),
                 pytest.param(
                     4,
@@ -255,41 +262,31 @@ def test_conv1d(
     tune: bool,
 ) -> None:
     test = Conv1dTest(n, c_in, l_in, c_out, kernel_size, stride, padding, dilation, groups, dtype)
-    op = Conv1dFwdOp(
-        stride=stride,
-        padding=padding,
-        dilation=dilation,
-        groups=groups,
-        tune=tune,
-    )
-    atol, rtol = (1e-3, 1e-3)
-    if dtype == torch.bfloat16:
-        atol, rtol = (1.6e-2, 1.6e-2)
-    test.check(op, *test.gen_inputs(), atol=atol, rtol=rtol)
-    if groups > 1:
-        assert isinstance(op.kernel, GroupConv1dKernel)
-        assert op.kernel.use_direct is (c_in // groups == 1 and c_out // groups == 1)
+    op = Conv1dFwdOp(stride=stride, padding=padding, dilation=dilation, groups=groups)
+    if tune:
+        op.request_tune()
+    test.check(op, *test.gen_inputs())
 
 
 @pytest.mark.smoke
 def test_conv1d_no_bias_matches_torch() -> None:
     op = Conv1dFwdOp(stride=2, padding=2)
-    x = torch.randn(1, 32, 256, device="ptpu", dtype=torch.float16).contiguous()
-    weight = torch.randn(64, 32, 5, device="ptpu", dtype=torch.float16).contiguous()
+    x = torch.randn(1, 32, 256, device=run_device(), dtype=torch.float16).contiguous()
+    weight = torch.randn(64, 32, 5, device=run_device(), dtype=torch.float16).contiguous()
     out = op(x, weight)
-    ref = F.conv1d(x.cpu(), weight.cpu(), bias=None, stride=2, padding=2).contiguous()
-    torch.testing.assert_close(out.cpu(), ref, atol=1e-3, rtol=1e-3)
+    ref = convolution_reference(F.conv1d, x, weight, bias=None, stride=2, padding=2).contiguous()
+    compare_outputs(out, ref, convolution_verification(out.dtype))
 
 
 @pytest.mark.smoke
 def test_conv1d_bias_matches_torch() -> None:
     op = Conv1dFwdOp(stride=2, padding=2)
-    x = torch.randn(1, 32, 256, device="ptpu", dtype=torch.float16).contiguous()
-    weight = torch.randn(64, 32, 5, device="ptpu", dtype=torch.float16).contiguous()
-    bias = torch.zeros(64, device="ptpu", dtype=torch.float16).contiguous()
+    x = torch.randn(1, 32, 256, device=run_device(), dtype=torch.float16).contiguous()
+    weight = torch.randn(64, 32, 5, device=run_device(), dtype=torch.float16).contiguous()
+    bias = torch.zeros(64, device=run_device(), dtype=torch.float16).contiguous()
     out = op(x, weight, bias)
-    ref = F.conv1d(x.cpu(), weight.cpu(), bias=bias.cpu(), stride=2, padding=2).contiguous()
-    torch.testing.assert_close(out.cpu(), ref, atol=1e-3, rtol=1e-3)
+    ref = convolution_reference(F.conv1d, x, weight, bias=bias, stride=2, padding=2).contiguous()
+    compare_outputs(out, ref, convolution_verification(out.dtype))
 
 
 @pytest.mark.parametrize(
@@ -307,11 +304,18 @@ def test_conv1d_dilation_matches_torch(dilation, use_bias: bool) -> None:
         padding=padding,
         dilation=dilation,
     )
-    x = torch.randn(n, c_in, l_in, device="ptpu", dtype=torch.float16).contiguous()
-    weight = torch.randn(c_out, c_in, kernel_size, device="ptpu", dtype=torch.float16).contiguous()
-    bias = torch.randn(c_out, device="ptpu", dtype=torch.float16).contiguous() if use_bias else None
+    x = torch.randn(n, c_in, l_in, device=run_device(), dtype=torch.float16).contiguous()
+    weight = torch.randn(
+        c_out, c_in, kernel_size, device=run_device(), dtype=torch.float16
+    ).contiguous()
+    bias = (
+        torch.randn(c_out, device=run_device(), dtype=torch.float16).contiguous()
+        if use_bias
+        else None
+    )
     out = op(x, weight, bias) if use_bias else op(x, weight)
-    ref = F.conv1d(
+    ref = convolution_reference(
+        F.conv1d,
         x.cpu(),
         weight.cpu(),
         bias=bias.cpu() if bias is not None else None,
@@ -320,7 +324,7 @@ def test_conv1d_dilation_matches_torch(dilation, use_bias: bool) -> None:
         dilation=2,
     )
     ref = ref.contiguous()
-    torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=3e-3)
+    compare_outputs(out, ref, convolution_verification(out.dtype))
 
 
 @pytest.mark.smoke
@@ -331,22 +335,29 @@ def test_conv1d_dilation_matches_torch(dilation, use_bias: bool) -> None:
 def test_conv1d_same_padding_even_kernel_matches_torch(use_bias: bool) -> None:
     n, c_in, l_in, c_out, kernel_size = 1, 16, 129, 32, 2
     op = Conv1dFwdOp(padding="same")
-    x = torch.randn(n, c_in, l_in, device="ptpu", dtype=torch.float16).contiguous()
-    weight = torch.randn(c_out, c_in, kernel_size, device="ptpu", dtype=torch.float16).contiguous()
-    bias = torch.randn(c_out, device="ptpu", dtype=torch.float16).contiguous() if use_bias else None
-    out = op(x, weight, bias) if use_bias else op(x, weight)
-    ref = F.conv1d(
-        x.cpu(), weight.cpu(), bias=bias.cpu() if bias is not None else None, padding="same"
+    x = torch.randn(n, c_in, l_in, device=run_device(), dtype=torch.float16).contiguous()
+    weight = torch.randn(
+        c_out, c_in, kernel_size, device=run_device(), dtype=torch.float16
     ).contiguous()
-    torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=3e-3)
+    bias = (
+        torch.randn(c_out, device=run_device(), dtype=torch.float16).contiguous()
+        if use_bias
+        else None
+    )
+    out = op(x, weight, bias) if use_bias else op(x, weight)
+    ref = convolution_reference(F.conv1d, x, weight, bias=bias, padding="same").contiguous()
+    compare_outputs(
+        out, ref, convolution_verification(out.dtype, padding="same", kernel_shape=weight.shape[2:])
+    )
 
 
 @pytest.mark.smoke
 @pytest.mark.parametrize(
-    "kernel_size, stride, padding, dilation, expected_kernel",
+    "kernel_size, stride, padding, dilation",
     [
-        pytest.param(3, 1, 1, 1, Conv1dKernel, id="generic"),
-        pytest.param(1, 1, 0, 1, Conv1dPointwiseKernel, id="pointwise"),
+        pytest.param(3, 1, 1, 1, id="unit-stride"),
+        pytest.param(3, 2, 1, 1, id="generic"),
+        pytest.param(1, 1, 0, 1, id="pointwise"),
     ],
 )
 def test_conv1d_dispatches_kernel(
@@ -354,21 +365,33 @@ def test_conv1d_dispatches_kernel(
     stride: int,
     padding: int,
     dilation: int,
-    expected_kernel: type,
 ) -> None:
     op = Conv1dFwdOp(
         stride=stride,
         padding=padding,
         dilation=dilation,
     )
-    x = torch.randn(1, 32, 256, device="ptpu", dtype=torch.float16).contiguous()
-    weight = torch.randn(64, 32, kernel_size, device="ptpu", dtype=torch.float16).contiguous()
+    x = torch.randn(1, 32, 256, device=run_device(), dtype=torch.float16).contiguous()
+    weight = torch.randn(64, 32, kernel_size, device=run_device(), dtype=torch.float16).contiguous()
     out = op(x, weight)
-    assert isinstance(op.kernel, expected_kernel)
-    ref = F.conv1d(
-        x.cpu(), weight.cpu(), bias=None, stride=stride, padding=padding, dilation=dilation
+    ref = convolution_reference(
+        F.conv1d, x, weight, bias=None, stride=stride, padding=padding, dilation=dilation
     )
-    torch.testing.assert_close(out.cpu(), ref.contiguous(), atol=1e-3, rtol=1e-3)
+    compare_outputs(out, ref.contiguous(), convolution_verification(out.dtype))
+
+
+@pytest.mark.parametrize(
+    "tune",
+    [pytest.param(False, marks=pytest.mark.smoke), pytest.param(True, marks=pytest.mark.full)],
+)
+def test_conv1d_unit_stride_under_tuning(tune: bool) -> None:
+    """c_in = 130 puts each tap's weight columns off a 16-byte boundary and needs two channel
+    blocks; the padding gives boundary CTAs, whichever taps per k tile tuning picks."""
+    test = Conv1dTest(1, 130, 260, 67, 4, 1, 3, 2, 1, torch.float16)
+    op = Conv1dFwdOp(padding=3, dilation=2)
+    if tune:
+        op.request_tune()
+    test.check(op, *test.gen_inputs())
 
 
 class Conv2dFixture(FixtureBase):
@@ -391,6 +414,22 @@ class Conv2dFixture(FixtureBase):
                     False,
                     marks=pytest.mark.smoke,
                     id="smoke-fp16-3x3",
+                ),
+                pytest.param(
+                    2,
+                    32,
+                    32,
+                    32,
+                    64,
+                    (3, 3),
+                    (1, 1),
+                    (1, 1),
+                    (1, 1),
+                    1,
+                    torch.float32,
+                    False,
+                    marks=pytest.mark.smoke,
+                    id="smoke-fp32-3x3",
                 ),
                 pytest.param(
                     2,
@@ -627,17 +666,10 @@ def test_conv2d(
     tune: bool,
 ) -> None:
     test = Conv2dTest(n, c_in, h, w, c_out, kernel_size, stride, padding, dilation, groups, dtype)
-    op = Conv2dFwdOp(
-        stride=stride,
-        padding=padding,
-        dilation=dilation,
-        groups=groups,
-        tune=tune,
-    )
-    atol, rtol = (1e-3, 1e-3) if dtype == torch.float16 else (1.6e-2, 1.6e-2)
-    test.check(op, *test.gen_inputs(), atol=atol, rtol=rtol)
-    if groups > 1:
-        assert isinstance(op.kernel, GroupConv2dKernel)
+    op = Conv2dFwdOp(stride=stride, padding=padding, dilation=dilation, groups=groups)
+    if tune:
+        op.request_tune()
+    test.check(op, *test.gen_inputs())
 
 
 @pytest.mark.smoke
@@ -647,10 +679,11 @@ def test_conv2d_no_bias_matches_torch() -> None:
         padding=4,
         dilation=2,
     )
-    x = torch.randn(1, 32, 16, 16, device="ptpu", dtype=torch.float16).contiguous()
-    weight = torch.randn(64, 32, 5, 5, device="ptpu", dtype=torch.float16).contiguous()
+    x = torch.randn(1, 32, 16, 16, device=run_device(), dtype=torch.float16).contiguous()
+    weight = torch.randn(64, 32, 5, 5, device=run_device(), dtype=torch.float16).contiguous()
     out = op(x, weight)
-    ref = F.conv2d(
+    ref = convolution_reference(
+        F.conv2d,
         x.cpu(),
         weight.cpu(),
         bias=None,
@@ -659,7 +692,7 @@ def test_conv2d_no_bias_matches_torch() -> None:
         dilation=2,
     )
     ref = ref.contiguous()
-    torch.testing.assert_close(out.cpu(), ref, atol=1e-3, rtol=1e-3)
+    compare_outputs(out, ref, convolution_verification(out.dtype))
 
 
 @pytest.mark.smoke
@@ -669,11 +702,13 @@ def test_conv2d_no_bias_grouped_matches_torch() -> None:
         padding=1,
         groups=groups,
     )
-    x = torch.randn(1, 16, 16, 16, device="ptpu", dtype=torch.float16).contiguous()
-    weight = torch.randn(32, 2, 3, 3, device="ptpu", dtype=torch.float16).contiguous()
+    x = torch.randn(1, 16, 16, 16, device=run_device(), dtype=torch.float16).contiguous()
+    weight = torch.randn(32, 2, 3, 3, device=run_device(), dtype=torch.float16).contiguous()
     out = op(x, weight)
-    ref = F.conv2d(x.cpu(), weight.cpu(), bias=None, padding=1, groups=groups).contiguous()
-    torch.testing.assert_close(out.cpu(), ref, atol=1e-3, rtol=1e-3)
+    ref = convolution_reference(
+        F.conv2d, x, weight, bias=None, padding=1, groups=groups
+    ).contiguous()
+    compare_outputs(out, ref, convolution_verification(out.dtype))
 
 
 @pytest.mark.smoke
@@ -682,64 +717,50 @@ def test_conv2d_depthwise_dispatches_the_direct_kernel(use_bias: bool) -> None:
     """S2 retains the grouped GEMM path for depthwise convolution."""
     channels = 32
     op = Conv2dFwdOp(padding=1, groups=channels)
-    x = torch.randn(1, channels, 28, 28, device="ptpu", dtype=torch.float16).contiguous()
-    weight = torch.randn(channels, 1, 3, 3, device="ptpu", dtype=torch.float16).contiguous()
+    x = torch.randn(1, channels, 28, 28, device=run_device(), dtype=torch.float16).contiguous()
+    weight = torch.randn(channels, 1, 3, 3, device=run_device(), dtype=torch.float16).contiguous()
     bias = (
-        torch.randn(channels, device="ptpu", dtype=torch.float16).contiguous() if use_bias else None
+        torch.randn(channels, device=run_device(), dtype=torch.float16).contiguous()
+        if use_bias
+        else None
     )
 
     out = op(x, weight, bias)
 
-    assert isinstance(op.kernel, GroupConv2dKernel) and op.kernel.use_direct
-    ref = F.conv2d(
-        x.cpu(), weight.cpu(), bias=None if bias is None else bias.cpu(), padding=1, groups=channels
+    ref = convolution_reference(
+        F.conv2d, x, weight, bias=bias, padding=1, groups=channels
     ).contiguous()
-    torch.testing.assert_close(out.cpu(), ref, atol=1e-3, rtol=1e-3)
+    compare_outputs(out, ref, convolution_verification(out.dtype))
 
 
 @pytest.mark.smoke
 def test_conv2d_dispatches_1x1_kernel() -> None:
     op = Conv2dFwdOp()
-    x = torch.randn(1, 32, 32, 32, device="ptpu", dtype=torch.float16).contiguous()
-    weight = torch.randn(64, 32, 1, 1, device="ptpu", dtype=torch.float16).contiguous()
+    x = torch.randn(1, 32, 32, 32, device=run_device(), dtype=torch.float16).contiguous()
+    weight = torch.randn(64, 32, 1, 1, device=run_device(), dtype=torch.float16).contiguous()
     out = op(x, weight)
-    assert isinstance(op.kernel, Conv2d1x1Kernel)
-    ref = F.conv2d(x.cpu(), weight.cpu(), bias=None, padding=0)
-    torch.testing.assert_close(out.cpu(), ref.contiguous(), atol=1e-3, rtol=1e-3)
-
-
-@pytest.mark.smoke
-def test_conv2d_does_not_dispatch_1x1_kernel_with_padding() -> None:
-    # Use c_in not divisible by 32 so the symmetric kernel is not selected and
-    # the general kernel handles the padded 1x1 case without the im2col-TMA
-    # constraints that affect the symmetric path.
-    op = Conv2dFwdOp(padding=1)
-    x = torch.randn(1, 16, 32, 32, device="ptpu", dtype=torch.float16).contiguous()
-    weight = torch.randn(64, 16, 1, 1, device="ptpu", dtype=torch.float16).contiguous()
-    op(x, weight)
-    assert not isinstance(op.kernel, Conv2d1x1Kernel)
+    ref = convolution_reference(F.conv2d, x, weight, bias=None, padding=0)
+    compare_outputs(out, ref.contiguous(), convolution_verification(out.dtype))
 
 
 @pytest.mark.smoke
 def test_conv2d_dispatches_3x3_kernel() -> None:
     op = Conv2dFwdOp(padding=1)
-    x = torch.randn(1, 32, 32, 32, device="ptpu", dtype=torch.float16).contiguous()
-    weight = torch.randn(64, 32, 3, 3, device="ptpu", dtype=torch.float16).contiguous()
+    x = torch.randn(1, 32, 32, 32, device=run_device(), dtype=torch.float16).contiguous()
+    weight = torch.randn(64, 32, 3, 3, device=run_device(), dtype=torch.float16).contiguous()
     out = op(x, weight)
-    assert isinstance(op.kernel, Conv2dSymmetricKernel)
-    ref = F.conv2d(x.cpu(), weight.cpu(), bias=None, padding=1)
-    torch.testing.assert_close(out.cpu(), ref.contiguous(), atol=1e-3, rtol=1e-3)
+    ref = convolution_reference(F.conv2d, x, weight, bias=None, padding=1)
+    compare_outputs(out, ref.contiguous(), convolution_verification(out.dtype))
 
 
 @pytest.mark.smoke
 def test_conv2d_dispatches_5x5_kernel() -> None:
     op = Conv2dFwdOp(padding=2)
-    x = torch.randn(1, 32, 32, 32, device="ptpu", dtype=torch.float16).contiguous()
-    weight = torch.randn(64, 32, 5, 5, device="ptpu", dtype=torch.float16).contiguous()
+    x = torch.randn(1, 32, 32, 32, device=run_device(), dtype=torch.float16).contiguous()
+    weight = torch.randn(64, 32, 5, 5, device=run_device(), dtype=torch.float16).contiguous()
     out = op(x, weight)
-    assert isinstance(op.kernel, Conv2dSymmetricKernel)
-    ref = F.conv2d(x.cpu(), weight.cpu(), bias=None, padding=2)
-    torch.testing.assert_close(out.cpu(), ref.contiguous(), atol=1e-3, rtol=1e-3)
+    ref = convolution_reference(F.conv2d, x, weight, bias=None, padding=2)
+    compare_outputs(out, ref.contiguous(), convolution_verification(out.dtype))
 
 
 @pytest.mark.smoke
@@ -748,21 +769,11 @@ def test_conv2d_batch_with_partial_tile_leaves_the_symmetric_kernel() -> None:
     # so an m tile would span two images and its implicit GEMM would take the wrong
     # image for the tail. More than one image therefore goes elsewhere.
     op = Conv2dFwdOp()
-    x = torch.randn(5, 96, 9, 9, device="ptpu", dtype=torch.float16).contiguous()
-    weight = torch.randn(64, 96, 3, 3, device="ptpu", dtype=torch.float16).contiguous()
+    x = torch.randn(5, 96, 9, 9, device=run_device(), dtype=torch.float16).contiguous()
+    weight = torch.randn(64, 96, 3, 3, device=run_device(), dtype=torch.float16).contiguous()
     out = op(x, weight)
-    assert not isinstance(op.kernel, Conv2dSymmetricKernel)
-    ref = F.conv2d(x.cpu(), weight.cpu(), bias=None)
-    torch.testing.assert_close(out.cpu(), ref.contiguous(), atol=1e-2, rtol=1e-2)
-
-
-@pytest.mark.smoke
-def test_conv2d_symmetric_kernel_refuses_a_tile_that_spans_two_images() -> None:
-    # applies() keeps the dispatcher off this shape, so only a direct construction
-    # reaches the kernel with a tile that would run off the end of an image. It has to
-    # be told, rather than left to write the wrong rows.
-    with pytest.raises(ValueError, match="spans two of this call's 5 images"):
-        Conv2dSymmetricKernel(5, 96, 9, 9, 64, 3, 1, 0, 1, torch.float16)
+    ref = convolution_reference(F.conv2d, x, weight, bias=None)
+    compare_outputs(out, ref.contiguous(), convolution_verification(out.dtype))
 
 
 class Conv3dFixture(FixtureBase):
@@ -786,6 +797,23 @@ class Conv3dFixture(FixtureBase):
                     False,
                     marks=pytest.mark.smoke,
                     id="smoke-3d-unet-k3-s1-fp16",
+                ),
+                pytest.param(
+                    1,
+                    16,
+                    8,
+                    32,
+                    32,
+                    32,
+                    (3, 3, 3),
+                    (1, 1, 1),
+                    (1, 1, 1),
+                    (1, 1, 1),
+                    1,
+                    torch.float32,
+                    False,
+                    marks=pytest.mark.smoke,
+                    id="smoke-3d-unet-k3-s1-fp32",
                 ),
                 pytest.param(
                     1,
@@ -954,31 +982,10 @@ def test_conv3d(
     test = Conv3dTest(
         n, c_in, d, h, w, c_out, kernel_size, stride, padding, dilation, groups, dtype
     )
-    op = Conv3dFwdOp(
-        stride=stride,
-        padding=padding,
-        dilation=dilation,
-        groups=groups,
-        tune=tune,
-    )
-    atol, rtol = (1e-3, 1e-3) if dtype == torch.float16 else (1.6e-2, 1.6e-2)
-    test.check(op, *test.gen_inputs(), atol=atol, rtol=rtol)
-    if _can_use_conv3d_ndhwc(
-        groups=groups,
-        c_in=c_in,
-        c_out=c_out,
-        kernel_d=kernel_size[0],
-        kernel_h=kernel_size[1],
-        kernel_w=kernel_size[2],
-        out_d=op.out_d,
-        out_h=op.out_h,
-        out_w=op.out_w,
-        n=n,
-        dtype=dtype,
-    ):
-        assert isinstance(op.kernel, Conv3dNdhwcKernel)
-    if groups > 1:
-        assert isinstance(op.kernel, GroupConv3dKernel)
+    op = Conv3dFwdOp(stride=stride, padding=padding, dilation=dilation, groups=groups)
+    if tune:
+        op.request_tune()
+    test.check(op, *test.gen_inputs())
 
 
 @pytest.mark.smoke
@@ -988,10 +995,11 @@ def test_conv3d_no_bias_matches_torch() -> None:
         padding=2,
         dilation=2,
     )
-    x = torch.randn(1, 8, 8, 16, 16, device="ptpu", dtype=torch.float16).contiguous()
-    weight = torch.randn(16, 8, 3, 3, 3, device="ptpu", dtype=torch.float16).contiguous()
+    x = torch.randn(1, 8, 8, 16, 16, device=run_device(), dtype=torch.float16).contiguous()
+    weight = torch.randn(16, 8, 3, 3, 3, device=run_device(), dtype=torch.float16).contiguous()
     out = op(x, weight)
-    ref = F.conv3d(
+    ref = convolution_reference(
+        F.conv3d,
         x.cpu(),
         weight.cpu(),
         bias=None,
@@ -1000,7 +1008,28 @@ def test_conv3d_no_bias_matches_torch() -> None:
         dilation=2,
     )
     ref = ref.contiguous()
-    torch.testing.assert_close(out.cpu(), ref, atol=1e-3, rtol=1e-3)
+    compare_outputs(out, ref, convolution_verification(out.dtype))
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "op_cls, conv, x_shape, w_shape",
+    [
+        pytest.param(Conv2dFwdOp, F.conv2d, (1, 16, 17, 20), (32, 16, 2, 3), id="conv2d"),
+        # Wide and large enough for the NDHWC path.
+        pytest.param(Conv3dFwdOp, F.conv3d, (1, 32, 8, 16, 16), (64, 32, 2, 3, 4), id="conv3d"),
+    ],
+)
+def test_same_padding_with_an_odd_total_matches_torch(op_cls, conv, x_shape, w_shape) -> None:
+    """torch puts the extra element of an odd ``'same'`` total after the axis."""
+    x = torch.randn(*x_shape, device=run_device(), dtype=torch.float16)
+    weight = torch.randn(*w_shape, device=run_device(), dtype=torch.float16)
+    bias = torch.randn(w_shape[0], device=run_device(), dtype=torch.float16)
+    out = op_cls(padding="same")(x, weight, bias)
+    ref = convolution_reference(conv, x, weight, bias=bias, padding="same")
+    compare_outputs(
+        out, ref, convolution_verification(out.dtype, padding="same", kernel_shape=weight.shape[2:])
+    )
 
 
 @pytest.mark.smoke
@@ -1010,11 +1039,13 @@ def test_conv3d_no_bias_grouped_matches_torch() -> None:
         padding=1,
         groups=groups,
     )
-    x = torch.randn(1, 8, 4, 12, 12, device="ptpu", dtype=torch.float16).contiguous()
-    weight = torch.randn(16, 2, 3, 3, 3, device="ptpu", dtype=torch.float16).contiguous()
+    x = torch.randn(1, 8, 4, 12, 12, device=run_device(), dtype=torch.float16).contiguous()
+    weight = torch.randn(16, 2, 3, 3, 3, device=run_device(), dtype=torch.float16).contiguous()
     out = op(x, weight)
-    ref = F.conv3d(x.cpu(), weight.cpu(), bias=None, padding=1, groups=groups).contiguous()
-    torch.testing.assert_close(out.cpu(), ref, atol=1e-3, rtol=1e-3)
+    ref = convolution_reference(
+        F.conv3d, x, weight, bias=None, padding=1, groups=groups
+    ).contiguous()
+    compare_outputs(out, ref, convolution_verification(out.dtype))
 
 
 @pytest.mark.smoke
@@ -1023,126 +1054,115 @@ def test_conv3d_accepts_zero_bias() -> None:
         stride=2,
         padding=1,
     )
-    x = torch.randn(1, 8, 8, 16, 16, device="ptpu", dtype=torch.float16).contiguous()
-    weight = torch.randn(16, 8, 3, 3, 3, device="ptpu", dtype=torch.float16).contiguous()
-    bias = torch.zeros(16, device="ptpu", dtype=torch.float16).contiguous()
+    x = torch.randn(1, 8, 8, 16, 16, device=run_device(), dtype=torch.float16).contiguous()
+    weight = torch.randn(16, 8, 3, 3, 3, device=run_device(), dtype=torch.float16).contiguous()
+    bias = torch.zeros(16, device=run_device(), dtype=torch.float16).contiguous()
     out = op(x, weight, bias)
-    ref = F.conv3d(
+    ref = convolution_reference(
+        F.conv3d,
         x.cpu(),
         weight.cpu(),
         bias=bias.cpu(),
         stride=2,
         padding=1,
-    ).contiguous()
-    torch.ptpu.synchronize()
-    torch.testing.assert_close(out.cpu(), ref, atol=1e-3, rtol=1e-3)
-
-
-@pytest.mark.smoke
-def test_conv3d_dispatches_kernel() -> None:
-    op = Conv3dFwdOp(stride=1, padding=1)
-    x = torch.randn(1, 8, 8, 32, 32, device="ptpu", dtype=torch.float16).contiguous()
-    weight = torch.randn(16, 8, 3, 3, 3, device="ptpu", dtype=torch.float16).contiguous()
-    op(x, weight)
-    assert isinstance(op.kernel, Conv3dKernel)
+    )
+    ref = ref.contiguous()
+    compare_outputs(out, ref, convolution_verification(out.dtype))
 
 
 @pytest.mark.smoke
 def test_conv3d_dispatches_ndhwc_kernel_no_bias() -> None:
     op = Conv3dFwdOp(stride=1, padding=1)
-    x = torch.randn(1, 32, 8, 16, 16, device="ptpu", dtype=torch.float16).contiguous()
-    weight = torch.randn(64, 32, 3, 3, 3, device="ptpu", dtype=torch.float16).contiguous()
+    x = torch.randn(1, 32, 8, 16, 16, device=run_device(), dtype=torch.float16).contiguous()
+    weight = torch.randn(64, 32, 3, 3, 3, device=run_device(), dtype=torch.float16).contiguous()
 
     out = op(x, weight)
 
-    assert isinstance(op.kernel, Conv3dNdhwcKernel)
-    ref = F.conv3d(x.cpu(), weight.cpu(), bias=None, stride=1, padding=1).contiguous()
-    torch.testing.assert_close(out.cpu(), ref, atol=1e-3, rtol=1e-3)
+    ref = convolution_reference(F.conv3d, x, weight, bias=None, stride=1, padding=1).contiguous()
+    compare_outputs(out, ref, convolution_verification(out.dtype))
 
 
 @pytest.mark.smoke
-def test_conv3d_ndhwc_kernel_roofline_counts_layout_traffic() -> None:
+def test_conv3d_ndhwc_tiles_straddle_batches() -> None:
+    """Two batches of 1125 output positions: a tile of positions runs from one batch into
+    the next, and each position lands in its own batch of the NCDHW result."""
     op = Conv3dFwdOp(stride=1, padding=1)
-    x = torch.randn(1, 32, 8, 16, 16, device="ptpu", dtype=torch.float16).contiguous()
-    weight = torch.randn(64, 32, 3, 3, 3, device="ptpu", dtype=torch.float16).contiguous()
+    x = torch.randn(2, 32, 5, 15, 15, device=run_device(), dtype=torch.float16).contiguous()
+    weight = torch.randn(64, 32, 3, 3, 3, device=run_device(), dtype=torch.float16).contiguous()
+
+    out = op(x, weight)
+
+    ref = convolution_reference(F.conv3d, x, weight, bias=None, stride=1, padding=1).contiguous()
+    compare_outputs(out, ref, convolution_verification(out.dtype))
+
+
+@pytest.mark.smoke
+@pytest.mark.in_tree_kernels
+@pytest.mark.parametrize(
+    ("op_type", "groups", "x_shape", "w_shape"),
+    [
+        pytest.param(Conv1dFwdOp, 1, (70_000, 4, 8), (8, 4, 3), id="images-conv1d"),
+        pytest.param(
+            Conv2dFwdOp, 640, (128, 1280, 4, 4), (1280, 2, 3, 3), id="grouped-images-conv2d"
+        ),
+    ],
+)
+def test_conv_past_the_grid_z_limit_is_refused_before_building(
+    op_type, groups, x_shape, w_shape
+) -> None:
+    """The kernels that serve these calls put one image, or one group of an image, a block
+    row along grid z, which CUDA caps at 65535: the op names that limit rather than failing
+    at launch."""
+    op = op_type(padding=1, groups=groups)
+    x = torch.randn(x_shape, device=run_device(), dtype=torch.float16)
+    weight = torch.randn(w_shape, device=run_device(), dtype=torch.float16)
+
+    with pytest.raises(ValueError, match="blocks along grid z"):
+        op(x, weight)
+    (interface,) = op_type.interfaces
+    assert not op._entries_built(interface)
+
+
+@pytest.mark.smoke
+def test_conv3d_roofline_ignores_the_serving_kernel_layout_traffic() -> None:
+    """The channels-last kernel stages input and weight. Those buffers are
+    intermediates of one implementation, and the roofline is the algorithm's minimum
+    traffic, so the number does not move with them."""
+    op = Conv3dFwdOp(stride=1, padding=1)
+    x = torch.randn(1, 32, 8, 16, 16, device=run_device(), dtype=torch.float16).contiguous()
+    weight = torch.randn(64, 32, 3, 3, 3, device=run_device(), dtype=torch.float16).contiguous()
 
     op(x, weight)
 
-    assert isinstance(op.kernel, Conv3dNdhwcKernel)
     _, nbytes = op.eval_roofline()
     out_elems = 1 * 64 * 8 * 16 * 16
     input_elems = 1 * 32 * 8 * 16 * 16
     weight_elems = 64 * 32 * 3 * 3 * 3
-    semantic_bytes = (input_elems + weight_elems + out_elems) * x.element_size()
-    layout_bytes = (input_elems + weight_elems + 2 * out_elems) * x.element_size()
-    assert nbytes == semantic_bytes + layout_bytes
+    assert nbytes == (input_elems + weight_elems + out_elems) * x.element_size()
 
 
 @pytest.mark.smoke
 def test_conv3d_does_not_dispatch_ndhwc_for_pointwise() -> None:
     op = Conv3dFwdOp(stride=1, padding=0)
-    x = torch.randn(1, 32, 8, 16, 16, device="ptpu", dtype=torch.float16).contiguous()
-    weight = torch.randn(64, 32, 1, 1, 1, device="ptpu", dtype=torch.float16).contiguous()
+    x = torch.randn(1, 32, 8, 16, 16, device=run_device(), dtype=torch.float16).contiguous()
+    weight = torch.randn(64, 32, 1, 1, 1, device=run_device(), dtype=torch.float16).contiguous()
 
     out = op(x, weight)
 
-    assert isinstance(op.kernel, Conv3dKernel)
-    ref = F.conv3d(x.cpu(), weight.cpu(), bias=None, stride=1, padding=0).contiguous()
-    torch.testing.assert_close(out.cpu(), ref, atol=1e-3, rtol=1e-3)
+    ref = convolution_reference(F.conv3d, x, weight, bias=None, stride=1, padding=0).contiguous()
+    compare_outputs(out, ref, convolution_verification(out.dtype))
 
 
 @pytest.mark.smoke
 def test_conv3d_does_not_dispatch_ndhwc_for_small_output() -> None:
     op = Conv3dFwdOp(stride=1, padding=1)
-    x = torch.randn(1, 32, 2, 4, 4, device="ptpu", dtype=torch.float16).contiguous()
-    weight = torch.randn(64, 32, 3, 3, 3, device="ptpu", dtype=torch.float16).contiguous()
+    x = torch.randn(1, 32, 2, 4, 4, device=run_device(), dtype=torch.float16).contiguous()
+    weight = torch.randn(64, 32, 3, 3, 3, device=run_device(), dtype=torch.float16).contiguous()
 
     out = op(x, weight)
 
-    assert isinstance(op.kernel, Conv3dKernel)
-    ref = F.conv3d(x.cpu(), weight.cpu(), bias=None, stride=1, padding=1).contiguous()
-    torch.testing.assert_close(out.cpu(), ref, atol=1e-3, rtol=1e-3)
-
-
-@pytest.mark.smoke
-def test_conv3d_ndhwc_guard_rejects_float32() -> None:
-    assert not _can_use_conv3d_ndhwc(
-        groups=1,
-        c_in=32,
-        c_out=64,
-        kernel_d=3,
-        kernel_h=3,
-        kernel_w=3,
-        out_d=8,
-        out_h=16,
-        out_w=16,
-        n=1,
-        dtype=torch.float32,
-    )
-
-
-@pytest.mark.smoke
-def test_conv2d_dynamic_shape_kernel_cache_and_roofline() -> None:
-    op = Conv2dFwdOp(stride=1, padding=1)
-    x1 = torch.randn(1, 16, 32, 32, dtype=torch.float16, device="ptpu")
-    w1 = torch.randn(24, 16, 3, 3, dtype=torch.float16, device="ptpu")
-    x2 = torch.randn(2, 16, 32, 32, dtype=torch.float16, device="ptpu")
-    w2 = torch.randn(24, 16, 3, 3, dtype=torch.float16, device="ptpu")
-
-    with pytest.raises(RuntimeError, match="requires a prior forward"):
-        op.eval_roofline()
-
-    op(x1, w1)
-    assert len(list(op.iter_kernels())) == 1
-    flops, nbytes = op.eval_roofline()
-    assert flops > 0
-    assert nbytes > 0
-
-    op(x1, w1)
-    assert len(list(op.iter_kernels())) == 1
-
-    op(x2, w2)
-    assert len(list(op.iter_kernels())) == 2
+    ref = convolution_reference(F.conv3d, x, weight, bias=None, stride=1, padding=1).contiguous()
+    compare_outputs(out, ref, convolution_verification(out.dtype))
 
 
 @pytest.mark.smoke
@@ -1150,52 +1170,15 @@ def test_conv1d_depthwise_no_bias_matches_torch() -> None:
     """The depthwise-direct path is the one Conv1d variant no other no-bias case reaches."""
     groups = 32
     op = Conv1dFwdOp(padding=1, groups=groups)
-    x = torch.randn(1, groups, 128, device="ptpu", dtype=torch.float16).contiguous()
-    weight = torch.randn(groups, 1, 3, device="ptpu", dtype=torch.float16).contiguous()
+    x = torch.randn(1, groups, 128, device=run_device(), dtype=torch.float16).contiguous()
+    weight = torch.randn(groups, 1, 3, device=run_device(), dtype=torch.float16).contiguous()
 
     out = op(x, weight)
 
-    assert isinstance(op.kernel, GroupConv1dKernel) and op.kernel.use_direct
-    ref = F.conv1d(x.cpu(), weight.cpu(), bias=None, padding=1, groups=groups).contiguous()
-    torch.testing.assert_close(out.cpu(), ref, atol=1e-3, rtol=1e-3)
-
-
-@pytest.mark.smoke
-def test_a_kernel_built_without_a_bias_refuses_one() -> None:
-    """Bias presence is compiled in, so the two sides are different programs.
-
-    Built directly: through the op the two always agree, so this guard has no op-level
-    entry point.
-    """
-    kernel = Conv2d1x1Kernel(
-        n=1,
-        c_in=32,
-        h=8,
-        w=8,
-        c_out=32,
-        stride_h=1,
-        stride_w=1,
-        pad_h=0,
-        pad_w=0,
-        dtype=torch.float16,
-    )
-    x = torch.randn(1, 32, 8, 8, device="ptpu", dtype=torch.float16).contiguous()
-    weight = torch.randn(32, 32, 1, 1, device="ptpu", dtype=torch.float16).contiguous()
-    bias = torch.randn(32, device="ptpu", dtype=torch.float16).contiguous()
-
-    with pytest.raises(ValueError, match="built without a bias"):
-        kernel(x, weight, bias)
-
-
-@pytest.mark.smoke
-def test_inputs_on_different_devices_are_rejected() -> None:
-    """The kernel memo lets the first input's device speak for the rest, so they agree."""
-    op = Conv2dFwdOp(padding=1)
-    x = torch.randn(1, 8, 8, 8, device="ptpu", dtype=torch.float16).contiguous()
-    weight = torch.randn(4, 8, 3, 3, dtype=torch.float16).contiguous()
-
-    with pytest.raises(ValueError, match="every input on ptpu"):
-        op(x, weight)
+    ref = convolution_reference(
+        F.conv1d, x, weight, bias=None, padding=1, groups=groups
+    ).contiguous()
+    compare_outputs(out, ref, convolution_verification(out.dtype))
 
 
 # --------------------------------------------------------------------------------------
@@ -1209,9 +1192,11 @@ def test_inputs_on_different_devices_are_rejected() -> None:
 def test_conv2d_cold_traces_fullgraph_and_owns_its_graph_nodes(use_bias: bool) -> None:
     """Cold is the whole contract: a warm op has nothing left for dynamo to trace into."""
     op = Conv2dFwdOp(padding=1)
-    x = torch.randn(1, 32, 16, 16, device="ptpu", dtype=torch.float16).contiguous()
-    weight = torch.randn(64, 32, 3, 3, device="ptpu", dtype=torch.float16).contiguous()
-    bias = torch.randn(64, device="ptpu", dtype=torch.float16).contiguous() if use_bias else None
+    x = torch.randn(1, 32, 16, 16, device=run_device(), dtype=torch.float16).contiguous()
+    weight = torch.randn(64, 32, 3, 3, device=run_device(), dtype=torch.float16).contiguous()
+    bias = (
+        torch.randn(64, device=run_device(), dtype=torch.float16).contiguous() if use_bias else None
+    )
 
     assert_op_owns_graph_nodes(op, x, weight, bias)
     torch.testing.assert_close(
@@ -1223,8 +1208,8 @@ def test_conv2d_cold_traces_fullgraph_and_owns_its_graph_nodes(use_bias: bool) -
 @pytest.mark.usefixtures("isolated_dynamo")
 def test_conv1d_cold_traces_fullgraph_and_owns_its_graph_nodes() -> None:
     op = Conv1dFwdOp(padding=1)
-    x = torch.randn(1, 32, 128, device="ptpu", dtype=torch.float16).contiguous()
-    weight = torch.randn(64, 32, 3, device="ptpu", dtype=torch.float16).contiguous()
+    x = torch.randn(1, 32, 128, device=run_device(), dtype=torch.float16).contiguous()
+    weight = torch.randn(64, 32, 3, device=run_device(), dtype=torch.float16).contiguous()
 
     assert_op_owns_graph_nodes(op, x, weight, None)
     torch.testing.assert_close(compile_fullgraph(op, fullgraph=True)(x, weight), op(x, weight))
@@ -1234,8 +1219,8 @@ def test_conv1d_cold_traces_fullgraph_and_owns_its_graph_nodes() -> None:
 @pytest.mark.usefixtures("isolated_dynamo")
 def test_conv3d_cold_traces_fullgraph_and_owns_its_graph_nodes() -> None:
     op = Conv3dFwdOp(padding=1)
-    x = torch.randn(1, 16, 8, 8, 8, device="ptpu", dtype=torch.float16).contiguous()
-    weight = torch.randn(32, 16, 3, 3, 3, device="ptpu", dtype=torch.float16).contiguous()
+    x = torch.randn(1, 16, 8, 8, 8, device=run_device(), dtype=torch.float16).contiguous()
+    weight = torch.randn(32, 16, 3, 3, 3, device=run_device(), dtype=torch.float16).contiguous()
 
     assert_op_owns_graph_nodes(op, x, weight, None)
     torch.testing.assert_close(compile_fullgraph(op, fullgraph=True)(x, weight), op(x, weight))
@@ -1246,11 +1231,34 @@ def test_conv3d_cold_traces_fullgraph_and_owns_its_graph_nodes() -> None:
 def test_a_non_contiguous_input_compiles_to_the_shape_the_fake_promised() -> None:
     """The fake speaks before the body normalizes contiguity, so it promises contiguous."""
     op = Conv2dFwdOp(padding=1)
-    x = torch.randn(1, 32, 16, 32, device="ptpu", dtype=torch.float16)[:, :, :, ::2]
-    weight = torch.randn(64, 32, 3, 3, device="ptpu", dtype=torch.float16).contiguous()
+    x = torch.randn(1, 32, 16, 32, device=run_device(), dtype=torch.float16)[:, :, :, ::2]
+    weight = torch.randn(64, 32, 3, 3, device=run_device(), dtype=torch.float16).contiguous()
     assert not x.is_contiguous()
 
     output = compile_fullgraph(op, fullgraph=True)(x, weight)
 
     assert output.is_contiguous()
     torch.testing.assert_close(output, op(x, weight))
+
+
+@pytest.mark.smoke
+@pytest.mark.sm90
+@pytest.mark.cuda_graph(op="Conv1dFwdOp")
+@pytest.mark.in_tree_kernels
+def test_conv1d_graph_reads_updated_inference_weights() -> None:
+    """Weight packing consumes live data, even without a Tensor version counter."""
+    workload = Conv1dTest(2, 64, 512, 128, 3, 1, 1, 1, 1, torch.float16)
+    op = Conv1dFwdOp(padding=1)
+    with torch.inference_mode():
+        inputs = workload.gen_inputs()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            op(*inputs)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = op(*inputs)
+        inputs[1].mul_(0.5)
+        graph.replay()
+        workload.check(op, *inputs, runs=lambda *args: output)

@@ -1,15 +1,8 @@
-"""Spec-conformance tests for arithmetic reductions.
+"""``SumFwdOp``, ``MeanFwdOp``, ``AmaxFwdOp`` and ``AminFwdOp`` over an innermost extent no
+tile divides, after a tuple or ``None`` ``dim`` moves the reduced axes to the end.
 
-Covers ``SumFwdOp``, ``MeanFwdOp``, ``AmaxFwdOp``, ``AminFwdOp`` against the
-PyTorch reference (``torch.sum`` / ``torch.mean`` / ``torch.amax`` /
-``torch.amin``) across the three ``dim`` shapes the manifest signature
-declares — ``int``, ``tuple[int, ...]``, ``None`` — and both ``keepdim``
-values.
-
-These tests assert the output shape matches PyTorch (in particular, a 0-D
-tensor for ``dim=None, keepdim=False``) and that the numerics match within
-standard reduction tolerances. Once green, the corresponding manifest
-entries can flip from ``status: spec-only`` to ``status: implemented``.
+``dim=int``, the dtypes and ``keepdim`` are covered in ``test_reduce.py``; tuple dims in
+``test_reduce_multidim.py``; ``dim=None`` in ``test_reduce_dim_none.py``.
 """
 
 from __future__ import annotations
@@ -19,12 +12,15 @@ from typing import Callable
 import pytest
 import torch
 
-from tileops.ops.reduction.reduce import (
+from tileops._ops.reduction.reduce import (
     AmaxFwdOp,
     AminFwdOp,
     MeanFwdOp,
     SumFwdOp,
 )
+from workloads.device import run_device
+from workloads.numerics import compare_outputs
+from workloads.reduction import reduction_verification
 
 # (op_cls, torch_fn) pairs.
 _OP_CASES: list[tuple[type, Callable]] = [
@@ -33,17 +29,6 @@ _OP_CASES: list[tuple[type, Callable]] = [
     (AmaxFwdOp, torch.amax),
     (AminFwdOp, torch.amin),
 ]
-
-_SHAPE = (4, 8, 256)
-
-
-def _tol(dtype: torch.dtype) -> dict:
-    # Reduce kernels accumulate in fp32 and only narrow at the boundary, so
-    # half-precision tolerances can stay close to the unit in the last place
-    # of the storage dtype rather than the looser 1e-2 default.
-    if dtype == torch.float32:
-        return {"atol": 1e-4, "rtol": 1e-4}
-    return {"atol": 1e-3, "rtol": 1e-3}
 
 
 def _ref(torch_fn: Callable, x: torch.Tensor, dim, keepdim: bool) -> torch.Tensor:
@@ -60,67 +45,13 @@ def _ref(torch_fn: Callable, x: torch.Tensor, dim, keepdim: bool) -> torch.Tenso
 
 
 @pytest.mark.smoke
-@pytest.mark.parametrize("op_cls, torch_fn", _OP_CASES, ids=[c[0].__name__ for c in _OP_CASES])
-@pytest.mark.parametrize(
-    "dim",
-    [
-        pytest.param(-1, id="dim=int"),
-        pytest.param((0, 2), id="dim=tuple"),
-        pytest.param(None, id="dim=None"),
-    ],
-)
-@pytest.mark.parametrize("keepdim", [False, True], ids=["keepdim=False", "keepdim=True"])
-@pytest.mark.parametrize(
-    "dtype",
-    [torch.float16, torch.bfloat16, torch.float32],
-    ids=["fp16", "bf16", "fp32"],
-)
-def test_arithmetic_reduce_conformance(
-    op_cls: type,
-    torch_fn: Callable,
-    dim,
-    keepdim: bool,
-    dtype: torch.dtype,
-) -> None:
-    """Each (op, dim-shape, keepdim, dtype) cell must match PyTorch."""
-    torch.manual_seed(0)
-    x = torch.randn(*_SHAPE, dtype=dtype, device="ptpu")
-    op = op_cls(dim=dim, keepdim=keepdim)
-    y = op(x)
-    ref = _ref(torch_fn, x, dim, keepdim)
-    assert y.shape == ref.shape, (
-        f"{op_cls.__name__} dim={dim} keepdim={keepdim} dtype={dtype}: "
-        f"shape {y.shape} vs ref {ref.shape}"
-    )
-    torch.testing.assert_close(y.cpu(), ref, **_tol(dtype))
-
-
-@pytest.mark.smoke
-@pytest.mark.parametrize("op_cls, torch_fn", _OP_CASES, ids=[c[0].__name__ for c in _OP_CASES])
-def test_dim_none_keepdim_false_returns_0d(op_cls: type, torch_fn: Callable) -> None:
-    """``dim=None, keepdim=False`` must return a 0-D tensor matching PyTorch."""
-    x = torch.randn(*_SHAPE, dtype=torch.float32, device="ptpu")
-    op = op_cls(dim=None, keepdim=False)
-    y = op(x)
-    ref = _ref(torch_fn, x, None, False)
-    assert y.ndim == 0, f"{op_cls.__name__}: expected 0-D, got shape {y.shape}"
-    assert ref.ndim == 0
-    torch.testing.assert_close(y.cpu(), ref, atol=1e-4, rtol=1e-4)
-
-
-@pytest.mark.smoke
 @pytest.mark.parametrize(
     "op_cls, torch_fn",
     _OP_CASES,
     ids=[c[0].__name__ for c in _OP_CASES],
 )
 @pytest.mark.parametrize(
-    "dim",
-    [
-        pytest.param(-1, id="dim=int"),
-        pytest.param((0, 2), id="dim=tuple"),
-        pytest.param(None, id="dim=None"),
-    ],
+    "dim", [pytest.param((0, 2), id="dim=tuple"), pytest.param(None, id="dim=None")]
 )
 def test_arithmetic_reduce_unaligned_innermost(
     op_cls: type,
@@ -129,18 +60,19 @@ def test_arithmetic_reduce_unaligned_innermost(
 ) -> None:
     """Unaligned innermost dim must still match PyTorch.
 
-    The aligned ``_SHAPE`` (innermost = 256, a kernel-tile multiple) bypasses
+    An aligned innermost extent of 256 (a kernel-tile multiple) bypasses
     the simple-reduce kernel's masked-load boundary path. Use 255 to flush
-    the pad branch on every (op, dim-mode) cell.
+    the pad branch, whose fill value is each op's identity. ``dim=-1`` at an
+    unaligned N is covered by ``test_reduce.py``'s ``(128, 300)`` cases.
     """
     torch.manual_seed(0)
     unaligned_shape = (4, 8, 255)
     dtype = torch.float16
-    x = torch.randn(*unaligned_shape, dtype=dtype, device="ptpu")
+    x = torch.randn(*unaligned_shape, dtype=dtype, device=run_device())
     op = op_cls(dim=dim, keepdim=False)
     y = op(x)
     ref = _ref(torch_fn, x, dim, False)
     assert y.shape == ref.shape, (
         f"{op_cls.__name__} dim={dim} unaligned: shape {y.shape} vs ref {ref.shape}"
     )
-    torch.testing.assert_close(y.cpu(), ref, **_tol(dtype))
+    compare_outputs(y, ref, reduction_verification((ref).dtype))

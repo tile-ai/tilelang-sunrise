@@ -5,24 +5,29 @@ loading flag, the memo dicts — is exercised through that behaviour rather than
 it stays free to change.
 """
 
-import subprocess
-import sys
+import dataclasses
+import os
 import warnings
 
 import pytest
 import torch
 
+from tests.fresh_interpreter import probe
 from tileops import backend
+from tileops._kernels.call_spec import CallSpec
+from tileops._kernels.kernel_base import Kernel
 from tileops.backend import (
     BUILTIN,
     AmbiguousTargetError,
     BackendError,
+    DeviceFacts,
     TensorSpec,
     UnknownTargetError,
-    registry,
 )
-from tileops.backend.dispatch import (
+from tileops.backend import _registry as registry
+from tileops.backend._dispatch import (
     detect_target,
+    device_facts_of,
     registered_kernel_builder,
     select_target,
 )
@@ -36,6 +41,7 @@ def isolated_registry():
     state = registry.snapshot()
     registry.DETECTORS.clear()
     registry.BUILDERS.clear()
+    registry.DEVICE_FACTS.clear()
     registry.LOAD_FAILURES.clear()
     registry.default_target = None
     registry._loaded = True  # no test may import the backends actually installed
@@ -83,16 +89,32 @@ def test_tensor_spec_describes_a_tensor_and_compares_by_its_properties():
     """A builder is handed these instead of tensors: no data to read, none to keep."""
     spec = TensorSpec.of(torch.zeros(4, 8, dtype=torch.bfloat16))
 
-    assert spec == (torch.device("cpu"), torch.bfloat16, (4, 8))
-    assert not any(isinstance(field, torch.Tensor) for field in spec)
+    assert spec == TensorSpec(device=torch.device("cpu"), dtype=torch.bfloat16, shape=(4, 8))
+    assert not any(isinstance(v, torch.Tensor) for v in dataclasses.astuple(spec))
     assert spec == TensorSpec.of(torch.ones(4, 8, dtype=torch.bfloat16))
     assert spec != TensorSpec.of(torch.zeros(4, 9, dtype=torch.bfloat16))
     assert spec != TensorSpec.of(torch.zeros(4, 8, dtype=torch.float32))
 
 
+@pytest.mark.parametrize(
+    ("cls", "values"),
+    [(TensorSpec, (torch.device("cpu"), torch.float16, (4,))), (DeviceFacts, (90, 132, 0))],
+    ids=["TensorSpec", "DeviceFacts"],
+)
+def test_a_boundary_record_is_built_by_keyword_only(cls, values):
+    """A field added later comes with a default; positions would break every caller."""
+    with pytest.raises(TypeError):
+        cls(*values)
+
+
+def test_device_facts_carry_no_board_calibration():
+    """The calibration key indexes TileOPs' own tuning tables, not a backend's."""
+    assert [f.name for f in dataclasses.fields(DeviceFacts)] == ["arch", "sm_count", "smem_budget"]
+
+
 def test_builtin_is_a_sentinel_that_outranks_a_target_claiming_the_device():
     """It says "run what ships with TileOPs", which no target name can say."""
-    backend.register_kernel_builder("Op", "acme", fake_build_kernel)
+    backend.register_kernel_builder("RMSNormFwdOp", "acme", fake_build_kernel)
     backend.register_detector("acme", lambda device: True)
 
     assert BUILTIN not in backend.registered_targets()
@@ -118,12 +140,19 @@ def test_register_then_look_up():
 
 def test_a_cell_is_claimed_once():
     """A target belongs to one distribution; a second claim is a misinstall."""
-    backend.register_kernel_builder("Op", "fake", fake_build_kernel)
+    backend.register_kernel_builder("RMSNormFwdOp", "fake", fake_build_kernel)
 
     with pytest.raises(BackendError, match="already registered"):
-        backend.register_kernel_builder("Op", "fake", lambda *a, **k: None)
+        backend.register_kernel_builder("RMSNormFwdOp", "fake", lambda *a, **k: None)
     with pytest.raises(BackendError, match="misinstall"):
-        backend.register_kernel_builder("Op", "fake", fake_build_kernel)
+        backend.register_kernel_builder("RMSNormFwdOp", "fake", fake_build_kernel)
+
+
+def test_a_builder_for_an_op_tileops_does_not_have_is_refused():
+    """A typo, or an op renamed since the backend was written, would never be asked."""
+    with pytest.raises(BackendError, match="op 'RMSNormFwdop'"):
+        backend.register_kernel_builder("RMSNormFwdop", "fake", fake_build_kernel)
+    assert backend.registered_targets() == []
 
 
 def test_a_target_has_one_detector():
@@ -188,7 +217,7 @@ def test_ambiguity_names_both_targets_in_a_fixed_order():
 )
 def test_target_precedence(requested, default, expected):
     for target in ("named", "configured"):
-        backend.register_kernel_builder("Op", target, fake_build_kernel)
+        backend.register_kernel_builder("RMSNormFwdOp", target, fake_build_kernel)
     backend.register_detector("detected", lambda device: True)
     backend.set_default_target(default)
 
@@ -197,7 +226,7 @@ def test_target_precedence(requested, default, expected):
 
 def test_a_named_target_is_taken_at_its_word():
     """Naming a target is how a caller overrides detection, so nothing is re-checked."""
-    backend.register_kernel_builder("Op", "named", fake_build_kernel)
+    backend.register_kernel_builder("RMSNormFwdOp", "named", fake_build_kernel)
     backend.register_detector("detected", lambda device: pytest.fail("must not detect"))
 
     assert select_target("named", torch.device("cpu")) == "named"
@@ -221,7 +250,7 @@ def test_the_default_target_starts_unset_and_must_name_a_real_target():
     with pytest.raises(UnknownTargetError, match="no backend registered target"):
         backend.set_default_target("nope")
 
-    backend.register_kernel_builder("Op", "fake", fake_build_kernel)
+    backend.register_kernel_builder("RMSNormFwdOp", "fake", fake_build_kernel)
     backend.set_default_target("fake")
     assert backend.default_target() == "fake"
 
@@ -231,18 +260,18 @@ def test_the_default_target_starts_unset_and_must_name_a_real_target():
 
 def test_a_target_with_builders_but_no_detector_is_still_reachable():
     """Such a target never wins by detection, which does not make it unusable."""
-    backend.register_kernel_builder("Op", "explicit_only", fake_build_kernel)
+    backend.register_kernel_builder("RMSNormFwdOp", "explicit_only", fake_build_kernel)
 
     backend.set_default_target("explicit_only")
-    assert registered_kernel_builder("Op", "explicit_only") is fake_build_kernel
+    assert registered_kernel_builder("RMSNormFwdOp", "explicit_only") is fake_build_kernel
 
 
 def test_a_missing_op_reads_as_missing_and_says_who_does_have_it():
     """The op layer turns this into an error; this layer only reports the absence."""
-    backend.register_kernel_builder("GQAPrefillFwdOp", "nv", fake_build_kernel)
+    backend.register_kernel_builder("LayerNormFwdOp", "nv", fake_build_kernel)
 
-    assert registered_kernel_builder("GQAPrefillFwdOp", "other") is None
-    assert backend.registered_targets("GQAPrefillFwdOp") == ["nv"]
+    assert registered_kernel_builder("LayerNormFwdOp", "other") is None
+    assert backend.registered_targets("LayerNormFwdOp") == ["nv"]
 
 
 # --------------------------------------------------------------------------------------
@@ -278,11 +307,13 @@ def test_a_backend_is_imported_once_however_dispatch_is_entered(installed):
 def test_a_broken_backend_is_skipped_and_stays_visible(installed):
     installed(
         broken=lambda: _raise(ImportError("libacme.so not found")),
-        working=lambda: backend.register_kernel_builder("Op", "working", fake_build_kernel),
+        working=lambda: backend.register_kernel_builder(
+            "RMSNormFwdOp", "working", fake_build_kernel
+        ),
     )
 
     with pytest.warns(RuntimeWarning, match="failed to load"):
-        assert backend.registered_targets("Op") == ["working"]
+        assert backend.registered_targets("RMSNormFwdOp") == ["working"]
     assert backend.load_failures() == (
         "broken (tileops_broken): ImportError: libacme.so not found",
     )
@@ -306,17 +337,17 @@ def test_a_backend_that_fails_midway_registers_nothing(installed):
 
     def half():
         backend.register_detector("half", lambda device: True)
-        backend.register_kernel_builder("First", "half", fake_build_kernel)
+        backend.register_kernel_builder("LayerNormFwdOp", "half", fake_build_kernel)
         raise RuntimeError("failed after registering two things")
 
     installed(
         half=half,
-        intact=lambda: backend.register_kernel_builder("Kept", "intact", fake_build_kernel),
+        intact=lambda: backend.register_kernel_builder("RMSNormFwdOp", "intact", fake_build_kernel),
     )
 
     with pytest.warns(RuntimeWarning):
-        assert backend.registered_targets("Kept") == ["intact"]
-    assert backend.registered_targets("First") == []
+        assert backend.registered_targets("RMSNormFwdOp") == ["intact"]
+    assert backend.registered_targets("LayerNormFwdOp") == []
     assert "half" not in backend.registered_targets()
 
 
@@ -328,7 +359,7 @@ def test_an_interrupt_reaches_the_caller_and_leaves_discovery_retryable(installe
     def rude():
         attempts.append(1)
         # The same cell twice: only a real rollback lets the retry claim it.
-        backend.register_kernel_builder("Op", "rude", fake_build_kernel)
+        backend.register_kernel_builder("RMSNormFwdOp", "rude", fake_build_kernel)
         if len(attempts) == 1:
             raise interrupt
 
@@ -336,7 +367,7 @@ def test_an_interrupt_reaches_the_caller_and_leaves_discovery_retryable(installe
 
     with pytest.raises(interrupt):
         backend.registered_targets()
-    assert backend.registered_targets("Op") == ["rude"], "asking again tries again"
+    assert backend.registered_targets("RMSNormFwdOp") == ["rude"], "asking again tries again"
     assert attempts == [1, 1]
 
 
@@ -344,7 +375,9 @@ def test_warnings_as_errors_cannot_truncate_discovery(installed):
     """CI runs with -W error, where warning mid-loop would strand every later backend."""
     installed(
         broken=lambda: _raise(ZeroDivisionError()),
-        working=lambda: backend.register_kernel_builder("Op", "working", fake_build_kernel),
+        working=lambda: backend.register_kernel_builder(
+            "RMSNormFwdOp", "working", fake_build_kernel
+        ),
     )
 
     with warnings.catch_warnings():
@@ -352,7 +385,7 @@ def test_warnings_as_errors_cannot_truncate_discovery(installed):
         with pytest.raises(RuntimeWarning):
             backend.registered_targets()
 
-    assert backend.registered_targets("Op") == ["working"]
+    assert backend.registered_targets("RMSNormFwdOp") == ["working"]
     assert [line.split()[0] for line in backend.load_failures()] == ["broken"]
 
 
@@ -360,12 +393,12 @@ def test_a_backend_may_read_the_registry_while_it_is_registering(installed):
     """A backend module imports tileops at its top level, so this must not recurse."""
 
     def introspective():
-        backend.register_kernel_builder("Op", "introspective", fake_build_kernel)
-        assert backend.registered_targets("Op") == ["introspective"]
+        backend.register_kernel_builder("RMSNormFwdOp", "introspective", fake_build_kernel)
+        assert backend.registered_targets("RMSNormFwdOp") == ["introspective"]
 
     installed(introspective=introspective)
 
-    assert backend.registered_targets("Op") == ["introspective"]
+    assert backend.registered_targets("RMSNormFwdOp") == ["introspective"]
 
 
 def test_a_detector_that_raises_names_the_target_that_owns_it(installed):
@@ -399,41 +432,148 @@ def test_every_error_can_still_blame_a_wheel_that_failed_to_load(installed):
 
 
 # --------------------------------------------------------------------------------------
+# Device facts
+# --------------------------------------------------------------------------------------
+
+# A device type torch accepts and this process has no accelerator of, spelled as torch
+# resolves it: a backend may rename PrivateUse1.
+_OTHER = torch.device("privateuseone").type
+if _OTHER == "ptpu":
+    # torch_ptpu renames PrivateUse1 to the S2 device this process does have.
+    _OTHER = "mtia"
+_FACTS = DeviceFacts(arch=31, sm_count=128, smem_budget=96 * 1024)
+_NO_FACTS = DeviceFacts(arch=-1, sm_count=0, smem_budget=0)
+
+
+def test_a_registered_device_type_reports_its_facts_to_a_call_spec():
+    seen = []
+    registry.register_device_facts(_OTHER, lambda device: seen.append(device) or _FACTS)
+
+    call = CallSpec(device=torch.device(_OTHER, 1))
+
+    assert (call.arch, call.sm_count, call.smem_budget) == (31, 128, 96 * 1024)
+    assert call.calibration is None, "a board calibration is TileOPs' own, read for CUDA only"
+    assert seen == [torch.device(_OTHER, 1)], "read once, with the call's device"
+
+
+def test_a_device_type_nobody_registered_reports_none():
+    for device in (torch.device("cpu"), torch.device(_OTHER, 0)):
+        assert device_facts_of(device) == _NO_FACTS
+
+
+def test_a_device_type_has_one_reader_and_cuda_is_read_by_tileops():
+    registry.register_device_facts(_OTHER, lambda device: _FACTS)
+    with pytest.raises(BackendError, match="already reports its facts"):
+        registry.register_device_facts(_OTHER, lambda device: _FACTS)
+    with pytest.raises(BackendError, match="TileOPs reads them itself"):
+        # The device type the in-tree kernels run on.
+        (in_tree,) = Kernel.devices
+        registry.register_device_facts(in_tree, lambda device: _FACTS)
+
+
+def test_a_device_that_numbers_none_reaches_its_reader_as_it_is():
+    """A ``cpu`` device carries no index; its reader decides what that means."""
+    seen = []
+    registry.register_device_facts("cpu", lambda device: seen.append(device) or _FACTS)
+
+    assert CallSpec(device=torch.device("cpu")).arch == _FACTS.arch
+    assert seen == [torch.device("cpu")]
+
+
+@pytest.mark.parametrize(
+    "read, why",
+    [
+        (lambda device: (31, 128, 0), "returns DeviceFacts"),
+        (lambda device: dataclasses.replace(_FACTS, sm_count=-1), "not negative"),
+        (lambda device: dataclasses.replace(_FACTS, arch="mp_31"), "arch is an int"),
+        (lambda device: _raise(RuntimeError("driver")), "raised"),
+    ],
+    ids=["tuple", "negative", "string-arch", "raises"],
+)
+def test_a_reader_that_misbehaves_is_named(read, why):
+    registry.register_device_facts(_OTHER, read)
+    with pytest.raises(BackendError, match=why) as caught:
+        device_facts_of(torch.device(_OTHER, 0))
+    assert "test_backend" in str(caught.value), "the message names the reader's module"
+
+
+# The tests that register a reader for a device type no backend in this process provides.
+_REGISTERS_ANOTHER_DEVICE_TYPE = [
+    "tests/test_backend.py::test_a_registered_device_type_reports_its_facts_to_a_call_spec",
+    "tests/test_backend.py::test_a_reader_that_misbehaves_is_named",
+    "tests/test_kernel_dispatch.py::"
+    "test_an_implementation_for_another_device_type_is_selected_by_the_facts_its_backend_reports",
+]
+
+
+def test_another_device_type_is_read_after_a_backend_renames_private_use():
+    """Regression: a reader registered under ``"privateuseone"`` went unread once a backend
+    renamed PrivateUse1. Renaming cannot be undone, hence the fresh interpreter."""
+    exit_code = probe(
+        "import types, pytest, torch\n"
+        "torch.utils.rename_privateuse1_backend('tileops_probe')\n"
+        "torch._register_device_module(\n"
+        "    'tileops_probe', types.SimpleNamespace(is_available=lambda: False)\n"
+        ")",
+        f"int(pytest.main(['-q', '-p', 'no:cacheprovider', *{_REGISTERS_ANOTHER_DEVICE_TYPE!r}]))",
+        # An autoloaded backend, such as torch_musa, would claim PrivateUse1 before this rename.
+        env={**os.environ, "TORCH_DEVICE_BACKEND_AUTOLOAD": "0"},
+    )
+    assert exit_code == "0"
+
+
+def test_restoring_the_registry_drops_a_device_type_registered_since():
+    state = registry.snapshot()
+    registry.register_device_facts(_OTHER, lambda device: _FACTS)
+    registry.restore(state)
+    assert device_facts_of(torch.device(_OTHER, 0)) == _NO_FACTS
+
+
+# --------------------------------------------------------------------------------------
 # The packaging boundary
 # --------------------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    ("source", "why"),
+    ("setup", "expr", "why"),
     [
         (
-            "import sys, tileops.backend; print('tilelang' in sys.modules)",
+            "import sys, tileops.backend",
+            "'tilelang' in sys.modules",
             "the module a backend imports must not drag the nv toolchain in with it",
         ),
         (
-            "import sys, tileops; print('torch' in sys.modules)",
+            "import sys, tileops",
+            "'torch' in sys.modules",
             "the manifest tooling reads YAML where torch is not installed",
         ),
         (
-            "import tileops.backend as b; print(b.registry._loaded)",
+            "import importlib.metadata as m, sys, tileops\n"
+            "assert tileops.__version__ == m.version('tileops')",
+            "'torch' in sys.modules",
+            "the version is the distribution's, and reading it imports nothing",
+        ),
+        (
+            "import tileops.backend as b",
+            "b._registry._loaded",
             "installing a backend costs nothing until something asks for it",
         ),
     ],
-    ids=["no tilelang", "no torch", "no discovery"],
+    ids=["no tilelang", "no torch", "version without torch", "no discovery"],
 )
-def test_importing_costs_nothing(source, why):
+def test_importing_costs_nothing(setup, expr, why):
     """Run in a fresh interpreter, since pytest has already imported everything."""
-    result = subprocess.run(
-        [sys.executable, "-c", source.replace("print(", 'print("RESULT:", ')],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    assert probe(setup, expr) == "False", why
 
-    assert result.returncode == 0, result.stderr
-    assert [line for line in result.stdout.splitlines() if line.startswith("RESULT:")] == [
-        "RESULT: False"
-    ], why
+
+def test_an_import_check_ignores_what_a_package_prints_while_loading(tmp_path):
+    """Regression: a device runtime that found no device printed on stdout at import, and
+    the check compared the whole stdout with ``False``."""
+    # Unterminated, so the result line must not be appended to it.
+    (tmp_path / "sitecustomize.py").write_text("print('CreatePlatform failed!', end='')\n")
+    path = os.pathsep.join(filter(None, [str(tmp_path), os.environ.get("PYTHONPATH")]))
+    env = {**os.environ, "PYTHONPATH": path}
+    assert probe("import sys, tileops.backend", "'tilelang' in sys.modules", env=env) == "False"
 
 
 def test_the_caller_api_is_reachable_from_the_package_root():

@@ -1,0 +1,570 @@
+"""The kernel dispatch contract: selection, the dispatch cache, and the three extension points.
+
+The mechanism is driven through a fake family whose implementations run on the CPU, so
+selection, caching and installation checks need no device. The contract tests use a shipped
+kernel interface and write their implementations against it only.
+"""
+
+import contextlib
+import dataclasses
+import importlib
+import inspect
+import pkgutil
+from abc import abstractmethod
+
+import pytest
+import torch
+import torch.nn.functional as F
+
+import tileops._ops
+from tileops._kernels.call_spec import CallSpec
+from tileops._kernels.kernel_base import Kernel, KernelInterface
+from tileops._kernels.norm.call_spec import LayerNormCall, LayerNormFwdInterface
+from tileops._ops.op_base import Op
+from tileops.backend import BUILTIN, DeviceFacts, OpNotAvailableError
+from tileops.backend import _registry as registry
+from tileops.backend._registry import register_kernel_type
+from tileops.norm import LayerNormFwdOp
+from workloads.device import run_device
+from workloads.numerics import reference_for
+
+pytestmark = pytest.mark.smoke
+
+
+@dataclasses.dataclass(frozen=True)
+class _Call(CallSpec):
+    n: int = 0
+
+
+class _Scaling(KernelInterface):
+    """Scale *x*."""
+
+    request = _Call
+
+    @abstractmethod
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return a new tensor."""
+
+
+class _Implementation(Kernel, _Scaling):
+    """Built per decade of ``n``, so two call specs can share one build identity."""
+
+    devices = frozenset({"cpu"})
+
+    def __init__(self, decade: int) -> None:
+        super().__init__()
+        self.decade = decade
+
+    @classmethod
+    def entry_for(cls, call: _Call):
+        return call.n // 10, lambda: cls(call.n // 10)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x
+
+    def autotune(self, warmup: int = 25, rep: int = 50) -> None:
+        self.config = {"tuned": True}
+
+
+def _implementation(name: str, serves=lambda call: True, **attrs) -> type:
+    """An implementation of ``_Scaling`` that serves the calls *serves* accepts."""
+    namespace = {
+        "refusal": classmethod(lambda cls, call: None if serves(call) else f"{name} declines"),
+        **attrs,
+    }
+    return type(name, (_Implementation,), namespace)
+
+
+_GENERAL = _implementation("General", general=True)
+_POSITIVE = _implementation("Positive", lambda c: c.n > 0)
+_BAND = _implementation("Band", lambda c: 10 < c.n <= 50, preferred_over=frozenset({"positive"}))
+# Never serves a call the band serves; it wins over the positive through it.
+_HUNDREDS = _implementation("Hundreds", lambda c: c.n > 100, preferred_over=frozenset({"band"}))
+_NEGATIVE = _implementation("Negative", lambda c: c.n < 0)
+
+
+class _ScaleOp(Op):
+    kernel_types = {
+        "general": _GENERAL,
+        "positive": _POSITIVE,
+        "band": _BAND,
+        "hundreds": _HUNDREDS,
+        "negative": _NEGATIVE,
+    }
+    interfaces = {"scale": _Scaling}
+
+    def __init__(self, *, target=None) -> None:
+        super().__init__(target=target)
+
+    def _infer_output_shapes(self, *shapes, dtypes=None):
+        return {}
+
+    def eval_roofline(self):
+        return (0, 0)
+
+    def forward(self, x):
+        return x
+
+    def entry(self, n: int):
+        return self.kernel_for("scale", lambda: _Call(device=torch.device("cpu"), n=n))
+
+
+def _selected(op: Op, *ns: int) -> dict:
+    """The key selected for each ``n``, or the error it raises."""
+    selected = {}
+    for n in ns:
+        try:
+            selected[n] = op.key_for("scale", _Call(device=torch.device("cpu"), n=n))
+        except (OpNotAvailableError, RuntimeError) as exc:
+            selected[n] = str(exc).split(":")[0]
+    return selected
+
+
+@pytest.fixture(autouse=True)
+def isolated_registry():
+    """Registrations made by a test do not outlive it."""
+    state = registry.snapshot()
+    yield
+    registry.restore(state)
+
+
+def test_selection_takes_the_implementation_no_other_is_preferred_over() -> None:
+    """The general one is below every other; ``preferred_over`` orders the rest, transitively."""
+    assert _selected(_ScaleOp(), 0, 5, 20, 200, -1) == {
+        0: "general",
+        5: "positive",
+        20: "band",
+        200: "hundreds",
+        -1: "negative",
+    }
+
+
+def test_availability_filters_before_precedence() -> None:
+    """An implementation that cannot run on the call's device takes nothing it is preferred over."""
+    register_kernel_type(
+        "_ScaleOp",
+        "meta_positive",
+        _implementation(
+            "MetaPositive",
+            lambda c: c.n > 0,
+            devices=frozenset({"meta"}),
+            preferred_over=frozenset({"positive"}),
+        ),
+    )
+    assert _selected(_ScaleOp(), 5) == {5: "positive"}
+
+
+def test_undeclared_overlap_and_an_uncovered_call_are_errors() -> None:
+    register_kernel_type(
+        "_ScaleOp", "also_positive", _implementation("AlsoPositive", lambda c: c.n > 0)
+    )
+    assert _selected(_ScaleOp(), 5) == {5: "dispatch is ambiguous"}
+    with pytest.raises(RuntimeError, match="dispatch is ambiguous"):
+        _ScaleOp().key_for("scale", _Call(device=torch.device("cpu"), n=5))
+
+    class _NoGeneralOp(_ScaleOp):
+        kernel_types = {k: v for k, v in _ScaleOp.kernel_types.items() if k != "general"}
+
+    assert _selected(_NoGeneralOp(), 0) == {0: "no implementation serves this call"}
+    with pytest.raises(OpNotAvailableError, match="no implementation serves this call"):
+        _NoGeneralOp().key_for("scale", _Call(device=torch.device("cpu"), n=0))
+
+
+def test_an_added_implementation_its_device_cannot_run_leaves_the_call_to_the_original() -> None:
+    """A registered implementation built for another architecture is unavailable, so the
+    implementation it is preferred over builds the entry."""
+    register_kernel_type(
+        "_ScaleOp",
+        "sm90_positive",
+        _implementation(
+            "Sm90Positive",
+            lambda c: c.n > 0,
+            devices=frozenset({"cpu"}),
+            supported_archs=[90],
+            preferred_over=frozenset({"positive"}),
+        ),
+    )
+    assert type(_ScaleOp().entry(5)).__name__ == "Positive"
+
+
+def test_a_hit_is_one_lookup_and_reads_no_device_fact(monkeypatch: pytest.MonkeyPatch) -> None:
+    op = _ScaleOp()
+    first = op.entry(5)
+
+    def unreachable(*args, **kwargs):
+        raise AssertionError("a hit resolved something")
+
+    monkeypatch.setattr(op, "_get_or_build_entry", unreachable)
+    call = _Call(device=torch.device("cpu"), n=5)
+    assert op.kernel_for("scale", lambda: call) is first
+    assert not {"_arch", "_calibration", "_sm_count", "_smem_budget"} & set(vars(call))
+
+
+def test_call_specs_sharing_a_build_identity_share_one_entry() -> None:
+    op = _ScaleOp()
+    assert op.entry(1) is op.entry(9)
+    assert op.entry(1) is not op.entry(20)
+    assert len(op._entries_built("scale")) == 2
+
+
+def test_tuning_acts_on_the_resolved_entry_not_the_builder() -> None:
+    """An equal call spec after ``request_tune`` serves the tuned entry; builders take no tune."""
+    op = _ScaleOp()
+    entry = op.entry(5)
+    assert entry.config == {}
+    op.request_tune()
+    assert op.entry(5) is entry and entry.config == {"tuned": True}
+    assert op.entry(7) is entry
+    assert op.entry(25).config == {"tuned": True}
+
+
+class _NotScaling(Kernel):
+    def forward(self, x):
+        return x
+
+
+class _ScalingOnly(_Scaling):
+    """Inherits the interface but is no ``Kernel``."""
+
+    @classmethod
+    def entry_for(cls, call):
+        return call, cls
+
+    def forward(self, x):
+        return x
+
+
+@pytest.mark.parametrize(
+    ("kernel_type", "error", "match"),
+    [
+        (_ScalingOnly, TypeError, "does not implement _Scaling; .* inherits _Scaling"),
+        (
+            _implementation("TwoArgs", forward=lambda self, x, y: x),
+            TypeError,
+            "does not take _Scaling's arguments",
+        ),
+        (
+            _implementation("StaticEntry", entry_for=staticmethod(lambda call: 0)),
+            TypeError,
+            "entry_for is not a classmethod",
+        ),
+    ],
+)
+def test_a_registered_implementation_implements_its_interface(kernel_type, error, match) -> None:
+    register_kernel_type("_ScaleOp", "added", kernel_type)
+    with pytest.raises(error, match=match):
+        _ScaleOp()
+
+
+class _Shifting(KernelInterface):
+    """Scale *x*, adding an optional *shift* passed by name."""
+
+    request = _Call
+
+    @abstractmethod
+    def forward(self, x: torch.Tensor, out=None, *, shift=None) -> torch.Tensor:
+        """Return a new tensor."""
+
+
+@pytest.mark.parametrize(
+    ("forward", "accepted"),
+    [
+        pytest.param(lambda self, x, out=None, *, shift=None: x, True, id="keyword-only"),
+        pytest.param(lambda self, x, out=None: x, False, id="without-the-keyword"),
+    ],
+)
+def test_an_implementation_takes_the_interface_keyword_only_argument_by_name(
+    forward, accepted
+) -> None:
+    """The interface's keyword-only argument is passed by name, never by position."""
+
+    class _ShiftImplementation(Kernel, _Shifting):
+        devices = frozenset({"cpu"})
+        general = True
+
+        @classmethod
+        def entry_for(cls, call):
+            return 0, cls
+
+    _ShiftImplementation.forward = forward
+
+    class _ShiftOp(_ScaleOp):
+        kernel_types = {"shift": _ShiftImplementation}
+        interfaces = {"shift": _Shifting}
+
+    if accepted:
+        _ShiftOp()
+    else:
+        with pytest.raises(TypeError, match="does not take _Shifting's arguments"):
+            _ShiftOp()
+
+
+@pytest.mark.parametrize(
+    ("added", "match"),
+    [
+        ({"also_general": _implementation("AlsoGeneral", general=True)}, "more than one"),
+        (
+            {"stray": _implementation("Stray", preferred_over=frozenset({"elsewhere"}))},
+            "preferred over \\['elsewhere'\\]",
+        ),
+        (
+            {
+                "ping": _implementation("Ping", preferred_over=frozenset({"pong"})),
+                "pong": _implementation("Pong", preferred_over=frozenset({"ping"})),
+            },
+            "cycle",
+        ),
+        ({"positive": _implementation("Clash")}, "reuse keys it has"),
+        ({"loose": _NotScaling}, "implement none of its kernel interfaces"),
+    ],
+)
+def test_installation_refuses_a_malformed_registration(added, match) -> None:
+    for key, cls in added.items():
+        register_kernel_type("_ScaleOp", key, cls)
+    with pytest.raises(ValueError, match=match):
+        _ScaleOp()
+
+
+def test_kernel_for_refuses_a_call_spec_it_cannot_key() -> None:
+    """A call spec of another type, with an unhashable field, or stating a device fact,
+    whether or not an equal call spec was served before."""
+    op = _ScaleOp()
+    cpu = torch.device("cpu")
+    op.entry(5)
+    for call, match in (
+        (CallSpec(device=cpu), "takes a _Call call spec"),
+        (_Call(device=cpu, n=[5]), "cannot key a dispatch cache"),
+        (_Call(device=cpu, n=5, arch=90), "states \\['arch'\\]"),
+        (_Call(device=cpu, n=5, smem_budget=1), "states \\['smem_budget'\\]"),
+    ):
+        with pytest.raises(TypeError, match=match):
+            op.kernel_for("scale", lambda call=call: call)
+
+
+def test_a_record_on_a_device_without_cuda_facts_reads_none() -> None:
+    """A record resolves no CUDA fact, and copying it — which reads every field — still works.
+
+    Named as CPU rather than left unstated on a CUDA-free host: `_read_device_facts`
+    takes the same branch for both, and only the first runs where a card exists.
+    """
+    call = _Call(n=8, device=torch.device("cpu"))
+
+    assert (call.arch, call.sm_count, call.smem_budget) == (-1, 0, 0)
+    assert dataclasses.replace(call, n=9) == _Call(n=9, device=torch.device("cpu"))
+
+
+def test_a_record_names_the_fields_off_their_default() -> None:
+    """A field without a default is always named; formatting never builds a record."""
+
+    @dataclasses.dataclass(frozen=True)
+    class Required(CallSpec):
+        m: int = dataclasses.field(default=0, kw_only=True)
+        n: int = dataclasses.field(kw_only=True)
+        dims: tuple = dataclasses.field(default_factory=tuple, kw_only=True)
+
+    cpu = torch.device("cpu")
+    assert str(Required(n=0, device=cpu)).endswith(", n=0")
+    assert str(Required(m=2, n=0, dims=(1,), device=cpu)).endswith(", m=2, n=0, dims=(1,)")
+    assert str(_Call(n=0, device=cpu)) == "arch=-1, calibration=None, sm_count=0, smem_budget=0"
+
+
+def test_an_installed_implementation_set_cannot_change() -> None:
+    """The installed set is read-only. A later registration reaches an instance when it
+    installs again, which drops the entries built from the previous set."""
+    op = _ScaleOp()
+    op.entry(5)
+    with pytest.raises(TypeError):
+        op._installed_kernel_types["positive"] = _NEGATIVE
+    register_kernel_type(
+        "_ScaleOp",
+        "later",
+        _implementation("Later", lambda c: c.n > 0, preferred_over=frozenset({"positive"})),
+    )
+    assert type(op.entry(5)).__name__ == "Positive"
+    op._install_kernel_types()
+    assert type(op.entry(5)).__name__ == "Later"
+
+
+@pytest.mark.cuda_only
+def test_a_call_without_a_device_resolves_again_when_the_current_device_changes() -> None:
+    import tileops._utils
+
+    # No device 1 exists to switch to.
+    class _Stay(contextlib.nullcontext):
+        def __init__(self, index: int) -> None:
+            super().__init__()
+
+    seen = []
+    cuda = _implementation(
+        "OnCuda",
+        lambda c: seen.append((c.device, c.arch)) or True,
+        devices=frozenset({"cuda"}),
+        general=True,
+        entry_for=classmethod(lambda cls, call: ((call.n, call.device), lambda: cls(call.n))),
+    )
+
+    class _CudaOp(_ScaleOp):
+        kernel_types = {"on_cuda": cuda}
+
+    current = [0]
+    # Undone before the teardown hooks, which read the real current device.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(torch.accelerator, "current_device_index", lambda: current[0])
+        patch.setattr(torch.accelerator, "device_index", _Stay)
+        patch.setattr(tileops._utils, "device_facts", lambda index=None: (89 + index, None, 1, 0))
+        op = _CudaOp()
+        first = op.kernel_for("scale", lambda: _Call(n=1))
+        current[0] = 1
+        second = op.kernel_for("scale", lambda: _Call(n=1))
+    assert seen == [(torch.device("cuda", 0), 89), (torch.device("cuda", 1), 90)]
+    assert first is not second
+
+
+def test_an_implementation_for_another_device_type_is_selected_by_the_facts_its_backend_reports():
+    """``supported_archs`` reads the architecture the device type's registered reader reports."""
+    # Spelled as torch resolves it: a backend may rename PrivateUse1.
+    other = torch.device("privateuseone").type
+    if other == "ptpu":
+        # torch_ptpu renames PrivateUse1 to the S2 device this process does have.
+        other = "mtia"
+    archs = {0: 31, 1: 22}
+    registry.register_device_facts(
+        other, lambda device: DeviceFacts(arch=archs[device.index], sm_count=1, smem_budget=0)
+    )
+
+    class _Newer(_Implementation):
+        devices = frozenset({other})
+        supported_archs = [31]
+        general = True
+
+        def __init__(self, decade: int, device_index: int) -> None:
+            Kernel.__init__(self, device_index=device_index)
+            self.decade = decade
+
+    class _OtherOp(_ScaleOp):
+        kernel_types = {"newer": _Newer}
+
+    op = _OtherOp()
+    assert op.key_for("scale", _Call(device=torch.device(other, 0))) == "newer"
+    with pytest.raises(OpNotAvailableError, match="device reports 22"):
+        op.key_for("scale", _Call(device=torch.device(other, 1)))
+    assert _Newer(1, device_index=0).decade == 1
+    with pytest.raises(OpNotAvailableError, match=f"{other}:1 reports 22"):
+        _Newer(1, device_index=1)
+
+
+def test_a_cpu_implementation_is_selected_by_the_architecture_its_backend_reports() -> None:
+    """A real ``cpu`` call, whose device carries no index, reads the registered facts too."""
+    registry.register_device_facts(
+        "cpu", lambda device: DeviceFacts(arch=7, sm_count=1, smem_budget=0)
+    )
+    wide = _implementation("Wide", supported_archs=[7], general=True)
+    narrow = _implementation("Narrow", supported_archs=[8], preferred_over=frozenset({"wide"}))
+
+    class _CpuOp(_ScaleOp):
+        kernel_types = {"wide": wide, "narrow": narrow}
+
+    op = _CpuOp()
+    assert op.key_for("scale", _Call(device=torch.device("cpu"))) == "wide"
+    assert type(op.entry(5)).__name__ == "Wide"
+
+
+def test_an_implementation_naming_architectures_runs_on_one_device_type() -> None:
+    """An architecture number compares within one device type, so the installation refuses two."""
+    both = _implementation(
+        "Both", devices=frozenset({"cpu", "meta"}), supported_archs=[90], general=True
+    )
+
+    class _BothOp(_ScaleOp):
+        kernel_types = {"both": both}
+
+    with pytest.raises(TypeError, match="declares supported_archs for devices"):
+        _BothOp()
+
+
+class _TorchLayerNorm(Kernel, LayerNormFwdInterface):
+    """A replacement written against ``LayerNormFwdInterface`` alone."""
+
+    devices = frozenset({torch.device(run_device()).type})
+
+    def __init__(self, n: int, eps: float) -> None:
+        super().__init__()
+        self.n, self.eps = n, eps
+
+    @classmethod
+    def entry_for(cls, call: LayerNormCall):
+        return (call.n, call.eps), lambda: cls(call.n, call.eps)
+
+    def forward(self, x, weight, bias):
+        return reference_for(
+            F.layer_norm, x.float(), (self.n,), weight.float(), bias.float(), self.eps
+        ).to(device=x.device, dtype=x.dtype)
+
+
+class _NarrowTorchLayerNorm(_TorchLayerNorm):
+    """An added implementation for short rows, which wins over the in-tree one there."""
+
+    preferred_over = frozenset({"layer_norm"})
+
+    @classmethod
+    def refusal(cls, call: LayerNormCall) -> "str | None":
+        return None if call.n <= 256 else "serves rows of at most 256"
+
+
+def _layer_norm(op, n: int):
+    x = torch.randn(8, n, device=run_device())
+    weight, bias = torch.randn(n, device=run_device()), torch.randn(n, device=run_device())
+    expected = reference_for(F.layer_norm, x, (n,), weight, bias)
+    got = op(x, weight, bias)
+    assert got.device == x.device
+    reference_for(torch.testing.assert_close, got, expected, atol=1e-4, rtol=1e-4)
+    return [type(k).__name__ for k in op._entries_built("layer_norm").values()]
+
+
+@pytest.mark.in_tree_kernels
+def test_an_added_implementation_needs_only_the_published_contract() -> None:
+    class _EveryRowTorchLayerNorm(_TorchLayerNorm):
+        preferred_over = frozenset(LayerNormFwdOp.kernel_types)
+
+    register_kernel_type("LayerNormFwdOp", "torch_layer_norm", _EveryRowTorchLayerNorm)
+    op = LayerNormFwdOp((256,), target=BUILTIN)
+    assert _layer_norm(op, 256) == ["_EveryRowTorchLayerNorm"]
+
+
+@pytest.mark.in_tree_kernels
+def test_register_kernel_type_takes_its_parameters_by_name() -> None:
+    register_kernel_type(
+        op="LayerNormFwdOp", key="torch_short_rows", kernel_type=_NarrowTorchLayerNorm
+    )
+    op = LayerNormFwdOp((256,), target=BUILTIN)
+    assert op._installed_kernel_types["torch_short_rows"] is _NarrowTorchLayerNorm
+
+
+@pytest.mark.in_tree_kernels
+@pytest.mark.cuda_only
+def test_an_added_implementation_serves_its_calls_and_the_in_tree_one_the_rest() -> None:
+    register_kernel_type("LayerNormFwdOp", "torch_short_rows", _NarrowTorchLayerNorm)
+    assert _layer_norm(LayerNormFwdOp((256,), target=BUILTIN), 256) == ["_NarrowTorchLayerNorm"]
+    wide = _layer_norm(LayerNormFwdOp((1024,), target=BUILTIN), 1024)
+    assert len(wide) == 1 and wide != ["_NarrowTorchLayerNorm"]
+
+
+def test_every_op_reaches_its_kernels_through_an_interface() -> None:
+    """An op that builds a kernel of its own declares the interface it calls it through."""
+    for module in pkgutil.walk_packages(tileops._ops.__path__, "tileops._ops."):
+        importlib.import_module(module.name)
+    ops, pending = set(), [Op]
+    while pending:
+        for cls in pending.pop().__subclasses__():
+            pending.append(cls)
+            ops.add(cls)
+    legacy = {
+        cls.__name__
+        for cls in ops
+        if cls.__module__.startswith("tileops._ops")
+        and not cls.__name__.startswith("_")
+        and not inspect.isabstract(cls)
+        and not cls.interfaces
+        and cls.kernel_types
+    }
+    assert sorted(legacy) == [], "declare interfaces instead"

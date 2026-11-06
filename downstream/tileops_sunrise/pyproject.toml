@@ -5,51 +5,58 @@ description = "TileOPs kernels for efficient LLM inference."
 readme = "README.md"
 authors = [{ name="Tile-AI"}]
 dependencies = [
-    "torch>=2.1.0,<2.14.0",
-    # tilelang as a compatibility range, not a source or exact pin. CI does not resolve tilelang
-    # from this range: the runner image bakes a specific tilelang build and CI installs tileops
-    # with --no-deps against it. constraints.txt pins tilelang's runtime deps (torch, triton,
-    # apache-tvm-ffi, ...) for reproducibility but intentionally does NOT pin tilelang itself.
-    # Downstream `pip install tileops` resolves a compatible tilelang release; apache-tvm-ffi
-    # comes in transitively via tilelang's own metadata — no manual cap here.
-    "tilelang-sunrise>=0.1.13,<0.2.0",
-    "einops",
-    "pyyaml>=6.0",
+    # Internal TANG CI installs a TileLang-Sunrise wheel with PyTorch 2.10.
+    "torch>=2.10.0,<2.14.0",
+    "tilelang-sunrise>=0.1.15",
+    "pyyaml>=6.0.1,<7",
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.13"
 license = "MIT"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES"]
 keywords = ["llm", "inference", "gpu", "kernel", "tiling"]
 classifiers = [
     "Development Status :: 3 - Alpha",
+    "Environment :: GPU :: NVIDIA CUDA :: 13",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
 [project.urls]
 Homepage = "https://github.com/tile-ai/TileOPs"
 Repository = "https://github.com/tile-ai/TileOPs"
+Documentation = "https://tile-ai.github.io/TileOPs.github.io/"
 Issues = "https://github.com/tile-ai/TileOPs/issues"
 
-[project.optional-dependencies]
+# Development dependencies: groups, not extras, so the published metadata lists none.
+[dependency-groups]
+# Contributor tools: linters, pytest, and the references tests import.
 dev = [
     "ruff==0.14.13",
     "codespell==2.4.1",
+    # Attention workloads, which tests and benchmarks import;
+    # nothing under src/ does.
+    "einops",
+    # Linear-attention correctness references shared with benchmarks.
+    "flash-linear-attention==0.5.2",
+    "pre-commit",
     "pytest>=8.0",
     "pytest-cov>=5.0",
+    "pytest-timeout>=2.3",
     "pytest-xdist>=3.0",
-    "pyyaml>=6.0",
 ]
+# Benchmark baselines. FlashAttention-3 (`flash_attn_interface`) is not on PyPI;
+# the dev image builds it.
 bench = [
     "flash-attn==2.8.3",
-    "flash-attn-interface>=2.8.3",
     "flash-linear-attention==0.5.2",
-    "flashinfer>=0.6.6",
+    "deepspeed==0.19.7",
+    "flashinfer-python>=0.6.6",
     "vllm==0.27.1",
     "sgl-kernel==0.3.21",
     "nvmath-python==1.0.0",
@@ -76,7 +83,8 @@ where = ["src"]
 # Kernel headers and YAML data are opened at run time by path relative to
 # __file__, so all of them must ship. Stated by extension, not by name, so a new
 # resource is covered on arrival. Enforced by scripts/ci/check_dist_contents.py.
-tileops = ["**/*.h", "**/*.yaml"]
+# `py.typed` tells type checkers to read the package's annotations.
+tileops = ["**/*.h", "**/*.yaml", "py.typed"]
 
 [tool.codespell]
 ignore-words-list = "nd, te, ist, LOD, offen, NotIn, HSA"
@@ -116,9 +124,16 @@ select = [
     "N",
     # pydoclint: a documented parameter the signature does not have
     "DOC102",
-    # flake8-tidy-imports: banned APIs only. Selected as the exact rule, not the
-    # whole TID family, because TID252 (relative imports) has standing violations.
+    # flake8-tidy-imports: banned APIs.
     "TID251",
+    # Every import is absolute (`from tileops.x import y`); no relative imports.
+    "TID252",
+    # docs/design/layer-boundaries.md §Test: a test does not import from benchmarks/.
+    "TID253",
+    # `__all__` is sorted, so two branches appending to one do not collide.
+    "RUF022",
+    # A `noqa` that suppresses nothing, or names a rule this config does not select.
+    "RUF100",
     # flake8-annotations (type hints) — enable when codebase has sufficient coverage
     # "ANN",
 ]
@@ -153,21 +168,35 @@ ignore = [
 [tool.ruff.lint.isort]
 known-first-party = ["tileops"]
 
+[tool.ruff.lint.flake8-tidy-imports]
+# Module level only: TID251 cannot be scoped to tests/ without lifting its bans elsewhere.
+banned-module-level-imports = ["benchmarks"]
+ban-relative-imports = "all"
+
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
 # Resolved through the import graph, so an alias other than the usual `T` is
 # caught too.
 "tilelang.language.Buffer".msg = "deprecated; use T.Tensor(shape, dtype)"
 
 [tool.ruff.lint.per-file-ignores]
+"!tests/**" = ["TID253"]
 "__init__.py" = ["F401"]
 
 [tool.pytest.ini_options]
+# A misspelled marker is an error, not a silent no-op that drops the arch guard.
+addopts = "--strict-markers"
 testpaths = ["tests", "benchmarks/tests"]
 python_files = ["test_*.py", "bench_*.py"]
 markers = [
     "smoke: fast PR critical-path tests",
     "full: standard correctness coverage",
     "nightly: exhaustive or long-running coverage",
-    "packaging: minimal wheel-install sanity check (one case per op family)",
-    "hopper: needs compute capability 9.x; skipped elsewhere, never skipped on Hopper",
+    "packaging(family): wheel-install sanity check, one case per op family; family-less cases check the public modules",
+    "cuda_graph(op): H200 warmup, capture and changed-input replay evidence for an op",
+    "sm90: needs compute capability 9.x; skipped elsewhere, never skipped on an SM90 device",
+    "sm89: needs compute capability 8.9; skipped elsewhere, never skipped on an SM89 device",
+    "sm86: needs compute capability 8.6; skipped elsewhere, never skipped on an SM86 device",
+    "sm80: needs compute capability 8.0; skipped elsewhere, never skipped on an SM80 device",
+    "cuda_only: needs a CUDA device whatever the target; deselected when --tileops-device is not cuda",
+    "in_tree_kernels: needs the in-tree implementations; deselected when --tileops-target is not builtin",
 ]

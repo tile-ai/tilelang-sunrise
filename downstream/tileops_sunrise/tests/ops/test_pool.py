@@ -1,5 +1,5 @@
-import inspect
-from typing import Callable, Optional, Tuple
+import math
+from typing import Callable, Optional
 
 import pytest
 import torch
@@ -10,29 +10,17 @@ from tests.compile_contract import (
     compile_fullgraph,
     register_compile_contract,
 )
-from tests.test_base import FixtureBase, TestBase
-from tileops.kernels.kernel_base import Kernel
-from tileops.kernels.pool import (
-    AdaptiveAvgPool2dKernel,
+from tests.workload_test_base import FixtureBase, TestBase
+from tileops._kernels.kernel_base import Kernel
+from tileops._kernels.pool import (
     AdaptiveMaxPool2dKernel,
-    AdaptiveMaxPool2dWithIndicesKernel,
-    AvgPool1dKernel,
-    AvgPool1dSpatialKernel,
-    AvgPool2dSpatialKernel,
-    AvgPool3dKernel,
-    AvgPool3dSpatialKernel,
-    MaxPool1dKernel,
-    MaxPool1dWithIndicesKernel,
-    MaxPool2dKernel,
-    MaxPool2dWithIndicesKernel,
-    MaxPool3dKernel,
-    MaxPool3dWithIndicesKernel,
+    AdaptiveMaxPool2dRegisterKernel,
+    AvgPool2dFwdInterface,
 )
-from tileops.kernels.pool.avg_pool1d import _WindowStaging
-from tileops.kernels.pool.common import AvgPoolWindow, pool_output_dim, window_span
-from tileops.kernels.pool.max_pool1d import _plan as _max_pool1d_plan
-from tileops.kernels.pool.max_pool1d import _Shape as _MaxPool1dShape
-from tileops.ops import (
+from tileops.backend import BUILTIN
+from tileops.backend import _registry as registry
+from tileops.backend._registry import register_kernel_type
+from tileops.pool import (
     AdaptiveAvgPool2dFwdOp,
     AdaptiveMaxPool2dFwdOp,
     AdaptiveMaxPool2dIndicesFwdOp,
@@ -46,24 +34,16 @@ from tileops.ops import (
     MaxPool3dFwdOp,
     MaxPool3dIndicesFwdOp,
 )
+from workloads.device import run_device, run_device_available
+from workloads.numerics import compare_outputs, reference_for
 from workloads.pool import (
-    AdaptivePool2dWorkload,
+    AdaptiveAvgPool2dWorkload,
+    AdaptiveMaxPool2dWorkload,
     AvgPoolWorkload,
     MaxPoolWorkload,
     max_pool_ref,
+    pool_verification,
 )
-
-
-class _DummyKernel(Kernel):
-    supported_archs = [80]
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x
-
-
-# ---------------------------------------------------------------------------
-# AvgPool family
-# ---------------------------------------------------------------------------
 
 _AVG_POOL_OPS: dict[int, type] = {
     1: AvgPool1dFwdOp,
@@ -88,7 +68,7 @@ class AvgPool1dFixture(FixtureBase):
                     True,
                     torch.float16,
                     False,
-                    marks=[pytest.mark.smoke, pytest.mark.packaging],
+                    marks=[pytest.mark.smoke, pytest.mark.packaging(family="pool")],
                     id="smoke-k3-default-stride-fp16",
                 ),
                 pytest.param(
@@ -170,7 +150,7 @@ class AvgPool2dFixture(FixtureBase):
                     None,
                     torch.float16,
                     False,
-                    marks=[pytest.mark.smoke, pytest.mark.packaging],
+                    marks=[pytest.mark.smoke, pytest.mark.packaging(family="pool")],
                     id="smoke-3x3-default-stride-fp16",
                 ),
                 pytest.param(
@@ -341,7 +321,7 @@ class AvgPool3dFixture(FixtureBase):
                     None,
                     torch.float16,
                     False,
-                    marks=[pytest.mark.smoke, pytest.mark.packaging],
+                    marks=[pytest.mark.smoke, pytest.mark.packaging(family="pool")],
                     id="smoke-2x2x2-default-stride-fp16",
                 ),
                 pytest.param(
@@ -378,6 +358,60 @@ class AvgPool3dFixture(FixtureBase):
                     marks=pytest.mark.smoke,
                     id="smoke-2x2x2-default-stride-fp32",
                 ),
+                # Windows past the rows the wide kernel holds, and padded windows past the taps
+                # it unrolls: both keep a serial loop.
+                pytest.param(
+                    1,
+                    4,
+                    10,
+                    10,
+                    20,
+                    (5, 5, 2),
+                    None,
+                    (0, 0, 0),
+                    False,
+                    True,
+                    None,
+                    torch.float32,
+                    False,
+                    marks=pytest.mark.smoke,
+                    id="smoke-5x5x2-wide-serial-fp32",
+                ),
+                pytest.param(
+                    1,
+                    4,
+                    8,
+                    8,
+                    8,
+                    (4, 4, 3),
+                    (2, 2, 2),
+                    (1, 1, 1),
+                    False,
+                    True,
+                    5,
+                    torch.float16,
+                    False,
+                    marks=pytest.mark.smoke,
+                    id="smoke-4x4x3-padded-serial-fp16",
+                ),
+                pytest.param(
+                    1,
+                    24,
+                    10,
+                    20,
+                    22,
+                    (2, 2, 3),
+                    (2, 2, 2),
+                    (0, 1, 1),
+                    False,
+                    True,
+                    7,
+                    torch.bfloat16,
+                    False,
+                    # A padded window with a fixed divisor and at most 32 taps: the clamped taps.
+                    marks=pytest.mark.smoke,
+                    id="smoke-divisor-override-clamped-bf16",
+                ),
                 pytest.param(
                     1,
                     48,
@@ -394,23 +428,6 @@ class AvgPool3dFixture(FixtureBase):
                     False,
                     marks=pytest.mark.full,
                     id="full-ceil-no-pad-count-fp16",
-                ),
-                pytest.param(
-                    1,
-                    24,
-                    10,
-                    20,
-                    22,
-                    (2, 2, 3),
-                    (2, 2, 2),
-                    (0, 1, 1),
-                    False,
-                    True,
-                    7,
-                    torch.bfloat16,
-                    False,
-                    marks=pytest.mark.full,
-                    id="full-divisor-override-bf16",
                 ),
                 pytest.param(
                     1,
@@ -452,28 +469,7 @@ class AvgPool3dFixture(FixtureBase):
 
 
 class AvgPoolTest(AvgPoolWorkload, TestBase):
-    """Dim-generic avg-pool reference harness (divisor_override is 2d/3d-only)."""
-
-
-def _avg_pool_expected_kernel(
-    ndim: int,
-    ceil_mode: bool,
-    count_include_pad: bool,
-    divisor_override: Optional[int],
-) -> Optional[type[Kernel]]:
-    """Per-dim kernel-dispatch expectation for the main correctness test.
-
-    2d dispatch is covered by test_avg_pool2d_dispatches_kernel instead.
-    """
-    if ndim == 1:
-        return AvgPool1dSpatialKernel if not ceil_mode and count_include_pad else AvgPool1dKernel
-    if ndim == 3:
-        return (
-            AvgPool3dSpatialKernel
-            if not ceil_mode and count_include_pad and divisor_override is None
-            else AvgPool3dKernel
-        )
-    return None
+    """Dim-generic avg-pool reference test (divisor_override is 2d/3d-only)."""
 
 
 def _run_avg_pool_case(
@@ -504,18 +500,13 @@ def _run_avg_pool_case(
         "padding": padding,
         "ceil_mode": ceil_mode,
         "count_include_pad": count_include_pad,
-        "tune": tune,
     }
     if ndim > 1:
         op_kwargs["divisor_override"] = divisor_override
     op = _AVG_POOL_OPS[ndim](**op_kwargs)
-    atol, rtol = (1e-3, 1e-3) if dtype == torch.float16 else (1.6e-2, 1.6e-2)
-    test.check(op, *test.gen_inputs(*shape), atol=atol, rtol=rtol)
-    expected_kernel = _avg_pool_expected_kernel(
-        ndim, ceil_mode, count_include_pad, divisor_override
-    )
-    if expected_kernel is not None:
-        assert isinstance(op.kernel, expected_kernel)
+    if tune:
+        op.request_tune()
+    test.check(op, *test.gen_inputs(*shape))
 
 
 @AvgPool1dFixture
@@ -605,206 +596,63 @@ def test_avg_pool3d(
 
 
 @pytest.mark.smoke
-def test_avg_pool2d_dispatches_kernel() -> None:
-    op = AvgPool2dFwdOp(
-        kernel_size=(3, 3),
-        stride=(2, 2),
-        padding=(1, 1),
-    )
-    x = torch.randn(1, 32, 28, 28, dtype=torch.float16).ptpu().contiguous()
-    op(x)
-    assert isinstance(op.kernel, AvgPool2dSpatialKernel)
-
-
-@pytest.mark.smoke
-def test_avg_pool2d_rejects_non_positive_output_size() -> None:
-    op = AvgPool2dFwdOp(
-        kernel_size=(5, 5),
-        stride=(1, 1),
-        padding=(0, 0),
-        ceil_mode=False,
-        count_include_pad=True,
-    )
-    x = torch.randn(1, 1, 2, 2, dtype=torch.float16).ptpu().contiguous()
-    with pytest.raises(ValueError, match="output size must be greater than zero"):
-        op(x)
+@pytest.mark.parametrize(
+    "l_in, kernel_l, stride_l, pad_l, dtype",
+    [
+        (4096, 3, 2, 1, torch.float16),
+        (32000, 5, 4, 2, torch.float16),
+        (2048, 4, 2, 1, torch.bfloat16),
+        (28000, 12000, 4001, 0, torch.float16),
+        (127, 7, 3, 3, torch.bfloat16),
+        (30, 4, 4, 2, torch.bfloat16),
+        (33, 3, 2, 1, torch.float16),
+        (64, 1, 1, 0, torch.float16),
+    ],
+)
+def test_avg_pool1d_staged_windows_match_the_reference(
+    l_in: int, kernel_l: int, stride_l: int, pad_l: int, dtype: torch.dtype
+) -> None:
+    """Rows, strides and padding that move the vectorized staging boundaries, including a
+    window too wide to stage at 128 outputs."""
+    _run_avg_pool_case(1, (1, 1, l_in), kernel_l, stride_l, pad_l, False, True, None, dtype, False)
 
 
 @pytest.mark.smoke
 @pytest.mark.parametrize(
-    ("op_cls", "kwargs", "exc_type", "match"),
+    "l_in, kernel_l, stride_l, pad_l, dtype, offset",
     [
-        # 1d
-        pytest.param(
-            AvgPool1dFwdOp,
-            {"kernel_size": (3, 4)},
-            ValueError,
-            "kernel_size must be an int or a tuple of 1 ints",
-            id="1d-wrong-tuple-arity",
-        ),
-        pytest.param(
-            AvgPool1dFwdOp,
-            {"kernel_size": 3, "stride": 0},
-            ValueError,
-            "stride must be greater than zero",
-            id="1d-zero-stride",
-        ),
-        pytest.param(
-            AvgPool1dFwdOp,
-            {"kernel_size": True},
-            TypeError,
-            "kernel_size must be an int or a tuple of 1 ints",
-            id="1d-bool-kernel-size",
-        ),
-        pytest.param(
-            AvgPool1dFwdOp,
-            {"kernel_size": 3, "stride": True},
-            TypeError,
-            "stride must be an int or a tuple of 1 ints",
-            id="1d-bool-stride",
-        ),
-        pytest.param(
-            AvgPool1dFwdOp,
-            {"kernel_size": 3, "padding": True},
-            TypeError,
-            "padding must be an int or a tuple of 1 ints",
-            id="1d-bool-padding",
-        ),
-        # 2d
-        pytest.param(
-            AvgPool2dFwdOp,
-            {"kernel_size": (3, 3), "divisor_override": 0},
-            ValueError,
-            "divisor_override must not be zero",
-            id="2d-zero-divisor-override",
-        ),
-        pytest.param(
-            AvgPool2dFwdOp,
-            {"kernel_size": (3, 3), "stride": (1, 0)},
-            ValueError,
-            "stride must be greater than zero",
-            id="2d-zero-stride",
-        ),
-        pytest.param(
-            AvgPool2dFwdOp,
-            {"kernel_size": (3, 3), "padding": (2, 1)},
-            ValueError,
-            "padding must be at most half",
-            id="2d-padding-too-large",
-        ),
-        pytest.param(
-            AvgPool2dFwdOp,
-            {"kernel_size": True},
-            TypeError,
-            "kernel_size must be an int or a tuple of 2 ints",
-            id="2d-bool-kernel-size",
-        ),
-        pytest.param(
-            AvgPool2dFwdOp,
-            {"kernel_size": (3, 3), "stride": True},
-            TypeError,
-            "stride must be an int or a tuple of 2 ints",
-            id="2d-bool-stride",
-        ),
-        pytest.param(
-            AvgPool2dFwdOp,
-            {"kernel_size": (3, 3), "padding": True},
-            TypeError,
-            "padding must be an int or a tuple of 2 ints",
-            id="2d-bool-padding",
-        ),
-        pytest.param(
-            AvgPool2dFwdOp,
-            {"kernel_size": (3, True)},
-            TypeError,
-            "kernel_size must contain only ints",
-            id="2d-kernel-size-contents",
-        ),
-        pytest.param(
-            AvgPool2dFwdOp,
-            {"kernel_size": (3, 3), "divisor_override": True},
-            TypeError,
-            "divisor_override must be an int or None",
-            id="2d-bool-divisor-override",
-        ),
-        pytest.param(
-            AvgPool2dFwdOp,
-            {"kernel_size": (3, 3), "divisor_override": 1.5},
-            TypeError,
-            "divisor_override must be an int or None",
-            id="2d-float-divisor-override",
-        ),
-        # 3d
-        pytest.param(
-            AvgPool3dFwdOp,
-            {"kernel_size": (2, 2, 2), "divisor_override": 0},
-            ValueError,
-            "divisor_override must not be zero",
-            id="3d-zero-divisor-override",
-        ),
-        pytest.param(
-            AvgPool3dFwdOp,
-            {"kernel_size": (2, 2, 2), "stride": (2, 0, 2)},
-            ValueError,
-            "stride must be greater than zero",
-            id="3d-zero-stride",
-        ),
-        pytest.param(
-            AvgPool3dFwdOp,
-            {"kernel_size": True},
-            TypeError,
-            "kernel_size must be an int or a tuple of 3 ints",
-            id="3d-bool-kernel-size",
-        ),
-        pytest.param(
-            AvgPool3dFwdOp,
-            {"kernel_size": (2, 2, 2), "stride": True},
-            TypeError,
-            "stride must be an int or a tuple of 3 ints",
-            id="3d-bool-stride",
-        ),
-        pytest.param(
-            AvgPool3dFwdOp,
-            {"kernel_size": (2, 2, 2), "padding": True},
-            TypeError,
-            "padding must be an int or a tuple of 3 ints",
-            id="3d-bool-padding",
-        ),
-        pytest.param(
-            AvgPool3dFwdOp,
-            {"kernel_size": (2, 2, True)},
-            TypeError,
-            "kernel_size must contain only ints",
-            id="3d-kernel-size-contents",
-        ),
-        pytest.param(
-            AvgPool3dFwdOp,
-            {"kernel_size": (2, 2, 2), "divisor_override": True},
-            TypeError,
-            "divisor_override must be an int or None",
-            id="3d-bool-divisor-override",
-        ),
-        pytest.param(
-            AvgPool3dFwdOp,
-            {"kernel_size": (2, 2, 2), "divisor_override": 1.5},
-            TypeError,
-            "divisor_override must be an int or None",
-            id="3d-float-divisor-override",
-        ),
+        pytest.param(4096, 3, 2, 1, torch.float16, 0, id="s2-pad-before-fp16"),
+        pytest.param(4096, 3, 2, 1, torch.float16, 1, id="misaligned-fp16"),
+        pytest.param(1024, 3, 1, 1, torch.float32, 0, id="s1-pad-both-sides-fp32"),
+        pytest.param(512, 4, 4, 0, torch.bfloat16, 0, id="s4-one-output-a-load-bf16"),
+        pytest.param(1024, 5, 4, 0, torch.float32, 0, id="s4-reach-past-the-load-fp32"),
     ],
 )
-def test_avg_pool_rejects_invalid_params(
-    op_cls: type,
-    kwargs: dict[str, object],
-    exc_type: type[Exception],
-    match: str,
+def test_avg_pool1d_windows_read_into_registers(
+    l_in: int, kernel_l: int, stride_l: int, pad_l: int, dtype: torch.dtype, offset: int
 ) -> None:
-    with pytest.raises(exc_type, match=match):
-        op_cls(**kwargs)
+    """Windows a 16-byte load covers whole outputs of, read with the elements they reach
+    past it on either side and divided as torch divides, so the result matches it bit for
+    bit; an input starting ``offset`` elements into its storage is served too."""
+    storage = torch.randn(offset + 2 * 3 * l_in, device=run_device(), dtype=dtype)
+    x = storage[offset:].view(2, 3, l_in)
+    out = AvgPool1dFwdOp(kernel_size=kernel_l, stride=stride_l, padding=pad_l)(x)
+    expected = reference_for(F.avg_pool1d, x, kernel_l, stride_l, pad_l).to(x.device)
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
 @pytest.mark.smoke
-@pytest.mark.skipif(not torch.ptpu.is_available(), reason="PTPU required")
+@pytest.mark.parametrize("l_in, kernel_l", [(15, 16), (31, 32), (100, 128), (1000, 1024)])
+def test_max_pool1d_window_wider_than_the_row(l_in: int, kernel_l: int) -> None:
+    """Ceil mode admits a window wider than the row; PyTorch pads the missing taps with -inf
+    and still emits one output, which reads no tap past the row's end."""
+    _run_max_pool_case(
+        1, (2, 4, l_in), (kernel_l,), (kernel_l,), (0,), (1,), True, torch.float16, False, True
+    )
+
+
+@pytest.mark.smoke
+@pytest.mark.skipif(not run_device_available(), reason="the run device is not available")
 @pytest.mark.parametrize(
     ("ndim", "shape"),
     [
@@ -816,8 +664,7 @@ def test_avg_pool_negative_divisor_override_matches_torch(
     ndim: int,
     shape: tuple[int, ...],
 ) -> None:
-    # Device principle: random tensor generated on CPU, then moved to PTPU.
-    x = torch.randn(*shape, dtype=torch.float16).ptpu().contiguous()
+    x = torch.randn(*shape, device=run_device(), dtype=torch.float16).contiguous()
     pool_kwargs = {
         "kernel_size": (2,) * ndim,
         "stride": (2,) * ndim,
@@ -826,94 +673,39 @@ def test_avg_pool_negative_divisor_override_matches_torch(
     }
     op = _AVG_POOL_OPS[ndim](**pool_kwargs)
     out = op(x)
-    # F.avg_pool2d/3d are unimplemented on PTPU; compute the reference on CPU
-    # (device principle). CPU avg_pool3d has no Half kernel, so run it in fp32
-    # and cast back to the input dtype.
-    ref = getattr(F, f"avg_pool{ndim}d")(x.cpu().float(), **pool_kwargs).to(x.dtype)
-    torch.testing.assert_close(out.cpu(), ref, atol=1e-3, rtol=1e-3)
+    if ndim == 3 and x.device.type == "ptpu":
+        ref = reference_for(
+            AvgPoolWorkload(
+                ndim, **pool_kwargs, ceil_mode=False, count_include_pad=True, dtype=x.dtype
+            ).ref_program,
+            x,
+        )
+    else:
+        ref = (
+            reference_for(getattr(F, f"avg_pool{ndim}d"), x, **pool_kwargs)
+            if ndim != 3
+            else getattr(F, f"avg_pool{ndim}d")(x, **pool_kwargs)
+        )
+    compare_outputs(out, ref, pool_verification(maximum=False))
 
 
 @pytest.mark.smoke
-@pytest.mark.parametrize(
-    ("ndim", "ctor_kwargs", "kernel_slot", "bad_shape", "match"),
-    [
-        pytest.param(
-            1,
-            {"kernel_size": 3, "stride": 1, "padding": 1},
-            "avg_pool1d_kernel",
-            (2, 8, 16, 4),
-            "expects input to be a 3D NCL tensor",
-            id="avg-pool1d",
-        ),
-        pytest.param(
-            2,
-            {"kernel_size": (3, 3), "stride": (1, 1), "padding": (1, 1)},
-            "avg_pool2d_kernel",
-            (2, 8, 16),
-            "expects input to be a 4D NCHW tensor",
-            id="avg-pool2d",
-        ),
-        pytest.param(
-            3,
-            {"kernel_size": (2, 2, 2), "stride": (2, 2, 2), "padding": (0, 0, 0)},
-            "avg_pool3d_kernel",
-            (1, 4, 8, 8),
-            "expects input to be a 5D NCDHW tensor",
-            id="avg-pool3d",
-        ),
-    ],
-)
-def test_avg_pool_rejects_wrong_rank_input(
-    ndim: int,
-    ctor_kwargs: dict[str, object],
-    kernel_slot: str,
-    bad_shape: tuple[int, ...],
-    match: str,
-) -> None:
-    # Construction probes no device, so a kernel built for another architecture
-    # installs fine; the rank check runs before anything is built.
-    op = _AVG_POOL_OPS[ndim](kernel_map={kernel_slot: _DummyKernel}, **ctor_kwargs)
-    x = torch.randn(*bad_shape)
-    with pytest.raises(ValueError, match=match):
-        op(x)
+@pytest.mark.skipif(not run_device_available(), reason="the run device is not available")
+def test_a_pool_param_changed_after_a_call_runs_the_next_call() -> None:
+    """A call reads the op's params as they are on that call, and a return to the first
+    params runs them again."""
+    (x,) = AvgPoolTest(2, 2, 2, 0, False, True, 4, torch.float16).gen_inputs(1, 4, 8, 8)
+    op = AvgPool2dFwdOp(kernel_size=2, stride=2, divisor_override=4)
+    op(x)
+    for divisor in (2, 4):
+        op.divisor_override = divisor
+        AvgPoolTest(2, 2, 2, 0, False, True, divisor, torch.float16).check(op, x)
+    op = MaxPool2dFwdOp(kernel_size=2)
+    op(x)
+    for kernel_size in (4, 2):
+        op.kernel_size = kernel_size
+        MaxPoolTest(2, kernel_size, None, 0, 1, False, torch.float16).check(op, x)
 
-
-@pytest.mark.smoke
-def test_avg_pool2d_dynamic_shape_kernel_cache_and_roofline() -> None:
-    op = AvgPool2dFwdOp(kernel_size=(3, 3), stride=(2, 2), padding=(1, 1))
-    x1 = torch.randn(1, 4, 16, 16, dtype=torch.float16).ptpu()
-    x2 = torch.randn(2, 4, 16, 16, dtype=torch.float16).ptpu()
-
-    with pytest.raises(RuntimeError, match="requires a prior forward"):
-        op.eval_roofline()
-
-    op(x1)
-    assert len(list(op.iter_kernels())) == 1
-    flops, nbytes = op.eval_roofline()
-    assert flops > 0
-    assert nbytes > 0
-
-    op(x1)
-    assert len(list(op.iter_kernels())) == 1
-
-    op(x2)
-    assert len(list(op.iter_kernels())) == 2
-
-
-@pytest.mark.smoke
-@pytest.mark.parametrize("op_cls", [AvgPool1dFwdOp, AvgPool2dFwdOp, AvgPool3dFwdOp])
-def test_avg_pool_dynamic_dtype_ignores_last_runtime_dtype(
-    op_cls: type[AvgPool1dFwdOp | AvgPool2dFwdOp | AvgPool3dFwdOp],
-) -> None:
-    op = op_cls(kernel_size=2)
-    op.dtype = torch.float16
-
-    op._validate_dtypes(torch.empty((), dtype=torch.bfloat16))
-
-
-# ---------------------------------------------------------------------------
-# MaxPool family
-# ---------------------------------------------------------------------------
 
 _MAX_POOL_OPS: dict[int, type] = {
     1: MaxPool1dFwdOp,
@@ -925,24 +717,6 @@ _MAX_POOL_INDICES_OPS: dict[int, type] = {
     1: MaxPool1dIndicesFwdOp,
     2: MaxPool2dIndicesFwdOp,
     3: MaxPool3dIndicesFwdOp,
-}
-
-_MAX_POOL_KERNEL_SLOTS: dict[type, str] = {
-    MaxPool1dFwdOp: "max_pool1d_kernel",
-    MaxPool1dIndicesFwdOp: "max_pool1d_with_indices_kernel",
-    MaxPool2dFwdOp: "max_pool2d_kernel",
-    MaxPool2dIndicesFwdOp: "max_pool2d_with_indices_kernel",
-    MaxPool3dFwdOp: "max_pool3d_kernel",
-    MaxPool3dIndicesFwdOp: "max_pool3d_with_indices_kernel",
-}
-
-_MAX_POOL_DUMMY_KERNELS: dict[type, type[Kernel]] = {
-    MaxPool1dFwdOp: MaxPool1dKernel,
-    MaxPool1dIndicesFwdOp: MaxPool1dWithIndicesKernel,
-    MaxPool2dFwdOp: MaxPool2dKernel,
-    MaxPool2dIndicesFwdOp: MaxPool2dWithIndicesKernel,
-    MaxPool3dFwdOp: MaxPool3dKernel,
-    MaxPool3dIndicesFwdOp: MaxPool3dWithIndicesKernel,
 }
 
 
@@ -964,7 +738,7 @@ _MAX_POOL1D_PARAMS = [
         torch.float16,
         False,
         True,
-        marks=[pytest.mark.smoke, pytest.mark.packaging],
+        marks=[pytest.mark.smoke, pytest.mark.packaging(family="pool")],
         id="smoke-k3-s2-p1-fp16",
     ),
     pytest.param(
@@ -1117,7 +891,7 @@ _MAX_POOL2D_PARAMS = [
         torch.float16,
         False,
         True,
-        marks=[pytest.mark.smoke, pytest.mark.packaging],
+        marks=[pytest.mark.smoke, pytest.mark.packaging(family="pool")],
         id="smoke-3x3-s2-p1-fp16",
     ),
     pytest.param(
@@ -1261,7 +1035,7 @@ _MAX_POOL3D_PARAMS = [
         torch.float16,
         False,
         True,
-        marks=[pytest.mark.smoke, pytest.mark.packaging],
+        marks=[pytest.mark.smoke, pytest.mark.packaging(family="pool")],
         id="smoke-k2-s2-fp16",
     ),
     pytest.param(
@@ -1380,7 +1154,7 @@ class MaxPool3dFixture(FixtureBase):
 
 
 class MaxPoolTest(MaxPoolWorkload, TestBase):
-    """Dim-generic max-pool reference harness."""
+    """Dim-generic max-pool reference test."""
 
 
 def _run_max_pool_case(
@@ -1414,9 +1188,10 @@ def _run_max_pool_case(
             padding=padding,
             dilation=dilation,
             ceil_mode=ceil_mode,
-            tune=tune,
         )
-        test.check(op, *test.gen_inputs(*shape), atol=0, rtol=0)
+        if tune:
+            op.request_tune()
+        test.check(op, *test.gen_inputs(*shape))
 
 
 @MaxPool1dFixture
@@ -1506,13 +1281,6 @@ def test_max_pool3d(
     )
 
 
-# Per-dim pool config for the special-values tests.
-_MAX_POOL_SPECIAL_KWARGS: dict[int, dict[str, object]] = {
-    1: {"kernel_size": 3, "stride": 1, "padding": 1},
-    2: {"kernel_size": (3, 3), "stride": (1, 1), "padding": (1, 1)},
-    3: {"kernel_size": 2, "stride": 1, "padding": 1},
-}
-
 # Curated per-dim special-value inputs (NaN / tied maxima / -inf / padding).
 # Smoke cases lead the list: the tier gate requires smoke to collect first.
 _MAX_POOL_SPECIAL_VALUE_CASES = [
@@ -1520,21 +1288,25 @@ _MAX_POOL_SPECIAL_VALUE_CASES = [
     pytest.param(
         1,
         "window_all_neg_inf",
-        lambda: torch.full((1, 1, 4), float("-inf"), device="ptpu", dtype=torch.float16),
+        lambda: torch.full((1, 1, 4), float("-inf"), device=run_device(), dtype=torch.float16),
         id="1d-window-all-neg-inf",
         marks=pytest.mark.smoke,
     ),
     pytest.param(
         2,
         "all_negative",
-        lambda: torch.tensor([[[[-1.0, -2.0, -3.0, -4.0]]]], device="ptpu", dtype=torch.float16),
+        lambda: torch.tensor(
+            [[[[-1.0, -2.0, -3.0, -4.0]]]], device=run_device(), dtype=torch.float16
+        ),
         id="2d-all-negative",
         marks=pytest.mark.smoke,
     ),
     pytest.param(
         3,
         "window_all_neg_inf",
-        lambda: torch.full((1, 1, 3, 3, 3), float("-inf"), device="ptpu", dtype=torch.float16),
+        lambda: torch.full(
+            (1, 1, 3, 3, 3), float("-inf"), device=run_device(), dtype=torch.float16
+        ),
         id="3d-window-all-neg-inf",
         marks=pytest.mark.smoke,
     ),
@@ -1542,7 +1314,9 @@ _MAX_POOL_SPECIAL_VALUE_CASES = [
     pytest.param(
         1,
         "window_with_nan",
-        lambda: torch.tensor([[[1.0, float("nan"), 3.0, 4.0]]], device="ptpu", dtype=torch.float16),
+        lambda: torch.tensor(
+            [[[1.0, float("nan"), 3.0, 4.0]]], device=run_device(), dtype=torch.float16
+        ),
         id="1d-window-with-nan",
         marks=pytest.mark.full,
     ),
@@ -1551,7 +1325,7 @@ _MAX_POOL_SPECIAL_VALUE_CASES = [
         "window_with_multiple_nans",
         lambda: torch.tensor(
             [[[float("nan"), 1.0, float("nan"), 0.0]]],
-            device="ptpu",
+            device=run_device(),
             dtype=torch.float16,
         ),
         id="1d-window-with-multiple-nans",
@@ -1560,21 +1334,23 @@ _MAX_POOL_SPECIAL_VALUE_CASES = [
     pytest.param(
         1,
         "window_with_tied_maxima",
-        lambda: torch.tensor([[[5.0, 5.0, 4.0, 3.0]]], device="ptpu", dtype=torch.float16),
+        lambda: torch.tensor([[[5.0, 5.0, 4.0, 3.0]]], device=run_device(), dtype=torch.float16),
         id="1d-window-with-tied-maxima",
         marks=pytest.mark.full,
     ),
     pytest.param(
         1,
         "all_negative",
-        lambda: torch.tensor([[[-1.0, -2.0, -3.0, -4.0]]], device="ptpu", dtype=torch.float16),
+        lambda: torch.tensor(
+            [[[-1.0, -2.0, -3.0, -4.0]]], device=run_device(), dtype=torch.float16
+        ),
         id="1d-all-negative",
         marks=pytest.mark.full,
     ),
     pytest.param(
         1,
         "padding_does_not_win_over_negative",
-        lambda: torch.full((1, 1, 4), -5.0, device="ptpu", dtype=torch.float16),
+        lambda: torch.full((1, 1, 4), -5.0, device=run_device(), dtype=torch.float16),
         id="1d-padding-does-not-win",
         marks=pytest.mark.full,
     ),
@@ -1582,7 +1358,7 @@ _MAX_POOL_SPECIAL_VALUE_CASES = [
     pytest.param(
         2,
         "window_all_neg_inf",
-        lambda: torch.full((1, 1, 4, 4), float("-inf"), device="ptpu", dtype=torch.float16),
+        lambda: torch.full((1, 1, 4, 4), float("-inf"), device=run_device(), dtype=torch.float16),
         id="2d-window-all-neg-inf",
         marks=pytest.mark.full,
     ),
@@ -1590,7 +1366,7 @@ _MAX_POOL_SPECIAL_VALUE_CASES = [
         2,
         "window_with_nan",
         lambda: torch.tensor(
-            [[[[1.0, float("nan"), 3.0, 4.0]]]], device="ptpu", dtype=torch.float16
+            [[[[1.0, float("nan"), 3.0, 4.0]]]], device=run_device(), dtype=torch.float16
         ),
         id="2d-window-with-nan",
         marks=pytest.mark.full,
@@ -1600,7 +1376,7 @@ _MAX_POOL_SPECIAL_VALUE_CASES = [
         "window_with_multiple_nans",
         lambda: torch.tensor(
             [[[[float("nan"), 1.0, float("nan"), 0.0]]]],
-            device="ptpu",
+            device=run_device(),
             dtype=torch.float16,
         ),
         id="2d-window-with-multiple-nans",
@@ -1609,14 +1385,14 @@ _MAX_POOL_SPECIAL_VALUE_CASES = [
     pytest.param(
         2,
         "window_with_tied_maxima",
-        lambda: torch.tensor([[[[5.0, 5.0, 4.0, 3.0]]]], device="ptpu", dtype=torch.float16),
+        lambda: torch.tensor([[[[5.0, 5.0, 4.0, 3.0]]]], device=run_device(), dtype=torch.float16),
         id="2d-window-with-tied-maxima",
         marks=pytest.mark.full,
     ),
     pytest.param(
         2,
         "padding_does_not_win_over_negative",
-        lambda: torch.full((1, 1, 4, 4), -5.0, device="ptpu", dtype=torch.float16),
+        lambda: torch.full((1, 1, 4, 4), -5.0, device=run_device(), dtype=torch.float16),
         id="2d-padding-does-not-win",
         marks=pytest.mark.full,
     ),
@@ -1626,7 +1402,7 @@ _MAX_POOL_SPECIAL_VALUE_CASES = [
         "window_with_nan",
         lambda: torch.tensor(
             [[[[[1.0, float("nan")], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]]]],
-            device="ptpu",
+            device=run_device(),
             dtype=torch.float16,
         ),
         id="3d-window-with-nan",
@@ -1637,7 +1413,7 @@ _MAX_POOL_SPECIAL_VALUE_CASES = [
         "window_with_multiple_nans",
         lambda: torch.tensor(
             [[[[[float("nan"), 1.0], [float("nan"), 0.0]], [[2.0, 3.0], [4.0, 5.0]]]]],
-            device="ptpu",
+            device=run_device(),
             dtype=torch.float16,
         ),
         id="3d-window-with-multiple-nans",
@@ -1648,7 +1424,7 @@ _MAX_POOL_SPECIAL_VALUE_CASES = [
         "window_with_tied_maxima",
         lambda: torch.tensor(
             [[[[[5.0, 5.0], [4.0, 3.0]], [[2.0, 1.0], [0.0, -1.0]]]]],
-            device="ptpu",
+            device=run_device(),
             dtype=torch.float16,
         ),
         id="3d-window-with-tied-maxima",
@@ -1657,14 +1433,14 @@ _MAX_POOL_SPECIAL_VALUE_CASES = [
     pytest.param(
         3,
         "all_negative",
-        lambda: torch.full((1, 1, 2, 2, 2), -5.0, device="ptpu", dtype=torch.float16),
+        lambda: torch.full((1, 1, 2, 2, 2), -5.0, device=run_device(), dtype=torch.float16),
         id="3d-all-negative",
         marks=pytest.mark.full,
     ),
     pytest.param(
         3,
         "padding_does_not_win_over_negative",
-        lambda: torch.full((1, 1, 3, 3, 3), -5.0, device="ptpu", dtype=torch.float16),
+        lambda: torch.full((1, 1, 3, 3, 3), -5.0, device=run_device(), dtype=torch.float16),
         id="3d-padding-does-not-win",
         marks=pytest.mark.full,
     ),
@@ -1682,385 +1458,23 @@ def test_max_pool_special_values(
     input_builder: Callable[[], torch.Tensor],
     return_indices: bool,
 ) -> None:
+    special_kwargs = {
+        1: {"kernel_size": 3, "stride": 1, "padding": 1},
+        2: {"kernel_size": (3, 3), "stride": (1, 1), "padding": (1, 1)},
+        3: {"kernel_size": 2, "stride": 1, "padding": 1},
+    }
     _ = case_name
     x = input_builder()
-    pool_kwargs = _MAX_POOL_SPECIAL_KWARGS[ndim]
-    # F.max_pool3d_with_indices is unimplemented on PTPU (1d/2d exist); compute
-    # the reference on CPU and compare on CPU (device principle).
-    ref = max_pool_ref(ndim)(x.cpu(), **pool_kwargs, return_indices=return_indices)
+    pool_kwargs = special_kwargs[ndim]
+    ref = reference_for(max_pool_ref(ndim), x, **pool_kwargs, return_indices=return_indices)
     op = _max_pool_op_cls(ndim, return_indices)(**pool_kwargs)
     if return_indices:
         out, idx = op(x)
-        torch.testing.assert_close(out.cpu(), ref[0], rtol=0, atol=0, equal_nan=True)
-        torch.testing.assert_close(idx.cpu(), ref[1], rtol=0, atol=0)
+        compare_outputs(out, ref[0], pool_verification(maximum=True))
+        compare_outputs(idx, ref[1], pool_verification(maximum=True))
     else:
         out = op(x)
-        torch.testing.assert_close(out.cpu(), ref, rtol=0, atol=0, equal_nan=True)
-
-
-# Curated per-dim constructor rejection cases; 2d carries the exhaustive
-# type-validation coverage, 1d/3d keep the dim-specific spot checks.
-_MAX_POOL_INVALID_PARAM_CASES = [
-    # Smoke cases lead the list: the tier gate requires smoke to collect first.
-    pytest.param(
-        1,
-        {"kernel_size": True},
-        TypeError,
-        "kernel_size must be an int or a tuple of 1 ints",
-        id="1d-kernel-size-type",
-        marks=pytest.mark.smoke,
-    ),
-    pytest.param(
-        2,
-        {"kernel_size": True},
-        TypeError,
-        "kernel_size must be an int or a tuple of 2 ints",
-        id="2d-kernel-size-type",
-        marks=pytest.mark.smoke,
-    ),
-    pytest.param(
-        3,
-        {"kernel_size": True},
-        TypeError,
-        "kernel_size must be an int or a tuple of 3 ints",
-        id="3d-kernel-size-type",
-        marks=pytest.mark.smoke,
-    ),
-    # 1d full
-    pytest.param(
-        1,
-        {"kernel_size": 3, "stride": 0},
-        ValueError,
-        "stride must be greater than zero",
-        id="1d-zero-stride",
-        marks=pytest.mark.full,
-    ),
-    pytest.param(
-        1,
-        {"kernel_size": 3, "padding": 2},
-        ValueError,
-        "padding must be at most half",
-        id="1d-padding-too-large",
-        marks=pytest.mark.full,
-    ),
-    pytest.param(
-        1,
-        {"kernel_size": 3, "ceil_mode": "true"},
-        TypeError,
-        "ceil_mode must be a bool",
-        id="1d-ceil-mode-type",
-        marks=pytest.mark.full,
-    ),
-    # 2d full
-    pytest.param(
-        2,
-        {"kernel_size": (3, 3), "stride": True},
-        TypeError,
-        "stride must be an int or a tuple of 2 ints",
-        id="2d-stride-type",
-        marks=pytest.mark.full,
-    ),
-    pytest.param(
-        2,
-        {"kernel_size": (3, 3), "padding": True},
-        TypeError,
-        "padding must be an int or a tuple of 2 ints",
-        id="2d-padding-type",
-        marks=pytest.mark.full,
-    ),
-    pytest.param(
-        2,
-        {"kernel_size": (3, 3), "dilation": True},
-        TypeError,
-        "dilation must be an int or a tuple of 2 ints",
-        id="2d-dilation-type",
-        marks=pytest.mark.full,
-    ),
-    pytest.param(
-        2,
-        {"kernel_size": (3, True)},
-        TypeError,
-        "kernel_size must contain only ints",
-        id="2d-kernel-size-contents",
-        marks=pytest.mark.full,
-    ),
-    pytest.param(
-        2,
-        {"kernel_size": (3, 3), "stride": (1, 0)},
-        ValueError,
-        "stride must be greater than zero",
-        id="2d-zero-stride",
-        marks=pytest.mark.full,
-    ),
-    pytest.param(
-        2,
-        {"kernel_size": (3, 3), "dilation": (0, 1)},
-        ValueError,
-        "dilation must be greater than zero",
-        id="2d-zero-dilation",
-        marks=pytest.mark.full,
-    ),
-    pytest.param(
-        2,
-        {"kernel_size": (3, 3), "padding": (2, 1)},
-        ValueError,
-        "padding must be at most half",
-        id="2d-padding-too-large",
-        marks=pytest.mark.full,
-    ),
-    pytest.param(
-        2,
-        {"kernel_size": (3, 3), "padding": (-1, 0)},
-        ValueError,
-        "padding must be non-negative",
-        id="2d-padding-negative",
-        marks=pytest.mark.full,
-    ),
-    pytest.param(
-        2,
-        {"kernel_size": (3, 3), "ceil_mode": "true"},
-        TypeError,
-        "ceil_mode must be a bool",
-        id="2d-ceil-mode-type",
-        marks=pytest.mark.full,
-    ),
-    # 3d full
-    pytest.param(
-        3,
-        {"kernel_size": 3, "stride": (1, 0, 1)},
-        ValueError,
-        "stride must be greater than zero",
-        id="3d-zero-stride",
-        marks=pytest.mark.full,
-    ),
-    pytest.param(
-        3,
-        {"kernel_size": 3, "padding": (0, 2, 0)},
-        ValueError,
-        "padding must be at most half",
-        id="3d-padding-too-large",
-        marks=pytest.mark.full,
-    ),
-    pytest.param(
-        3,
-        {"kernel_size": 3, "ceil_mode": "true"},
-        TypeError,
-        "ceil_mode must be a bool",
-        id="3d-ceil-mode-type",
-        marks=pytest.mark.full,
-    ),
-]
-
-
-@pytest.mark.parametrize("return_indices", [False, True], ids=["plain", "indices"])
-@pytest.mark.parametrize(
-    ("ndim", "kwargs", "exc_type", "match"),
-    _MAX_POOL_INVALID_PARAM_CASES,
-)
-def test_max_pool_rejects_invalid_params(
-    ndim: int,
-    kwargs: dict[str, object],
-    exc_type: type[Exception],
-    match: str,
-    return_indices: bool,
-) -> None:
-    op_cls = _max_pool_op_cls(ndim, return_indices)
-    with pytest.raises(exc_type, match=match):
-        op_cls(**kwargs)
-
-
-# Curated per-dim runtime-input rejection cases:
-# (ndim, ctor_kwargs, (input shape, input dtype), expected match, needs dummy kernel).
-_MAX_POOL_INVALID_INPUT_CASES = [
-    # Smoke cases lead the list: the tier gate requires smoke to collect first.
-    pytest.param(
-        1,
-        {"kernel_size": 3},
-        ((2, 8, 16, 16), None),
-        "expects input to be a 3D NCL tensor",
-        True,
-        id="1d-wrong-rank-input",
-        marks=pytest.mark.smoke,
-    ),
-    pytest.param(
-        2,
-        {"kernel_size": (3, 3)},
-        ((2, 8, 16), None),
-        "expects input to be a 4D NCHW tensor",
-        True,
-        id="2d-wrong-rank-input",
-        marks=pytest.mark.smoke,
-    ),
-    pytest.param(
-        3,
-        {"kernel_size": 3},
-        ((2, 8, 16, 16), None),
-        "expects input to be a 5D NCDHW tensor",
-        True,
-        id="3d-wrong-rank-input",
-        marks=pytest.mark.smoke,
-    ),
-    # 1d full
-    pytest.param(
-        1,
-        {"kernel_size": 3},
-        ((1, 1, 8), None),
-        "requires a GPU tensor",
-        False,
-        id="1d-cpu-input",
-        marks=pytest.mark.full,
-    ),
-    pytest.param(
-        1,
-        {"kernel_size": 3},
-        ((1, 1, 8), torch.float64),
-        "input.dtype must be float16, bfloat16, or float32",
-        False,
-        id="1d-unsupported-dtype",
-        marks=pytest.mark.full,
-    ),
-    pytest.param(
-        1,
-        {"kernel_size": 5, "stride": 1, "padding": 0},
-        ((1, 1, 2), torch.float16),
-        "output size must be greater than zero",
-        False,
-        id="1d-non-positive-output-size",
-        marks=pytest.mark.full,
-    ),
-    # 2d full
-    pytest.param(
-        2,
-        {"kernel_size": (3, 3)},
-        ((1, 1, 8, 8), None),
-        "requires a GPU tensor",
-        False,
-        id="2d-cpu-input",
-        marks=pytest.mark.full,
-    ),
-    pytest.param(
-        2,
-        {"kernel_size": (3, 3)},
-        ((1, 1, 8, 8), torch.float64),
-        "input.dtype must be float16, bfloat16, or float32",
-        False,
-        id="2d-unsupported-dtype",
-        marks=pytest.mark.full,
-    ),
-    pytest.param(
-        2,
-        {"kernel_size": (5, 5), "stride": (1, 1), "padding": (0, 0)},
-        ((1, 1, 2, 2), torch.float16),
-        "output size must be greater than zero",
-        False,
-        id="2d-non-positive-output-size",
-        marks=pytest.mark.full,
-    ),
-    # 3d full
-    pytest.param(
-        3,
-        {"kernel_size": 3},
-        ((1, 1, 4, 8, 8), None),
-        "requires a GPU tensor",
-        False,
-        id="3d-cpu-input",
-        marks=pytest.mark.full,
-    ),
-    pytest.param(
-        3,
-        {"kernel_size": 3},
-        ((1, 1, 4, 8, 8), torch.float64),
-        "input.dtype must be float16, bfloat16, or float32",
-        False,
-        id="3d-unsupported-dtype",
-        marks=pytest.mark.full,
-    ),
-    pytest.param(
-        3,
-        {"kernel_size": 5, "stride": 1, "padding": 0},
-        ((1, 1, 2, 8, 8), torch.float16),
-        "output size must be greater than zero",
-        False,
-        id="3d-non-positive-output-size",
-        marks=pytest.mark.full,
-    ),
-]
-
-
-@pytest.mark.skipif(not torch.ptpu.is_available(), reason="PTPU required")
-@pytest.mark.parametrize("return_indices", [False, True], ids=["plain", "indices"])
-@pytest.mark.parametrize(
-    ("ndim", "ctor_kwargs", "input_spec", "expected_match", "needs_dummy_kernel"),
-    _MAX_POOL_INVALID_INPUT_CASES,
-)
-def test_max_pool_rejects_invalid_input(
-    ndim: int,
-    ctor_kwargs: dict[str, object],
-    input_spec: tuple[tuple[int, ...], torch.dtype | None],
-    expected_match: str,
-    needs_dummy_kernel: bool,
-    return_indices: bool,
-) -> None:
-    op_cls = _max_pool_op_cls(ndim, return_indices)
-    kwargs = dict(ctor_kwargs)
-    if needs_dummy_kernel:
-        # Construction probes no device, so the stand-in kernel installs
-        # whatever architecture it declares.
-        kwargs["kernel_map"] = {_MAX_POOL_KERNEL_SLOTS[op_cls]: _MAX_POOL_DUMMY_KERNELS[op_cls]}
-    op = op_cls(**kwargs)
-
-    shape, dtype = input_spec
-    # These cases only exercise shape/device/dtype rejection, so the values are
-    # irrelevant. Build the on-device tensor with torch.zeros rather than
-    # torch.randn: PTPU's normal_ rejects float64, which would crash the tensor
-    # construction before the op's own dtype validation could run.
-    x = torch.randn(*shape) if dtype is None else torch.zeros(*shape, device="ptpu", dtype=dtype)
-    with pytest.raises(ValueError, match=expected_match):
-        op(x)
-
-
-# Per-dim constructor config shared by the dynamic-shape and compile tests.
-_MAX_POOL_CTOR_KWARGS: dict[int, dict[str, object]] = {
-    1: {"kernel_size": 3, "stride": 2, "padding": 1},
-    2: {"kernel_size": (3, 3), "stride": (2, 2), "padding": (1, 1)},
-    3: {"kernel_size": 3, "stride": 2, "padding": 1},
-}
-
-# Per-dim (first, second) input shapes for the dynamic-shape cache test.
-_MAX_POOL_DYNAMIC_SHAPES: dict[int, tuple[tuple[int, ...], tuple[int, ...]]] = {
-    1: ((1, 4, 32), (2, 4, 32)),
-    2: ((1, 4, 16, 16), (2, 4, 16, 16)),
-    3: ((1, 4, 8, 16, 16), (2, 4, 8, 16, 16)),
-}
-
-
-@pytest.mark.smoke
-@pytest.mark.skipif(not torch.ptpu.is_available(), reason="PTPU required")
-@pytest.mark.parametrize("return_indices", [False, True], ids=["plain", "indices"])
-@pytest.mark.parametrize("ndim", [1, 2, 3], ids=["1d", "2d", "3d"])
-def test_max_pool_dynamic_shape_kernel_cache_and_roofline(
-    ndim: int,
-    return_indices: bool,
-) -> None:
-    op = _max_pool_op_cls(ndim, return_indices)(**_MAX_POOL_CTOR_KWARGS[ndim])
-    shape1, shape2 = _MAX_POOL_DYNAMIC_SHAPES[ndim]
-    x1 = torch.randn(*shape1, dtype=torch.float16).ptpu()
-    x2 = torch.randn(*shape2, dtype=torch.float16).ptpu()
-
-    with pytest.raises(RuntimeError, match="requires a prior forward"):
-        op.eval_roofline()
-
-    op(x1)
-    assert len(list(op.iter_kernels())) == 1
-    flops, nbytes = op.eval_roofline()
-    assert flops > 0
-    assert nbytes > 0
-
-    op(x1)
-    assert len(list(op.iter_kernels())) == 1
-
-    op(x2)
-    assert len(list(op.iter_kernels())) == 2
+        compare_outputs(out, ref, pool_verification(maximum=True))
 
 
 _MAX_POOL_COMPILE_CASES = [
@@ -2076,7 +1490,7 @@ for _case in _MAX_POOL_COMPILE_CASES:
 
 
 @pytest.mark.smoke
-@pytest.mark.skipif(not torch.ptpu.is_available(), reason="PTPU required")
+@pytest.mark.skipif(not run_device_available(), reason="the run device is not available")
 @pytest.mark.usefixtures("isolated_dynamo")
 @pytest.mark.parametrize(
     ("op_cls", "ndim", "return_indices", "x_shape"),
@@ -2088,99 +1502,32 @@ def test_max_pool_compile_fullgraph(
     return_indices: bool,
     x_shape: tuple[int, ...],
 ) -> None:
-    op = op_cls(**_MAX_POOL_CTOR_KWARGS[ndim])
-    # Device principle: random tensor generated on CPU, then moved to PTPU.
-    x = torch.randn(*x_shape, dtype=torch.float16).ptpu()
-    # Use the "eager" backend: torch._inductor has no codegen registered for
-    # the 'ptpu' device (InductorError: KeyError: 'ptpu'), so the default
-    # inductor backend cannot compile here. fullgraph=True still verifies the
-    # op traces into a single Dynamo graph with no graph breaks.
-    compiled = torch.compile(op, fullgraph=True, backend="eager")
+    ctor_kwargs = {
+        1: {"kernel_size": 3, "stride": 2, "padding": 1},
+        2: {"kernel_size": (3, 3), "stride": (2, 2), "padding": (1, 1)},
+        3: {"kernel_size": 3, "stride": 2, "padding": 1},
+    }
+    op = op_cls(**ctor_kwargs[ndim])
+    x = torch.randn(*x_shape, device=run_device(), dtype=torch.float16)
+    compiled = compile_fullgraph(op, fullgraph=True)
     out = compiled(x)
     # F.max_pool3d is unimplemented on PTPU; reference + compare on CPU.
-    ref = max_pool_ref(ndim)(
-        x.cpu(),
-        **_MAX_POOL_CTOR_KWARGS[ndim],
+    ref = reference_for(
+        max_pool_ref(ndim),
+        x,
+        **ctor_kwargs[ndim],
         return_indices=return_indices,
     )
     if return_indices:
-        torch.testing.assert_close(out[0].cpu(), ref[0], atol=0, rtol=0, equal_nan=True)
-        torch.testing.assert_close(out[1].cpu(), ref[1], atol=0, rtol=0)
+        compare_outputs(out[0], ref[0], pool_verification(maximum=True))
+        compare_outputs(out[1], ref[1], pool_verification(maximum=True))
     else:
-        torch.testing.assert_close(out.cpu(), ref, atol=0, rtol=0)
+        compare_outputs(out, ref, pool_verification(maximum=True))
     assert_op_owns_graph_nodes(op, x)
 
 
-# ---------------------------------------------------------------------------
-# Kernel helpers and cross-family compile tests
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("input_size", "kernel_size", "stride", "padding", "dilation", "ceil_mode", "expected"),
-    [
-        pytest.param(7, 3, 2, 1, 1, False, 4, marks=pytest.mark.smoke),
-        pytest.param(7, 3, 2, 1, 2, False, 3, marks=pytest.mark.full),
-        pytest.param(7, 3, 2, 1, 1, True, 4, marks=pytest.mark.full),
-        pytest.param(55, 3, 2, 0, 1, True, 27, marks=pytest.mark.full),
-        pytest.param(56, 2, 2, 0, 1, False, 28, marks=pytest.mark.full),
-        # Default dilation regression: omitting dilation must equal explicit dilation=1.
-        pytest.param(56, 3, 2, 1, 1, False, "default_matches_explicit", marks=pytest.mark.full),
-    ],
-)
-def test_pool_output_dim_with_dilation(
-    input_size: int,
-    kernel_size: int,
-    stride: int,
-    padding: int,
-    dilation: int,
-    ceil_mode: bool,
-    expected: int | str,
-) -> None:
-    if expected == "default_matches_explicit":
-        default = pool_output_dim(input_size, kernel_size, stride, padding, ceil_mode)
-        explicit = pool_output_dim(
-            input_size, kernel_size, stride, padding, ceil_mode, dilation=dilation
-        )
-        assert default == explicit
-    else:
-        assert (
-            pool_output_dim(input_size, kernel_size, stride, padding, ceil_mode, dilation)
-            == expected
-        )
-
-
-@pytest.mark.parametrize(
-    ("dilation", "valid"),
-    [
-        pytest.param((1, 1), True, marks=pytest.mark.smoke),
-        pytest.param((0, 1), False, marks=pytest.mark.full),
-    ],
-)
-def test_validate_pool_params_with_dilation(dilation: tuple[int, int], valid: bool) -> None:
-    from tileops.ops.pool import validate_pool_params
-
-    if valid:
-        validate_pool_params(
-            ndim=2,
-            kernel_size=(3, 3),
-            stride=(2, 2),
-            padding=(1, 1),
-            dilation=dilation,
-        )
-    else:
-        with pytest.raises(ValueError, match="dilation must be greater than zero"):
-            validate_pool_params(
-                ndim=2,
-                kernel_size=(3, 3),
-                stride=(2, 2),
-                padding=(1, 1),
-                dilation=dilation,
-            )
-
-
 @pytest.mark.smoke
-@pytest.mark.skipif(not torch.ptpu.is_available(), reason="PTPU required")
+@pytest.mark.skipif(not run_device_available(), reason="the run device is not available")
 @pytest.mark.usefixtures("isolated_dynamo")
 def test_pool_compile_two_instances_one_frame() -> None:
     """Second instance through the same frame must not degrade the dispatch key.
@@ -2189,23 +1536,18 @@ def test_pool_compile_two_instances_one_frame() -> None:
     an int instance key becomes an unhashable SymInt on the second cold
     compile of the same class.
     """
-    # Device principle: random tensor generated on CPU, then moved to PTPU.
-    x = torch.randn(2, 8, 32, dtype=torch.float16).ptpu()
+    x = torch.randn(2, 8, 32, device=run_device(), dtype=torch.float16)
     a = MaxPool1dFwdOp(kernel_size=3, stride=2, padding=1)
     b = MaxPool1dFwdOp(kernel_size=3, stride=1, padding=1)
-    # backend="eager": inductor has no 'ptpu' codegen. fullgraph=True still
-    # exercises the two-instances-one-frame recompilation contract.
-    torch.testing.assert_close(
-        torch.compile(a, fullgraph=True, backend="eager")(x).cpu(),
-        F.max_pool1d(x.cpu(), 3, 2, 1),
-        atol=0,
-        rtol=0,
+    compare_outputs(
+        compile_fullgraph(a, fullgraph=True)(x),
+        F.max_pool1d(x, 3, 2, 1),
+        pool_verification(maximum=True),
     )
-    torch.testing.assert_close(
-        torch.compile(b, fullgraph=True, backend="eager")(x).cpu(),
-        F.max_pool1d(x.cpu(), 3, 1, 1),
-        atol=0,
-        rtol=0,
+    compare_outputs(
+        compile_fullgraph(b, fullgraph=True)(x),
+        F.max_pool1d(x, 3, 1, 1),
+        pool_verification(maximum=True),
     )
 
 
@@ -2219,366 +1561,120 @@ for _case in _AVG_POOL_COMPILE_CASES:
 
 
 @pytest.mark.smoke
-@pytest.mark.skipif(not torch.ptpu.is_available(), reason="PTPU required")
+@pytest.mark.skipif(not run_device_available(), reason="the run device is not available")
 @pytest.mark.usefixtures("isolated_dynamo")
 @pytest.mark.parametrize(("op_cls", "x_shape"), _AVG_POOL_COMPILE_CASES)
 def test_avg_pool_compile_fullgraph(op_cls: type, x_shape: tuple) -> None:
     dims = len(x_shape) - 2
     op = op_cls(kernel_size=2, stride=2, padding=0)
-    # Device principle: random tensor generated on CPU, then moved to PTPU.
-    x = torch.randn(*x_shape, dtype=torch.float16).ptpu()
-    # backend="eager": inductor has no 'ptpu' codegen (KeyError: 'ptpu').
-    # fullgraph=True still verifies a graph-break-free trace.
-    compiled = torch.compile(op, fullgraph=True, backend="eager")
+    x = torch.randn(*x_shape, device=run_device(), dtype=torch.float16)
+    compiled = compile_fullgraph(op, fullgraph=True)
     out = compiled(x)
-    # F.avg_pool2d/3d are unimplemented on PTPU; reference + compare on CPU.
-    # CPU avg_pool3d has no Half kernel, so compute in fp32 and cast back.
-    ref = getattr(F, f"avg_pool{dims}d")(x.cpu().float(), 2, 2, 0).to(x.dtype)
-    torch.testing.assert_close(out.cpu(), ref, atol=1e-3, rtol=1e-3)
+    if dims == 3 and x.device.type == "ptpu":
+        ref = reference_for(
+            AvgPoolWorkload(
+                dims,
+                kernel_size=2,
+                stride=2,
+                padding=0,
+                ceil_mode=False,
+                count_include_pad=True,
+                divisor_override=None,
+                dtype=x.dtype,
+            ).ref_program,
+            x,
+        )
+    else:
+        ref = (
+            reference_for(getattr(F, f"avg_pool{dims}d"), x, 2, 2, 0)
+            if dims != 3
+            else getattr(F, f"avg_pool{dims}d")(x, 2, 2, 0)
+        )
+    compare_outputs(out, ref, pool_verification(maximum=False))
     assert_op_owns_graph_nodes(op, x)
 
 
-# ---------------------------------------------------------------------------
-# Cross-family contract snapshots
-# ---------------------------------------------------------------------------
-
-_EMPTY = inspect.Parameter.empty
-
-_AVG_POOL_CTOR_PARAMS_1D = (
-    ("kernel_size", _EMPTY),
-    ("stride", None),
-    ("padding", 0),
-    ("ceil_mode", False),
-    ("count_include_pad", True),
-    ("target", None),
-    ("kernel_map", None),
-    ("tune", False),
-)
-
-_AVG_POOL_CTOR_PARAMS_ND = (
-    ("kernel_size", _EMPTY),
-    ("stride", None),
-    ("padding", 0),
-    ("ceil_mode", False),
-    ("count_include_pad", True),
-    ("divisor_override", None),
-    ("target", None),
-    ("kernel_map", None),
-    ("tune", False),
-)
-
-_MAX_POOL_CTOR_PARAMS = (
-    ("kernel_size", _EMPTY),
-    ("stride", None),
-    ("padding", 0),
-    ("dilation", 1),
-    ("ceil_mode", False),
-    ("target", None),
-    ("kernel_map", None),
-    ("tune", False),
-)
-
-# Manifest-pinned constructor contract: parameter names, order, and defaults.
-_POOL_CTOR_SNAPSHOTS: list = [
-    pytest.param(AvgPool1dFwdOp, _AVG_POOL_CTOR_PARAMS_1D, id="avg-pool1d"),
-    pytest.param(AvgPool2dFwdOp, _AVG_POOL_CTOR_PARAMS_ND, id="avg-pool2d"),
-    pytest.param(AvgPool3dFwdOp, _AVG_POOL_CTOR_PARAMS_ND, id="avg-pool3d"),
-    pytest.param(MaxPool1dFwdOp, _MAX_POOL_CTOR_PARAMS, id="max-pool1d"),
-    pytest.param(MaxPool1dIndicesFwdOp, _MAX_POOL_CTOR_PARAMS, id="max-pool1d-indices"),
-    pytest.param(MaxPool2dFwdOp, _MAX_POOL_CTOR_PARAMS, id="max-pool2d"),
-    pytest.param(MaxPool2dIndicesFwdOp, _MAX_POOL_CTOR_PARAMS, id="max-pool2d-indices"),
-    pytest.param(MaxPool3dFwdOp, _MAX_POOL_CTOR_PARAMS, id="max-pool3d"),
-    pytest.param(MaxPool3dIndicesFwdOp, _MAX_POOL_CTOR_PARAMS, id="max-pool3d-indices"),
-]
-
-
-@pytest.mark.smoke
-@pytest.mark.parametrize(("op_cls", "expected"), _POOL_CTOR_SNAPSHOTS)
-def test_pool_ctor_signature_snapshot(
-    op_cls: type,
-    expected: tuple[tuple[str, object], ...],
-) -> None:
-    params = inspect.signature(op_cls.__init__).parameters
-    got = tuple((name, p.default) for name, p in params.items() if name != "self")
-    assert got == expected
-
-
 @pytest.mark.smoke
 @pytest.mark.parametrize(
-    ("op_cls", "ndim"),
+    "size, kernel, stride, padding, dtype, offset",
     [
-        pytest.param(AvgPool1dFwdOp, 1, id="avg-pool1d"),
-        pytest.param(AvgPool2dFwdOp, 2, id="avg-pool2d"),
-        pytest.param(AvgPool3dFwdOp, 3, id="avg-pool3d"),
-        pytest.param(MaxPool1dFwdOp, 1, id="max-pool1d"),
-        pytest.param(MaxPool1dIndicesFwdOp, 1, id="max-pool1d-indices"),
-        pytest.param(MaxPool2dFwdOp, 2, id="max-pool2d"),
-        pytest.param(MaxPool2dIndicesFwdOp, 2, id="max-pool2d-indices"),
-        pytest.param(MaxPool3dFwdOp, 3, id="max-pool3d"),
-        pytest.param(MaxPool3dIndicesFwdOp, 3, id="max-pool3d-indices"),
-    ],
-)
-def test_pool_ctor_rank_annotations_snapshot(op_cls: type, ndim: int) -> None:
-    """Public ctor annotations stay rank-specific; ``Tuple[int, ...]`` is a regression."""
-    rank_tuple = "typing.Tuple[" + ", ".join(["int"] * ndim) + "]"
-    params = inspect.signature(op_cls.__init__).parameters
-    pool_params = ["kernel_size", "stride", "padding"]
-    if "dilation" in params:
-        pool_params.append("dilation")
-    for name in pool_params:
-        ann = str(params[name].annotation)
-        assert "Tuple[int, ...]" not in ann, f"{op_cls.__name__}.{name} widened to variadic: {ann}"
-        assert rank_tuple in ann, f"{op_cls.__name__}.{name} lost rank annotation: {ann}"
-
-
-@pytest.mark.smoke
-@pytest.mark.parametrize(
-    ("op_cls", "expected_return"),
-    [
-        pytest.param(MaxPool2dFwdOp, torch.Tensor, id="max-pool2d"),
+        pytest.param((112, 112), (3, 3), (2, 2), (1, 1), torch.float16, 0, id="pad-before-fp16"),
+        pytest.param((112, 112), (3, 3), (2, 2), (1, 1), torch.float16, 1, id="misaligned-fp16"),
+        pytest.param((32, 32), (2, 2), (2, 2), (0, 0), torch.float32, 0, id="no-reach-fp32"),
+        pytest.param((15, 16), (3, 2), (2, 2), (1, 0), torch.bfloat16, 0, id="pad-rows-bf16"),
         pytest.param(
-            MaxPool2dIndicesFwdOp, Tuple[torch.Tensor, torch.Tensor], id="max-pool2d-indices"
+            (16, 32), (3, 3), (1, 1), (1, 1), torch.float32, 0, id="reach-both-sides-fp32"
         ),
+        pytest.param((17, 16), (4, 5), (3, 4), (0, 0), torch.float32, 0, id="reach-after-fp32"),
     ],
 )
-def test_max_pool_forward_return_annotation_snapshot(op_cls: type, expected_return) -> None:
-    """forward return annotations match manifest outputs per concrete class."""
-    ann = inspect.signature(op_cls.forward).return_annotation
-    assert ann == expected_return, f"{op_cls.__name__}.forward -> {ann}"
-
-
-@pytest.mark.smoke
-@pytest.mark.parametrize(
-    "op_cls",
-    [
-        AvgPool1dFwdOp,
-        AvgPool2dFwdOp,
-        AvgPool3dFwdOp,
-        MaxPool1dFwdOp,
-        MaxPool1dIndicesFwdOp,
-        MaxPool2dFwdOp,
-        MaxPool2dIndicesFwdOp,
-        MaxPool3dFwdOp,
-        MaxPool3dIndicesFwdOp,
-    ],
-)
-def test_pool_codegen_slots_are_class_local(op_cls: type) -> None:
-    """eval_roofline / _validate_dtypes must live in each concrete class __dict__.
-
-    Manifest codegen (``maybe_install_validator`` / ``maybe_install_eval_roofline``)
-    keys off the concrete class definition; a definition inherited only from an
-    intermediate base either gets silently shadowed by generated code or
-    silently bypasses per-op generation.
-    """
-    assert "eval_roofline" in op_cls.__dict__
-    assert "_validate_dtypes" in op_cls.__dict__
-
-
-class _PassthroughGenericKernel(Kernel):
-    supported_archs = None
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # clone(): custom-op outputs must not alias custom-op inputs.
-        return x.clone()
-
-
-class _PassthroughSpatialKernel(Kernel):
-    supported_archs = None
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # clone(): custom-op outputs must not alias custom-op inputs.
-        return x.clone()
-
-
-@pytest.mark.smoke
-@pytest.mark.skipif(not torch.ptpu.is_available(), reason="PTPU required")
-@pytest.mark.parametrize("ndim", [1, 3], ids=["1d", "3d"])
-def test_avg_pool_explicit_generic_kernel_map_disables_fast_path(ndim: int) -> None:
-    """1d/3d policy: an explicit generic override alone opts out of the fast path."""
-    generic_slot = f"avg_pool{ndim}d_kernel"
-    spatial_slot = f"avg_pool{ndim}d_spatial_kernel"
-    shape = (1, 2) + (8,) * ndim
-    x = torch.randn(*shape, dtype=torch.float16).ptpu()
-
-    op = _AVG_POOL_OPS[ndim](kernel_size=2, kernel_map={generic_slot: _PassthroughGenericKernel})
-    op(x)
-    assert isinstance(op.kernel, _PassthroughGenericKernel)
-
-    op_both = _AVG_POOL_OPS[ndim](
-        kernel_size=2,
-        kernel_map={
-            generic_slot: _PassthroughGenericKernel,
-            spatial_slot: _PassthroughSpatialKernel,
-        },
+def test_avg_pool2d_windows_read_into_registers(
+    size, kernel, stride, padding, dtype, offset: int
+) -> None:
+    """Windows a 16-byte load of an input row covers whole outputs of, summed in torch's
+    order and divided as torch divides, so the result matches it bit for bit; an input
+    starting ``offset`` elements into its storage is served too."""
+    numel = 2 * 3 * size[0] * size[1]
+    storage = torch.randn(offset + numel, device=run_device(), dtype=dtype)
+    x = storage[offset:].view(2, 3, *size)
+    out = AvgPool2dFwdOp(kernel_size=kernel, stride=stride, padding=padding)(x)
+    torch.testing.assert_close(
+        out, reference_for(F.avg_pool2d, x, kernel, stride, padding).to(x.device), rtol=0, atol=0
     )
-    op_both(x)
-    assert isinstance(op_both.kernel, _PassthroughSpatialKernel)
-
-
-@pytest.mark.smoke
-@pytest.mark.skipif(not torch.ptpu.is_available(), reason="PTPU required")
-def test_avg_pool2d_explicit_generic_kernel_map_keeps_fast_path() -> None:
-    """2d policy asymmetry: an explicit generic override does NOT opt out."""
-    op = AvgPool2dFwdOp(kernel_size=2, kernel_map={"avg_pool2d_kernel": _PassthroughGenericKernel})
-    x = torch.randn(1, 2, 8, 8, dtype=torch.float16).ptpu()
-    op(x)
-    assert isinstance(op.kernel, AvgPool2dSpatialKernel)
-
-
-# _infer_output_shapes snapshot: (op_cls, ctor kwargs, input shape, expected shapes).
-_POOL_INFER_SHAPE_SNAPSHOTS: list = [
-    pytest.param(
-        AvgPool1dFwdOp,
-        {"kernel_size": 3, "stride": 2, "padding": 1},
-        (2, 4, 32),
-        {"output": (2, 4, 16)},
-        id="avg-pool1d",
-    ),
-    pytest.param(
-        AvgPool2dFwdOp,
-        {"kernel_size": (3, 3), "stride": (2, 2), "padding": (1, 1)},
-        (2, 4, 16, 16),
-        {"output": (2, 4, 8, 8)},
-        id="avg-pool2d",
-    ),
-    pytest.param(
-        AvgPool3dFwdOp,
-        {"kernel_size": (3, 3, 3), "stride": (2, 2, 2), "padding": (1, 1, 1)},
-        (2, 4, 8, 16, 16),
-        {"output": (2, 4, 4, 8, 8)},
-        id="avg-pool3d",
-    ),
-    pytest.param(
-        MaxPool1dFwdOp,
-        {"kernel_size": 3, "stride": 2, "padding": 1},
-        (2, 4, 32),
-        {"output": (2, 4, 16)},
-        id="max-pool1d",
-    ),
-    pytest.param(
-        MaxPool1dIndicesFwdOp,
-        {"kernel_size": 3, "stride": 2, "padding": 1},
-        (2, 4, 32),
-        {"output": (2, 4, 16), "indices": (2, 4, 16)},
-        id="max-pool1d-indices",
-    ),
-    pytest.param(
-        MaxPool2dFwdOp,
-        {"kernel_size": (3, 3), "stride": (2, 2), "padding": (1, 1)},
-        (2, 4, 16, 16),
-        {"output": (2, 4, 8, 8)},
-        id="max-pool2d",
-    ),
-    pytest.param(
-        MaxPool2dIndicesFwdOp,
-        {"kernel_size": (3, 3), "stride": (2, 2), "padding": (1, 1)},
-        (2, 4, 16, 16),
-        {"output": (2, 4, 8, 8), "indices": (2, 4, 8, 8)},
-        id="max-pool2d-indices",
-    ),
-    pytest.param(
-        MaxPool3dFwdOp,
-        {"kernel_size": 3, "stride": 2, "padding": 1},
-        (2, 4, 8, 16, 16),
-        {"output": (2, 4, 4, 8, 8)},
-        id="max-pool3d",
-    ),
-    pytest.param(
-        MaxPool3dIndicesFwdOp,
-        {"kernel_size": 3, "stride": 2, "padding": 1},
-        (2, 4, 8, 16, 16),
-        {"output": (2, 4, 4, 8, 8), "indices": (2, 4, 4, 8, 8)},
-        id="max-pool3d-indices",
-    ),
-]
 
 
 @pytest.mark.smoke
 @pytest.mark.parametrize(
-    ("op_cls", "ctor_kwargs", "input_shape", "expected"),
-    _POOL_INFER_SHAPE_SNAPSHOTS,
+    "make_op, shape",
+    [
+        pytest.param(lambda: AvgPool1dFwdOp(7, 1, 3), (2, 64, 4096), id="avg-pool1d"),
+        pytest.param(lambda: MaxPool1dFwdOp(3, 2, 1), (2, 64, 4096), id="max-pool1d"),
+        pytest.param(lambda: AvgPool3dFwdOp(2, 2, 0), (2, 16, 16, 64, 64), id="avg-pool3d"),
+        pytest.param(lambda: MaxPool2dFwdOp((1, 8), (1, 8), 0), (2, 64, 32, 256), id="max-pool2d"),
+    ],
 )
-def test_pool_infer_output_shapes_snapshot(
-    op_cls: type,
-    ctor_kwargs: dict[str, object],
-    input_shape: tuple[int, ...],
-    expected: dict[str, tuple[int, ...]],
-) -> None:
-    op = op_cls(**ctor_kwargs)
-    assert op._infer_output_shapes(input_shape) == expected
+def test_pool_serves_an_input_off_a_vector_boundary(make_op, shape) -> None:
+    """A contiguous input starting one element into its storage, which 16-byte loads
+    cannot read in place, gives the result an aligned copy of it gives."""
+    numel = 1
+    for extent in shape:
+        numel *= extent
+    storage = torch.randn(1 + numel, device=run_device(), dtype=torch.float16)
+    x = storage[1:].view(shape)
+    op = make_op()
+    torch.testing.assert_close(op(x), op(x.clone()), rtol=0, atol=0)
 
 
+class _PassthroughGenericKernel(Kernel, AvgPool2dFwdInterface):
+    supported_archs = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Every other element per spatial axis: the shape a 2-wide, 2-stride window gives.
+        # clone(): custom-op outputs must not alias custom-op inputs.
+        return x[:, :, ::2, ::2].clone()
+
+
+@pytest.mark.in_tree_kernels
 @pytest.mark.smoke
-@pytest.mark.skipif(not torch.ptpu.is_available(), reason="PTPU required")
-def test_pool_fake_indices_shapes_and_int64_dtype() -> None:
-    from torch._subclasses.fake_tensor import FakeTensorMode
+@pytest.mark.skipif(not run_device_available(), reason="the run device is not available")
+def test_avg_pool_runs_a_registered_implementation_preferred_over_the_general_one() -> None:
+    """An added implementation inheriting the key's interface runs where it is preferred."""
 
-    op = MaxPool2dIndicesFwdOp(kernel_size=(3, 3), stride=(2, 2), padding=(1, 1))
-    with FakeTensorMode():
-        # Device principle: build the tensor on CPU. FakeTensorMode only traces
-        # shapes/dtypes -- no real allocation and no kernel runs -- so there is
-        # never a point where a tilelang kernel needs a ptpu tensor. The output
-        # shapes come from _infer_output_shapes (device-agnostic) and the int64
-        # index dtype is hard-coded in the fake impl, so CPU proves the exact
-        # same contract. Building/copying a fake tensor onto ptpu instead would
-        # re-enter FakeTensor's privateuse1 device normalization
-        # (torch.ptpu.is_initialized()/current_device()), which is backend-build
-        # fragile and fails on CI.
-        x = torch.empty(2, 4, 16, 16, dtype=torch.float16)
-        out, idx = op(x)
-    assert tuple(out.shape) == (2, 4, 8, 8)
-    assert out.dtype == torch.float16
-    assert tuple(idx.shape) == (2, 4, 8, 8)
-    assert idx.dtype == torch.int64
+    class _PreferredPassthrough(_PassthroughGenericKernel):
+        devices = frozenset({torch.device(run_device()).type})
+        preferred_over = frozenset({"avg_pool2d_kernel"})
 
+    state = registry.snapshot()
+    try:
+        register_kernel_type("AvgPool2dFwdOp", "avg_pool2d_passthrough", _PreferredPassthrough)
+        op = AvgPool2dFwdOp(kernel_size=2, target=BUILTIN)
+    finally:
+        registry.restore(state)
 
-# eval_roofline snapshot over n=1, c=2, 8-per-spatial-dim, k=2, s=2, p=0, fp16.
-# Expected values are the hand-expanded flops/bytes formulas:
-#   flops = n*c*prod(out)*prod(k); bytes = (n*c*prod(in) + n*c*prod(out))*2 [+ n*c*prod(out)*8].
-_POOL_ROOFLINE_SNAPSHOTS: list = [
-    pytest.param(AvgPool1dFwdOp, (1, 2, 8), 16, 48, id="avg-pool1d"),
-    pytest.param(AvgPool2dFwdOp, (1, 2, 8, 8), 128, 320, id="avg-pool2d"),
-    pytest.param(AvgPool3dFwdOp, (1, 2, 8, 8, 8), 1024, 2304, id="avg-pool3d"),
-    pytest.param(MaxPool1dFwdOp, (1, 2, 8), 16, 48, id="max-pool1d"),
-    pytest.param(MaxPool1dIndicesFwdOp, (1, 2, 8), 16, 112, id="max-pool1d-indices"),
-    pytest.param(MaxPool2dFwdOp, (1, 2, 8, 8), 128, 320, id="max-pool2d"),
-    pytest.param(MaxPool2dIndicesFwdOp, (1, 2, 8, 8), 128, 576, id="max-pool2d-indices"),
-    pytest.param(MaxPool3dFwdOp, (1, 2, 8, 8, 8), 1024, 2304, id="max-pool3d"),
-    pytest.param(MaxPool3dIndicesFwdOp, (1, 2, 8, 8, 8), 1024, 3328, id="max-pool3d-indices"),
-]
+    # A width no 16-byte load divides, so no implementation preferred over the key serves it.
+    op(torch.randn(1, 2, 8, 10, device=run_device(), dtype=torch.float16))
 
-
-@pytest.mark.smoke
-@pytest.mark.skipif(not torch.ptpu.is_available(), reason="PTPU required")
-@pytest.mark.parametrize(
-    ("op_cls", "shape", "expected_flops", "expected_bytes"),
-    _POOL_ROOFLINE_SNAPSHOTS,
-)
-def test_pool_eval_roofline_snapshot(
-    op_cls: type,
-    shape: tuple[int, ...],
-    expected_flops: int,
-    expected_bytes: int,
-) -> None:
-    op = op_cls(kernel_size=2, stride=2, padding=0)
-    x = torch.randn(*shape, dtype=torch.float16).ptpu()
-    op(x)
-    assert op.eval_roofline() == (expected_flops, expected_bytes)
-
-
-@pytest.mark.smoke
-@pytest.mark.skipif(not torch.ptpu.is_available(), reason="PTPU required")
-def test_avg_pool2d_kernel_cache_separates_dtypes() -> None:
-    op = AvgPool2dFwdOp(kernel_size=(3, 3), stride=(2, 2), padding=(1, 1))
-    shape = (1, 4, 16, 16)
-    op(torch.randn(*shape, dtype=torch.float16).ptpu())
-    op(torch.randn(*shape, dtype=torch.float32).ptpu())
-    assert len(list(op.iter_kernels())) == 2
-
-
-# ---------------------------------------------------------------------------
-# Adaptive pool family
-# ---------------------------------------------------------------------------
+    assert [type(k) for k in op.iter_kernels()] == [_PreferredPassthrough]
 
 
 class AdaptiveAvgPool2dFixture(FixtureBase):
@@ -2594,7 +1690,7 @@ class AdaptiveAvgPool2dFixture(FixtureBase):
                     (6, 6),
                     torch.float16,
                     False,
-                    marks=[pytest.mark.smoke, pytest.mark.packaging],
+                    marks=[pytest.mark.smoke, pytest.mark.packaging(family="pool")],
                     id="smoke-spp-6x6-fp16",
                 ),
                 pytest.param(
@@ -2670,7 +1766,7 @@ class AdaptiveMaxPool2dFixture(FixtureBase):
                     (6, 6),
                     torch.float16,
                     False,
-                    marks=[pytest.mark.smoke, pytest.mark.packaging],
+                    marks=[pytest.mark.smoke, pytest.mark.packaging(family="pool")],
                     id="smoke-spp-6x6-fp16",
                 ),
                 pytest.param(
@@ -2719,31 +1815,42 @@ class AdaptiveMaxPool2dFixture(FixtureBase):
                     marks=pytest.mark.full,
                     id="full-expanding-bins-fp16",
                 ),
+                # Five planes of sixteen threads in a block of 128: 48 threads idle.
+                pytest.param(
+                    1,
+                    5,
+                    9,
+                    9,
+                    (1, 1),
+                    torch.bfloat16,
+                    False,
+                    marks=pytest.mark.full,
+                    id="full-global-partial-warp-bf16",
+                ),
+                # Shape coverage: a 28x28 plane's lane runs pass 32 bytes, so the lanes read a
+                # staged tile (AdaptiveMaxPool2dKernel), not registers loaded from global.
+                pytest.param(
+                    1,
+                    4,
+                    28,
+                    28,
+                    (1, 1),
+                    torch.float16,
+                    False,
+                    marks=pytest.mark.full,
+                    id="full-global-staged-lanes-fp16",
+                ),
             ],
         ),
     ]
 
 
-class AdaptiveAvgPool2dTest(AdaptivePool2dWorkload, TestBase):
-    def ref_program(self, input: torch.Tensor) -> torch.Tensor:
-        # torch rejects a scalar None here; (None, None) means the same.
-        size = (None, None) if self.output_size is None else self.output_size
-        return F.adaptive_avg_pool2d(input, size)
+class AdaptiveAvgPool2dTest(AdaptiveAvgPool2dWorkload, TestBase):
+    """Adaptive avg-pool reference test."""
 
 
-class AdaptiveMaxPool2dTest(AdaptivePool2dWorkload, TestBase):
-    def __init__(self, *args, return_indices: bool, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self.return_indices = return_indices
-
-    def ref_program(self, input: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        # torch rejects a scalar None here; (None, None) means the same.
-        size = (None, None) if self.output_size is None else self.output_size
-        result = F.adaptive_max_pool2d(input.float(), size, return_indices=self.return_indices)
-        if self.return_indices:
-            values, indices = result
-            return values.to(input.dtype), indices
-        return result.to(input.dtype)
+class AdaptiveMaxPool2dTest(AdaptiveMaxPool2dWorkload, TestBase):
+    """Adaptive max-pool reference test, with or without indices."""
 
 
 @AdaptiveAvgPool2dFixture
@@ -2757,10 +1864,10 @@ def test_adaptive_avg_pool2d(
     tune: bool,
 ) -> None:
     test = AdaptiveAvgPool2dTest(n, c_in, h_in, w_in, output_size, dtype)
-    op = AdaptiveAvgPool2dFwdOp(output_size, tune=tune)
-    atol, rtol = (1e-3, 1e-3) if dtype == torch.float16 else (1.6e-2, 1.6e-2)
-    test.check(op, *test.gen_inputs(), atol=atol, rtol=rtol)
-    assert isinstance(op.kernel, AdaptiveAvgPool2dKernel)
+    op = AdaptiveAvgPool2dFwdOp(output_size)
+    if tune:
+        op.request_tune()
+    test.check(op, *test.gen_inputs())
 
 
 @AdaptiveMaxPool2dFixture
@@ -2779,12 +1886,10 @@ def test_adaptive_max_pool2d(
             n, c_in, h_in, w_in, output_size, dtype, return_indices=return_indices
         )
         op_cls = AdaptiveMaxPool2dIndicesFwdOp if return_indices else AdaptiveMaxPool2dFwdOp
-        op = op_cls(output_size, tune=tune)
-        test.check(op, *test.gen_inputs(), atol=0, rtol=0)
-        expected_kernel = (
-            AdaptiveMaxPool2dWithIndicesKernel if return_indices else AdaptiveMaxPool2dKernel
-        )
-        assert isinstance(op.kernel, expected_kernel)
+        op = op_cls(output_size)
+        if tune:
+            op.request_tune()
+        test.check(op, *test.gen_inputs())
 
 
 _ADAPTIVE_POOL_COMPILE_CASES = [
@@ -2799,7 +1904,7 @@ for _case in _ADAPTIVE_POOL_COMPILE_CASES:
 
 
 @pytest.mark.smoke
-@pytest.mark.skipif(not torch.ptpu.is_available(), reason="PTPU required")
+@pytest.mark.skipif(not run_device_available(), reason="the run device is not available")
 @pytest.mark.usefixtures("isolated_dynamo")
 @pytest.mark.parametrize(
     ("op_cls", "x_shape", "return_indices"),
@@ -2811,112 +1916,208 @@ def test_adaptive_pool_compile_fullgraph(
     return_indices: bool,
 ) -> None:
     op = op_cls(output_size=(4, 4))
-    x = torch.randn(*x_shape, device="ptpu", dtype=torch.float16)
-    out = compile_fullgraph(op)(x)  # cold start: no eager warmup
+    x = torch.randn(*x_shape, device=run_device(), dtype=torch.float16)
+    out = compile_fullgraph(op, fullgraph=True)(x)  # cold start: no eager warmup
     if op_cls is AdaptiveAvgPool2dFwdOp:
-        ref = F.adaptive_avg_pool2d(x.cpu(), (4, 4))
-        torch.testing.assert_close(out.cpu(), ref, atol=1e-3, rtol=1e-3)
+        ref = F.adaptive_avg_pool2d(x, (4, 4))
+        compare_outputs(out, ref, pool_verification(maximum=False))
     elif return_indices:
-        ref_out, ref_idx = F.adaptive_max_pool2d(x.cpu(), (4, 4), return_indices=True)
-        torch.testing.assert_close(out[0].cpu(), ref_out, atol=0, rtol=0)
-        assert torch.equal(out[1].cpu(), ref_idx)
+        ref_out, ref_idx = reference_for(F.adaptive_max_pool2d, x, (4, 4), return_indices=True)
+        compare_outputs(out[0], ref_out, pool_verification(maximum=True))
+        compare_outputs(out[1], ref_idx, pool_verification(maximum=True))
     else:
-        ref = F.adaptive_max_pool2d(x.cpu(), (4, 4))
-        torch.testing.assert_close(out.cpu(), ref, atol=0, rtol=0)
+        ref = reference_for(F.adaptive_max_pool2d, x, (4, 4))
+        compare_outputs(out, ref, pool_verification(maximum=True))
     assert_op_owns_graph_nodes(op, x)
 
 
 @pytest.mark.smoke
 def test_adaptive_pool2d_accepts_chw() -> None:
     """A 3-D input keeps its rank on the way out; NCHW cases never exercise that."""
-    x = torch.randn(16, 11, 13, device="ptpu", dtype=torch.float16)
+    x = torch.randn(16, 11, 13, device=run_device(), dtype=torch.float16)
     avg = AdaptiveAvgPool2dFwdOp(output_size=(5, 4))(x)
     assert avg.shape == (16, 5, 4)
-    torch.testing.assert_close(
-        avg.cpu().float(), F.adaptive_avg_pool2d(x.cpu().float(), (5, 4)), atol=2e-3, rtol=2e-3
+    compare_outputs(
+        avg, F.adaptive_avg_pool2d(x.float(), (5, 4)).to(x.dtype), pool_verification(maximum=False)
     )
 
     val, idx = AdaptiveMaxPool2dIndicesFwdOp(output_size=(5, 4))(x)
     ref_val, ref_idx = F.adaptive_max_pool2d(x.cpu().float(), (5, 4), return_indices=True)
     assert val.shape == (16, 5, 4) and idx.shape == (16, 5, 4)
-    torch.testing.assert_close(val.cpu().float(), ref_val, atol=0, rtol=0)
-    torch.testing.assert_close(idx.cpu(), ref_idx, atol=0, rtol=0)
+    compare_outputs(val.float(), ref_val, pool_verification(maximum=True))
+    compare_outputs(idx, ref_idx, pool_verification(maximum=True))
 
 
 @pytest.mark.smoke
 def test_adaptive_max_pool2d_indices_nan_window() -> None:
     """A NaN in the window wins, and the recorded index is the last one seen."""
-    x = torch.randn(1, 1, 4, 4, device="ptpu", dtype=torch.float16)
+    x = torch.randn(1, 1, 4, 4, device=run_device(), dtype=torch.float16)
     x[0, 0, 1, 1] = float("nan")
     x[0, 0, 3, 3] = float("nan")
 
     val, idx = AdaptiveMaxPool2dIndicesFwdOp(output_size=(1, 1))(x)
-    ref_val, ref_idx = F.adaptive_max_pool2d(x.cpu().float(), (1, 1), return_indices=True)
-    assert torch.isnan(val.cpu().float()).all()
-    torch.testing.assert_close(idx.cpu(), ref_idx, atol=0, rtol=0)
+    ref_val, ref_idx = reference_for(F.adaptive_max_pool2d, x.float(), (1, 1), return_indices=True)
+    assert torch.isnan(val.float()).all()
+    compare_outputs(idx, ref_idx, pool_verification(maximum=True))
+
+
+@pytest.mark.smoke
+def test_adaptive_max_pool2d_global_nan_plane() -> None:
+    """A NaN anywhere in a plane makes its global max NaN, whichever thread reads it."""
+    x = torch.randn(2, 64, 7, 7, device=run_device(), dtype=torch.float16)
+    x[0, 3, 6, 6] = float("nan")
+    x[1, 10, 0, 0] = float("nan")
+    out = AdaptiveMaxPool2dFwdOp(output_size=(1, 1))(x)
+    torch.testing.assert_close(
+        out, reference_for(F.adaptive_max_pool2d, x, (1, 1)).to(x.device), equal_nan=True
+    )
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("first_sign", [1.0, -1.0], ids=["positive-first", "negative-first"])
+def test_adaptive_max_pool2d_global_zero_keeps_first_sign(first_sign: float) -> None:
+    """Of +0.0 and -0.0, the one torch meets first is the max, across the threads of a plane."""
+    x = torch.full((1, 1, 33), -1.0, device=run_device(), dtype=torch.float16)
+    x[0, 0, 1] = 0.0 * first_sign
+    x[0, 0, 32] = -0.0 * first_sign
+    out = AdaptiveMaxPool2dFwdOp(output_size=(1, 1))(x)
+    expected = reference_for(F.adaptive_max_pool2d, x, (1, 1)).to(x.device)
+    assert out.device == x.device
+    out, expected = reference_for(lambda actual, gold: (actual, gold), out, expected)
+    assert torch.equal(torch.signbit(out), torch.signbit(expected))
+
+
+@pytest.mark.in_tree_kernels
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "h_in, implementation",
+    [
+        pytest.param(7, AdaptiveMaxPool2dRegisterKernel, id="7x7-registers"),
+        pytest.param(28, AdaptiveMaxPool2dKernel, id="28x28-staged"),
+    ],
+)
+def test_adaptive_max_pool2d_global_lane_run_selects_kernel(h_in: int, implementation) -> None:
+    """A global pool reads planes into registers while a lane's run is at most 32 bytes."""
+    op = AdaptiveMaxPool2dFwdOp(output_size=(1, 1), target=BUILTIN)
+    op(torch.randn(1, 4, h_in, h_in, device=run_device(), dtype=torch.float16))
+    assert [type(k) for k in op.iter_kernels()] == [implementation]
 
 
 @pytest.mark.smoke
 @pytest.mark.parametrize(
     "l_in, kernel_l, stride_l, pad_l, dtype",
     [
-        (4096, 3, 2, 1, "float16"),
-        (32000, 5, 4, 2, "float16"),
-        (2048, 4, 2, 1, "bfloat16"),
-        (28000, 12000, 4001, 0, "float16"),
-        (127, 7, 3, 3, "bfloat16"),
-        (30, 4, 4, 2, "bfloat16"),
-        (33, 3, 2, 1, "float16"),
-        (64, 1, 1, 0, "float16"),
+        pytest.param(4096, 3, 3, 0, torch.float32, id="in-row-fp32"),
+        pytest.param(4096, 3, 3, 0, torch.bfloat16, id="in-row-bf16"),
+        pytest.param(1000, 2, 3, 1, torch.float32, id="padded-fp32"),
+        pytest.param(1001, 3, 4, 1, torch.bfloat16, id="padded-bf16"),
     ],
 )
-def test_avg_pool1d_staged_span_stays_aligned(
-    l_in: int, kernel_l: int, stride_l: int, pad_l: int, dtype: str
+def test_max_pool1d_windowed_taps_match_torch(
+    l_in: int, kernel_l: int, stride_l: int, pad_l: int, dtype: torch.dtype
 ) -> None:
-    """Every group of the staged span lies wholly inside the row or wholly outside it.
-
-    The staging load is vectorized, and it is the group boundaries that decide whether a
-    group is loaded or zeroed, so a boundary landing mid-row would read the wrong
-    elements for the whole group. Three things move a boundary: the block step
-    ``block_ol * stride_l``, the head in front of the leftmost window, and the row end.
-    Only a window too wide to stage at 128 outputs selects a width that can break this,
-    which is why no benchmarked shape reaches it.
-    """
-    window = AvgPoolWindow(
-        rows=1,
-        size=(l_in,),
-        kernel=(kernel_l,),
-        stride=(stride_l,),
-        pad=(pad_l,),
-        ceil_mode=False,
-        count_include_pad=True,
-        divisor_override=None,
-    )
-    staging = _WindowStaging(window, dtype)
-    for block_ol in staging.widths():
-        staged = window_span(
-            block_ol, block_ol * stride_l, l_in, kernel_l, stride_l, pad_l, 1, dtype
-        )
-        assert (block_ol * stride_l) % staged.vector_elems == 0
-        assert l_in % staged.vector_elems == 0
-        assert staged.head % staged.vector_elems == 0
-        assert staged.span % staged.vector_elems == 0
-        assert staged.head >= pad_l
-        assert staged.span >= staged.head + (block_ol - 1) * stride_l + kernel_l
+    """Windows no wider than their stride read each tap where it lies, with the 4- and
+    2-byte element loads; the maxima match torch exactly, a NaN winning."""
+    x = torch.randn(4, 8, l_in, device=run_device(), dtype=dtype)
+    x.view(-1)[::313] = float("nan")
+    out = MaxPool1dFwdOp(kernel_size=kernel_l, stride=stride_l, padding=pad_l)(x)
+    expected = F.max_pool1d(x, kernel_l, stride_l, pad_l)
+    torch.testing.assert_close(out, expected, rtol=0, atol=0, equal_nan=True)
 
 
 @pytest.mark.smoke
-@pytest.mark.parametrize("l_in, kernel_l", [(15, 16), (31, 32), (100, 128), (1000, 1024)])
-def test_max_pool1d_row_reduce_takes_no_tap_past_the_row(l_in: int, kernel_l: int) -> None:
-    """A window wider than the row does not reach the row-reduce body.
+@pytest.mark.parametrize(
+    "l_in, kernel_l, stride_l, pad_l, dtype",
+    [
+        pytest.param(3072, 3, 3, 0, torch.float32, id="in-row-fp32"),
+        pytest.param(3072, 3, 3, 0, torch.bfloat16, id="in-row-bf16"),
+        pytest.param(3070, 2, 3, 1, torch.float32, id="padded-fp32"),
+        pytest.param(4093, 3, 4, 1, torch.bfloat16, id="padded-bf16"),
+    ],
+)
+def test_max_pool1d_indices_windowed_taps_match_torch(
+    l_in: int, kernel_l: int, stride_l: int, pad_l: int, dtype: torch.dtype
+) -> None:
+    """Windows no wider than their stride, 1024 outputs a row so that a block divides the
+    output and each thread stores adjacent outputs as vectors, give torch's values and
+    positions with the 4- and 2-byte element loads, the last NaN in a window winning."""
+    x = torch.randn(4, 8, l_in, device=run_device(), dtype=dtype)
+    # Adjacent pairs put two NaNs in some windows.
+    x.view(-1)[::313] = float("nan")
+    x.view(-1)[1::313] = float("nan")
+    op = MaxPool1dIndicesFwdOp(kernel_size=kernel_l, stride=stride_l, padding=pad_l)
+    expected = max_pool_ref(1)(x, kernel_l, stride_l, pad_l, return_indices=True)
+    compare_outputs(op(x), expected, pool_verification(maximum=True))
 
-    That body reads taps 0 to ``kernel_size - 1`` of the row with no bounds test, which
-    only holds where the window fits. Ceil mode admits a window wider than the row --
-    PyTorch pads the missing taps with ``-inf`` and still emits one output -- and the
-    taps past the row's end would then read the row after it.
-    """
-    shape = _MaxPool1dShape(8, l_in, kernel_l, kernel_l, 0, 1, "float16")
-    plan = _max_pool1d_plan(shape, True, False)
-    assert plan.out_l == 1
-    assert not plan.always_in_bounds
-    assert plan.body != "rowreduce"
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "shape, kernel, stride, padding, dtype, offset, nan",
+    [
+        pytest.param((2, 3, 112, 112), 3, 2, 1, torch.float16, 0, False, id="pad-before-fp16"),
+        pytest.param((2, 3, 112, 112), 3, 2, 1, torch.float16, 1, False, id="misaligned-fp16"),
+        pytest.param((2, 3, 32, 32), 2, 2, 0, torch.float32, 0, True, id="nan-fp32"),
+        pytest.param(
+            (2, 3, 15, 16), (3, 2), 2, (1, 0), torch.bfloat16, 0, False, id="pad-rows-bf16"
+        ),
+        pytest.param((2, 3, 16, 32), 3, 1, 1, torch.float32, 0, False, id="reach-both-sides-fp32"),
+        pytest.param(
+            (2, 3, 17, 16), (4, 5), (3, 4), 0, torch.float32, 0, False, id="reach-after-fp32"
+        ),
+        # Past 128 MiB the run is read without the evict-first hint.
+        pytest.param((1, 1344, 224, 224), 2, 2, 0, torch.float16, 0, True, id="large-fp16"),
+    ],
+)
+def test_max_pool2d_windows_read_into_registers(
+    shape, kernel, stride, padding, dtype, offset: int, nan: bool
+) -> None:
+    """Windows a 16-byte load of an input row covers whole outputs of match torch bit for
+    bit, a NaN in a window winning; an input starting ``offset`` elements into its storage
+    is served too."""
+    numel = math.prod(shape)
+    storage = torch.randn(offset + numel, device=run_device(), dtype=dtype)
+    x = storage[offset:].view(shape)
+    if nan:
+        x.view(-1)[::997] = float("nan")
+    out = MaxPool2dFwdOp(kernel_size=kernel, stride=stride, padding=padding)(x)
+    expected = F.max_pool2d(x, kernel, stride, padding)
+    torch.testing.assert_close(out, expected, rtol=0, atol=0, equal_nan=True)
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "shape, kernel, stride, padding, dtype, offset, fill",
+    [
+        pytest.param((2, 3, 112, 112), 3, 2, 1, torch.float16, 0, "ties", id="pad-ties-fp16"),
+        pytest.param((2, 3, 112, 112), 3, 2, 1, torch.bfloat16, 1, "randn", id="misaligned-bf16"),
+        pytest.param((2, 3, 32, 32), 2, 2, 0, torch.float32, 0, "nan", id="nan-fp32"),
+        pytest.param((2, 3, 16, 32), 3, 1, 1, torch.float32, 0, "ties", id="reach-both-ties-fp32"),
+        pytest.param((2, 3, 16, 32), 3, 2, 1, torch.float32, 0, "-inf", id="all-neg-inf-fp32"),
+        pytest.param(
+            (2, 3, 17, 16), (4, 5), (3, 4), 0, torch.float32, 0, "nan", id="reach-after-nan-fp32"
+        ),
+    ],
+)
+def test_max_pool2d_indices_windows_read_into_registers(
+    shape, kernel, stride, padding, dtype, offset: int, fill: str
+) -> None:
+    """Windows a 16-byte load of an input row covers whole outputs of give torch's values
+    and positions: a tie keeps the first position, the last NaN in a window wins, a window
+    of nothing but -inf reports its first tap, and an edge read in place of padding
+    reports the edge. An input starting ``offset`` elements into its storage is served
+    too."""
+    numel = math.prod(shape)
+    if fill == "ties":
+        storage = torch.randint(0, 3, (offset + numel,), device=run_device()).to(dtype)
+    elif fill == "-inf":
+        storage = torch.full((offset + numel,), float("-inf"), device=run_device(), dtype=dtype)
+    else:
+        storage = torch.randn(offset + numel, device=run_device(), dtype=dtype)
+    x = storage[offset:].view(shape)
+    if fill == "nan":
+        x.view(-1)[::97] = float("nan")
+        x.view(-1)[1::97] = float("nan")
+    out, indices = MaxPool2dIndicesFwdOp(kernel_size=kernel, stride=stride, padding=padding)(x)
+    expected, expected_indices = F.max_pool2d(x, kernel, stride, padding, return_indices=True)
+    torch.testing.assert_close(out, expected, rtol=0, atol=0, equal_nan=True)
+    assert torch.equal(indices, expected_indices)

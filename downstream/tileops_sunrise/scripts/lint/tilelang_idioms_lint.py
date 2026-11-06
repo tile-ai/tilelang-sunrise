@@ -1,29 +1,27 @@
 #!/usr/bin/env python3
-"""Lint TileLang source for idioms that compile but do the wrong thing.
+"""Flag TileLang forms that compile but do the wrong thing.
 
-Each rule below is a form the compiler accepts, so nothing downstream reports it:
+- ``T.reinterpret`` with the dtype first; the signature is ``T.reinterpret(value, dtype)``.
+- A numeric literal cast to a narrow float (``T.cast(1.0, "float16")``), which rounds at
+  build time. A narrow integer cast passes.
+- A ``@tilelang.jit`` builder closing over a value provably not a scalar; the autotuner's
+  cache key takes only ``int``, ``float``, ``str``, ``bool`` and ``None``. A value this
+  cannot classify passes.
+- ``and`` / ``or`` with a non-bool constant operand in a ``@T.prim_func`` or ``@T.macro``
+  body, where TIR yields a bool rather than the operand.
+- A file-level ``# ruff: noqa`` or ``# flake8: noqa``.
+- ``os.environ`` or ``os.getenv`` in ``src/tileops/``, ``workloads/`` or ``benchmarks/``, and
+  ``monkeypatch.setenv`` in ``tests/`` or ``benchmarks/``; that code takes arguments.
+- TileLang's ``autotune`` reached in ``src/tileops/``, ``workloads/`` or ``benchmarks/``
+  outside ``tileops._kernels.autotune``; its cache key leaves out the input supplier.
+- A ``call_extern`` / ``call_pure_extern`` target that is neither ``tileops::...`` nor in
+  ``_EXTERN_TARGETS``, or that does not resolve to strings bound in the same file. Call the
+  ``T.*`` intrinsic that emits it; a function no intrinsic emits joins ``_EXTERN_TARGETS``
+  with its reason.
 
-- ``T.Buffer`` as a TIR parameter annotation. TileLang deprecated it for
-  ``T.Tensor``; the old form still parses and gives a kernel whose shape and dtype
-  the newer passes do not read.
-- ``T.reinterpret`` written dtype first. The signature is
-  ``T.reinterpret(value, dtype)``. Swapped, the dtype string is reinterpreted as a
-  value and the intended value is read as a type name.
-- A literal cast to a narrow float (``T.cast(1.0, "float16")``). The constant is
-  rounded at build time, so a value the surrounding math needed in fp32 silently
-  loses its low bits. Reference ``x.dtype``, or compute wider and cast at the
-  boundary. A narrow *integer* cast is not this: a uint8 mask compared against 0
-  or 1 loses nothing.
-- A ``@tilelang.jit`` builder closing over a value that is not a scalar. The
-  autotuner folds free variables into its cache key and accepts only ``int``,
-  ``float``, ``str``, ``bool`` and ``None``. Assignments and parameter
-  annotations classify enclosing bindings.
-- A file-level lint suppression (``# ruff: noqa``, ``# flake8: noqa``). It hides
-  every future finding in the file, not the one being waived.
-
-Usage: ``tilelang_idioms_lint.py [FILE ...]``. With no arguments, scans the
-source trees that carry TileLang code (``src/tileops/``, ``tests/``,
-``benchmarks/``, ``workloads/``). Exits 1 when any rule fires.
+Exempt: an extern call carrying ``lint: extern-target allow: <reason>`` on its first line.
+``T.Buffer`` is ruff's ``TID251``. Default scan: ``src/tileops/``, ``tests/``,
+``benchmarks/``, ``workloads/``.
 """
 
 import argparse
@@ -36,19 +34,72 @@ import tokenize
 from collections.abc import Iterator
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_TREES = ("src/tileops", "tests", "benchmarks", "workloads")
+from comment_lines import allowed_lines
+from common import REPO_ROOT, files, report
 
-# Narrow floats only — a literal in one of these is rounded where it is written.
-# An integer cast is not this: a uint8 mask compared against 0 or 1 loses nothing.
+SCANNED = ("src/tileops", "tests", "benchmarks", "workloads")
+
+# A literal cast to one of these rounds where it is written.
 _NARROW_FLOAT = re.compile(r"^(float16|bfloat16|float8[a-z0-9_]*)$")
 
 # Where the dtype sits: `T.reinterpret(value, dtype)` and `T.cast(value, dtype)`
 # take it second, `T.Cast(dtype, value)` first. The value takes the other slot.
 _DTYPE_POS = {"reinterpret": 1, "cast": 1, "Cast": 0}
 
+# Trees configured by their arguments, and the trees whose tests set arguments.
+_NO_ENV_READ_TREES = (("src", "tileops"), ("workloads",), ("benchmarks",))
+_NO_SETENV_TREES = (("tests",), ("benchmarks",))
+_ENV_READ = (
+    "reads the environment — code here is configured by its arguments; "
+    "the environment is invisible to cache keys and callers"
+)
+_SETENV = "monkeypatch.setenv configures code through the environment — pass the argument instead"
+
+# Where tuning goes through tileops._kernels.autotune, and the one file that wraps TileLang's.
+_TILEOPS_AUTOTUNE_TREES = _NO_ENV_READ_TREES
+_AUTOTUNE_WRAPPER = ("src", "tileops", "_kernels", "autotune.py")
+_TILELANG_AUTOTUNE = (
+    "TileLang's autotune keeps a result tuned on inputs the supplier no longer feeds — "
+    "tune through tileops._kernels.autotune.autotune"
+)
+
+# The CUDA functions a kernel may name in T.call_extern: no T.* intrinsic emits them.
+_EXTERN_TARGETS = {
+    # div.approx.f32 with no range guard; T.ieee_fdiv rounds exactly.
+    "__fdividef",
+    # The high 32 bits of a 32x32-bit product.
+    "__umulhi",
+    # Two 16-bit lanes of a 32-bit word, compared or maxed at once.
+    "__vcmpeq2",
+    "__vcmpgeu2",
+    "__vcmpgtu2",
+    "__vmaxu2",
+    # The bulk reduce-add store from a shared pointer; T.atomic_add(..., use_tma=True)
+    # emits the tensor-map form instead, one box at a time, with its own commit and wait.
+    "tl::tma_store_add",
+    # The trace marker placeholder, which src/tileops/trace/_passes.py rewrites before codegen.
+    "tl_trace_marker",
+}
+_EXTERN_CALLS = ("call_extern", "call_pure_extern")
+
 _FILE_LEVEL_NOQA = re.compile(r"^#\s*(ruff|flake8)\s*:\s*noqa")
 _DTYPE_NAME = re.compile(r"^(u?int[0-9]+|b?float[0-9]+|float8[a-z0-9_]*|bool|handle)$")
+
+
+_NONSCALAR_KINDS = {
+    ast.List: "list",
+    ast.ListComp: "list",
+    ast.Dict: "dict",
+    ast.DictComp: "dict",
+    ast.Set: "set",
+    ast.SetComp: "set",
+    ast.Tuple: "tuple",
+    ast.GeneratorExp: "generator",
+    ast.Lambda: "function",
+}
+_SCOPE = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+_Func = ast.FunctionDef | ast.AsyncFunctionDef
+_SCALAR_ANNOTATIONS = frozenset({"int", "float", "str", "bool", "None", "NoneType"})
 
 
 def _attr_path(node: ast.AST) -> str | None:
@@ -93,12 +144,9 @@ def _narrow_float(node: ast.AST) -> str | None:
 
 
 def _tilelang_names(tree: ast.Module) -> tuple[set[str], dict[str, str]]:
-    """What this file binds to `tilelang.language`.
+    """The aliases of `tilelang.language` (``T`` if none), and bare imported names by member.
 
-    Returns the module aliases (conventionally ``T``) and, for
-    ``from tilelang.language import cast``, the bare names mapped to the member
-    they stand for. Binding is read file-wide: rebinding one of these names to
-    another module inside a function is not tracked, and would be reported here.
+    Binding is read file-wide; a name rebound inside a function is not tracked.
     """
     aliases, bare = set(), {}
     for node in ast.walk(tree):
@@ -113,11 +161,9 @@ def _tilelang_names(tree: ast.Module) -> tuple[set[str], dict[str, str]]:
 
 
 def _file_level_noqa_lines(text: str) -> list[int]:
-    """Lines carrying a file-level suppression, read from comments only.
+    """Lines whose only content is a file-level suppression comment.
 
-    The same text inside a docstring suppresses nothing, and trailing a statement
-    (``x = 1  # ruff: noqa``) it waives that line rather than the file — a textual
-    scan would report both.
+    The text in a docstring, or trailing a statement, suppresses no file and passes.
     """
     try:
         tokens = tokenize.generate_tokens(io.StringIO(text).readline)
@@ -148,23 +194,6 @@ def _arg(call: ast.Call, pos: int, name: str) -> ast.AST | None:
     if len(call.args) > pos:
         return call.args[pos]
     return next((k.value for k in call.keywords if k.arg == name), None)
-
-
-_NONSCALAR_KINDS = {
-    ast.List: "list",
-    ast.ListComp: "list",
-    ast.Dict: "dict",
-    ast.DictComp: "dict",
-    ast.Set: "set",
-    ast.SetComp: "set",
-    ast.Tuple: "tuple",
-    ast.GeneratorExp: "generator",
-    ast.Lambda: "function",
-}
-
-_SCOPE = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-
-_Func = ast.FunctionDef | ast.AsyncFunctionDef
 
 
 def _jit_names(tree: ast.Module) -> tuple[set[str], set[str]]:
@@ -239,9 +268,6 @@ def _function_tables(top: symtable.SymbolTable) -> dict[tuple[str, int], symtabl
     return tables
 
 
-_SCALAR_ANNOTATIONS = frozenset({"int", "float", "str", "bool", "None", "NoneType"})
-
-
 def _string_annotation_kind(annotation: str) -> str | None:
     """Classify a quoted annotation."""
     try:
@@ -291,11 +317,7 @@ def _annotation_kind(annotation: ast.AST | None) -> str | None:
 
 
 def _nonscalar_kind(value: ast.AST, classes: set[str]) -> str | None:
-    """What kind of non-scalar this expression provably builds, or None.
-
-    One-sided on purpose: an expression this cannot classify is left alone, so a
-    factory call returning an object passes.
-    """
+    """What kind of non-scalar this expression provably builds; None, and passing, if unsure."""
     for node_type, kind in _NONSCALAR_KINDS.items():
         if isinstance(value, node_type):
             return kind
@@ -336,6 +358,13 @@ def _nonscalar_closures(path: Path, text: str, tree: ast.Module) -> list[str]:
             bound = set(last)
             # The final assignment in a scope determines the captured cell value.
             for node in _own_scope(outer):
+                # A def or class statement binds its name to something never scalar.
+                if isinstance(node, _SCOPE) and node.name in free:
+                    bound.add(node.name)
+                    if node.lineno >= last.get(node.name, (-1, None))[0]:
+                        kind = "class" if isinstance(node, ast.ClassDef) else "function"
+                        last[node.name] = (node.lineno, kind)
+                    continue
                 if not isinstance(node, (ast.Assign, ast.AnnAssign)) or node.value is None:
                     continue
                 targets = node.targets if isinstance(node, ast.Assign) else [node.target]
@@ -356,16 +385,221 @@ def _nonscalar_closures(path: Path, text: str, tree: ast.Module) -> list[str]:
     return sorted(out)
 
 
+def _value_selecting_boolops(path: Path, tree: ast.Module, aliases, bare) -> list[str]:
+    """``and`` / ``or`` with a non-bool constant operand inside a kernel or macro body."""
+    out = []
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        decorators = (d.func if isinstance(d, ast.Call) else d for d in func.decorator_list)
+        if not any(_member(d, aliases, bare) in ("prim_func", "macro") for d in decorators):
+            continue
+        for node in ast.walk(func):
+            if isinstance(node, ast.BoolOp) and any(
+                isinstance(v, ast.Constant) and not isinstance(v.value, bool) for v in node.values
+            ):
+                op = "or" if isinstance(node.op, ast.Or) else "and"
+                out.append(
+                    f"{path}:{node.lineno}: `{op}` inside a TileLang kernel or macro builds a "
+                    "TIR logical op, not the operand Python would pick — select the value "
+                    "before the kernel body"
+                )
+    return out
+
+
+def _in_trees(path: Path, trees: tuple[tuple[str, ...], ...]) -> bool:
+    """Whether *path*, read relative to the repository, sits under one of *trees*."""
+    parts = path.parts
+    if path.is_absolute():
+        try:
+            parts = path.resolve().relative_to(REPO_ROOT).parts
+        except ValueError:
+            return False
+    return any(parts[: len(tree)] == tree for tree in trees)
+
+
+def _environment_uses(path: Path, tree: ast.Module) -> list[str]:
+    """Environment reads, and ``monkeypatch.setenv`` calls, in the trees that refuse them."""
+    reads = _in_trees(path, _NO_ENV_READ_TREES)
+    setenv = _in_trees(path, _NO_SETENV_TREES)
+    # Every name this file binds to the `os` module, so an alias reads as `os` does.
+    modules = {"os"} | {
+        a.asname
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for a in node.names
+        if a.name == "os" and a.asname
+    }
+    env_paths = {f"{m}.{attr}" for m in modules for attr in ("environ", "getenv")}
+    out = []
+    for node in ast.walk(tree):
+        if reads and isinstance(node, ast.ImportFrom) and node.module == "os":
+            if any(a.name in ("environ", "getenv") for a in node.names):
+                out.append(f"{path}:{node.lineno}: {_ENV_READ}")
+        elif reads and isinstance(node, ast.Attribute):
+            if _attr_path(node) in env_paths:
+                out.append(f"{path}:{node.lineno}: {_ENV_READ}")
+        elif (
+            setenv and isinstance(node, ast.Call) and _attr_path(node.func) == "monkeypatch.setenv"
+        ):
+            out.append(f"{path}:{node.lineno}: {_SETENV}")
+    return out
+
+
+def _resolved(path: str | None, aliases: dict[str, str]) -> str | None:
+    """*path* with its first name replaced by the module that name aliases."""
+    if path is None:
+        return None
+    head, dot, rest = path.partition(".")
+    return aliases.get(head, head) + dot + rest
+
+
+def _tilelang_autotune_uses(path: Path, tree: ast.Module) -> list[str]:
+    """Imports of TileLang's ``autotune``, and ``tilelang.autotune(r.autotune)`` attributes,
+    outside the TileOPs wrapper."""
+    if not _in_trees(path, _TILEOPS_AUTOTUNE_TREES) or _in_trees(path, (_AUTOTUNE_WRAPPER,)):
+        return []
+    modules = ("tilelang", "tilelang.autotuner", "tilelang.autotuner.tuner")
+    # Every name this file binds to one of those modules, so `tl.autotune` reads as
+    # `tilelang.autotune`.
+    aliases = {
+        a.asname: a.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for a in node.names
+        if a.asname and a.name in modules
+    }
+    aliases.update(
+        {
+            a.asname or a.name: f"{node.module}.{a.name}"
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.module in modules
+            for a in node.names
+            if f"{node.module}.{a.name}" in modules
+        }
+    )
+    out = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module in modules:
+            if any(a.name == "autotune" for a in node.names):
+                out.append(f"{path}:{node.lineno}: {_TILELANG_AUTOTUNE}")
+        elif (
+            isinstance(node, ast.Attribute)
+            and node.attr == "autotune"
+            and _resolved(_attr_path(node.value), aliases) in modules
+        ):
+            out.append(f"{path}:{node.lineno}: {_TILELANG_AUTOTUNE}")
+    return out
+
+
+def _strings(node: ast.AST, assigned: dict[str, list[str] | None]) -> list[str] | None:
+    """The strings *node* can evaluate to, an f-string's fields read as ``{}``; None if unknown."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return [node.value]
+    if isinstance(node, ast.JoinedStr):
+        return ["".join(v.value if isinstance(v, ast.Constant) else "{}" for v in node.values)]
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = _strings(node.left, assigned), _strings(node.right, assigned)
+        return None if left is None or right is None else [a + b for a in left for b in right]
+    if isinstance(node, ast.IfExp):
+        body, orelse = _strings(node.body, assigned), _strings(node.orelse, assigned)
+        return None if body is None or orelse is None else body + orelse
+    if isinstance(node, ast.Name):
+        return assigned.get(node.id)
+    return None
+
+
+def _string_bindings(tree: ast.Module) -> dict[str, list[str] | None]:
+    """Each name the file binds, mapped to the strings it can hold; None where one is unknown.
+
+    Bindings from every scope merge. Any binding but an assignment of a string expression
+    (an import, a parameter, a loop target, an unpacking, ...) makes the name unknown.
+    """
+    out: dict[str, list[str] | None] = {}
+    # The Name nodes an Assign below records itself, so the Store pass skips exactly those.
+    recorded: set[int] = set()
+
+    def bind(name: str, values: list[str] | None) -> None:
+        known = out.get(name, [])
+        out[name] = None if values is None or known is None else known + values
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                bind(alias.asname or alias.name, None)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                bind(alias.asname or alias.name.split(".", 1)[0], None)
+        elif isinstance(node, ast.arg):
+            bind(node.arg, None)
+        elif (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            or isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar))
+            and node.name
+        ):
+            bind(node.name, None)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            bind(node.rest, None)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    bind(target.id, _strings(node.value, {}))
+                    recorded.add(id(target))
+                else:
+                    for name in ast.walk(target):
+                        if isinstance(name, ast.Name):
+                            bind(name.id, None)
+        elif (
+            isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Store)
+            and id(node) not in recorded
+        ):
+            # Loop, with, comprehension, walrus and augmented targets.
+            bind(node.id, None)
+    return out
+
+
+def _extern_targets(path: Path, text: str, tree: ast.Module) -> list[str]:
+    """Extern calls whose target is outside ``tileops::`` and ``_EXTERN_TARGETS``."""
+    assigned = _string_bindings(tree)
+    allowed = allowed_lines(text, "extern-target")
+    allow = 'or add "# lint: extern-target allow: <reason>" on the line'
+    out = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or node.lineno in allowed:
+            continue
+        func = node.func
+        member = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+        if member not in _EXTERN_CALLS:
+            continue
+        target = _arg(node, 1, "func_name")
+        names = None if target is None else _strings(target, assigned)
+        if names is None:
+            out.append(
+                f"{path}:{node.lineno}: {member} target does not resolve to a string bound in "
+                f"this file — name the function with a string literal, {allow}"
+            )
+            continue
+        for name in names:
+            function = name.split("<", 1)[0]
+            if not function.startswith("tileops::") and function not in _EXTERN_TARGETS:
+                out.append(
+                    f"{path}:{node.lineno}: {member}({function!r}) — call the T.* intrinsic "
+                    "that emits it; a function no intrinsic emits joins _EXTERN_TARGETS"
+                )
+    return out
+
+
 def check(path: Path) -> list[str]:
     """Violations in one file, each rendered as ``path:line: message``."""
     raw = path.read_bytes()
     try:
-        # Python reads a BOM and a `coding:` line before parsing; decoding without
-        # them leaves a stray \ufeff that turns every later rule into a no-op.
+        # Decode as Python does, honouring a BOM and a `coding:` line.
         encoding, _ = tokenize.detect_encoding(io.BytesIO(raw).readline)
         text = raw.decode(encoding)
     except (SyntaxError, UnicodeDecodeError) as exc:
-        return [f"{path}: source could not be decoded ({exc}) — nothing here could read it"]
+        return [f"{path}:1: source could not be decoded ({exc}) — nothing here could read it"]
     out = []
 
     for line in _file_level_noqa_lines(text):
@@ -377,13 +611,14 @@ def check(path: Path) -> list[str]:
         return out  # check-ast reports it; nothing here to add
 
     out += _nonscalar_closures(path, text, tree)
+    out += _environment_uses(path, tree)
+    out += _tilelang_autotune_uses(path, tree)
 
     aliases, bare = _tilelang_names(tree)
+    out += _value_selecting_boolops(path, tree, aliases, bare)
+    out += _extern_targets(path, text, tree)
 
     for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute) and _member(node, aliases, bare) == "Buffer":
-            out.append(f"{path}:{node.lineno}: T.Buffer is deprecated — use T.Tensor(shape, dtype)")
-
         if not isinstance(node, ast.Call):
             continue
         member = _member(node.func, aliases, bare)
@@ -413,21 +648,11 @@ def check(path: Path) -> list[str]:
     return out
 
 
-def _targets(args: list[str]) -> list[Path]:
-    if args:
-        return [Path(a) for a in args if a.endswith(".py")]
-    return sorted(p for tree in DEFAULT_TREES for p in (REPO_ROOT / tree).rglob("*.py"))
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("files", nargs="*")
-    files = _targets(parser.parse_args().files)
-
-    violations = [v for path in files if path.is_file() for v in check(path)]
-    for v in violations:
-        print(v)
-    return 1 if violations else 0
+    parser.add_argument("files", nargs="*", type=Path)
+    paths = files(parser.parse_args().files, SCANNED, (".py",))
+    return report(v for path in paths if path.is_file() for v in check(path))
 
 
 if __name__ == "__main__":

@@ -9,6 +9,8 @@ and logsumexp reduces everything, and either choice keeps the output shape while
 the values, so a case that does not say which axis it means proves little.
 """
 
+from math import inf
+
 import pytest
 import torch
 
@@ -17,7 +19,7 @@ from tests.compile_contract import (
     compile_fullgraph,
     register_compile_contract,
 )
-from tileops.ops.reduction import (
+from tileops._ops.reduction import (
     AllFwdOp,
     AmaxFwdOp,
     AminFwdOp,
@@ -27,9 +29,6 @@ from tileops.ops.reduction import (
     CountNonzeroFwdOp,
     CumprodFwdOp,
     CumsumFwdOp,
-    InfNormFwdOp,
-    L1NormFwdOp,
-    L2NormFwdOp,
     LogSoftmaxFwdOp,
     LogSumExpFwdOp,
     MeanFwdOp,
@@ -39,11 +38,11 @@ from tileops.ops.reduction import (
     SumFwdOp,
     VarFwdOp,
     VarMeanFwdOp,
+    VectorNormFwdOp,
 )
+from workloads.device import run_device
 
 _DTYPE = torch.float16
-_ROWS = 8
-_COLS = 256
 
 _OP_CLASSES = (
     SumFwdOp,
@@ -59,9 +58,7 @@ _OP_CLASSES = (
     AllFwdOp,
     AnyFwdOp,
     CountNonzeroFwdOp,
-    L1NormFwdOp,
-    L2NormFwdOp,
-    InfNormFwdOp,
+    VectorNormFwdOp,
     SoftmaxFwdOp,
     LogSoftmaxFwdOp,
     LogSumExpFwdOp,
@@ -74,13 +71,13 @@ for _op_cls in _OP_CLASSES:
 
 
 def _x(*shape, dtype=_DTYPE):
-    return torch.randn(*shape, dtype=dtype, device="ptpu")
+    return torch.randn(*shape, dtype=dtype, device=run_device())
 
 
 def _cases():
     """One builder per op. Built inside the test, not at import: this module is imported on
     the CPU-only runner that enforces the compile-contract gate."""
-    rows = (_ROWS, _COLS)
+    rows = (8, 256)
 
     def one_tensor(op_cls, *args, **kwargs):
         return lambda: (op_cls(*args, **kwargs), (_x(*rows),))
@@ -105,20 +102,20 @@ def _cases():
         # A non-contiguous reduced axis, which is the layout argreduce strides along
         # instead of transposing.
         "argmax-strided-axis": one_tensor(ArgmaxFwdOp, dim=0),
-        # bool out, not same_as(x): the fake reads the manifest, not the input.
+        # bool out, not the input dtype: the fake reads the manifest, not the input.
         "all": one_tensor(AllFwdOp, dim=-1),
         # dim=[] is a no-op, and a bool input makes the cast to bool one too, so the
         # result must still be a tensor of its own.
         "all-empty-dim-bool": lambda: (
             AllFwdOp(dim=[]),
-            (torch.randint(2, (_ROWS, _COLS), dtype=torch.bool, device="ptpu"),),
+            (torch.randint(2, rows, dtype=torch.bool, device=run_device()),),
         ),
         "any": one_tensor(AnyFwdOp, dim=-1),
         # int64 out.
         "count-nonzero": one_tensor(CountNonzeroFwdOp, dim=-1),
-        "l1-norm": one_tensor(L1NormFwdOp, dim=-1),
-        "l2-norm": one_tensor(L2NormFwdOp, dim=-1),
-        "inf-norm": one_tensor(InfNormFwdOp, dim=-1),
+        "l1-norm": one_tensor(VectorNormFwdOp, 1, dim=-1),
+        "l2-norm": one_tensor(VectorNormFwdOp, 2, dim=-1),
+        "inf-norm": one_tensor(VectorNormFwdOp, inf, dim=-1),
         "softmax": one_tensor(SoftmaxFwdOp, dim=-1),
         # A same-shape result over a non-last axis comes back through a permute, so its
         # strides have to match what the fake promised.

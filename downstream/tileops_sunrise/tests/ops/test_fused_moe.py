@@ -1,0 +1,622 @@
+"""Tests for FusedMoE — unified routed MoE FFN operator.
+
+Covers:
+  - Qwen3 config: softmax, renormalize=False/True
+  - Kimi K2 config: sigmoid, correction_bias, routed_scaling_factor=2.827
+  - gpt-oss: swigluoai with the per-expert biases
+  - vLLM correctness (optional, skipped when vLLM is not installed)
+  - correction_bias routing precision (weights from original sigmoid, not biased)
+  - DeepSeek-V3 grouped routing, with the scaling factor applied once
+"""
+
+import pytest
+import torch
+
+from tests.workload_test_base import FixtureBase, TestBase
+from tileops._ops.moe import (
+    FusedMoEFwdOp,
+    FusedTopKFwdOp,
+)
+from tileops._utils import get_shared_memory_optin
+from workloads.device import run_device
+from workloads.moe import (
+    FusedMoEWorkload,
+    FusedTopKWorkload,
+    moe_verification,
+    ref_routed_experts,
+)
+from workloads.numerics import compare_outputs, reference_for, verification_for
+from workloads.workload_base import manifest_call
+
+# vLLM optional import
+
+try:
+    from vllm.model_executor.layers.fused_moe.fused_moe import (
+        fused_experts as _vllm_fused_experts,
+    )
+
+    _VLLM_AVAILABLE = True
+except ImportError:
+    _VLLM_AVAILABLE = False
+
+
+# Reference implementations
+
+
+# Test fixture — Qwen3 config
+
+
+class Qwen3Fixture(FixtureBase):
+    PARAMS = [
+        (
+            "num_tokens, num_experts, top_k, hidden_size, ffn_size,"
+            " scoring_func, renormalize, dtype",
+            [
+                pytest.param(
+                    32,
+                    8,
+                    2,
+                    64,
+                    32,
+                    "softmax",
+                    False,
+                    torch.bfloat16,
+                    marks=pytest.mark.smoke,
+                    id="smoke-softmax-bf16",
+                ),
+                pytest.param(
+                    32,
+                    8,
+                    2,
+                    64,
+                    32,
+                    "softmax",
+                    True,
+                    torch.float16,
+                    marks=pytest.mark.smoke,
+                    id="smoke-softmax-renorm-fp16",
+                ),
+                pytest.param(
+                    32,
+                    8,
+                    2,
+                    64,
+                    32,
+                    "sigmoid",
+                    True,
+                    torch.bfloat16,
+                    marks=pytest.mark.smoke,
+                    id="smoke-sigmoid-renorm-bf16",
+                ),
+                pytest.param(
+                    512,
+                    128,
+                    8,
+                    2048,
+                    1024,
+                    "softmax",
+                    False,
+                    torch.bfloat16,
+                    marks=pytest.mark.full,
+                    id="qwen3-small",
+                ),
+                pytest.param(
+                    2048,
+                    128,
+                    8,
+                    2048,
+                    1024,
+                    "softmax",
+                    False,
+                    torch.bfloat16,
+                    marks=pytest.mark.full,
+                    id="qwen3-medium",
+                ),
+                pytest.param(
+                    512,
+                    256,
+                    8,
+                    2048,
+                    1024,
+                    "softmax",
+                    True,
+                    torch.bfloat16,
+                    marks=pytest.mark.full,
+                    id="qwen35-small",
+                ),
+                pytest.param(
+                    512,
+                    256,
+                    8,
+                    2048,
+                    1024,
+                    "sigmoid",
+                    True,
+                    torch.bfloat16,
+                    marks=pytest.mark.full,
+                    id="deepseek-small",
+                ),
+            ],
+        )
+    ]
+
+
+@Qwen3Fixture
+def test_fused_moe_qwen3(
+    num_tokens,
+    num_experts,
+    top_k,
+    hidden_size,
+    ffn_size,
+    scoring_func,
+    renormalize,
+    dtype,
+) -> None:
+    torch.manual_seed(42)
+    dev = run_device()
+    hidden = torch.randn(num_tokens, hidden_size, dtype=dtype, device=dev)
+    gating = torch.randn(num_tokens, num_experts, device=dev)
+    w_gate_up = torch.randn(num_experts, ffn_size * 2, hidden_size, dtype=dtype, device=dev) * 0.02
+    w_down = torch.randn(num_experts, hidden_size, ffn_size, dtype=dtype, device=dev) * 0.02
+
+    op_nopad = FusedMoEFwdOp(
+        top_k=top_k,
+        scoring_func=scoring_func,
+        renormalize=renormalize,
+    )
+
+    out_nopad = op_nopad(hidden, gating, w_gate_up, w_down)
+
+    assert out_nopad.shape == (num_tokens, hidden_size)
+    assert out_nopad.dtype == dtype
+
+    # Reference using the same FusedTopKFwdOp routing
+    fk = FusedTopKFwdOp(top_k, scoring_func, renormalize)
+    topk_weights, topk_ids = fk(gating)
+    ref = reference_for(
+        ref_routed_experts, hidden, w_gate_up, w_down, topk_weights, topk_ids.long()
+    )
+
+    compare_outputs(out_nopad, ref, moe_verification(2))
+
+    # vLLM's fp32 Triton tiles take up to 128 KB of shared memory, over SM86/SM89's 99 KB.
+    if (
+        _VLLM_AVAILABLE
+        and scoring_func == "softmax"
+        and get_shared_memory_optin(hidden.device.index) >= 128 * 1024
+    ):
+        out_vllm = _vllm_fused_experts(
+            hidden.float(),
+            w_gate_up.float(),
+            w_down.float(),
+            topk_weights,
+            topk_ids,
+        ).to(dtype)
+        compare_outputs(out_nopad.float(), out_vllm.float(), moe_verification(2))
+
+
+# Cases for the FusedMoE non-determinism regression. The cooperative 3WG
+# grouped-GEMM TMA-store epilogue race is intermittent (~3% of calls at the
+# qwen3-medium scale) and only manifests inside the full FusedMoE pipeline
+# (adjacent activation/permute kernels keep the timing window open) — an
+# isolated grouped-GEMM loop never trips it, so this must run the op. The
+# nightly case repeats many times: at 3% per call, 200 repeats give >99%
+# detection. The smoke case is a fast path-coverage check.
+_DET_CASES = [
+    pytest.param(
+        dict(num_tokens=32, num_experts=8, top_k=2, hidden_size=64, ffn_size=32, reps=3),
+        marks=pytest.mark.smoke,
+        id="smoke",
+    ),
+    pytest.param(
+        dict(num_tokens=2048, num_experts=128, top_k=8, hidden_size=2048, ffn_size=1024, reps=200),
+        marks=pytest.mark.nightly,
+        id="qwen3-medium",
+    ),
+]
+
+
+@pytest.mark.parametrize("case", _DET_CASES)
+def test_fused_moe_deterministic(case):
+    """Regression for the cooperative 3WG grouped-GEMM TMA-store epilogue race.
+
+    The fast-path epilogue staged each full tile through a per-WG ``C_shared``
+    SMEM buffer without ordering the register→SMEM write before the async TMA
+    read, so the store could read a half-written ``C_shared`` on a small
+    fraction of calls, corrupting a sub-tile of the output non-deterministically.
+    The race only manifests inside the full FusedMoE pipeline; qwen3-medium
+    (E=128, ~128 rows/expert) drives the cooperative full-tile fast path heavily.
+    Run the op many times on fixed seed-42 inputs and assert every call matches
+    the PyTorch reference and is bitwise-identical to the first. Pre-fix the
+    qwen3-medium case trips within ~100 repeats; post-fix it is deterministic.
+    """
+    torch.manual_seed(42)
+    dev = run_device()
+    dtype = torch.bfloat16
+    nt, ne, tk = case["num_tokens"], case["num_experts"], case["top_k"]
+    hs, ff, reps = case["hidden_size"], case["ffn_size"], case["reps"]
+    hidden = torch.randn(nt, hs, dtype=dtype, device=dev)
+    gating = torch.randn(nt, ne, device=dev)
+    w_gate_up = torch.randn(ne, ff * 2, hs, dtype=dtype, device=dev) * 0.02
+    w_down = torch.randn(ne, hs, ff, dtype=dtype, device=dev) * 0.02
+
+    op = FusedMoEFwdOp(
+        top_k=tk,
+        scoring_func="softmax",
+        renormalize=False,
+    )
+    fk = FusedTopKFwdOp(tk, "softmax", False)
+    topk_weights, topk_ids = fk(gating)
+    ref = reference_for(
+        ref_routed_experts, hidden, w_gate_up, w_down, topk_weights, topk_ids.long()
+    )
+
+    first = op(hidden, gating, w_gate_up, w_down)
+    compare_outputs(first, ref, moe_verification(2))
+    for i in range(reps):
+        out = op(hidden, gating, w_gate_up, w_down)
+        assert torch.equal(out, first), (
+            f"non-deterministic FusedMoE output on call {i + 1}/{reps}: "
+            "3WG grouped-GEMM TMA-store epilogue write→read race regressed"
+        )
+
+
+# gpt-oss config
+
+
+@pytest.mark.smoke
+def test_fused_moe_gpt_oss_swigluoai_and_expert_biases() -> None:
+    """gpt-oss's routing (softmax with renormalize), swigluoai and both expert biases meet the
+    reference."""
+    call = manifest_call(
+        "FusedMoEFwdOp",
+        {"D": "bfloat16"},
+        T=32,
+        E=8,
+        H=64,
+        F=32,
+        top_k=2,
+        scoring_func="softmax",
+        renormalize=True,
+        activation="swigluoai",
+        some=["b_gate_up", "b_down"],
+    )
+    workload = FusedMoEWorkload(call)
+    inputs = workload.gen_inputs()
+    out = FusedMoEFwdOp(**call.arguments({}))(*inputs)
+    compare_outputs(
+        out,
+        reference_for(workload.ref_program, *inputs),
+        verification_for(workload.verification, inputs),
+    )
+
+
+# Test fixture — Kimi K2 config
+
+
+class KimiFixture(FixtureBase):
+    PARAMS = [
+        (
+            "num_tokens, num_experts, top_k, hidden_size, ffn_size,"
+            " routed_scaling_factor, with_correction_bias, dtype",
+            [
+                pytest.param(
+                    32,
+                    8,
+                    2,
+                    64,
+                    32,
+                    1.0,
+                    False,
+                    torch.bfloat16,
+                    marks=pytest.mark.smoke,
+                    id="smoke-nobias-bf16",
+                ),
+                pytest.param(
+                    32,
+                    8,
+                    2,
+                    64,
+                    32,
+                    1.0,
+                    True,
+                    torch.bfloat16,
+                    marks=pytest.mark.smoke,
+                    id="smoke-bias-bf16",
+                ),
+                pytest.param(
+                    32,
+                    8,
+                    2,
+                    64,
+                    32,
+                    2.827,
+                    True,
+                    torch.bfloat16,
+                    marks=pytest.mark.smoke,
+                    id="smoke-bias-scale-bf16",
+                ),
+                pytest.param(
+                    32,
+                    8,
+                    2,
+                    64,
+                    32,
+                    2.827,
+                    True,
+                    torch.float16,
+                    marks=pytest.mark.smoke,
+                    id="smoke-bias-scale-fp16",
+                ),
+                pytest.param(
+                    64,
+                    384,
+                    8,
+                    64,
+                    32,
+                    2.827,
+                    True,
+                    torch.bfloat16,
+                    marks=pytest.mark.smoke,
+                    id="kimi-k2-smoke-bf16",
+                ),
+                pytest.param(
+                    512,
+                    384,
+                    8,
+                    256,
+                    128,
+                    2.827,
+                    True,
+                    torch.bfloat16,
+                    marks=pytest.mark.full,
+                    id="kimi-k2-small-bf16",
+                ),
+                pytest.param(
+                    2048,
+                    384,
+                    8,
+                    256,
+                    128,
+                    2.827,
+                    True,
+                    torch.bfloat16,
+                    marks=pytest.mark.full,
+                    id="kimi-k2-medium-bf16",
+                ),
+            ],
+        )
+    ]
+
+
+@KimiFixture
+def test_fused_moe_kimi(
+    num_tokens,
+    num_experts,
+    top_k,
+    hidden_size,
+    ffn_size,
+    routed_scaling_factor,
+    with_correction_bias,
+    dtype,
+) -> None:
+    torch.manual_seed(42)
+    dev = run_device()
+    hidden = torch.randn(num_tokens, hidden_size, dtype=dtype, device=dev)
+    gating = torch.randn(num_tokens, num_experts, device=dev)
+    correction_bias = (
+        torch.randn(num_experts, dtype=torch.float32, device=dev) * 0.1
+        if with_correction_bias
+        else None
+    )
+    w_gate_up = torch.randn(num_experts, ffn_size * 2, hidden_size, dtype=dtype, device=dev) * 0.02
+    w_down = torch.randn(num_experts, hidden_size, ffn_size, dtype=dtype, device=dev) * 0.02
+
+    op_nopad = FusedMoEFwdOp(
+        top_k=top_k,
+        scoring_func="sigmoid",
+        renormalize=True,
+        routed_scaling_factor=routed_scaling_factor,
+    )
+
+    out_nopad = op_nopad(hidden, gating, w_gate_up, w_down, correction_bias)
+
+    assert out_nopad.shape == (num_tokens, hidden_size)
+    assert out_nopad.dtype == dtype
+
+    # Reference using FusedTopKFwdOp for consistent routing
+    fk = FusedTopKFwdOp(top_k, "sigmoid", True)
+    topk_weights, topk_ids = fk(gating, correction_bias)
+    ref = reference_for(
+        ref_routed_experts, hidden, w_gate_up, w_down, topk_weights, topk_ids.long()
+    )
+    if routed_scaling_factor != 1.0:
+        ref = ref * routed_scaling_factor
+
+    compare_outputs(out_nopad, ref, moe_verification(2))
+
+
+# correction_bias routing precision
+
+
+@pytest.mark.smoke
+def test_correction_bias_routing_precision() -> None:
+    """Verify correction_bias is used only for top-k selection, not for weights.
+
+    Constructs a case where biased and unbiased top-k differ, then checks:
+      - topk_ids match the biased-sort order
+      - topk_weights use ORIGINAL (unbiased) sigmoid scores, renormalized
+    """
+    torch.manual_seed(7)
+    T, E, K = 4, 8, 2
+    dev = run_device()
+
+    logits = torch.randn(T, E, dtype=torch.float32, device=dev)
+    bias = torch.randn(E, dtype=torch.float32, device=dev)
+
+    call = manifest_call(
+        "FusedTopKFwdOp",
+        {"G": "float32"},
+        T=T,
+        E=E,
+        top_k=K,
+        scoring_func="sigmoid",
+        renormalize=True,
+    )
+    workload = FusedTopKWorkload(call)
+    TestBase.check(
+        workload, FusedTopKFwdOp(top_k=K, scoring_func="sigmoid", renormalize=True), logits, bias
+    )
+
+
+# DeepSeek-V3 grouped routing
+
+
+@pytest.mark.smoke
+def test_grouped_routing_scales_the_output_once() -> None:
+    """DeepSeek-V3 grouped routing scales the routed output by the scaling factor once."""
+    call = manifest_call(
+        "FusedMoEFwdOp",
+        {"D": "bfloat16"},
+        T=32,
+        E=256,
+        H=64,
+        F=32,
+        top_k=8,
+        num_expert_group=8,
+        topk_group=4,
+        scoring_func="sigmoid",
+        renormalize=True,
+        routed_scaling_factor=2.5,
+        some=["correction_bias"],
+    )
+    workload = FusedMoEWorkload(call)
+    op = FusedMoEFwdOp(**call.arguments({}))
+    TestBase.check(workload, op, *workload.gen_inputs())
+
+
+# vLLM alignment (optional)
+
+
+class VllmFixture(FixtureBase):
+    PARAMS = [
+        (
+            "num_tokens, num_experts, top_k, hidden_size, ffn_size, routed_scaling_factor, dtype",
+            [
+                pytest.param(
+                    32,
+                    8,
+                    2,
+                    64,
+                    32,
+                    1.0,
+                    torch.bfloat16,
+                    marks=pytest.mark.smoke,
+                    id="smoke-bf16",
+                ),
+                pytest.param(
+                    32,
+                    8,
+                    2,
+                    64,
+                    32,
+                    2.827,
+                    torch.bfloat16,
+                    marks=pytest.mark.smoke,
+                    id="smoke-scale-bf16",
+                ),
+                pytest.param(
+                    64,
+                    384,
+                    8,
+                    64,
+                    32,
+                    2.827,
+                    torch.bfloat16,
+                    marks=pytest.mark.smoke,
+                    id="kimi-k2-smoke-bf16",
+                ),
+                pytest.param(
+                    512,
+                    384,
+                    8,
+                    256,
+                    128,
+                    2.827,
+                    torch.bfloat16,
+                    marks=pytest.mark.full,
+                    id="kimi-k2-small-bf16",
+                ),
+            ],
+        )
+    ]
+
+
+@VllmFixture
+def test_fused_moe_vs_vllm(
+    num_tokens,
+    num_experts,
+    top_k,
+    hidden_size,
+    ffn_size,
+    routed_scaling_factor,
+    dtype,
+) -> None:
+    if not _VLLM_AVAILABLE:
+        pytest.skip("vllm not installed")
+
+    torch.manual_seed(42)
+    dev = run_device()
+    hidden = torch.randn(num_tokens, hidden_size, dtype=dtype, device=dev)
+    gating = torch.randn(num_tokens, num_experts, device=dev)
+    correction_bias = torch.randn(num_experts, dtype=torch.float32, device=dev) * 0.1
+    w_gate_up = torch.randn(num_experts, ffn_size * 2, hidden_size, dtype=dtype, device=dev) * 0.02
+    w_down = torch.randn(num_experts, hidden_size, ffn_size, dtype=dtype, device=dev) * 0.02
+
+    fk = FusedTopKFwdOp(top_k, "sigmoid", True)
+    topk_weights, topk_ids = fk(gating, correction_bias)
+
+    op = FusedMoEFwdOp(
+        top_k=top_k,
+        scoring_func="sigmoid",
+        renormalize=True,
+        routed_scaling_factor=routed_scaling_factor,
+    )
+    out_tileops = op(hidden, gating, w_gate_up, w_down, correction_bias)
+
+    out_vllm = _vllm_fused_experts(hidden, w_gate_up, w_down, topk_weights, topk_ids)
+    if routed_scaling_factor != 1.0:
+        out_vllm = out_vllm * routed_scaling_factor
+
+    compare_outputs(out_tileops.float(), out_vllm.float(), moe_verification(2))
+
+
+# roofline
+
+
+@pytest.mark.in_tree_kernels
+@pytest.mark.smoke
+def test_the_routed_weights_are_priced_from_the_experts_stage() -> None:
+    """The in-tree call prices the experts its routed-experts stage read; with no stage call
+    the price falls to the data-independent bound of top_k experts."""
+    torch.manual_seed(7)
+    dev = run_device()
+    T, E, K, H, F_ = 32, 8, 2, 64, 32
+    dtype = torch.bfloat16
+    hidden = torch.randn(T, H, dtype=dtype, device=dev)
+    gating = torch.randn(T, E, device=dev)
+    w_gate_up = torch.randn(E, F_ * 2, H, dtype=dtype, device=dev) * 0.02
+    w_down = torch.randn(E, H, F_, dtype=dtype, device=dev) * 0.02
+
+    op = FusedMoEFwdOp(top_k=K)
+    op(hidden, gating, w_gate_up, w_down)
+    _, topk_ids = FusedTopKFwdOp(K)(gating)
+    active = reference_for(lambda ids: ids.unique().numel(), topk_ids)
+    per_expert = 3 * F_ * H * 2
+    fixed = 2 * T * H * 2 + T * E * 4
+    flops, nbytes = op.eval_roofline()
+    # Softmax routing as FusedTopKFwdOp prices it, then per route the two GEMMs, the gated
+    # activation and the weighted combine.
+    assert flops == T * (4 * E + K + K * E) + T * K * (6 * F_ * H + 6 * F_ + 2 * H)
+    assert nbytes == active * per_expert + fixed
+    assert op.roofline_data_terms() == {"active_experts": active}

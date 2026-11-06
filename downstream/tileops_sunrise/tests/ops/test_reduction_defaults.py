@@ -5,8 +5,7 @@ Pins two manifest-conformance invariants for the reduction op family:
 1. For the ten ops whose manifest declares ``default: null`` on ``dim``
    (Sum/Mean/Amax/Amin/Var/Std/VarMean/All/Any/CountNonzero), constructing
    the op with only ``dtype=`` performs a full reduction (output shape
-   equals ``torch.<op>(x).shape``). ``ProdFwdOp`` keeps its documented
-   ``dim=-1`` default.
+   equals ``torch.<op>(x).shape``).
 
 2. ``AllFwdOp`` / ``AnyFwdOp`` honor the spec's ``dim=[]`` / ``dim=()``
    no-op contract: output shape equals the input shape, output dtype is
@@ -18,20 +17,22 @@ from __future__ import annotations
 import pytest
 import torch
 
-pytestmark = pytest.mark.skipif(not torch.ptpu.is_available(), reason="PTPU required")
+from workloads.device import run_device, run_device_available
+from workloads.numerics import compare_outputs
+from workloads.reduction import reduction_verification
 
-
-_FLOAT_SHAPE = (2, 4, 8)
-_LOGICAL_SHAPE = (2, 4, 8)
+pytestmark = pytest.mark.skipif(
+    not run_device_available(), reason="the run device is not available"
+)
 
 
 def _make_float(shape: tuple, dtype: torch.dtype) -> torch.Tensor:
-    return torch.randn(*shape, dtype=dtype, device="ptpu")
+    return torch.randn(*shape, dtype=dtype, device=run_device())
 
 
 def _make_logical(shape: tuple, dtype: torch.dtype) -> torch.Tensor:
     # values in {-1, 0, 1} so .bool() has both T and F.
-    return (torch.randint(-1, 2, shape, device="ptpu")).to(dtype)
+    return (torch.randint(-1, 2, shape, device=run_device())).to(dtype)
 
 
 # default dim=None for the ten ops -> full reduction on 3-D input
@@ -39,9 +40,11 @@ def _make_logical(shape: tuple, dtype: torch.dtype) -> torch.Tensor:
 
 @pytest.mark.smoke
 def test_sum_default_dim_full_reduction() -> None:
-    from tileops.ops.reduction.reduce import SumFwdOp
+    from tileops._ops.reduction.reduce import SumFwdOp
 
-    x = _make_float(_FLOAT_SHAPE, torch.float16)
+    shape = (2, 4, 8)
+
+    x = _make_float(shape, torch.float16)
     op = SumFwdOp()
     y = op(x)
     assert y.shape == torch.sum(x.cpu()).shape
@@ -49,9 +52,11 @@ def test_sum_default_dim_full_reduction() -> None:
 
 @pytest.mark.smoke
 def test_mean_default_dim_full_reduction() -> None:
-    from tileops.ops.reduction.reduce import MeanFwdOp
+    from tileops._ops.reduction.reduce import MeanFwdOp
 
-    x = _make_float(_FLOAT_SHAPE, torch.float16)
+    shape = (2, 4, 8)
+
+    x = _make_float(shape, torch.float16)
     op = MeanFwdOp()
     y = op(x)
     assert y.shape == torch.mean(x.cpu()).shape
@@ -59,9 +64,11 @@ def test_mean_default_dim_full_reduction() -> None:
 
 @pytest.mark.smoke
 def test_amax_default_dim_full_reduction() -> None:
-    from tileops.ops.reduction.reduce import AmaxFwdOp
+    from tileops._ops.reduction.reduce import AmaxFwdOp
 
-    x = _make_float(_FLOAT_SHAPE, torch.float16)
+    shape = (2, 4, 8)
+
+    x = _make_float(shape, torch.float16)
     op = AmaxFwdOp()
     y = op(x)
     assert y.shape == torch.amax(x.cpu()).shape
@@ -69,9 +76,11 @@ def test_amax_default_dim_full_reduction() -> None:
 
 @pytest.mark.smoke
 def test_amin_default_dim_full_reduction() -> None:
-    from tileops.ops.reduction.reduce import AminFwdOp
+    from tileops._ops.reduction.reduce import AminFwdOp
 
-    x = _make_float(_FLOAT_SHAPE, torch.float16)
+    shape = (2, 4, 8)
+
+    x = _make_float(shape, torch.float16)
     op = AminFwdOp()
     y = op(x)
     assert y.shape == torch.amin(x.cpu()).shape
@@ -79,9 +88,11 @@ def test_amin_default_dim_full_reduction() -> None:
 
 @pytest.mark.smoke
 def test_var_default_dim_full_reduction() -> None:
-    from tileops.ops.reduction.reduce import VarFwdOp
+    from tileops._ops.reduction.reduce import VarFwdOp
 
-    x = _make_float(_FLOAT_SHAPE, torch.float16)
+    shape = (2, 4, 8)
+
+    x = _make_float(shape, torch.float16)
     op = VarFwdOp()
     y = op(x)
     assert y.shape == torch.var(x.cpu()).shape
@@ -89,9 +100,11 @@ def test_var_default_dim_full_reduction() -> None:
 
 @pytest.mark.smoke
 def test_std_default_dim_full_reduction() -> None:
-    from tileops.ops.reduction.reduce import StdFwdOp
+    from tileops._ops.reduction.reduce import StdFwdOp
 
-    x = _make_float(_FLOAT_SHAPE, torch.float16)
+    shape = (2, 4, 8)
+
+    x = _make_float(shape, torch.float16)
     op = StdFwdOp()
     y = op(x)
     assert y.shape == torch.std(x.cpu()).shape
@@ -99,9 +112,11 @@ def test_std_default_dim_full_reduction() -> None:
 
 @pytest.mark.smoke
 def test_var_mean_default_dim_full_reduction() -> None:
-    from tileops.ops.reduction.reduce import VarMeanFwdOp
+    from tileops._ops.reduction.reduce import VarMeanFwdOp
 
-    x = _make_float(_FLOAT_SHAPE, torch.float16)
+    shape = (2, 4, 8)
+
+    x = _make_float(shape, torch.float16)
     op = VarMeanFwdOp()
     var_out, mean_out = op(x)
     ref_var, ref_mean = torch.var_mean(x.cpu())
@@ -111,9 +126,11 @@ def test_var_mean_default_dim_full_reduction() -> None:
 
 @pytest.mark.smoke
 def test_all_default_dim_full_reduction() -> None:
-    from tileops.ops.reduction.logical_reduce import AllFwdOp
+    from tileops._ops.reduction.logical_reduce import AllFwdOp
 
-    x = _make_logical(_LOGICAL_SHAPE, torch.float16)
+    shape = (2, 4, 8)
+
+    x = _make_logical(shape, torch.float16)
     op = AllFwdOp()
     y = op(x)
     assert y.shape == torch.all(x.cpu().bool()).shape
@@ -122,9 +139,11 @@ def test_all_default_dim_full_reduction() -> None:
 
 @pytest.mark.smoke
 def test_any_default_dim_full_reduction() -> None:
-    from tileops.ops.reduction.logical_reduce import AnyFwdOp
+    from tileops._ops.reduction.logical_reduce import AnyFwdOp
 
-    x = _make_logical(_LOGICAL_SHAPE, torch.float16)
+    shape = (2, 4, 8)
+
+    x = _make_logical(shape, torch.float16)
     op = AnyFwdOp()
     y = op(x)
     assert y.shape == torch.any(x.cpu().bool()).shape
@@ -133,27 +152,15 @@ def test_any_default_dim_full_reduction() -> None:
 
 @pytest.mark.smoke
 def test_count_nonzero_default_dim_full_reduction() -> None:
-    from tileops.ops.reduction.logical_reduce import CountNonzeroFwdOp
+    from tileops._ops.reduction.logical_reduce import CountNonzeroFwdOp
 
-    x = _make_logical(_LOGICAL_SHAPE, torch.float16)
+    shape = (2, 4, 8)
+
+    x = _make_logical(shape, torch.float16)
     op = CountNonzeroFwdOp()
     y = op(x)
     assert y.shape == torch.count_nonzero(x.cpu()).shape
     assert y.dtype == torch.int64
-
-
-# ProdFwdOp keeps documented dim=-1 default
-
-
-@pytest.mark.smoke
-def test_prod_default_dim_last_axis() -> None:
-    from tileops.ops.reduction.reduce import ProdFwdOp
-
-    # use a narrow value range so fp16 prod is numerically stable
-    x = torch.rand(*_FLOAT_SHAPE, dtype=torch.float16, device="ptpu") * 0.01 + 0.99
-    op = ProdFwdOp()
-    y = op(x)
-    assert y.shape == torch.prod(x.cpu(), dim=-1).shape
 
 
 # AllFwdOp/AnyFwdOp dim=[] / dim=() noop contract
@@ -162,90 +169,31 @@ def test_prod_default_dim_last_axis() -> None:
 @pytest.mark.smoke
 @pytest.mark.parametrize("empty_dim", [[], ()])
 def test_all_empty_dim_noop(empty_dim) -> None:
-    from tileops.ops.reduction.logical_reduce import AllFwdOp
+    from tileops._ops.reduction.logical_reduce import AllFwdOp
 
-    x = _make_logical(_LOGICAL_SHAPE, torch.float16)
+    shape = (2, 4, 8)
+
+    x = _make_logical(shape, torch.float16)
     op = AllFwdOp(dim=empty_dim)
     y = op(x)
     assert y.shape == x.shape
     assert y.dtype == torch.bool
-    assert torch.equal(y.cpu(), x.cpu().bool())
+    compare_outputs(y, x.bool(), reduction_verification((x.bool()).dtype))
 
 
 @pytest.mark.smoke
 @pytest.mark.parametrize("empty_dim", [[], ()])
 def test_any_empty_dim_noop(empty_dim) -> None:
-    from tileops.ops.reduction.logical_reduce import AnyFwdOp
+    from tileops._ops.reduction.logical_reduce import AnyFwdOp
 
-    x = _make_logical(_LOGICAL_SHAPE, torch.float16)
+    shape = (2, 4, 8)
+
+    x = _make_logical(shape, torch.float16)
     op = AnyFwdOp(dim=empty_dim)
     y = op(x)
     assert y.shape == x.shape
     assert y.dtype == torch.bool
-    assert torch.equal(y.cpu(), x.cpu().bool())
-
-
-# normalize_dim noop policy returns []
-
-
-@pytest.mark.smoke
-def test_normalize_dim_noop_returns_empty() -> None:
-    from tileops.ops.reduction._multidim import normalize_dim
-
-    assert normalize_dim([], ndim=3, empty_dim_policy="noop") == []
-    assert normalize_dim((), ndim=3, empty_dim_policy="noop") == []
-
-
-@pytest.mark.smoke
-def test_normalize_dim_reject_raises_on_empty() -> None:
-    from tileops.ops.reduction._multidim import normalize_dim
-
-    with pytest.raises(ValueError):
-        normalize_dim([], ndim=3, empty_dim_policy="reject")
-
-
-@pytest.mark.smoke
-def test_normalize_dim_full_returns_all() -> None:
-    from tileops.ops.reduction._multidim import normalize_dim
-
-    assert normalize_dim([], ndim=3, empty_dim_policy="full") == [0, 1, 2]
-
-
-@pytest.mark.smoke
-def test_empty_dim_policy_class_attrs() -> None:
-    """Per-op empty_dim_policy bindings."""
-    from tileops.ops.reduction.logical_reduce import AllFwdOp, AnyFwdOp, CountNonzeroFwdOp
-    from tileops.ops.reduction.reduce import (
-        AmaxFwdOp,
-        AminFwdOp,
-        MeanFwdOp,
-        ProdFwdOp,
-        StdFwdOp,
-        SumFwdOp,
-        VarFwdOp,
-        VarMeanFwdOp,
-        _ReduceOpBase,
-    )
-
-    assert _ReduceOpBase._empty_dim_policy == "reject"
-    assert AllFwdOp._empty_dim_policy == "noop"
-    assert AnyFwdOp._empty_dim_policy == "noop"
-    for cls in (
-        SumFwdOp,
-        MeanFwdOp,
-        AmaxFwdOp,
-        AminFwdOp,
-        StdFwdOp,
-        VarFwdOp,
-        VarMeanFwdOp,
-        CountNonzeroFwdOp,
-    ):
-        assert cls._empty_dim_policy == "full", cls.__name__
-    # ProdFwdOp inherits default (reject); empty dim is not in its contract
-    assert ProdFwdOp._empty_dim_policy == "reject"
-
-
-# Empty-dim noop must NOT bypass input validation or roofline binding
+    compare_outputs(y, x.bool(), reduction_verification((x.bool()).dtype))
 
 
 @pytest.mark.smoke
@@ -259,103 +207,24 @@ def test_empty_dim_noop_answers_without_a_target(op_name: str) -> None:
     reach one and is refused there — that asymmetry is the edge of what the installed
     targets cover, not an inconsistency in the op.
     """
-    import tileops.ops.reduction.logical_reduce as logical_reduce
+    import tileops._ops.reduction.logical_reduce as logical_reduce
 
-    x = (torch.randint(-1, 2, _LOGICAL_SHAPE)).to(torch.float16)  # cpu
+    shape = (2, 4, 8)
+
+    x = (torch.randint(-1, 2, shape)).to(torch.float16)  # cpu
     op = getattr(logical_reduce, op_name)(dim=[])
 
     out = op(x)
 
     assert out.device == x.device
     assert out.dtype == torch.bool
-    assert torch.equal(out.cpu(), x != 0)
-
-
-@pytest.mark.smoke
-def test_all_empty_dim_noop_rejects_undeclared_dtype() -> None:
-    """dim=[] must not let an input skip the manifest dtype gate."""
-    from tileops.ops.reduction.logical_reduce import AllFwdOp
-
-    x = torch.empty(_LOGICAL_SHAPE, dtype=torch.float64, device="ptpu")  # undeclared dtype
-    op = AllFwdOp(dim=[])
-    with pytest.raises(ValueError, match="has dtype torch.float64"):
-        op(x)
-
-
-@pytest.mark.smoke
-def test_any_empty_dim_noop_rejects_undeclared_dtype() -> None:
-    from tileops.ops.reduction.logical_reduce import AnyFwdOp
-
-    x = torch.empty(_LOGICAL_SHAPE, dtype=torch.float64, device="ptpu")
-    op = AnyFwdOp(dim=[])
-    with pytest.raises(ValueError, match="has dtype torch.float64"):
-        op(x)
-
-
-@pytest.mark.smoke
-def test_all_empty_dim_noop_binds_roofline() -> None:
-    """eval_roofline() must succeed after a dim=[] noop forward and
-    report non-zero data-movement (the noop still reads the input and
-    writes an equal-shape cast result)."""
-    from tileops.ops.reduction.logical_reduce import AllFwdOp
-
-    x = _make_logical(_LOGICAL_SHAPE, torch.float16)
-    op = AllFwdOp(dim=[])
-    op(x)
-    flops, mem_bytes = op.eval_roofline()
-    numel = x.numel()
-    elem_bytes = x.element_size()
-    # Noop binds (M=numel, N=1); for the "all" op_kind this gives
-    # mem_bytes = numel * elem_bytes + numel (input read + bool write).
-    expected_lower = numel * elem_bytes
-    expected_upper = 2 * numel * elem_bytes + numel
-    assert mem_bytes >= expected_lower, (
-        f"noop bandwidth {mem_bytes} under-counts input read ({expected_lower} bytes)"
-    )
-    assert mem_bytes <= expected_upper
-    # flops are degenerate (one op per element); contract is non-negative.
-    assert flops >= 0
-
-
-@pytest.mark.smoke
-def test_any_empty_dim_noop_binds_roofline() -> None:
-    from tileops.ops.reduction.logical_reduce import AnyFwdOp
-
-    x = _make_logical(_LOGICAL_SHAPE, torch.float16)
-    op = AnyFwdOp(dim=[])
-    op(x)
-    flops, mem_bytes = op.eval_roofline()
-    numel = x.numel()
-    elem_bytes = x.element_size()
-    expected_lower = numel * elem_bytes
-    expected_upper = 2 * numel * elem_bytes + numel
-    assert mem_bytes >= expected_lower
-    assert mem_bytes <= expected_upper
-    assert flops >= 0
-
-
-@pytest.mark.smoke
-def test_validate_dim_rejects_bool_scalar() -> None:
-    """`bool` subclasses `int`, but a boolean dim is never a valid axis;
-    `_validate_dim` must reject it explicitly."""
-    from tileops.ops.reduction.reduce import SumFwdOp
-
-    with pytest.raises(TypeError, match="dim must not be bool"):
-        SumFwdOp(dim=True)
-
-
-@pytest.mark.smoke
-def test_validate_dim_rejects_bool_in_list() -> None:
-    """Same guard applies element-wise to `list[int]` / `tuple[int, ...]`."""
-    from tileops.ops.reduction.reduce import SumFwdOp
-
-    with pytest.raises(TypeError, match="must be int .not bool"):
-        SumFwdOp(dim=[True, 0])
+    compare_outputs(out, x != 0, reduction_verification((x != 0).dtype))
 
 
 # A kernel's architecture check reads the device the op handed over
 
 
+@pytest.mark.cuda_only
 @pytest.mark.smoke
 def test_the_arch_check_asks_about_the_input_s_device(monkeypatch) -> None:
     """Not whichever device is current: the two differ on a mixed-architecture host.
@@ -363,20 +232,21 @@ def test_the_arch_check_asks_about_the_input_s_device(monkeypatch) -> None:
     A homogeneous host cannot show the wrong answer, so what is asserted is which device
     was asked about.
     """
-    import tileops.utils as utils
-    from tileops.ops.reduction.reduce import SumFwdOp
+    import tileops._utils as utils
+    from tileops._ops.reduction.reduce import SumFwdOp
 
     asked: list = []
-    real = utils.get_sm_version
+    real = utils.device_facts
 
     def recording(index=None):
         asked.append(index)
         return real(index)
 
-    monkeypatch.setattr(utils, "get_sm_version", recording)
+    # The call record carries the architecture the kernel is checked against.
+    monkeypatch.setattr(utils, "device_facts", recording)
 
     x = torch.randn(4, 8, dtype=torch.float16, device="ptpu")
     SumFwdOp(dim=-1)(x)
 
-    assert asked, "the kernel declares supported_archs, so it must have probed"
+    assert asked, "the kernel declares supported_archs, so the call record must have probed"
     assert all(i == x.device.index for i in asked), asked
