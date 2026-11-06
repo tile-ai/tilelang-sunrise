@@ -33,7 +33,16 @@ def _make_item(
     """Build a lightweight mock pytest.Item for tier validation tests."""
     markers = markers or []
     item = MagicMock(
-        spec=["nodeid", "path", "name", "originalname", "get_closest_marker", "callspec"]
+        spec=[
+            "nodeid",
+            "path",
+            "name",
+            "originalname",
+            "get_closest_marker",
+            "iter_markers",
+            "callspec",
+            "user_properties",
+        ]
     )
     item.nodeid = f"{path}::{name}"
     item.path = Path(path)
@@ -41,6 +50,9 @@ def _make_item(
     item.originalname = originalname
 
     marker_set = set(markers)
+
+    item.iter_markers = lambda name=None: iter(())
+    item.user_properties = []
 
     def _get_closest_marker(marker_name: str):
         if marker_name in marker_set:
@@ -195,30 +207,6 @@ class TestSmokeConstraints:
             pytest_collection_modifyitems(items)
         assert "must not be xfail" in str(exc_info.value)
         assert "must appear as the first" not in str(exc_info.value)
-
-
-@pytest.mark.full
-class TestNonRuntimeOpsFileExemption:
-    """Explicitly exempted non-runtime ops files may be full-only."""
-
-    def test_exempt_ops_file_may_have_zero_smoke(self):
-        items = [
-            _make_item(
-                name="test_compile[0]",
-                originalname="test_compile",
-                path="tests/ops/test_elementwise_compile.py",
-                markers=["full"],
-                tune=False,
-            ),
-            _make_item(
-                name="test_compile[1]",
-                originalname="test_compile",
-                path="tests/ops/test_elementwise_compile.py",
-                markers=["full"],
-                tune=True,
-            ),
-        ]
-        pytest_collection_modifyitems(items)
 
 
 @pytest.mark.smoke

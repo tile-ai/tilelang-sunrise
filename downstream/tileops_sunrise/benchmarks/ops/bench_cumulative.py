@@ -11,71 +11,40 @@ compiled. cumprod has no flag_gems entry point in 5.0.2.
 import pytest
 import torch
 
-from benchmarks.baselines import (
-    FLAGGEMS_TAG,
-    TORCH_COMPILE_TAG,
-    assert_matches_reference,
-    compiled_reference,
-    flaggems_op,
-    reference_tolerance,
-)
-from benchmarks.benchmark_base import (
-    ManifestBenchmark,
-    workloads_to_params,
-)
-from tileops.ops.reduction.cumulative import CumprodFwdOp, CumsumFwdOp
-from workloads.reduction import CumulativeWorkload
+from benchmarks import api as bench
+from benchmarks.baselines import FLAGGEMS_TAG, TORCH_COMPILE_TAG, compiled_reference, flaggems_op
+from tileops._ops.reduction.cumulative import CumprodFwdOp, CumsumFwdOp
 
 
-class CumulativeBenchmarkWorkload(CumulativeWorkload):
-    def ref_program(self, x: torch.Tensor) -> torch.Tensor:
-        x_f32 = x.float()
-        if self.op_kind == "cumsum":
-            return x_f32.cumsum(dim=-1).to(x.dtype)
-        if self.op_kind == "cumprod":
-            return x_f32.cumprod(dim=-1).to(x.dtype)
-        raise ValueError(f"Unknown op_kind: {self.op_kind}")
-
-
-@pytest.mark.parametrize("shape, dtype", workloads_to_params(CumsumFwdOp))
-def test_cumsum_bench(shape: tuple, dtype: torch.dtype) -> None:
-    test = CumulativeBenchmarkWorkload(shape, dtype, "cumsum")
-    inputs = test.gen_inputs()
-
-    op = CumsumFwdOp(dim=-1)
-    bm = ManifestBenchmark(op, test)
-
+@pytest.mark.parametrize("case", bench.cases(CumsumFwdOp), ids=lambda case: case.id)
+def test_cumsum_bench(case) -> None:
+    op = CumsumFwdOp(**case.arguments)
     flaggems_cumsum = flaggems_op("cumsum")
+    dim, out_dtype = case.workload.dim, case.workload.out_dtype
 
     def flaggems_fn(x):
-        return flaggems_cumsum(x, -1)
+        return flaggems_cumsum(x, dim, dtype=out_dtype)
 
-    assert_matches_reference(flaggems_fn, test.ref_program, *inputs, **reference_tolerance(dtype))
-
-    bm.compare(
+    torch_cumsum = case.torch
+    if case.inputs[0].dtype == torch.bfloat16 and out_dtype is None:
+        torch_cumsum = bench.Implementation(
+            torch_cumsum, noncomparable_reason="torch accumulates a bfloat16 cumsum in bfloat16"
+        )
+    bench.Runner(op, case).compare(
         {
-            "tileops": op,
             FLAGGEMS_TAG: flaggems_fn,
-            "torch": test.ref_program,
-            TORCH_COMPILE_TAG: compiled_reference(test.ref_program),
-        },
-        *inputs,
+            "torch": torch_cumsum,
+            TORCH_COMPILE_TAG: compiled_reference(case.torch),
+        }
     )
 
 
-@pytest.mark.parametrize("shape, dtype", workloads_to_params(CumprodFwdOp))
-def test_cumprod_bench(shape: tuple, dtype: torch.dtype) -> None:
-    test = CumulativeBenchmarkWorkload(shape, dtype, "cumprod")
-    inputs = test.gen_inputs()
-
-    op = CumprodFwdOp(dim=-1)
-    bm = ManifestBenchmark(op, test)
-
-    bm.compare(
+@pytest.mark.parametrize("case", bench.cases(CumprodFwdOp), ids=lambda case: case.id)
+def test_cumprod_bench(case) -> None:
+    op = CumprodFwdOp(**case.arguments)
+    bench.Runner(op, case).compare(
         {
-            "tileops": op,
-            "torch": test.ref_program,
-            TORCH_COMPILE_TAG: compiled_reference(test.ref_program),
-        },
-        *inputs,
+            "torch": case.torch,
+            TORCH_COMPILE_TAG: compiled_reference(case.torch),
+        }
     )

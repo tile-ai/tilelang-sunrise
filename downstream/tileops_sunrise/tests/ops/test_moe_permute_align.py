@@ -1,4 +1,4 @@
-"""Op-level tests for MoePermuteAlignFwdOp.
+"""Op-level tests for MoEPermuteAlignFwdOp.
 
 Verifies that the op correctly routes tokens to experts and pads each
 expert's slot count to the GEMM block_size boundary.
@@ -7,178 +7,139 @@ Reference: SGLang moe_align_block_size
   python/sglang/srt/layers/moe/fused_moe_triton/moe_align_block_size.py
 """
 
+import re
+
 import pytest
 import torch
 
-from tests.test_base import FixtureBase, TestBase
-from tileops.ops.moe import MoePermuteAlignFwdOp
-from workloads.moe import MoePermuteAlignWorkload, ref_permute_align
+from tests.workload_test_base import FixtureBase, TestBase
+from tileops._ops._signature_codegen import CheckError
+from tileops._ops.moe import MoEPermuteAlignFwdOp
+from workloads.device import run_device
+from workloads.moe import MoEPermuteAlignWorkload
+from workloads.workload_base import manifest_call
 
 
-class MoePermuteAlignTest(MoePermuteAlignWorkload, TestBase):
-    pass
-
-
-class MoePermuteAlignFixture(FixtureBase):
+class MoEPermuteAlignFixture(FixtureBase):
     PARAMS = [
         (
             "total_tokens, top_k, num_experts, block_size",
             [
-                pytest.param(4, 2, 4, 4, marks=pytest.mark.smoke, id="tiny-bs4"),
+                pytest.param(
+                    4,
+                    2,
+                    4,
+                    4,
+                    marks=[pytest.mark.smoke, pytest.mark.packaging(family="moe")],
+                    id="tiny-bs4",
+                ),
                 pytest.param(16, 2, 8, 16, marks=pytest.mark.full, id="small-bs16"),
-                pytest.param(128, 4, 8, 64, marks=pytest.mark.full, id="medium-bs64"),
                 pytest.param(1024, 8, 64, 128, marks=pytest.mark.full, id="large-bs128"),
                 pytest.param(1, 2, 4, 4, marks=pytest.mark.full, id="single-token"),
                 # top_k=1: each token is routed to exactly one expert
                 pytest.param(8, 1, 4, 4, marks=pytest.mark.full, id="top-k-1"),
-                # small-batch path (numel < 1024, num_experts <= 64)
+                # A few hundred routes over 8, 32 and 33 experts.
                 pytest.param(100, 2, 8, 16, marks=pytest.mark.full, id="sb-numel200"),
-                pytest.param(300, 2, 8, 16, marks=pytest.mark.full, id="sb-numel600"),
-                pytest.param(400, 2, 8, 16, marks=pytest.mark.full, id="sb-numel800"),
-                pytest.param(100, 6, 64, 64, marks=pytest.mark.full, id="sb-numel600-maxexp"),
+                pytest.param(100, 6, 32, 64, marks=pytest.mark.full, id="sb-numel600-maxexp"),
+                pytest.param(100, 6, 33, 64, marks=pytest.mark.full, id="experts-33"),
                 # dispatch boundary: numel=1023 (last small-batch) vs numel=1024 (first large-batch)
-                pytest.param(511, 2, 8, 16, marks=pytest.mark.full, id="sb-boundary-1022"),
+                pytest.param(1023, 1, 8, 16, marks=pytest.mark.full, id="routes-1023"),
                 pytest.param(512, 2, 8, 16, marks=pytest.mark.full, id="lb-boundary-1024"),
+                # 1024 experts, then 1100.
+                pytest.param(64, 8, 1024, 64, marks=pytest.mark.full, id="experts-1024"),
+                pytest.param(64, 8, 1100, 64, marks=pytest.mark.full, id="experts-past-threads"),
+                # No routes, over many experts and over few.
+                pytest.param(0, 8, 128, 64, marks=pytest.mark.full, id="no-routes"),
+                pytest.param(0, 8, 8, 16, marks=pytest.mark.full, id="no-routes-few-experts"),
+                # One route over many experts.
+                pytest.param(1, 1, 128, 64, marks=pytest.mark.full, id="one-route"),
+                # Every route on the only expert.
+                pytest.param(2048, 1, 1, 64, marks=pytest.mark.full, id="one-expert"),
+                # A block height of one, then one that is not a power of two.
+                pytest.param(64, 8, 128, 1, marks=pytest.mark.full, id="bs1"),
+                pytest.param(64, 8, 128, 48, marks=pytest.mark.full, id="bs-not-pow2"),
+                # 1032 routes, which no power of two above 8 divides.
+                pytest.param(129, 8, 128, 64, marks=pytest.mark.full, id="routes-1032"),
+                # 512 experts, then 513.
+                pytest.param(64, 8, 512, 64, marks=pytest.mark.full, id="experts-512"),
+                pytest.param(64, 8, 513, 64, marks=pytest.mark.full, id="experts-513"),
             ],
         ),
     ]
 
 
-# Custom comparator
-
-
-def _permute_align_compare(
-    outputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-    outputs_ref: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-    block_size: int,
-    num_experts: int,
-    numel: int,
-) -> None:
-    """Order-insensitive comparison for permute_align outputs.
-
-    sorted_token_ids comparison is per-expert token-set (parallel atomicAdd
-    makes intra-expert ordering non-deterministic).
-
-    Args:
-        outputs: (sorted_token_ids, expert_ids, num_tokens_post_pad) from kernel.
-        outputs_ref: same tuple from reference implementation.
-        block_size: GEMM tile size used to compute num_blocks.
-        num_experts: number of experts.
-        numel: total (token, expert) assignments; also the sentinel value.
-    """
-    sorted_ids, expert_ids, num_post_pad = outputs
-    ref_sorted, ref_expert, ref_num = outputs_ref
-
-    n = ref_num.item()
-    num_blocks = n // block_size
-
-    assert num_post_pad.item() == ref_num.item(), (
-        f"num_tokens_post_pad mismatch: got {num_post_pad.item()}, expected {ref_num.item()}"
-    )
-    assert torch.equal(expert_ids[:num_blocks].cpu(), ref_expert[:num_blocks].cpu()), (
-        f"expert_ids mismatch:\n  got: {expert_ids[:num_blocks].cpu()}"
-        f"\n  ref: {ref_expert[:num_blocks].cpu()}"
-    )
-
-    got_sorted = sorted_ids[:n].cpu().tolist()
-    # Use the reference expert_ids (verified equal above) for both slices so
-    # the per-expert token sets are computed consistently.
-    ref_eids = ref_expert[:num_blocks].cpu().tolist()
-    for e in range(num_experts):
-        got_tokens = sorted(
-            tok
-            for b, eid in enumerate(ref_eids)
-            if eid == e
-            for tok in got_sorted[b * block_size : (b + 1) * block_size]
-            if tok < numel
-        )
-        ref_tokens = sorted(
-            tok
-            for b, eid in enumerate(ref_eids)
-            if eid == e
-            for tok in ref_sorted[:n].cpu().tolist()[b * block_size : (b + 1) * block_size]
-            if tok < numel
-        )
-        assert got_tokens == ref_tokens, (
-            f"Expert {e} token set mismatch:\n  got: {got_tokens}\n  ref: {ref_tokens}"
-        )
-
-    # Padding slots must all equal sentinel
-    padding_mask = sorted_ids[:n].cpu() >= numel
-    assert (sorted_ids[:n].cpu()[padding_mask] == numel).all(), (
-        "Padding slots must equal sentinel (numel)"
-    )
-
-
-@MoePermuteAlignFixture
+@MoEPermuteAlignFixture
 def test_permute_align_op(total_tokens: int, top_k: int, num_experts: int, block_size: int) -> None:
-    numel = total_tokens * top_k
-    test = MoePermuteAlignTest(total_tokens, top_k, num_experts, block_size)
-    op = MoePermuteAlignFwdOp(total_tokens, top_k, num_experts, block_size)
+    call = manifest_call(
+        "MoEPermuteAlignFwdOp",
+        T=total_tokens,
+        K=top_k,
+        num_experts=num_experts,
+        block_size=block_size,
+    )
+    test = MoEPermuteAlignWorkload(call)
+    op = MoEPermuteAlignFwdOp(num_experts, block_size)
     inputs = test.gen_inputs()
 
-    outputs = tuple(op(*inputs))
-    outputs_ref = tuple(test.ref_program(*inputs))
+    TestBase.check(test, op, *inputs)
 
-    _permute_align_compare(outputs, outputs_ref, block_size, num_experts, numel)
+
+@pytest.mark.parametrize(
+    "total_tokens, top_k, num_experts, block_size",
+    [
+        pytest.param(32, 4, 8, 16, marks=pytest.mark.smoke, id="few-experts"),
+        pytest.param(256, 8, 384, 64, marks=pytest.mark.full, id="many-experts"),
+    ],
+)
+def test_permute_align_skewed_distribution(
+    total_tokens: int, top_k: int, num_experts: int, block_size: int
+) -> None:
+    """Every route on expert 0, over few experts and over many."""
+    topk_ids = torch.zeros((total_tokens, top_k), dtype=torch.int32, device=run_device())
+
+    op = MoEPermuteAlignFwdOp(num_experts, block_size)
+    workload = MoEPermuteAlignWorkload(
+        manifest_call(
+            "MoEPermuteAlignFwdOp",
+            T=total_tokens,
+            K=top_k,
+            num_experts=num_experts,
+            block_size=block_size,
+        )
+    )
+    TestBase.check(workload, op, topk_ids)
+
+
+@pytest.mark.parametrize(
+    "num_experts, block_size, rule",
+    [
+        pytest.param(0, 64, "num_experts > 0", marks=pytest.mark.smoke, id="no-experts"),
+        pytest.param(8, 0, "block_size > 0", marks=pytest.mark.full, id="empty-block"),
+    ],
+)
+def test_permute_align_rejects_nonpositive_params(
+    num_experts: int, block_size: int, rule: str
+) -> None:
+    """The op refuses an expert count or block height below one when it is built."""
+    with pytest.raises(CheckError, match=re.escape(rule)):
+        MoEPermuteAlignFwdOp(num_experts, block_size)
 
 
 @pytest.mark.smoke
-def test_permute_align_sentinel_padding() -> None:
-    """Padding slots must be filled with sentinel value (numel).
-
-    Uses 3 tokens (not a multiple of block_size=4) to force non-trivial padding.
-    """
-    total_tokens, top_k, num_experts, block_size = 3, 2, 4, 4
-    numel = total_tokens * top_k
-    topk_ids = torch.randint(
-        0, num_experts, (total_tokens, top_k), dtype=torch.int32, device="ptpu"
+def test_permute_align_tuned_mode() -> None:
+    """A tuned op returns a verified result, and the same result on the call after."""
+    total_tokens, top_k, num_experts, block_size = 64, 8, 128, 64
+    op = MoEPermuteAlignFwdOp(num_experts, block_size)
+    op.request_tune()
+    workload = MoEPermuteAlignWorkload(
+        manifest_call(
+            "MoEPermuteAlignFwdOp",
+            T=total_tokens,
+            K=top_k,
+            num_experts=num_experts,
+            block_size=block_size,
+        )
     )
-
-    op = MoePermuteAlignFwdOp(total_tokens, top_k, num_experts, block_size)
-    sorted_ids, _, num_post_pad = op(topk_ids)
-
-    n = num_post_pad.item()
-    padding_mask = sorted_ids[:n] >= numel
-    assert (sorted_ids[:n][padding_mask] == numel).all(), (
-        "Padding slots must equal sentinel (numel)"
-    )
-
-
-@pytest.mark.smoke
-def test_permute_align_expert_ids_range() -> None:
-    """All expert_ids must be in [0, num_experts)."""
-    total_tokens, top_k, num_experts, block_size = 16, 4, 8, 16
-    topk_ids = torch.randint(
-        0, num_experts, (total_tokens, top_k), dtype=torch.int32, device="ptpu"
-    )
-
-    op = MoePermuteAlignFwdOp(total_tokens, top_k, num_experts, block_size)
-    _, expert_ids, num_post_pad = op(topk_ids)
-
-    n = num_post_pad.item()
-    num_blocks = n // block_size
-    eids = expert_ids[:num_blocks].cpu()
-    assert (eids >= 0).all() and (eids < num_experts).all(), (
-        f"expert_ids out of range [0, {num_experts}): {eids}"
-    )
-
-
-@pytest.mark.smoke
-def test_permute_align_skewed_distribution() -> None:
-    """All tokens routed to expert 0 — stress-tests Step 3 loop bound.
-
-    With a uniform loop bound of ceil(max_num_blocks / num_experts), expert 0
-    would only write the first few expert_ids entries and leave the rest
-    uninitialised. This test catches that regression.
-    """
-    total_tokens, top_k, num_experts, block_size = 32, 4, 8, 16
-    numel = total_tokens * top_k
-    # All tokens go to expert 0
-    topk_ids = torch.zeros((total_tokens, top_k), dtype=torch.int32, device="ptpu")
-
-    op = MoePermuteAlignFwdOp(total_tokens, top_k, num_experts, block_size)
-    outputs = tuple(op(topk_ids))
-    outputs_ref = tuple(ref_permute_align(topk_ids, block_size, num_experts))
-
-    _permute_align_compare(outputs, outputs_ref, block_size, num_experts, numel)
+    inputs = workload.gen_inputs()
+    TestBase.check(workload, op, *inputs)
+    TestBase.check(workload, op, *inputs)

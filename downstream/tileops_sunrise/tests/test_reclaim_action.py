@@ -354,40 +354,40 @@ def test_fork_fast_path_accepts_the_same_op_tests() -> None:
         )
 
 
-# preflight manifest gate
+def test_every_native_source_forces_gpu_smoke() -> None:
+    """Kernels compile `src/tileops/csrc` in at build time; a file the arm misses
+    reads as a non-Python change and skips GPU smoke."""
+    import re
+
+    arms = re.findall(r"^\s*(src/tileops/csrc[^)\n]*)\)\s*$", _policy_script(), re.M)
+    assert len(arms) == 1, f"expected one src/tileops/csrc case arm, found {arms}"
+
+    # Read off the tree, not `git ls-files`: a test that needs a repository
+    # cannot run from an installed package or an exported source archive, and
+    # the question is which files exist, which the directory answers.
+    root = REPO_ROOT / "src" / "tileops" / "csrc"
+    sources = sorted(str(p.relative_to(REPO_ROOT)) for p in root.rglob("*") if p.is_file())
+    assert sources, "expected native sources under src/tileops/csrc"
+
+    ungated = [f for f in sources if not _case_matches(arms[0], f)]
+    assert not ungated, f"case arm '{arms[0]}' misses these native sources: {ungated}"
+
+
+# preflight manifest validator
 
 PREFLIGHT_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "preflight.yml"
 
 
-def test_manifest_gate_covers_every_manifest_file() -> None:
-    """`validate-manifest` is the only job that runs the validator and is gated on
-    this arm, so a file the arm misses leaves no failing check to read — just an
-    absent one."""
-    import re
-
+def test_the_manifest_validator_runs_on_every_pr() -> None:
+    """`validate-manifest` is the only run of the validator over the real manifest, and the
+    validator imports every op family and reads every benchmark file, so no path filter can
+    say which PRs leave it unaffected."""
     import yaml
 
-    wf = yaml.safe_load(PREFLIGHT_WORKFLOW.read_text())
-    step = next(
-        s for s in wf["jobs"]["detect-changes"]["steps"] if "manifest=false" in (s.get("run") or "")
-    )
-    arms = re.findall(r"^\s*(src/tileops/manifest[^)\n]*)\)\s*$", step["run"], re.M)
-    assert len(arms) == 1, f"expected one manifest case arm, found {arms}"
-
-    tracked = subprocess.run(
-        ["git", "ls-files", "src/tileops/manifest"],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.split()
-    assert tracked, "expected tracked files under src/tileops/manifest"
-
-    ungated = [f for f in tracked if not _case_matches(arms[0], f)]
-    assert not ungated, (
-        f"case arm '{arms[0]}' does not gate these manifest files, so changing one of "
-        f"them skips validate-manifest: {ungated}"
-    )
+    job = yaml.safe_load(PREFLIGHT_WORKFLOW.read_text())["jobs"]["validate-manifest"]
+    needs = job.get("needs") or []
+    assert "detect-changes" not in ([needs] if isinstance(needs, str) else needs)
+    assert "detect-changes" not in job.get("if", "")
 
 
 # runner maintenance vs nightly
@@ -459,7 +459,7 @@ def _evaluate_checks(runs: list[tuple[str, str, str, int]]) -> tuple[str, str]:
     # turn that into an error instead of a wrong answer.
     # check_ever_succeeded is the workflow's one call out to the API; stubbing it
     # against the same synthetic runs keeps the loop text under test verbatim.
-    harness = f"""
+    script = f"""
     set -euo pipefail
     all_runs={json.dumps(checks_json)}
     latest_checks=$(echo "$all_runs" | jq '.check_runs | group_by(.name) | map(max_by(.id))')
@@ -478,7 +478,7 @@ def _evaluate_checks(runs: list[tuple[str, str, str, int]]) -> tuple[str, str]:
     echo "$pending $failed"
     """
     out = subprocess.run(
-        ["bash", "-c", harness], capture_output=True, text=True, check=True
+        ["bash", "-c", script], capture_output=True, text=True, check=True
     ).stdout.split()
     return out[0], (out[1] if len(out) > 1 else "")
 

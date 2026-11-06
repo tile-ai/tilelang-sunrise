@@ -1,0 +1,555 @@
+"""Varlen GQA tests against a pure-PyTorch reference."""
+
+import pytest
+import torch
+
+from tests.workload_test_base import FixtureBase, TestBase
+from tileops._perf.formulas import visible_scores
+from tileops.attention import GQAVarlenFwdOp
+from workloads.attention.gqa.varlen import GQAVarlenFwdWorkload
+
+
+class GQAVarlenFwdTest(GQAVarlenFwdWorkload, TestBase):
+    pass
+
+
+class GQAVarlenFwdFixture(FixtureBase):
+    # Parameters: (batch, seqlens_q, seqlens_k, heads, heads_kv, dim,
+    #              is_causal, wl, wr, dtype, tune)
+    PARAMS = [
+        (
+            "batch, seqlens_q, seqlens_k, heads, heads_kv, dim, is_causal, wl, wr, dtype, tune",
+            [
+                # Prefill: seqlen_q == seqlen_k (offset=0)
+                pytest.param(
+                    2,
+                    [256, 512],
+                    [256, 512],
+                    8,
+                    2,
+                    64,
+                    True,
+                    -1,
+                    -1,
+                    torch.float16,
+                    False,
+                    marks=pytest.mark.smoke,
+                ),  # causal
+                pytest.param(
+                    2,
+                    [256, 512],
+                    [256, 512],
+                    8,
+                    2,
+                    64,
+                    True,
+                    -1,
+                    -1,
+                    torch.bfloat16,
+                    False,
+                    marks=pytest.mark.smoke,
+                ),  # causal bf16
+                pytest.param(
+                    2,
+                    [256, 512],
+                    [256, 512],
+                    8,
+                    2,
+                    64,
+                    True,
+                    128,
+                    -1,
+                    torch.float16,
+                    False,
+                    marks=pytest.mark.smoke,
+                ),  # causal + wl
+                pytest.param(
+                    1,
+                    [128],
+                    [128],
+                    8,
+                    2,
+                    128,
+                    True,
+                    64,
+                    -1,
+                    torch.float16,
+                    False,
+                    marks=pytest.mark.smoke,
+                ),  # D=128 uses the two-stage sliding pipeline on SM90
+                pytest.param(
+                    1,
+                    [6],
+                    [2],
+                    8,
+                    2,
+                    64,
+                    True,
+                    -1,
+                    -1,
+                    torch.float16,
+                    False,
+                    marks=pytest.mark.smoke,
+                ),  # leading queries have no visible key
+                pytest.param(
+                    2,
+                    [256, 512],
+                    [256, 512],
+                    8,
+                    2,
+                    64,
+                    False,
+                    -1,
+                    -1,
+                    torch.float16,
+                    False,
+                    marks=pytest.mark.full,
+                ),  # bidirectional
+                pytest.param(
+                    2,
+                    [256, 512],
+                    [256, 512],
+                    8,
+                    2,
+                    64,
+                    False,
+                    64,
+                    64,
+                    torch.float16,
+                    False,
+                    marks=pytest.mark.full,
+                ),  # window
+                # KV-cache: seqlen_k > seqlen_q (offset > 0)
+                pytest.param(
+                    2,
+                    [64, 128],
+                    [256, 512],
+                    8,
+                    2,
+                    64,
+                    True,
+                    -1,
+                    -1,
+                    torch.float16,
+                    False,
+                    marks=pytest.mark.full,
+                ),  # causal kvcache
+                pytest.param(
+                    2,
+                    [64, 128],
+                    [256, 512],
+                    8,
+                    2,
+                    64,
+                    True,
+                    128,
+                    -1,
+                    torch.float16,
+                    False,
+                    marks=pytest.mark.full,
+                ),  # causal+wl kvcache
+                pytest.param(
+                    2,
+                    [64, 128],
+                    [256, 512],
+                    8,
+                    2,
+                    64,
+                    False,
+                    64,
+                    64,
+                    torch.float16,
+                    False,
+                    marks=pytest.mark.full,
+                ),  # window kvcache
+                # bfloat16
+                pytest.param(
+                    2,
+                    [256, 512],
+                    [256, 512],
+                    8,
+                    2,
+                    64,
+                    False,
+                    64,
+                    64,
+                    torch.bfloat16,
+                    False,
+                    marks=pytest.mark.full,
+                ),  # window bf16
+                # GQA ratios
+                pytest.param(
+                    2,
+                    [256, 512],
+                    [256, 512],
+                    8,
+                    8,
+                    64,
+                    True,
+                    -1,
+                    -1,
+                    torch.float16,
+                    False,
+                    marks=pytest.mark.full,
+                ),  # MHA 1:1
+                pytest.param(
+                    2,
+                    [256, 512],
+                    [256, 512],
+                    16,
+                    1,
+                    64,
+                    True,
+                    -1,
+                    -1,
+                    torch.float16,
+                    False,
+                    marks=pytest.mark.full,
+                ),  # ratio 16:1
+                # Mixed lengths within batch
+                pytest.param(
+                    3,
+                    [128, 256, 384],
+                    [128, 256, 384],
+                    8,
+                    2,
+                    64,
+                    True,
+                    -1,
+                    -1,
+                    torch.float16,
+                    False,
+                    marks=pytest.mark.full,
+                ),
+                # Right window only
+                pytest.param(
+                    2,
+                    [256, 512],
+                    [256, 512],
+                    8,
+                    2,
+                    64,
+                    False,
+                    -1,
+                    64,
+                    torch.float16,
+                    False,
+                    marks=pytest.mark.full,
+                ),  # right window
+                # wl=0 boundary
+                pytest.param(
+                    2,
+                    [128, 256],
+                    [128, 256],
+                    8,
+                    2,
+                    64,
+                    True,
+                    0,
+                    -1,
+                    torch.float16,
+                    False,
+                    marks=pytest.mark.full,
+                ),  # wl=0
+                # Regression: a window at D=256 reached the sliding-window kernel, whose
+                # tiles need 394240 bytes of shared memory, and failed at launch; the
+                # general kernel serves it
+                pytest.param(
+                    2,
+                    [300, 129],
+                    [300, 129],
+                    8,
+                    2,
+                    256,
+                    True,
+                    64,
+                    -1,
+                    torch.bfloat16,
+                    False,
+                    marks=pytest.mark.full,
+                ),  # D=256 causal+wl
+                # D=512 stages the score tile through shared memory: two warpgroups where
+                # shared memory allows it, a 32-row tile on one warpgroup where it does not
+                pytest.param(
+                    2,
+                    [300, 700],
+                    [300, 700],
+                    8,
+                    2,
+                    512,
+                    True,
+                    -1,
+                    -1,
+                    torch.bfloat16,
+                    False,
+                    marks=pytest.mark.full,
+                ),  # D=512 causal, partial tiles
+                pytest.param(
+                    2,
+                    [100, 200],
+                    [300, 700],
+                    8,
+                    2,
+                    512,
+                    True,
+                    -1,
+                    -1,
+                    torch.float16,
+                    False,
+                    marks=pytest.mark.full,
+                ),  # D=512 causal kvcache
+            ],
+        ),
+    ]
+
+
+@GQAVarlenFwdFixture
+def test_gqa_varlen_fwd_op(
+    batch: int,
+    seqlens_q: list[int],
+    seqlens_k: list[int],
+    heads: int,
+    heads_kv: int,
+    dim: int,
+    is_causal: bool,
+    wl: int,
+    wr: int,
+    dtype: torch.dtype,
+    tune: bool,
+) -> None:
+    test = GQAVarlenFwdTest(
+        batch, seqlens_q, seqlens_k, heads, heads_kv, dim, is_causal, wl, wr, dtype
+    )
+    op = GQAVarlenFwdOp(
+        is_causal=is_causal,
+        window_size_left=wl,
+        window_size_right=wr,
+    )
+    test.check(op, *test.gen_inputs())
+
+
+@pytest.mark.smoke
+def test_varlen_reuses_one_op_across_dynamic_packed_totals() -> None:
+    op = GQAVarlenFwdOp(is_causal=True)
+    for q_lens, kv_lens in (([31, 65], [63, 129]), ([127, 3], [255, 7])):
+        test = GQAVarlenFwdTest(2, q_lens, kv_lens, 8, 2, 64, True, -1, -1, torch.float16)
+        test.check(op, *test.gen_inputs())
+
+
+@pytest.mark.smoke
+@pytest.mark.sm90
+def test_varlen_tuned_window_large_batch() -> None:
+    """Hopper window attention must retain valid packed inputs when tuning large batches."""
+    batch = 449
+    test = GQAVarlenFwdTest(batch, [2] * batch, [4] * batch, 2, 1, 64, True, 64, -1, torch.float16)
+    op = GQAVarlenFwdOp(is_causal=True, window_size_left=64)
+    op.request_tune()
+    test.check(op, *test.gen_inputs())
+
+
+@pytest.mark.parametrize(
+    "scale,cap",
+    [
+        pytest.param(0.125, 5.0, marks=pytest.mark.smoke, id="positive-softcap"),
+    ],
+)
+def test_varlen_regular_forwards_scale_and_softcap(scale, cap) -> None:
+    """A scale and a softcap preserve causal masking."""
+    test = GQAVarlenFwdTest(
+        2,
+        [65, 127],
+        [129, 255],
+        8,
+        2,
+        64,
+        True,
+        -1,
+        -1,
+        torch.float16,
+        sm_scale=scale,
+        softcap=cap,
+    )
+    op = GQAVarlenFwdOp(
+        is_causal=True,
+        sm_scale=scale,
+        softcap=cap,
+    )
+    test.check(op, *test.gen_inputs())
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "q_lens, kv_lens",
+    [([0, 65], [0, 129]), ([4, 4], [0, 8])],
+)
+def test_varlen_handles_empty_requests_and_per_request_kv(
+    q_lens: list[int], kv_lens: list[int]
+) -> None:
+    test = GQAVarlenFwdTest(2, q_lens, kv_lens, 8, 2, 64, True, -1, -1, torch.float16)
+    op = GQAVarlenFwdOp(is_causal=True)
+    test.check(op, *test.gen_inputs())
+
+
+@pytest.mark.smoke
+@pytest.mark.sm90
+@pytest.mark.parametrize(
+    "q_lens, kv_lens, is_causal, scores, kernel",
+    [
+        pytest.param(
+            [129, 65, 6, 0, 300],
+            [33, 131, 2, 0, 400],
+            True,
+            {},
+            "GQAPrefillVarlenWSFwdKernel",
+            id="causal-ragged",
+        ),
+        pytest.param(
+            [65, 129, 128],
+            [129, 65, 0],
+            False,
+            {"sm_scale": 0.125, "softcap": 5.0},
+            "GQAPrefillVarlenWSFwdKernel",
+            id="bidirectional-softcap-empty-kv",
+        ),
+        # No KV at all: TMA needs an extent, so the general kernel serves.
+        pytest.param([4, 128], [0, 0], True, {}, "GQAPrefillVarlenFwdKernel", id="all-kv-empty"),
+        # More requests than the warp-specialized kernel's shared prefix holds.
+        pytest.param([1] * 449, [1] * 449, True, {}, "GQAPrefillVarlenFwdKernel", id="batch-449"),
+        pytest.param(
+            ([0, 1, 17, 130] * 16)[:64],
+            ([0, 200, 17, 130] * 16)[:64],
+            True,
+            {},
+            "GQAPrefillVarlenWSFwdKernel",
+            id="batch-64",
+        ),
+        pytest.param(
+            ([0, 1, 17, 130] * 17)[:65],
+            ([0, 200, 17, 130] * 17)[:65],
+            True,
+            {},
+            "GQAPrefillVarlenWSFwdKernel",
+            id="batch-65",
+        ),
+    ],
+)
+@pytest.mark.parametrize("dim", [64, 128])
+def test_varlen_ws_dims_serve_ragged_requests_on_sm90(
+    q_lens: list[int], kv_lens: list[int], is_causal: bool, scores: dict, kernel: str, dim: int
+) -> None:
+    """Partial tiles, q_len > kv_len, and empty requests on the warp-specialized kernel."""
+    test = GQAVarlenFwdTest(
+        len(q_lens), q_lens, kv_lens, 8, 2, dim, is_causal, -1, -1, torch.float16, **scores
+    )
+    op = GQAVarlenFwdOp(is_causal=is_causal, **scores)
+    inputs = test.gen_inputs()
+    test.check(op, *inputs)
+
+
+@pytest.mark.smoke
+@pytest.mark.sm90
+def test_varlen_ws_kernel_claims_work_across_calls() -> None:
+    """More work items than SMs; a later call must see the counter the first one reset."""
+    test = GQAVarlenFwdTest(1, [1152], [1152], 16, 8, 128, True, -1, -1, torch.bfloat16)
+    op = GQAVarlenFwdOp(is_causal=True)
+    inputs = test.gen_inputs()
+    test.check(op, *inputs)
+    first = op(*inputs)
+    assert torch.equal(op(*inputs), first)
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "q_lens, kv_lens, dim, rotary_dim, rope_layout, window_size_left",
+    [
+        pytest.param([256, 130], [300, 130], 128, 10, "neox", -1, id="odd-half-ws"),
+        pytest.param([256, 130], [300, 130], 256, 14, "neox", -1, id="odd-half-general"),
+        pytest.param([256, 128], [256, 128], 128, None, "neox", -1, id="neox-full"),
+        pytest.param([256, 128], [256, 128], 64, None, "interleaved", -1, id="interleaved-full"),
+        # The channels past a partial rotary width pass through unrotated.
+        pytest.param([1, 0, 130], [200, 0, 130], 128, 64, "neox", -1, id="ragged-partial"),
+        pytest.param([130, 70], [130, 70], 128, None, "interleaved", 64, id="windowed"),
+        pytest.param([70, 40], [200, 40], 512, None, "neox", -1, id="dim-512"),
+        pytest.param([1, 0, 130], [200, 0, 130], 128, 12, "neox", -1, id="narrow-neox"),
+        pytest.param([130, 70], [130, 70], 64, 14, "interleaved", -1, id="narrow-interleaved"),
+    ],
+)
+def test_varlen_rope_rotates_at_per_request_positions(
+    q_lens: list[int],
+    kv_lens: list[int],
+    dim: int,
+    rotary_dim: int | None,
+    rope_layout: str,
+    window_size_left: int,
+) -> None:
+    """Query token i of a request sits at kv_len - q_len + i, key token j at j."""
+    test = GQAVarlenFwdTest(
+        len(q_lens), q_lens, kv_lens, 8, 2, dim, True, window_size_left, -1, torch.float16,
+        pos_encoding_mode="rope", rotary_dim=rotary_dim, rope_layout=rope_layout,
+    )  # fmt: skip
+    op = GQAVarlenFwdOp(
+        is_causal=True,
+        window_size_left=window_size_left,
+        pos_encoding_mode="rope",
+        rotary_dim=rotary_dim,
+        rope_layout=rope_layout,
+    )
+    test.check(op, *test.gen_inputs())
+
+
+# ----------------------------------------------------------------------
+# Visible-score accounting for the packed-varlen and sliding-window GQA rooflines.
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("q_len", "kv_len", "is_causal", "left", "visible"),
+    [
+        # A square causal request sees the lower triangle.
+        (8, 8, True, -1, 36),
+        # Without a causal mask every query sees every key.
+        (8, 8, False, -1, 64),
+        # Bottom-right aligned: query i of 2 against 6 keys sees keys 0..i+4.
+        (2, 6, True, -1, 11),
+        # The first four of 6 queries against 2 keys see nothing, never a negative count.
+        (6, 2, True, -1, 3),
+        # A left window of 3 caps each row at 4 keys.
+        (2, 6, True, 3, 8),
+        (8, 8, True, 3, 26),
+    ],
+)
+@pytest.mark.smoke
+def test_visible_scores_follow_alignment_mask_and_window(
+    q_len: int, kv_len: int, is_causal: bool, left: int, visible: int
+) -> None:
+    assert visible_scores(q_len, kv_len, is_causal, left, -1) == visible
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "q_lens, kv_lens, is_causal, wl, wr",
+    [
+        pytest.param([300, 700], [300, 700], True, 100, -1, id="causal-left-partial-tiles"),
+        pytest.param([256, 512], [256, 512], False, 64, 64, id="both"),
+        pytest.param([64, 128], [256, 512], False, -1, 64, id="right-kvcache"),
+    ],
+)
+def test_varlen_sliding_window_with_fused_rope(
+    q_lens: list[int], kv_lens: list[int], is_causal: bool, wl: int, wr: int
+) -> None:
+    """Window bounds hold when the call also rotates Q and K."""
+    test = GQAVarlenFwdTest(
+        len(q_lens),
+        q_lens,
+        kv_lens,
+        8,
+        2,
+        64,
+        is_causal,
+        wl,
+        wr,
+        torch.float16,
+        pos_encoding_mode="rope",
+    )
+    op = GQAVarlenFwdOp(is_causal, wl, wr, pos_encoding_mode="rope")
+    test.check(op, *test.gen_inputs())

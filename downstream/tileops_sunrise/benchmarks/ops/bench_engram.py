@@ -1,8 +1,7 @@
 """Benchmarks for the Engram gate-conv and decode ops.
 
 Workload shapes and dtypes come from the ops manifest; roofline FLOP and
-byte counts come from each op's ``eval_roofline()`` via
-:class:`ManifestBenchmark`.
+byte counts come from each op's ``eval_roofline()``.
 
 One ``test_*_bench`` per op, so every op this file is declared the benchmark
 of records a row of its own.
@@ -11,111 +10,51 @@ of records a row of its own.
 import pytest
 import torch
 
+from benchmarks import api as bench
 from benchmarks.baselines import TORCH_COMPILE_TAG, compiled_reference
-from benchmarks.benchmark_base import (
-    ManifestBenchmark,
-    fields,
-    workload_params,
-)
-from tileops.manifest import load_workloads
-from tileops.ops.sequence_modeling.engram import EngramGateConvBwdOp, EngramGateConvFwdOp
-from tileops.ops.sequence_modeling.engram_decode import EngramDecodeFwdOp
-from workloads.engram import (
-    EngramDecodeWorkload,
-    EngramGateConvBwdWorkload,
-    EngramGateConvFwdWorkload,
-)
+from tileops._ops.sequence_modeling.engram import EngramGateConvBwdOp, EngramGateConvFwdOp
+from tileops._ops.sequence_modeling.engram_decode import EngramDecodeFwdOp
 
 # Autotuning is a bench-run policy, not a workload property; manifest
 # workloads do not carry it.
 _TUNE = True
 
 
-_ENGRAM_GATE_CONV_FWD_PARAMS = workload_params(
-    load_workloads(EngramGateConvFwdOp),
-    fields("M", "seq_len", "d", "dtype"),
-    smoke_first=True,
-)
-
-
-@pytest.mark.parametrize("M, seq_len, d, dtype", _ENGRAM_GATE_CONV_FWD_PARAMS)
-def test_engram_gate_conv_fwd_bench(M, seq_len, d, dtype):
-    test = EngramGateConvFwdWorkload(M, seq_len, d, dtype)
-    inputs = test.gen_inputs()
-
-    op = EngramGateConvFwdOp(M, seq_len, d, tune=_TUNE)
-    bm = ManifestBenchmark(op, test)
-
-    bm.compare(
+@pytest.mark.parametrize("case", bench.cases(EngramGateConvFwdOp), ids=lambda case: case.id)
+def test_engram_gate_conv_fwd_bench(case):
+    op = EngramGateConvFwdOp(**case.arguments)
+    if _TUNE:
+        op.request_tune()
+    bench.Runner(op, case).compare(
         {
-            "tileops": op,
-            "torch-ref": test.ref_program,
-            TORCH_COMPILE_TAG: compiled_reference(test.ref_program),
-        },
-        *inputs,
+            "torch-ref": case.reference,
+            TORCH_COMPILE_TAG: compiled_reference(case.reference),
+        }
     )
 
 
-_ENGRAM_GATE_CONV_BWD_PARAMS = workload_params(
-    load_workloads(EngramGateConvBwdOp),
-    fields("M", "seq_len", "d", "dtype"),
-    smoke_first=True,
-)
-
-
-@pytest.mark.parametrize("M, seq_len, d, dtype", _ENGRAM_GATE_CONV_BWD_PARAMS)
-def test_engram_gate_conv_bwd_bench(M, seq_len, d, dtype):
-    test = EngramGateConvBwdWorkload(M, seq_len, d, dtype)
-    inputs = test.gen_inputs()
-
-    op = EngramGateConvBwdOp(M, seq_len, d, tune=_TUNE)
-    bm = ManifestBenchmark(op, test)
+@pytest.mark.parametrize("case", bench.cases(EngramGateConvBwdOp), ids=lambda case: case.id)
+def test_engram_gate_conv_bwd_bench(case):
+    op = EngramGateConvBwdOp(**case.arguments)
+    if _TUNE:
+        op.request_tune()
+    reference = case.reference
 
     @torch.enable_grad()
     def ref_with_grad(*args):
-        return test.ref_program(*args)
+        return reference(*args)
 
-    bm.compare(
+    bench.Runner(op, case).compare({"torch": ref_with_grad})
+
+
+@pytest.mark.parametrize("case", bench.cases(EngramDecodeFwdOp), ids=lambda case: case.id)
+def test_engram_decode_bench(case):
+    op = EngramDecodeFwdOp(**case.arguments)
+    if _TUNE:
+        op.request_tune()
+    bench.Runner(op, case).compare(
         {
-            "tileops": op,
-            "torch": ref_with_grad,
-            TORCH_COMPILE_TAG: compiled_reference(ref_with_grad),
-        },
-        *inputs,
-    )
-
-
-_ENGRAM_DECODE_PARAMS = workload_params(
-    load_workloads(EngramDecodeFwdOp),
-    fields("batch", "d_mem", "d", "max_conv_len", "conv_kernel_size", "dilation", "dtype"),
-    smoke_first=True,
-)
-
-
-@pytest.mark.parametrize(
-    "batch, d_mem, d, max_conv_len, conv_kernel_size, dilation, dtype",
-    _ENGRAM_DECODE_PARAMS,
-)
-def test_engram_decode_bench(batch, d_mem, d, max_conv_len, conv_kernel_size, dilation, dtype):
-    test = EngramDecodeWorkload(batch, d_mem, d, max_conv_len, conv_kernel_size, dilation, dtype)
-    inputs = test.gen_inputs()
-
-    op = EngramDecodeFwdOp(
-        batch,
-        d_mem,
-        d,
-        max_conv_len,
-        conv_kernel_size,
-        dilation,
-        tune=_TUNE,
-    )
-    bm = ManifestBenchmark(op, test)
-
-    bm.compare(
-        {
-            "tileops": op,
-            "torch-ref": test.ref_program,
-            TORCH_COMPILE_TAG: compiled_reference(test.ref_program),
-        },
-        *inputs,
+            "torch-ref": case.reference,
+            TORCH_COMPILE_TAG: compiled_reference(case.reference),
+        }
     )

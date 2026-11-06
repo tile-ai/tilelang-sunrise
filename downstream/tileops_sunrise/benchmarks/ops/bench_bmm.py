@@ -1,39 +1,30 @@
+"""Benchmark TileOPs batched matmul and its FP8 variant, one case per manifest call, against cuBLAS, FlagGems and FlashInfer."""
+
+from typing import Optional
+
 import pytest
 import torch
 
+from benchmarks import api as bench
 from benchmarks.baselines import (
     FLAGGEMS_TAG,
-    assert_matches_reference,
+    QUACK_TAG,
+    baseline_module,
     flaggems_op,
-    reference_tolerance,
+    quack_op,
 )
-from benchmarks.benchmark_base import ManifestBenchmark, fields, workload_params
-from tileops.manifest import load_workloads
-from tileops.ops import BmmFp8KNFwdOp, BmmFp8NKFwdOp, BmmFwdOp
-from workloads.bmm import BmmFp8Workload, BmmWorkload
-
-
-class BmmFp8BenchmarkWorkload(BmmFp8Workload):
-    def torch_fp32_bmm_ref(self, *inputs: torch.Tensor) -> torch.Tensor:
-        a, b, scale_a, scale_b = inputs
-        if scale_a.dim() != 0 or scale_b.dim() != 0:
-            raise ValueError(
-                "BmmFp8 benchmark baseline requires per-tensor 0-D scales, "
-                f"got {tuple(scale_a.shape)} / {tuple(scale_b.shape)}"
-            )
-        a_f = a.float() * scale_a
-        b_f = b.float() * scale_b
-        return torch.bmm(a_f, b_f).to(self.out_dtype)
+from tileops.gemm import BMMFP8FwdOp, BMMFwdOp
+from workloads.gemm import BMMFP8Workload
 
 
 def _flashinfer_bmm_fp8_per_tensor_ref(
-    workload: BmmFp8BenchmarkWorkload,
+    workload: BMMFP8Workload,
     a: torch.Tensor,
     b_kmajor: torch.Tensor,
     scale_a: torch.Tensor,
     scale_b: torch.Tensor,
 ) -> torch.Tensor:
-    import flashinfer
+    flashinfer = baseline_module("flashinfer", "flashinfer")
 
     if a.dtype != torch.float8_e4m3fn or b_kmajor.dtype != torch.float8_e4m3fn:
         raise ValueError("FlashInfer bmm_fp8 baseline requires float8_e4m3fn.")
@@ -54,107 +45,64 @@ def _flashinfer_bmm_fp8_per_tensor_ref(
     )
 
 
-@pytest.mark.parametrize(
-    "batch, m, n, k, dtype",
-    workload_params(load_workloads(BmmFwdOp), fields("b", "m", "n", "k", dtype_last=True)),
-)
-def test_bmm_bench(batch: int, m: int, n: int, k: int, dtype: torch.dtype) -> None:
-    workload = BmmWorkload(batch, m, n, k, dtype)
-    a, b = workload.gen_inputs()
+def _flashinfer_bmm_fp8_row(
+    workload: BMMFP8Workload, *inputs: torch.Tensor
+) -> Optional[bench.Implementation]:
+    """The flashinfer entry for this case, or ``None`` when it cannot serve it.
 
-    op = BmmFwdOp(tune=True)
-    bm = ManifestBenchmark(op, workload)
+    Preferred, not selected: a flashinfer row that cannot run drops its tag
+    rather than failing the case. If flashinfer runs but disagrees with the
+    reference, that is a correctness signal and should fail the benchmark.
 
-    # eval_roofline() is read lazily after profiling, by which point
-    # forward() has bound the dims.
+    Args:
+        workload: The case's workload.
+        *inputs: ``a``, ``b`` as a ``[B, K, N]`` view, ``scale_a``, ``scale_b``, as
+            flashinfer takes them.
 
-    flaggems_bmm = flaggems_op("bmm")
-    assert_matches_reference(flaggems_bmm, torch.bmm, a, b, **reference_tolerance(a.dtype))
+    Returns:
+        The implementation, or ``None`` when flashinfer cannot serve the case.
+    """
 
-    bm.compare(
+    def run(a: torch.Tensor, b: torch.Tensor, sa: torch.Tensor, sb: torch.Tensor):
+        return _flashinfer_bmm_fp8_per_tensor_ref(workload, a, b, sa, sb)
+
+    try:
+        run(*inputs)
+    except (ImportError, RuntimeError) as exc:
+        print(f"  [skip] flashinfer-bmm-fp8: {str(exc).splitlines()[0]}")
+        return None
+    return bench.Implementation(run=run, args=inputs)
+
+
+@pytest.mark.parametrize("case", bench.cases(BMMFwdOp), ids=lambda case: case.id)
+def test_bmm_bench(case) -> None:
+    op = BMMFwdOp(**case.arguments)
+    op.request_tune()
+    quack_gemm = quack_op("gemm", "quack.gemm_interface")
+
+    def quack_fn(a, b):
+        return quack_gemm(a, b)
+
+    bench.Runner(op, case).compare(
         {
-            "tileops": op,
-            FLAGGEMS_TAG: flaggems_bmm,
-            "torch-cublas": torch.bmm,
-        },
-        a,
-        b,
+            FLAGGEMS_TAG: flaggems_op("bmm"),
+            QUACK_TAG: quack_fn,
+            "torch-cublas": case.torch,
+        }
     )
 
 
-@pytest.mark.parametrize(
-    "batch, m, n, k, dtype",
-    workload_params(load_workloads(BmmFp8KNFwdOp), fields("b", "m", "n", "k", dtype_last=True)),
-)
-def test_bmm_fp8_kn_bench(
-    batch: int,
-    m: int,
-    n: int,
-    k: int,
-    dtype: torch.dtype,
-) -> None:
-    """The [B, K, N] order, which the kernel reaches through a transpose."""
-    out_dtype = torch.bfloat16
-    workload = BmmFp8BenchmarkWorkload(batch, m, n, k, dtype, out_dtype=out_dtype)
-    a, b_kn, scale_a, scale_b = workload.gen_inputs()
-
-    op = BmmFp8KNFwdOp(out_dtype=out_dtype, tune=True)
-    bm = ManifestBenchmark(op, workload)
-    functors = {
-        "tileops": (op, (a, b_kn, scale_a, scale_b)),
-        "torch-fp32-ref": (workload.torch_fp32_bmm_ref, (a, b_kn, scale_a, scale_b)),
-    }
-
-    def flashinfer_fn(a_, b_, sa_, sb_):
-        return _flashinfer_bmm_fp8_per_tensor_ref(workload, a_, b_, sa_, sb_)
-
-    # b_kn is already [B, K, N], the order flashinfer's bmm_fp8 reads.
-    try:
-        flashinfer_fn(a, b_kn, scale_a, scale_b)
-    except (ImportError, RuntimeError) as exc:
-        print(f"  [skip] flashinfer-bmm-fp8: {exc}")
-    else:
-        functors["flashinfer-bmm-fp8"] = (flashinfer_fn, (a, b_kn, scale_a, scale_b))
-
-    bm.compare(functors)
-
-
-@pytest.mark.parametrize(
-    "batch, m, n, k, dtype",
-    workload_params(load_workloads(BmmFp8NKFwdOp), fields("b", "m", "n", "k", dtype_last=True)),
-)
-def test_bmm_fp8_nk_bench(
-    batch: int,
-    m: int,
-    n: int,
-    k: int,
-    dtype: torch.dtype,
-) -> None:
-    out_dtype = torch.bfloat16
-    workload = BmmFp8BenchmarkWorkload(batch, m, n, k, dtype, out_dtype=out_dtype)
-    a, b_kn, scale_a, scale_b = workload.gen_inputs()
-    b_nk = b_kn.transpose(-2, -1).contiguous()  # [B, N, K], K-innermost
-    b_kmajor = b_nk.transpose(-2, -1)  # [B, K, N] view, zero-copy
-
-    # Fast path: feed [B, N, K] (K-innermost) using BmmFp8NKFwdOp.
-    op = BmmFp8NKFwdOp(out_dtype=out_dtype, tune=True)
-    bm = ManifestBenchmark(op, workload)
-    functors = {
-        "tileops": (op, (a, b_nk, scale_a, scale_b)),
-        "torch-fp32-ref": (workload.torch_fp32_bmm_ref, (a, b_kn, scale_a, scale_b)),
-    }
-
-    def flashinfer_fn(a_, b_, sa_, sb_):
-        return _flashinfer_bmm_fp8_per_tensor_ref(workload, a_, b_, sa_, sb_)
-
-    # flashinfer is optional and shape-sensitive. Probe it once and drop only
-    # its row when it cannot run; skipping the case would take the op's own
-    # numbers down with it.
-    try:
-        flashinfer_fn(a, b_kmajor, scale_a, scale_b)
-    except (ImportError, RuntimeError) as exc:
-        print(f"  [skip] flashinfer-bmm-fp8: {exc}")
-    else:
-        functors["flashinfer-bmm-fp8"] = (flashinfer_fn, (a, b_kmajor, scale_a, scale_b))
-
-    bm.compare(functors)
+@pytest.mark.parametrize("case", bench.cases(BMMFP8FwdOp), ids=lambda case: case.id)
+def test_bmm_fp8_bench(case) -> None:
+    """Both orders of ``b``: ``[B, K, N]`` reaches the kernel through a transpose,
+    ``[B, N, K]`` (``trans_b``) lies K-innermost already."""
+    workload = case.workload
+    a, b, scale_a, scale_b = case.inputs
+    b_kn = b.transpose(-2, -1) if workload.trans_b else b
+    op = BMMFP8FwdOp(**case.arguments)
+    op.request_tune()
+    implementations = {"torch-fp32-ref": case.reference}
+    row = _flashinfer_bmm_fp8_row(workload, a, b_kn, scale_a, scale_b)
+    if row is not None:
+        implementations["flashinfer-bmm-fp8"] = row
+    bench.Runner(op, case).compare(implementations)

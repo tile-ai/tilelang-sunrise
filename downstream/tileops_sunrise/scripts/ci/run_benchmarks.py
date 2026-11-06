@@ -1,16 +1,9 @@
 #!/usr/bin/env python3
-"""Run each benchmark file in its own pytest process and merge the results.
+"""Run isolated benchmark processes and merge reports, including partial failures.
 
-A native failure (hang, segfault, OOM kill) costs one file: other fragments
-survive into the merged report and a hung child leaves a py-spy stack dump.
-Upcoming children import while the current file owns the GPU, hiding startup
-cost. This parent must never import torch: children need fresh processes.
-
-Two limits, because a stuck file and an expensive one call for opposite
-responses. ``--stall-timeout`` kills a child that stopped starting tests,
-however long its individual tests take. ``--total-budget`` stops launching
-files and writes the report, killing nothing for being slow.
-"""
+Collect and run one file at a time. The parent must not import torch.
+``--stall-timeout`` limits time without a new test; ``--total-budget`` bounds the
+entire sweep. Timeout failures retain partial results and a py-spy stack dump."""
 
 from __future__ import annotations
 
@@ -25,7 +18,6 @@ import sys
 import tempfile
 import time
 import xml.etree.ElementTree as ET
-from collections import deque
 from pathlib import Path
 
 LOG_TAIL_LINES = 80
@@ -34,9 +26,8 @@ TEARDOWN_TIMEOUT_S = 120
 
 # Child preamble; argv[1] = status pipe fd, argv[2:] = pytest args, argv[3]
 # = the bench file. prctl(PR_SET_PTRACER, parent) lets py-spy attach under
-# yama ptrace_scope=1. The collect-only pass runs while another file owns
-# the GPU, so it must stay GPU-silent; CUDA init happens after the stdin
-# grant. TILEOPS_COLLECT_STATUS holds "started", then the collect exit code,
+# yama ptrace_scope=1. The collect-only pass finishes before the child receives
+# its stdin grant. TILEOPS_COLLECT_STATUS holds "started", then the collect exit code,
 # so a child that dies mid-collect stays distinguishable from a clean one.
 # TILEOPS_HEARTBEAT is rewritten at every test start: its mtime is the
 # parent's progress signal, its contents name the test to blame for a stall.
@@ -59,7 +50,7 @@ class Heartbeat:
         with open(beat, "w") as fh:
             fh.write(nodeid)
 
-rc_collect = int(pytest.main(["--collect-only", "-q", sys.argv[3]]))
+rc_collect = int(pytest.main(["--collect-only", *sys.argv[2:]]))
 open(status, "w").write(str(rc_collect))
 sys.stdin.readline()
 open(beat, "w").write("")
@@ -94,6 +85,7 @@ class Child:
                 env={
                     **os.environ,
                     "TILEOPS_COLLECT_STATUS": str(status_path),
+                    "PYTHONUNBUFFERED": "1",
                     "TILEOPS_HEARTBEAT": str(beat_path),
                 },
             )
@@ -285,6 +277,23 @@ def main() -> int:
             "written instead of the CI job being cancelled mid-sweep"
         ),
     )
+    parser.add_argument(
+        "--warn-after",
+        type=float,
+        help="warn once after this many sweep seconds without interrupting tests",
+    )
+    parser.add_argument(
+        "--pytest-arg",
+        action="append",
+        default=[],
+        help=(
+            "an argument handed to every child pytest, repeatable; "
+            "--pytest-arg=--tileops-verify runs the verification pass with this file isolation"
+        ),
+    )
+    parser.add_argument(
+        "--progress-interval", type=float, default=30, help="seconds between live progress updates"
+    )
     parser.add_argument("--dump-dir", default="bench_stack_dumps", help="stack dump directory")
     parser.add_argument(
         "--teardown-timeout",
@@ -292,13 +301,11 @@ def main() -> int:
         default=TEARDOWN_TIMEOUT_S,
         help="seconds a reported child may spend in interpreter teardown",
     )
-    parser.add_argument(
-        "--prewarm",
-        type=int,
-        default=4,
-        help="upcoming files importing in advance while the current file runs",
-    )
     args = parser.parse_args()
+    if args.progress_interval <= 0:
+        parser.error("--progress-interval must be positive")
+    if args.warn_after is not None and args.warn_after <= 0:
+        parser.error("--warn-after must be positive")
 
     dump_dir = Path(args.dump_dir)
     suites: list[ET.Element] = []
@@ -325,7 +332,7 @@ def main() -> int:
 
         def spawn_at(index: int) -> Child:
             fragment = work_dir / f"{index:03d}.xml"
-            argv = ["-q", bench_files[index], f"--junit-xml={fragment}"]
+            argv = ["-q", bench_files[index], f"--junit-xml={fragment}", *args.pytest_arg]
             return Child(
                 _CHILD,
                 argv,
@@ -334,33 +341,26 @@ def main() -> int:
                 work_dir / f"{index:03d}.beat",
             )
 
-        pending: deque[Child] = deque()
         current: Child | None = None
         collect_failed: list[tuple[str, str]] = []
-        spawned = 0
 
-        def top_up() -> None:
-            nonlocal spawned
-            while len(pending) <= args.prewarm and spawned < len(bench_files):
-                pending.append(spawn_at(spawned))
-                spawned += 1
-
-        run_deadline = (
-            time.monotonic() + args.total_budget if args.total_budget is not None else None
-        )
+        run_start = time.monotonic()
+        run_deadline = run_start + args.total_budget if args.total_budget is not None else None
+        warned = False
         unrun: list[str] = []
 
         def budget_spent() -> bool:
             return run_deadline is not None and time.monotonic() >= run_deadline
 
-        top_up()
         try:
             for index, bench_file in enumerate(bench_files):
                 if budget_spent():
                     unrun.extend(os.path.relpath(f) for f in bench_files[index:])
                     break
-                child = current = pending.popleft()
-                top_up()
+                # Collection can initialize CUDA through imported benchmark code.
+                # On an EXCLUSIVE_PROCESS card a waiting child then blocks the
+                # active benchmark from using the GPU.
+                child = current = spawn_at(index)
                 rel = os.path.relpath(bench_file)
                 print(f"\n=== [{index + 1}/{len(bench_files)}] {rel} ===", flush=True)
                 fragment = work_dir / f"{index:03d}.xml"
@@ -372,20 +372,43 @@ def main() -> int:
                 # a file of many slow tests is progressing, not stuck.
                 stall_deadline = start + args.stall_timeout
                 last_beat = 0.0
+                last_progress = start
+                running_node = "collecting tests"
                 out_of_budget = False
                 while True:
+                    if (
+                        args.warn_after is not None
+                        and not warned
+                        and time.monotonic() - run_start >= args.warn_after
+                    ):
+                        print(
+                            f"::warning::Benchmark sweep exceeded {args.warn_after:.0f}s; "
+                            f"continuing [{index + 1}/{len(bench_files)}] {rel}",
+                            flush=True,
+                        )
+                        warned = True
                     limit = (
                         stall_deadline
                         if run_deadline is None
                         else min(stall_deadline, run_deadline)
                     )
-                    rc = child.wait_result(min(1.0, max(0.0, limit - time.monotonic())))
+                    rc = child.wait_result(
+                        min(1.0, args.progress_interval, max(0.0, limit - time.monotonic()))
+                    )
                     if rc is not None:
                         break
-                    beat_mtime, _ = child.beat()
+                    beat_mtime, node = child.beat()
                     if beat_mtime > last_beat:
                         last_beat = beat_mtime
                         stall_deadline = time.monotonic() + args.stall_timeout
+                        running_node = node or "starting tests"
+                    now = time.monotonic()
+                    if now - last_progress >= args.progress_interval:
+                        print(
+                            f"RUNNING [{index + 1}/{len(bench_files)}] {now - start:.0f}s: {running_node}",
+                            flush=True,
+                        )
+                        last_progress = now
                     if time.monotonic() >= stall_deadline:
                         break
                     if budget_spent():
@@ -452,10 +475,9 @@ def main() -> int:
                 print(f"--- {rel} finished in {elapsed:.0f}s ---", flush=True)
                 _absorb_profile_log(profile_parts)
         finally:
-            # The file being run owns the card; an exception before its teardown
-            # was awaited would leave that process holding it.
-            for leftover in ([current] if current else []) + list(pending):
-                leftover.kill()
+            # An exception before teardown would leave the child holding the card.
+            if current is not None:
+                current.kill()
 
     # Absent from the sweep, not passing: the report must show the gap.
     for rel in unrun:

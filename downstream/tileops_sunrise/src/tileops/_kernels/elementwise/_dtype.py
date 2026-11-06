@@ -1,0 +1,63 @@
+"""Dtype and scalar coercion helpers for elementwise kernels."""
+
+import math
+
+import tilelang.language as T
+import torch
+
+# Bool has no vectorised CUDA type, so a bool result is stored one byte per element.
+BOOL_STORAGE_DTYPE = "int8"
+
+
+BITWISE_DTYPES = (
+    torch.bool,
+    torch.uint8,
+    torch.int8,
+    torch.int16,
+    torch.int32,
+    torch.int64,
+)
+INT_DTYPES = BITWISE_DTYPES[1:]
+FLOAT_DTYPES = (
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+)
+LOGICAL_DTYPES = BITWISE_DTYPES + FLOAT_DTYPES
+BINARY_FULL_DTYPES = BITWISE_DTYPES + FLOAT_DTYPES
+BINARY_NO_BOOL_DTYPES = tuple(dt for dt in BINARY_FULL_DTYPES if dt is not torch.bool)
+
+
+def log_for_output_precision(value, wide):
+    """Return ``log(wide)`` computed to the precision *value*'s dtype can keep."""
+    return T.log(wide) if value.dtype == "float32" else T.__log(wide)
+
+
+def torch_dtype_nbytes(dtype: torch.dtype) -> int:
+    """Return the byte width of a torch dtype."""
+    return torch.empty(0, dtype=dtype).element_size()
+
+
+def clamp_to_dtype_range(value, dtype: torch.dtype):
+    """Normalize *value* into the storage representation of *dtype*."""
+    if dtype == torch.bool:
+        return 1 if bool(value) else 0
+    if dtype in BITWISE_DTYPES:
+        if isinstance(value, float) and math.isinf(value):
+            iinfo = torch.iinfo(dtype)
+            return iinfo.max if value > 0 else iinfo.min
+        if (
+            dtype == torch.uint8
+            and isinstance(value, int)
+            and not isinstance(value, bool)
+            and value < 0
+        ):
+            return value & 0xFF
+        return int(value)
+    fvalue = float(value)
+    if math.isnan(fvalue):
+        return fvalue
+    finfo = torch.finfo(dtype)
+    if math.isinf(fvalue):
+        return fvalue
+    return max(finfo.min, min(finfo.max, fvalue))

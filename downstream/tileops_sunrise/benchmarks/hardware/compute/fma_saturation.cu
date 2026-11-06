@@ -164,9 +164,13 @@ BenchResult run_bench(std::function<void()> launch, double ops_per_launch,
 // Sweeps
 // ============================================================
 
-// fp32 FMA lanes per SM per clock on compute capability 9.0, from the CUDA C
-// Programming Guide's native arithmetic throughput table.
-static const int FMA_LANES_PER_SM = 128;
+// fp32 FMA lanes per SM per clock by compute capability, from the CUDA C
+// Programming Guide's native arithmetic throughput table; 0 where it is not listed here.
+static int fma_lanes_per_sm(int major, int minor) {
+    if (major == 8 && minor == 0) return 64;
+    if ((major == 8 && (minor == 6 || minor == 9)) || (major == 9 && minor == 0)) return 128;
+    return 0;
+}
 
 struct Grid {
     int nblocks;
@@ -215,16 +219,27 @@ double sweep_mufu(const Grid& g) {
 int main(int argc, char* argv[]) {
     int iters = 20000;
     double theo_peak_tflops = 67.0;
+    int device = 0;
     if (argc >= 2) iters = atoi(argv[1]);
     if (argc >= 3) theo_peak_tflops = atof(argv[2]);
     if (iters <= 0 || theo_peak_tflops <= 0) {
-        fprintf(stderr, "usage: %s [iters > 0] [theo_peak_tflops > 0]\n", argv[0]);
+        fprintf(stderr, "usage: %s [iters > 0] [theo_peak_tflops > 0] [pci_bus_id]\n", argv[0]);
         return 1;
     }
+    // The GPU nvidia-smi samples, named by PCI bus id: CUDA and nvidia-smi can number
+    // GPUs differently.
+    if (argc >= 4) CHECK_CUDA(cudaDeviceGetByPCIBusId(&device, argv[3]));
+    CHECK_CUDA(cudaSetDevice(device));
 
     cudaDeviceProp prop;
-    CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
+    CHECK_CUDA(cudaGetDeviceProperties(&prop, device));
     const int sm_count = prop.multiProcessorCount;
+    const int fma_lanes = fma_lanes_per_sm(prop.major, prop.minor);
+    if (fma_lanes == 0) {
+        fprintf(stderr, "no fp32 FMA lane count for compute capability %d.%d\n",
+                prop.major, prop.minor);
+        return 1;
+    }
     const int block = 256;
     // Fill every SM to its thread limit (2048 on sm_90).
     const int nblocks = sm_count * (prop.maxThreadsPerMultiProcessor / block);
@@ -233,10 +248,10 @@ int main(int argc, char* argv[]) {
     // cudaDeviceProp::clockRate was removed in CUDA 13; the attribute query is
     // the portable spelling.
     int clock_khz = 0;
-    CHECK_CUDA(cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, 0));
+    CHECK_CUDA(cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, device));
 
-    printf("GPU: %s | SMs: %d | max SM clock: %.2f GHz\n",
-           prop.name, sm_count, clock_khz / 1e6);
+    printf("GPU: %s | SMs: %d | max SM clock: %.2f GHz | FMA lanes/SM: %d\n",
+           prop.name, sm_count, clock_khz / 1e6, fma_lanes);
     printf("Grid: %d blocks x %d threads = %.0f threads (%d per SM)\n",
            nblocks, block, threads, prop.maxThreadsPerMultiProcessor);
     printf("Each config: 5 runs x 50 reps, warmup 20; calibration uses the median\n");
@@ -280,7 +295,7 @@ int main(int argc, char* argv[]) {
     // measured rate / (lanes * SMs) = the clock the GPU actually held; the gap
     // to the boost ceiling is the power cap at work.
     double fma_per_s = peak_fma_tflops * 1e12 / 2.0;
-    double implied_ghz = fma_per_s / ((double)FMA_LANES_PER_SM * sm_count) / 1e9;
+    double implied_ghz = fma_per_s / ((double)fma_lanes * sm_count) / 1e9;
     double mufu_ratio = (peak_mufu_gops > 0) ? fma_per_s / (peak_mufu_gops * 1e9) : 0.0;
 
     printf("\n# derived\n");

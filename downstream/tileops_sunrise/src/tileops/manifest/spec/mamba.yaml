@@ -1,0 +1,389 @@
+# mamba.yaml -- manifest entries for the 'mamba' (Mamba-2 / SSD) family.
+#
+# Reference: Dao & Gu, "Transformers are SSMs: Generalized Models and
+# Efficient Algorithms Through Structured State Space Duality" (Mamba-2),
+# arXiv:2405.21060. Signatures follow the staged decomposition of
+# mamba_ssm.ops.triton.ssd_combined.mamba_chunk_scan_combined; no single public
+# API covers these stages, so no entry names a `ref_api`.
+#
+# Index names shared across this family:
+#   B  batch       S  seq_len     H  n_heads     P  d_head
+#   N  d_state     G  n_groups    NC num_chunks  Q  chunk_len
+# Workload shapes follow the public Mamba-2 model sizes
+# (780M: H=48, 1.3B: H=64, 2.7B: H=80; P=64, N=128, Q=256, G=1).
+
+SSDChunkCumsumFwdOp:
+  # dt preprocessing (optional per-head bias, optional softplus, clamp) and the
+  # chunk-local inclusive prefix sum of dA = dt * A. dA_cumsum is computed from
+  # the float32 dt before dt_out is cast to out_dtype.
+  family: mamba
+  status: implemented
+  ref_api: mamba_ssm.ops.triton.ssd_chunk_state._chunk_cumsum_fwd
+  signature:
+    forall: {B: Dim, S: Dim, H: Dim}
+    params:
+      chunk_size: {type: int}
+      out_dtype: {type: "float16 | bfloat16 | float32", default: float32}
+      dt_softplus: {type: bool, default: false}
+      dt_min: {type: float, default: 0.0}
+      dt_max: {type: float, default: .inf}
+    inputs:
+      dt: {dtype: float32, shape: "[B, S, H]"}
+      A: {dtype: float32, shape: "[H]"}
+      dt_bias: {dtype: float32, shape: "[H]", optional: true}
+    outputs:
+      dt_out: {dtype: out_dtype, shape: "[B, H, NC, chunk_size]"}
+      dA_cumsum: {dtype: float32, shape: "[B, H, NC, chunk_size]"}
+    let: {NC: "S // chunk_size"}
+    shape_rules:
+    - "B > 0 and S > 0 and H > 0"
+    - "chunk_size > 0 and S % chunk_size == 0"
+  workloads:
+  - {B: 1, S: 4096, H: 48, chunk_size: 256, out_dtype: float16, dt_softplus: true, label: mamba2-780m}
+  - {B: 8, S: 2048, H: 64, chunk_size: 256, out_dtype: bfloat16, dt_softplus: true, label: mamba2-1p3b}
+  - {B: 1, S: 4096, H: 48, chunk_size: 256, out_dtype: float16, dt_softplus: true, some: [dt_bias], label: mamba2-780m-dt-bias}
+  - {B: 8, S: 2048, H: 64, chunk_size: 256, out_dtype: bfloat16, dt_softplus: true, some: [dt_bias], label: mamba2-1p3b-dt-bias}
+  - {B: 2, S: 32768, H: 80, chunk_size: 256, out_dtype: float16, dt_softplus: true, some: [dt_bias], label: mamba2-2p7b}
+  roofline:
+    # clamp, dt * A and the cumsum add per token; the bias add and softplus
+    # (4 flops) when present.
+    flops: "(3 + (1 if present(dt_bias) else 0) + (4 if dt_softplus else 0)) * B * S * H"
+
+SSDChunkCouplingFwdOp:
+  # Causal C@B coupling matrix per chunk and group:
+  #   cb[b, c, g, l, s] = sum_n C[b, c*Q+l, g, n] * B[b, c*Q+s, g, n] for s <= l, else 0.
+  family: mamba
+  status: implemented
+  ref_api: mamba_ssm.ops.triton.ssd_bmm._bmm_chunk_fwd
+  signature:
+    forall: {Bsz: Dim, S: Dim, G: Dim, N: Dim, T: "DType[float16 | bfloat16]"}
+    params:
+      chunk_size: {type: int}
+    inputs:
+      C: {dtype: T, shape: "[Bsz, S, G, N]"}
+      B: {dtype: T, shape: "[Bsz, S, G, N]"}
+    outputs:
+      cb: {dtype: T, shape: "[Bsz, NC, G, chunk_size, chunk_size]"}
+    let: {NC: "S // chunk_size"}
+    shape_rules:
+    - "Bsz > 0 and S > 0 and G > 0 and N > 0"
+    - "chunk_size > 0 and S % chunk_size == 0"
+  workloads:
+  - {Bsz: 1, S: 4096, G: 1, N: 128, chunk_size: 256, dtype_cases: [{T: float16}], label: mamba2-780m}
+  - {Bsz: 4, S: 2048, G: 1, N: 128, chunk_size: 256, dtype_cases: [{T: bfloat16}], label: mamba2-2p7b}
+  - {Bsz: 3, S: 3072, G: 8, N: 128, chunk_size: 256, dtype_cases: [{T: float16}], label: mamba2-grouped-prefill}
+  roofline:
+    # Causal masking halves the 2 * Q * Q * N contraction per (batch, chunk, group).
+    flops: "Bsz * NC * G * chunk_size * chunk_size * N"
+
+SSDChunkStateFwdOp:
+  # Per-chunk SSM state: decay-weighted (P x Q) @ (Q x N) per (batch, chunk,
+  # head). seq_idx, when passed, masks contributions from another sequence.
+  # dt is taken in x's dtype (as Mamba2FwdOp passes it) or in float32 (as
+  # mamba_ssm's _chunk_cumsum_fwd produces it).
+  family: mamba
+  status: implemented
+  ref_api: mamba_ssm.ops.triton.ssd_chunk_state._chunk_state_fwd
+  signature:
+    forall: {Bsz: Dim, NC: Dim, Q: Dim, H: Dim, P: Dim, G: Dim, N: Dim, T: "DType[float16 | bfloat16]", TD: "DType[float16 | bfloat16 | float32]"}
+    inputs:
+      x: {dtype: T, shape: "[Bsz, NC * Q, H, P]"}
+      B: {dtype: T, shape: "[Bsz, NC * Q, G, N]"}
+      dt: {dtype: TD, shape: "[Bsz, H, NC, Q]"}
+      dA_cumsum: {dtype: float32, shape: "[Bsz, H, NC, Q]"}
+      seq_idx: {dtype: int32, shape: "[Bsz, NC * Q]", optional: true}
+    outputs:
+      states: {dtype: float32, shape: "[Bsz, NC, H, P, N]"}
+    shape_rules:
+    - "Bsz > 0 and NC > 0 and Q > 0 and H > 0 and P > 0 and N > 0"
+    - "G > 0 and H % G == 0"
+    dtype_combos:
+    - {T: float16, TD: float16}
+    - {T: float16, TD: float32}
+    - {T: bfloat16, TD: bfloat16}
+    - {T: bfloat16, TD: float32}
+  workloads:
+  - {Bsz: 1, NC: 16, Q: 256, H: 48, P: 64, G: 1, N: 128, dtype_cases: [{T: float16, TD: float32}, {T: bfloat16, TD: float32}], label: mamba2-780m}
+  - {Bsz: 4, NC: 8, Q: 256, H: 80, P: 64, G: 1, N: 128, dtype_cases: [{T: bfloat16, TD: float32}], label: mamba2-2p7b}
+  - {Bsz: 1, NC: 16, Q: 256, H: 48, P: 64, G: 1, N: 128, some: [seq_idx], dtype_cases: [{T: float16, TD: float32}, {T: bfloat16, TD: float32}], label: mamba2-780m-seq-idx}
+  - {Bsz: 2, NC: 128, Q: 256, H: 64, P: 64, G: 1, N: 128, some: [seq_idx], dtype_cases: [{T: float16, TD: float32}], label: mamba2-1p3b}
+  roofline:
+    # The (P x Q) @ (Q x N) contraction, the per-token decay weight and the x row scaling.
+    flops: "2 * Bsz * NC * H * P * N * Q + 4 * Bsz * NC * Q * H + Bsz * NC * Q * H * P"
+
+SSDStatePassingFwdOp:
+  # Inter-chunk recurrent scan over a flattened state dimension:
+  #   s_c = exp(dA_chunk_cumsum[b, h, c]) * s_{c-1} + states[b, c, h, :],
+  # starting from initial_states, or from zero when it is not passed.
+  # prev_states[:, c] is the state entering chunk c. In the Mamba-2 pipeline N
+  # is the flattened d_head * d_state.
+  family: mamba
+  status: implemented
+  ref_api: mamba_ssm.ops.triton.ssd_state_passing._state_passing_fwd
+  signature:
+    forall: {B: Dim, NC: Dim, H: Dim, N: Dim, T: "DType[float16 | bfloat16 | float32]"}
+    inputs:
+      states: {dtype: T, shape: "[B, NC, H, N]"}
+      dA_chunk_cumsum: {dtype: float32, shape: "[B, H, NC]"}
+      initial_states: {dtype: float32, shape: "[B, H, N]", optional: true}
+    outputs:
+      prev_states: {dtype: float32, shape: "[B, NC, H, N]"}
+      final_states: {dtype: float32, shape: "[B, H, N]"}
+    shape_rules:
+    - "B > 0 and NC > 0 and H > 0 and N > 0"
+  workloads:
+  - {B: 1, NC: 16, H: 64, N: 128, dtype_cases: [{T: float16}, {T: bfloat16}], label: mamba2-1p3b}
+  - {B: 2, NC: 128, H: 80, N: 128, dtype_cases: [{T: float16}], label: mamba2-2p7b}
+  - {B: 1, NC: 16, H: 64, N: 128, some: [initial_states], dtype_cases: [{T: float16}, {T: bfloat16}], label: mamba2-1p3b-init}
+  # Flattened d_head * d_state = 8192 as produced inside Mamba2FwdOp.
+  - {B: 1, NC: 16, H: 64, N: 8192, some: [initial_states], dtype_cases: [{T: float32}], label: mamba2-1p3b-flat}
+  roofline:
+    # A multiply-add per state element, one exp per (batch, head, chunk).
+    flops: "2 * B * NC * H * N + B * H * NC"
+
+SSDChunkScanFwdOp:
+  # Fused SSD chunk output: the history term exp(dA[l]) * (C[l] @ prev_states)
+  # plus the causal intra-chunk term sum_{s <= l} cb[l, s] * exp(dA[l] - dA[s]) * dt[s] * x[s].
+  family: mamba
+  status: implemented
+  ref_api: mamba_ssm.ops.triton.ssd_chunk_scan._chunk_scan_fwd
+  signature:
+    forall: {B: Dim, NC: Dim, Q: Dim, H: Dim, P: Dim, G: Dim, N: Dim, T: "DType[float16 | bfloat16]"}
+    inputs:
+      x: {dtype: T, shape: "[B, NC * Q, H, P]"}
+      cb: {dtype: T, shape: "[B, NC, G, Q, Q]"}
+      dA_cumsum: {dtype: float32, shape: "[B, H, NC, Q]"}
+      C: {dtype: T, shape: "[B, NC * Q, G, N]"}
+      prev_states: {dtype: float32, shape: "[B, NC, H, P, N]"}
+      dt: {dtype: T, shape: "[B, H, NC, Q]"}
+    outputs:
+      y: {dtype: float32, shape: "[B, NC * Q, H, P]"}
+    shape_rules:
+    - "B > 0 and NC > 0 and Q > 0 and H > 0 and P > 0 and N > 0"
+    - "G > 0 and H % G == 0"
+  workloads:
+  - {B: 1, NC: 16, Q: 256, H: 48, P: 64, G: 1, N: 128, dtype_cases: [{T: float16}, {T: bfloat16}], label: mamba2-780m}
+  - {B: 4, NC: 8, Q: 256, H: 80, P: 64, G: 1, N: 128, dtype_cases: [{T: bfloat16}], label: mamba2-2p7b}
+  - {B: 2, NC: 128, Q: 256, H: 64, P: 64, G: 1, N: 128, dtype_cases: [{T: float16}], label: mamba2-1p3b}
+  roofline:
+    # History: a (1 x N) @ (N x P) per token and head; intra-chunk: the causal
+    # (Q x Q) @ (Q x P) per (batch, chunk, head), halved by the mask.
+    flops: "2 * B * NC * Q * H * N * P + B * NC * H * Q * Q * P"
+
+SSDRecurrentFwdOp:
+  # Single-token Mamba-2 SSD decode step. y is the only returned tensor;
+  # state is updated in place. The D * x skip connection and z-gate are not
+  # fused here.
+  family: mamba
+  status: implemented
+  ref_api: mamba_ssm.ops.triton.selective_state_update.selective_state_update
+  signature:
+    forall: {Bsz: Dim, H: Dim, P: Dim, G: Dim, N: Dim, T: "DType[float16 | bfloat16]"}
+    inputs:
+      A: {dtype: float32, shape: "[H, P, N]"}
+      dt: {dtype: float32, shape: "[Bsz, H, P]"}
+      x: {dtype: T, shape: "[Bsz, H, P]"}
+      B: {dtype: T, shape: "[Bsz, G, N]"}
+      C: {dtype: T, shape: "[Bsz, G, N]"}
+      state: {dtype: float32, shape: "[Bsz, H, P, N]", mutated: true, contiguous: true}
+    outputs:
+      y: {dtype: float32, shape: "[Bsz, H, P]"}
+    shape_rules:
+    - "Bsz > 0 and H > 0 and P > 0 and N > 0"
+    - "G > 0 and H % G == 0"
+  workloads:
+  - {Bsz: 1, H: 64, P: 64, G: 1, N: 128, dtype_cases: [{T: float16}, {T: bfloat16}], label: mamba2-1p3b}
+  - {Bsz: 8, H: 80, P: 64, G: 1, N: 128, dtype_cases: [{T: float16}], label: mamba2-2p7b}
+  - {Bsz: 32, H: 48, P: 64, G: 1, N: 128, dtype_cases: [{T: float16}], label: mamba2-780m}
+  roofline:
+    # Per state element: dt * A, exp, dt * x * B (two products), the decay
+    # multiply, the state add and the multiply-add against C.
+    flops: "8 * Bsz * H * P * N"
+
+Mamba2FwdOp:
+  # End-to-end Mamba-2 SSD forward: SSDChunkCumsum -> SSDChunkCoupling -> SSDChunkState ->
+  # SSDStatePassing -> SSDChunkScan. Follows
+  # mamba_ssm.ops.triton.ssd_combined.mamba_chunk_scan_combined with one
+  # deviation: final_states is always returned (chunked prefill consumes the
+  # carried state), so the upstream return_final_states switch does not exist.
+  # dt_bias is added to dt in the SSDChunkCumsum stage; initial_states seeds the
+  # inter-chunk scan. The batch index is Bsz because B names a tensor.
+  family: mamba
+  status: implemented
+  ref_api: mamba_ssm.ops.triton.ssd_combined.mamba_chunk_scan_combined
+  signature:
+    forall: {Bsz: Dim, S: Dim, H: Dim, P: Dim, G: Dim, N: Dim, T: "DType[float16 | bfloat16]"}
+    params:
+      chunk_size: {type: int, default: 256}
+      dt_softplus: {type: bool, default: true}
+    inputs:
+      x: {dtype: T, shape: "[Bsz, S, H, P]"}
+      dt: {dtype: float32, shape: "[Bsz, S, H]"}
+      A: {dtype: float32, shape: "[H]"}
+      B: {dtype: T, shape: "[Bsz, S, G, N]"}
+      C: {dtype: T, shape: "[Bsz, S, G, N]"}
+      dt_bias: {dtype: float32, shape: "[H]", optional: true}
+      initial_states: {dtype: float32, shape: "[Bsz, H, P, N]", optional: true}
+    outputs:
+      y: {dtype: float32, shape: "[Bsz, S, H, P]"}
+      final_states: {dtype: float32, shape: "[Bsz, H, P, N]"}
+    let: {NC: "S // chunk_size"}
+    shape_rules:
+    - "Bsz > 0 and S > 0 and H > 0 and P > 0 and N > 0"
+    - "chunk_size > 0 and S % chunk_size == 0"
+    - "G > 0 and H % G == 0"
+  workloads:
+  - {Bsz: 1, S: 2048, H: 80, P: 64, G: 1, N: 128, dtype_cases: [{T: bfloat16}], label: mamba2-2p7b}
+  - {Bsz: 1, S: 8192, H: 64, P: 64, G: 1, N: 128, dtype_cases: [{T: float16}], label: mamba2-1p3b}
+  - {Bsz: 1, S: 2048, H: 80, P: 64, G: 1, N: 128, some: [dt_bias], dtype_cases: [{T: bfloat16}], label: mamba2-2p7b-dt-bias}
+  - {Bsz: 1, S: 8192, H: 64, P: 64, G: 1, N: 128, some: [dt_bias], dtype_cases: [{T: float16}], label: mamba2-1p3b-dt-bias}
+  - {Bsz: 1, S: 2048, H: 80, P: 64, G: 1, N: 128, some: [initial_states], dtype_cases: [{T: bfloat16}], label: mamba2-2p7b-init}
+  - {Bsz: 1, S: 8192, H: 64, P: 64, G: 1, N: 128, some: [initial_states], dtype_cases: [{T: float16}], label: mamba2-1p3b-init}
+  - {Bsz: 1, S: 2048, H: 80, P: 64, G: 1, N: 128, some: [dt_bias, initial_states], dtype_cases: [{T: bfloat16}], label: mamba2-2p7b-dt-bias-init}
+  - {Bsz: 1, S: 8192, H: 64, P: 64, G: 1, N: 128, some: [dt_bias, initial_states], dtype_cases: [{T: float16}], label: mamba2-1p3b-dt-bias-init}
+  roofline:
+    # The sum of the five stages' counts: SSDChunkCumsum, SSDChunkCoupling, SSDChunkState,
+    # SSDStatePassing over the flattened P * N state, SSDChunkScan.
+    flops: >-
+      (3 + (1 if present(dt_bias) else 0) + (4 if dt_softplus else 0)) * Bsz * S * H
+      + Bsz * NC * G * chunk_size * chunk_size * N
+      + 2 * Bsz * S * H * P * N + 4 * Bsz * S * H + Bsz * S * H * P
+      + 2 * Bsz * NC * H * P * N + Bsz * H * NC
+      + 2 * Bsz * S * H * N * P + Bsz * NC * H * chunk_size * chunk_size * P
+  composition:
+    kind: composite
+    stages:
+    - {name: ssd_chunk_cumsum_float16, op: SSDChunkCumsumFwdOp}
+    - {name: ssd_chunk_cumsum_bfloat16, op: SSDChunkCumsumFwdOp}
+    - {name: ssd_chunk_coupling, op: SSDChunkCouplingFwdOp}
+    - {name: chunk_state, op: SSDChunkStateFwdOp}
+    - {name: state_passing, op: SSDStatePassingFwdOp}
+    - {name: chunk_scan, op: SSDChunkScanFwdOp}
+CausalConv1dFwdOp:
+  family: mamba
+  status: implemented
+  ref_api: vllm.model_executor.layers.mamba.ops.causal_conv1d.causal_conv1d_fn
+  signature:
+    forall:
+      B: Dim
+      D: Dim
+      W: Dim
+      Tt: Dim
+      T: "DType[float16 | bfloat16]"
+      seq_lens: "Seq[Int]"
+    params:
+      activation: {type: "'silu' | None", default: silu}
+      validate_inputs: {type: bool, default: false, kw_only: true}
+    inputs:
+      # Token-major, the sequences packed along Tt: the layout the Mamba block's input
+      # projection produces. The ref_api takes the (D, Tt) transposed view of this storage.
+      x: {dtype: T, shape: "[Tt, D]"}
+      weight: {dtype: T, shape: "[D, W]"}
+      # The W-1 tokens preceding each sequence. Read for a sequence whose
+      # has_initial_state is true, and overwritten with that sequence's own tail; an empty
+      # sequence keeps its state.
+      conv_state: {dtype: T, shape: "[B, D, W - 1]", mutated: true, contiguous: true}
+      cu_seqlens: {dtype: int32, shape: "[B + 1]", values: "prefix_sum(seq_lens)", requires: ["prefix_offsets(Tt)"]}
+      bias: {dtype: T, shape: "[D]", optional: true}
+      has_initial_state: {dtype: bool, shape: "[B]", optional: true}
+    outputs:
+      output: {dtype: T, shape: "[Tt, D]"}
+    shape_rules:
+      - "B > 0 and D > 0 and Tt > 0"
+      - "W >= 2 and W <= 4"
+  roofline:
+    flops: "2 * D * Tt * W"
+  workloads:
+    - {D: 5376, W: 4, Tt: 4096, seq_lens: "repeat(1024, 4)", dtype_cases: [{T: bfloat16}], some: [bias, has_initial_state], label: mamba2-2.7b-prefill-4k}
+    - {D: 5376, W: 4, Tt: 4096, seq_lens: "repeat(1024, 4)", dtype_cases: [{T: bfloat16}], some: [bias], label: mamba2-2.7b-pf4k-nost}
+    - {D: 5376, W: 4, Tt: 32768, seq_lens: "repeat(4096, 8)", dtype_cases: [{T: bfloat16}], some: [bias, has_initial_state], label: mamba2-2.7b-prefill-32k}
+    - {D: 8192, W: 4, Tt: 4096, seq_lens: [2500, 1000, 500, 96], dtype_cases: [{T: float16}], some: [has_initial_state], label: qwen3-next-pf4k-ragged}
+    - {D: 8192, W: 4, Tt: 32768, seq_lens: "repeat(8192, 4)", dtype_cases: [{T: float16}], some: [has_initial_state], label: qwen3-next-prefill-32k}
+
+CausalConv1dUpdateFwdOp:
+  family: mamba
+  status: implemented
+  ref_api: vllm.model_executor.layers.mamba.ops.causal_conv1d.causal_conv1d_update
+  signature:
+    forall:
+      B: Dim
+      D: Dim
+      W: Dim
+      T: "DType[float16 | bfloat16]"
+    params:
+      activation: {type: "'silu' | None", default: silu}
+    inputs:
+      x: {dtype: T, shape: "[B, D]"}
+      weight: {dtype: T, shape: "[D, W]"}
+      # The W-1 most recent tokens per sequence, the state CausalConv1dFwdOp leaves.
+      # Advanced by one token in place.
+      conv_state: {dtype: T, shape: "[B, D, W - 1]", mutated: true, contiguous: true}
+      bias: {dtype: T, shape: "[D]", optional: true}
+    outputs:
+      output: {dtype: T, shape: "[B, D]"}
+    shape_rules:
+      - "B > 0 and D > 0"
+      - "W >= 2 and W <= 4"
+  roofline:
+    flops: "2 * B * D * W"
+  workloads:
+    - {B: 1, D: 5376, W: 4, dtype_cases: [{T: bfloat16}], some: [bias], label: mamba2-2.7b-decode-b1}
+    - {B: 64, D: 5376, W: 4, dtype_cases: [{T: bfloat16}], some: [bias], label: mamba2-2.7b-decode-b64}
+    - {B: 256, D: 5376, W: 4, dtype_cases: [{T: bfloat16}], some: [bias], label: mamba2-2.7b-decode-b256}
+    - {B: 64, D: 8192, W: 4, dtype_cases: [{T: float16}], label: qwen3-next-decode-b64}
+
+SelectiveScanFwdOp:
+  # Mamba-1 S6 selective scan: a first-order recurrence whose decay and input gates are
+  # functions of the input, discretized per channel. The SSD entries above carry one
+  # scalar decay per head; this one does not reduce to their chunked matmul.
+  #
+  # Index names, which differ from the SSD stages above:
+  #   Di d_inner   N d_state   G n_groups   Bsz batch
+  family: mamba
+  status: implemented
+  ref_api: mamba_ssm.ops.selective_scan_interface.selective_scan_fn
+  signature:
+    forall: {Bsz: Dim, S: Dim, Di: Dim, N: Dim, G: Dim, T: "DType[float16 | bfloat16 | float32]"}
+    params:
+      delta_softplus: {type: bool, default: true}
+    inputs:
+      u: {dtype: T, shape: "[Bsz, Di, S]"}
+      delta: {dtype: T, shape: "[Bsz, Di, S]"}
+      A: {dtype: float32, shape: "[Di, N]"}
+      B: {dtype: T, shape: "[Bsz, G, N, S]"}
+      C: {dtype: T, shape: "[Bsz, G, N, S]"}
+      # The skip term `D * u`, and the gate `u * silu(z)`.
+      D: {dtype: float32, shape: "[Di]", optional: true}
+      z: {dtype: T, shape: "[Bsz, Di, S]", optional: true}
+      delta_bias: {dtype: float32, shape: "[Di]", optional: true}
+      # Packed sequences: the id each token belongs to, as the SSD stages take it. A
+      # token whose id differs from its predecessor's restarts the recurrence.
+      seq_idx: {dtype: int32, shape: "[Bsz, S]", optional: true}
+      initial_states: {dtype: float32, shape: "[Bsz, Di, N]", optional: true}
+    outputs:
+      y: {dtype: T, shape: "[Bsz, Di, S]"}
+      final_states: {dtype: float32, shape: "[Bsz, Di, N]"}
+    shape_rules:
+    - "Bsz > 0 and S > 0 and Di > 0 and N > 0 and G > 0"
+    - "Di % G == 0"
+    # A packed batch starts from zero: a carried state names one sequence per batch row.
+    - "not present(seq_idx) or not present(initial_states)"
+  workloads:
+  # Mamba-1 model sizes: 130M D=1536, 1.4B D=4096, 2.8B D=5120; N=16, G=1.
+  - {Bsz: 1, S: 4096, Di: 5120, N: 16, G: 1, some: [D, z, delta_bias], dtype_cases: [{T: bfloat16}, {T: float16}], label: mamba-2.8b-prefill}
+  - {Bsz: 1, S: 1, Di: 5120, N: 16, G: 1, some: [D, z, delta_bias, initial_states], dtype_cases: [{T: bfloat16}], label: mamba-2.8b-decode}
+  - {Bsz: 64, S: 1, Di: 5120, N: 16, G: 1, some: [D, z, delta_bias, initial_states], dtype_cases: [{T: bfloat16}], label: mamba-2.8b-decode-b64}
+  - {Bsz: 1, S: 4096, Di: 4096, N: 16, G: 1, some: [D, z, delta_bias], dtype_cases: [{T: bfloat16}], label: mamba-1.4b-prefill}
+  - {Bsz: 1, S: 4096, Di: 1536, N: 16, G: 1, some: [D, delta_bias], dtype_cases: [{T: float32}], label: mamba-130m-no-gate}
+  - {Bsz: 1, S: 4096, Di: 5120, N: 16, G: 1, some: [D, z, delta_bias, seq_idx], dtype_cases: [{T: bfloat16}], label: mamba-2.8b-packed}
+  - {Bsz: 8, S: 2048, Di: 4096, N: 32, G: 8, some: [D, z, delta_bias], dtype_cases: [{T: bfloat16}], label: grouped-state}
+  # The bare recurrence: a gate, no skip and no bias.
+  - {Bsz: 4, S: 1024, Di: 2048, N: 16, G: 1, some: [z], dtype_cases: [{T: bfloat16}], label: bare-scan}
+  roofline:
+    # Per (element, state): the discretized decay exp(delta * A), the state update against
+    # delta * B * u, and the C readout. Per element: the optional bias and softplus on
+    # delta, the optional D skip, and the optional silu gate.
+    flops: >-
+      Bsz * Di * S * (6 * N + (1 if present(delta_bias) else 0)
+      + (4 if delta_softplus else 0) + (2 if present(D) else 0)
+      + (5 if present(z) else 0))

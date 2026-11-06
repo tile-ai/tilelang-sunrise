@@ -1,32 +1,28 @@
-"""Benchmark: TileOPs DeltaNet (ungated) chunkwise vs FLA chunk_delta_rule.
-
-Compares forward and backward latency across sequence lengths and dtypes.
-
-FLA is required, not optional: this file exists to compare against chunk_delta_rule,
-and a torch reference is not a comparison worth recording.
-
-Layout convention:
-    TileOPs uses BHSD: q/k [B, H, S, DK], v [B, H, S, DV], beta [B, H, S].
-    FLA uses BTHK:     q/k [B, T, H, K],  v [B, T, H, V],  beta [B, T, H].
-    Tensors are permuted before calling FLA to ensure both implementations
-    compute the same function.
+"""Benchmarks for the DeltaNet ops (chunkwise forward and backward, inference, decode), one case per
+manifest call, against FLA and torch.
 """
 
 import pytest
-import torch
-from fla.ops.delta_rule import chunk_delta_rule
 
-from benchmarks.benchmark_base import (
-    ManifestBenchmark,
+from benchmarks import api as bench
+from benchmarks.baselines import (
+    FLA_TAG,
+    TORCH_COMPILE_TAG,
     backward_of,
-    then_dtype,
-    workload_params,
+    baseline_module,
+    compiled_reference,
+    fla_op,
 )
-from tileops.manifest import load_workloads
-from tileops.ops import DeltaNetAutogradOp, DeltaNetBwdOp, DeltaNetFwdOp
-from workloads.linear_attention import DeltaNetFwdWorkload
+from tileops.linear_attention import (
+    DeltaNetChunkBwdOp,
+    DeltaNetChunkFwdOp,
+    DeltaNetFwdOp,
+    DeltaNetRecurrentFwdOp,
+)
 
 
+# Chunkwise: FLA's chunk_delta_rule is required. TileOPs uses BHSD (q/k [B, H, S, DK], v [B, H, S, DV],
+# beta [B, H, S]) and FLA BTHK, so inputs are permuted before calling FLA.
 def _to_fla_layout(q, k, v, beta):
     """Convert TileOPs BHSD tensors to FLA BTHK layout."""
     return (
@@ -37,124 +33,68 @@ def _to_fla_layout(q, k, v, beta):
     )
 
 
-def _deltanet_args(workload: dict) -> tuple[int, int, int, int, int, int]:
-    """Constructor arguments for one manifest workload row."""
-    batch, heads, seq_len, dim_k = workload["q_shape"]
-    dim_v = workload["v_shape"][3]
-    return batch, seq_len, heads, dim_k, dim_v, workload.get("chunk_size", 64)
+@pytest.mark.parametrize("case", bench.cases(DeltaNetFwdOp), ids=lambda case: case.id)
+def test_deltanet_fwd_bench(case) -> None:
+    op = DeltaNetFwdOp(**case.arguments)
+    bench.Runner(op, case).compare({"fla": case.reference})
 
 
-@pytest.mark.parametrize(
-    "batch, seq_len, heads, dim_k, dim_v, chunk_size, dtype, tune",
-    workload_params(load_workloads(DeltaNetFwdOp), then_dtype(_deltanet_args, tune=False)),
-)
-def test_deltanet_vs_fla_fwd(
-    batch: int,
-    seq_len: int,
-    heads: int,
-    dim_k: int,
-    dim_v: int,
-    chunk_size: int,
-    dtype: torch.dtype,
-    tune: bool,
-) -> None:
-    test = DeltaNetFwdWorkload(batch, heads, seq_len, dim_k, dim_v, chunk_size, dtype)
-    inputs = test.gen_inputs()  # q, k, v, beta (BHSD)
+@pytest.mark.parametrize("case", bench.cases(DeltaNetChunkFwdOp), ids=lambda case: case.id)
+def test_deltanet_vs_fla_fwd(case) -> None:
+    chunk_delta_rule = baseline_module("fla.ops.delta_rule", "fla").chunk_delta_rule
 
-    # --- TileOPs (BHSD) ---
-    op = DeltaNetFwdOp(chunk_size=chunk_size, tune=tune)
-    bm = ManifestBenchmark(op, test)
-    functors = {"tileops": op}
-
-    # --- FLA (BTHK) ---
-    q, k, v, beta = inputs
-    scale = dim_k**-0.5
-    q_fla, k_fla, v_fla, beta_fla = _to_fla_layout(q, k, v, beta)
+    op = DeltaNetChunkFwdOp(**case.arguments)
+    q_fla, k_fla, v_fla, beta_fla = _to_fla_layout(*case.inputs)
 
     def fla_fwd():
-        return chunk_delta_rule(q_fla, k_fla, v_fla, beta_fla, scale=scale)
+        out, state = chunk_delta_rule(q_fla, k_fla, v_fla, beta_fla, scale=1.0)
+        return out.transpose(1, 2), state
 
-    functors["fla"] = (fla_fwd, ())
-
-    bm.compare(functors, *inputs)
+    bench.Runner(op, case).compare({"fla": bench.Implementation(run=fla_fwd, args=())})
 
 
-@pytest.mark.parametrize(
-    "batch, seq_len, heads, dim_k, dim_v, chunk_size, dtype, tune",
-    workload_params(load_workloads(DeltaNetBwdOp), then_dtype(_deltanet_args, tune=False)),
-)
-def test_deltanet_vs_fla_bwd(
-    batch: int,
-    seq_len: int,
-    heads: int,
-    dim_k: int,
-    dim_v: int,
-    chunk_size: int,
-    dtype: torch.dtype,
-    tune: bool,
-) -> None:
-    test = DeltaNetFwdWorkload(batch, heads, seq_len, dim_k, dim_v, chunk_size, dtype)
+@pytest.mark.parametrize("case", bench.cases(DeltaNetChunkBwdOp), ids=lambda case: case.id)
+def test_deltanet_vs_fla_bwd(case) -> None:
+    chunk_delta_rule = baseline_module("fla.ops.delta_rule", "fla").chunk_delta_rule
 
-    B, H, S, DK, DV, BC = batch, heads, seq_len, dim_k, dim_v, chunk_size
-    q = torch.randn(B, H, S, DK, dtype=dtype).ptpu() * 0.1
-    k = torch.randn(B, H, S, DK, dtype=dtype).ptpu() * 0.1
-    v = torch.randn(B, H, S, DV, dtype=dtype).ptpu() * 0.1
-    beta = torch.rand(B, H, S, dtype=dtype).ptpu() * 0.5
-    do = torch.randn(B, H, S, DV, dtype=dtype).ptpu() * 0.1
-
-    # --- TileOPs: fwd to get S, Aw, Au, w, u; then profile bwd only ---
-    fwd_op = DeltaNetFwdOp(chunk_size=BC)
-    _o, S_fwd, Aw, Au, w_fwd, u_fwd = fwd_op.forward(q, k, v, beta)
-
-    bwd_op = DeltaNetBwdOp(chunk_size=BC, tune=tune)
-    bm = ManifestBenchmark(bwd_op, test)
-    functors = {"tileops": bwd_op.forward}
-
-    # --- FLA (BTHK layout) ---
-    scale = DK**-0.5
-    q_fla, k_fla, v_fla, beta_fla = _to_fla_layout(q, k, v, beta)
-    do_fla = do.permute(0, 2, 1, 3).contiguous()  # [B,H,S,DV] -> [B,S,H,DV]
-
-    q_fla = q_fla.detach().requires_grad_(True)
-    k_fla = k_fla.detach().requires_grad_(True)
-    v_fla = v_fla.detach().requires_grad_(True)
-    beta_fla = beta_fla.detach().requires_grad_(True)
-
-    o_fla, _ = chunk_delta_rule(q_fla, k_fla, v_fla, beta_fla, scale=scale)
+    do, q, k, v, beta, *_saved = case.inputs
+    bwd_op = DeltaNetChunkBwdOp(**case.arguments)
+    q_fla, k_fla, v_fla, beta_fla = (
+        t.detach().requires_grad_(True) for t in _to_fla_layout(q, k, v, beta)
+    )
+    do_fla = do.permute(0, 2, 1, 3).contiguous()
+    o_fla, _ = chunk_delta_rule(q_fla, k_fla, v_fla, beta_fla, scale=1.0)
     fla_backward = backward_of(o_fla)
 
     def fla_bwd():
-        return fla_backward(do_fla, None)
+        dq, dk, dv, dbeta = fla_backward(do_fla, None)[:4]
+        return (dq.transpose(1, 2), dk.transpose(1, 2), dv.transpose(1, 2), dbeta.transpose(1, 2))
 
-    functors["fla"] = (fla_bwd, ())
-
-    bm.compare(functors, do, q, k, v, beta, S_fwd, Aw, Au, w_fwd, u_fwd)
+    bench.Runner(bwd_op, case).compare({"fla": bench.Implementation(run=fla_bwd, args=())})
 
 
-@pytest.mark.parametrize(
-    "batch, seq_len, heads, dim_k, dim_v, chunk_size, dtype, tune",
-    workload_params(load_workloads(DeltaNetAutogradOp), then_dtype(_deltanet_args, tune=False)),
-)
-def test_deltanet_vs_fla_autograd(
-    batch: int,
-    seq_len: int,
-    heads: int,
-    dim_k: int,
-    dim_v: int,
-    chunk_size: int,
-    dtype: torch.dtype,
-    tune: bool,
-) -> None:
-    test = DeltaNetFwdWorkload(batch, heads, seq_len, dim_k, dim_v, chunk_size, dtype)
-    inputs = test.gen_inputs()
+@pytest.mark.parametrize("case", bench.cases(DeltaNetRecurrentFwdOp), ids=lambda case: case.id)
+def test_deltanet_decode_bench(case) -> None:
+    op = DeltaNetRecurrentFwdOp(**case.arguments)
+    recurrent = fla_op("ops.delta_rule.fused_recurrent_delta_rule")
 
-    op = DeltaNetAutogradOp(chunk_size=chunk_size, tune=tune)
-    bm = ManifestBenchmark(op, test)
+    def fla_fn(q, k, v, beta, state):
+        out, final_state = recurrent(
+            q.unsqueeze(1),
+            k.unsqueeze(1),
+            v.unsqueeze(1),
+            beta.unsqueeze(1),
+            scale=1.0,
+            initial_state=state.float(),
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=False,
+        )
+        return out.squeeze(1), final_state.to(state.dtype)
 
-    scale = dim_k**-0.5
-    q_fla, k_fla, v_fla, beta_fla = _to_fla_layout(*inputs)
-
-    def fla_fwd():
-        return chunk_delta_rule(q_fla, k_fla, v_fla, beta_fla, scale=scale)
-
-    bm.compare({"tileops": op, "fla": (fla_fwd, ())}, *inputs)
+    bench.Runner(op, case).compare(
+        {
+            FLA_TAG: fla_fn,
+            "torch": case.reference,
+            TORCH_COMPILE_TAG: compiled_reference(case.reference),
+        }
+    )

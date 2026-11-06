@@ -1,0 +1,1481 @@
+"""Methods generated from a parametric signature (docs/design/manifest.md § Call Semantics)."""
+
+from pathlib import Path
+
+import pytest
+import torch
+import yaml
+
+from tileops._ops._naming import operator_name
+from tileops._ops._signature_codegen import (
+    CheckError,
+    _SignaturePlan,
+    install,
+    install_compile_boundary,
+)
+from tileops.manifest import load_adts, load_manifest
+from tileops.manifest._expr import SignatureError
+from tileops.manifest._plan import entry_plan
+from tileops.manifest._workload import instantiate
+from workloads.device import run_device, run_device_available
+
+pytestmark = pytest.mark.smoke
+
+_CASES = yaml.safe_load((Path(__file__).parent / "manifest_cases.yaml").read_text())
+_ENTRIES = _CASES["entries"]
+
+
+def _op(name, params):
+    cls = type(name, (), {})
+    install(cls, _ENTRIES[name], _CASES["adts"])
+    op = cls()
+    vars(op).update(params)
+    op._construction_indices = op._check_construction()
+    return op
+
+
+def _calls(name):
+    sig = entry_plan(name, _ENTRIES[name], _CASES["adts"])
+    for row in _ENTRIES[name].get("workloads", []):
+        if not row.get("expect_fail"):
+            for case in row.get("dtype_cases") or [{}]:
+                yield instantiate(sig, row, case)
+
+
+@pytest.mark.parametrize("name", sorted(_ENTRIES))
+def test_check_accepts_every_instantiated_row(name):
+    for call in _calls(name):
+        tensors = call.materialize(device="cpu")
+        op = _op(name, call.arguments(tensors))
+        checked = type(op)._signature.check(op, tensors)
+        for t, spec in call.specs.items():
+            assert checked.tensors.get(t) == (None if spec is None else (spec.shape, spec.dtype))
+
+
+def _gemm(**roofline):
+    cls = type("GEMMFwdOp", (), {"__init__": lambda self, **p: vars(self).update(p)})
+    install(cls, {**_ENTRIES["GEMMFwdOp"], "roofline": roofline}, _CASES["adts"])
+    op = cls(trans_a=False, trans_b=True)
+    op._construction_indices = op._check_construction()
+    return op
+
+
+_A, _B = torch.zeros(4, 8, dtype=torch.float16), torch.zeros(16, 8, dtype=torch.float16)
+
+
+@pytest.mark.parametrize(
+    ("tensors", "message"),
+    [
+        ({"a": _A, "b": _B.float()}, "b dtype differs from T"),
+        ({"a": _A, "b": _B[:, :4]}, "does not match K"),
+        ({"a": _A[None], "b": _B}, "a needs rank == 2"),
+        ({"b": _B}, "'a' is required"),
+    ],
+    ids=["dtype", "axis", "rank", "missing"],
+)
+def test_check_rejects(tensors, message):
+    op = _gemm(flops="1")
+    with pytest.raises(ValueError, match=message):
+        type(op)._signature.check(op, tensors)
+
+
+@pytest.mark.parametrize("name", ["ClampTensorFwdOp", "GQAPrefillVarlenFwdOp", "SumFwdOp"])
+def test_check_traces_on_symints(name):
+    call = next(_calls(name))
+    tensors = call.materialize(device="cpu")
+    op = _op(name, call.arguments(tensors))
+    plan = type(op)._signature
+    torch._dynamo.reset()
+    compiled = torch.compile(lambda ts: plan.check(op, ts).tensors, fullgraph=True, dynamic=True)
+    assert compiled(tensors) == plan.check(op, tensors).tensors
+
+
+def test_eval_roofline_prices_the_last_call(monkeypatch):
+    derived = _gemm(flops="2 * M * N * K")
+    derived._last_call = type(derived)._signature.check(derived, {"a": _A, "b": _B})
+    assert derived.eval_roofline() == (2 * 4 * 16 * 8, (4 * 8 + 16 * 8 + 4 * 16) * 2)
+    written = _gemm(flops="M", bytes="bytes(d) if present(a) else 0")
+    written._last_call = derived._last_call
+    assert written.eval_roofline() == (4, 4 * 16 * 2)
+    import tileops._perf.formulas
+
+    monkeypatch.setattr(
+        tileops._perf.formulas,
+        "probe_gemm",
+        lambda call: (call.indices["M"], call.bytes("a")),
+        raising=False,
+    )
+    func = _gemm(func="tileops._perf.formulas.probe_gemm")
+    func._last_call = derived._last_call
+    assert func.eval_roofline() == (4, 4 * 8 * 2)
+    with pytest.raises(RuntimeError, match="needs a completed call"):
+        _gemm(flops="1").eval_roofline()
+
+
+def test_construction_checks_what_construction_decides():
+    _op("DSADecodeFwdOp", {"dim_tail": -1})  # a signed offset carries no obligation of its own
+    with pytest.raises(ValueError, match="axis 1 of hidden_states, hidden_size, is negative"):
+        _op(
+            "FusedMoESharedExpertFwdOp",
+            {"num_tokens": 2, "hidden_size": -1, "shared_ffn_size": None},
+        )
+
+
+def _probe(name, signature, forward, *, boundary=False, roofline=None, status="implemented"):
+    """An `Op` subclass whose entry is *signature* and whose `forward` is *forward*.
+
+    Without *boundary* the entry carries a composition, which is what leaves an op with a
+    call-time tensor input without a compile boundary.
+    """
+    from tileops._ops.op_base import Op
+
+    entry = {
+        "family": "probe",
+        "status": status,
+        "signature": signature,
+        "roofline": roofline or {"flops": "1"},
+    }
+    if not boundary:
+        entry["composition"] = {"kind": "composite", "stages": []}
+
+    def construct(self, **params):
+        vars(self).update(params)
+        Op.__init__(self)
+
+    # Inside tileops, as the in-tree ops these stand in for are: a target serves only those.
+    body = {"__module__": "tileops._probe", "__init__": construct, "forward": forward}
+    cls = type(name, (Op,), body)
+    install(cls, entry)
+    install_compile_boundary(cls, entry)
+    return cls
+
+
+_SILU = _ENTRIES["SiLUAndMulFwdOp"]["signature"]
+
+
+def test_op_call_runs_the_check_and_keeps_its_binding():
+    probe = _probe(
+        "ProbeSiLUAndMulFwdOp",
+        _SILU,
+        lambda self, x: x[:, : x.shape[1] // 2].clone(),
+        roofline={"flops": "M * N"},
+    )
+    op = probe()
+    with pytest.raises(RuntimeError, match="no call has completed"):
+        _ = op.last_call
+    op(torch.zeros(3, 8, dtype=torch.float16))
+    assert op.eval_roofline() == (12, (3 * 8 + 3 * 4) * 2)
+    assert op.eval_roofline_read_bytes() == 3 * 8 * 2
+    with pytest.raises(ValueError, match="axis 1 is not 2 \\* N"):
+        op(torch.zeros(3, 7, dtype=torch.float16))
+    assert op._infer_output_shapes((5, 8)) == {"output": (5, 4)}
+
+
+def test_the_returned_value_is_checked_before_the_call_is_kept():
+    op = _probe("ProbeWrongDtypeFwdOp", _SILU, lambda self, x: x[:, :4].float())()
+    with pytest.raises(ValueError, match="output has dtype torch.float32"):
+        op(torch.zeros(3, 8, dtype=torch.float16))
+    with pytest.raises(RuntimeError, match="needs a completed call"):
+        op.eval_roofline()
+
+
+def test_an_out_buffer_is_held_to_the_call_device():
+    signature = {
+        "forall": {"M": "Dim", "T": "DType[float16]"},
+        "inputs": {"x": {"dtype": "T", "shape": "[M]"}},
+        "outputs": {"y": {"dtype": "T", "shape": "[M]", "buffer": "out"}},
+    }
+    op = _probe("ProbeOutFwdOp", signature, lambda self, x, out=None: out)()
+    x = torch.zeros(3, dtype=torch.float16)
+    with pytest.raises(ValueError, match="out is not on the call device"):
+        op(x, torch.empty(3, dtype=torch.float16, device="meta"))
+    out = torch.empty(3, dtype=torch.float16)
+    assert op(x, out) is out
+
+
+def test_each_effect_branch_registers_its_own_operator():
+    signature = {
+        "forall": {"M": "Dim", "T": "DType[float16]"},
+        "params": {"inplace": {"type": "bool"}},
+        "inputs": {"x": {"dtype": "T", "shape": "[M]", "mutated": "inplace"}},
+        "outputs": {"y": {"dtype": "T", "shape": "[M]", "alias": "x"}},
+    }
+    probe = _probe(
+        "ProbeInplaceFwdOp",
+        signature,
+        lambda self, x: x.add_(1) if self.inplace else x + 1,
+        boundary=True,
+    )
+    assert probe.compile_op_names == (
+        "tileops::probe_inplace_fwd",
+        "tileops::probe_inplace_fwd_writes_x",
+    )
+    x = torch.zeros(2, dtype=torch.float16)
+    assert probe(inplace=True)(x) is x and x.tolist() == [1, 1]
+    y = probe(inplace=False)(x)
+    assert y is not x and y.tolist() == [2, 2]
+
+
+def test_a_traced_boundary_call_is_one_graph():
+    signature = {**_VEC, "outputs": {"y": {"dtype": "T", "shape": "[M]"}}}
+    op = _probe("ProbeTracedFwdOp", signature, lambda self, x: x + 1, boundary=True)()
+    x = torch.zeros(4, dtype=torch.float16)
+    torch._dynamo.reset()
+    compiled = torch.compile(op, fullgraph=True)
+    assert compiled(x).tolist() == [1] * 4
+    assert compiled(x).tolist() == [1] * 4
+
+
+def test_each_output_slot_is_returned_on_its_own():
+    signature = {
+        **_VEC,
+        "params": {"with_aux": {"type": "bool"}},
+        "outputs": {
+            "y": {"dtype": "T", "shape": "[M]", "buffer": "out"},
+            "aux": {"dtype": "T", "shape": "[M]", "nullable": "with_aux"},
+        },
+    }
+
+    def eager(self, x, out=None):
+        out.copy_(x + 1)
+        return out, (x + 2 if self.with_aux else None)
+
+    probe = _probe("ProbeMixedFwdOp", signature, eager, boundary=True)
+    x, out = torch.zeros(2, dtype=torch.float16), torch.empty(2, dtype=torch.float16)
+    y, aux = probe(with_aux=True)(x, out)
+    assert y is out and aux.tolist() == [2, 2]
+    y, aux = probe(with_aux=False)(x, out)
+    assert y is out and aux is None
+
+
+def test_the_fake_leaves_an_absent_output_absent():
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    signature = {
+        "forall": {"M": "Dim", "T": "DType[float16]"},
+        "params": {"with_aux": {"type": "bool"}},
+        "inputs": {"x": {"dtype": "T", "shape": "[M]"}},
+        "outputs": {
+            "y": {"dtype": "T", "shape": "[M]"},
+            "aux": {"dtype": "T", "shape": "[M]", "nullable": "with_aux"},
+        },
+    }
+    probe = _probe("ProbeNullableFwdOp", signature, lambda self, x: (x + 1, None), boundary=True)
+    op = probe(with_aux=False)
+    with FakeTensorMode() as mode:
+        y, aux = op(mode.from_tensor(torch.zeros(4, dtype=torch.float16)))
+    assert aux is None and tuple(y.shape) == (4,)
+
+
+def test_construction_holds_parameters_to_their_type():
+    signature = {
+        "forall": {"M": "Dim", "T": "DType[float16]"},
+        "params": {"flag": {"type": "bool"}},
+        "inputs": {"x": {"dtype": "T", "shape": "[M]"}},
+        "outputs": {"y": {"dtype": "T", "shape": "[M]"}},
+    }
+    probe = _probe("ProbeFlagFwdOp", signature, lambda self, x: x)
+    with pytest.raises(ValueError, match="flag = 1 is not a bool"):
+        probe(flag=1)
+
+
+def test_roofline_expressions_read_only_ix():
+    from tileops.manifest._plan import roofline_plan
+    from tileops.manifest._signature import parse_signature
+
+    sig = parse_signature("SiLUAndMulFwdOp", {"signature": _SILU}, {})
+    assert roofline_plan(sig, {"flops": "M * N", "bytes": "bytes(x) + bytes(output)"})[0] == []
+    errors = roofline_plan(sig, {"flops": "NOPE", "extra": 1})[0]
+    assert any("unknown key 'extra'" in e for e in errors)
+    assert any("'NOPE' is not in indices" in e for e in errors)
+    assert roofline_plan(None, {"flops": "isinstance(M)", "extra": 1})[0] == [
+        "roofline: unknown key 'extra'",
+        "roofline.flops: isinstance is not a built-in primitive",
+    ]
+
+
+_VEC = {
+    "forall": {"M": "Dim", "T": "DType[float16]"},
+    "inputs": {"x": {"dtype": "T", "shape": "[M]"}},
+}
+
+
+def test_execution_parameters_cross_the_compile_boundary():
+    def eager(self, x, scale: int = 1):
+        return x * scale
+
+    signature = {**_VEC, "outputs": {"y": {"dtype": "T", "shape": "[M]"}}}
+    op = _probe("ProbeScaleFwdOp", signature, eager, boundary=True)()
+    assert op(torch.ones(2, dtype=torch.float16), 3).tolist() == [3, 3]
+
+
+def test_a_returned_out_buffer_is_checked_after_the_call():
+    signature = {**_VEC, "outputs": {"y": {"dtype": "T", "shape": "[M]", "buffer": "out"}}}
+    op = _probe("ProbeResizeFwdOp", signature, lambda self, x, out=None: out.resize_(4))()
+    with pytest.raises(ValueError, match="y has shape"):
+        op(torch.zeros(3, dtype=torch.float16), torch.empty(3, dtype=torch.float16))
+
+
+def test_a_domain_restriction_on_parameters_is_checked_at_construction():
+    signature = {
+        **_VEC,
+        "params": {"flag": {"type": "bool"}},
+        "outputs": {"y": {"dtype": "T", "shape": "[M]"}},
+        "shape_rules": ["flag"],
+    }
+    probe = _probe("ProbeFlaggedFwdOp", signature, lambda self, x=None: x)
+    with pytest.raises(ValueError, match="refinement fails: flag"):
+        probe(flag=False)
+
+
+def test_a_contiguous_input_must_be_contiguous():
+    signature = {
+        "forall": {"M": "Dim", "N": "Dim", "T": "DType[float16]"},
+        "inputs": {"x": {"dtype": "T", "shape": "[M, N]", "contiguous": True}},
+        "outputs": {"y": {"dtype": "T", "shape": "[M, N]"}},
+    }
+    op = _probe("ProbeContiguousFwdOp", signature, lambda self, x: x)()
+    with pytest.raises(ValueError, match="x must be contiguous"):
+        op(torch.zeros(3, 2, dtype=torch.float16).t())
+
+
+def test_an_alias_is_priced_as_a_fresh_output_where_its_input_is_not_written():
+    signature = {
+        **_VEC,
+        "params": {"inplace": {"type": "bool"}},
+        "inputs": {"x": {"dtype": "T", "shape": "[M]", "mutated": "inplace"}},
+        "outputs": {"y": {"dtype": "T", "shape": "[M]", "alias": "x"}},
+    }
+    probe = _probe("ProbeAliasFwdOp", signature, lambda self, x: x + 1)
+    op = probe(inplace=False)
+    op(torch.zeros(4, dtype=torch.float16))
+    assert op.eval_roofline()[1] == 4 * 2 + 4 * 2
+
+
+def test_an_adt_parameter_must_be_its_declared_class():
+    from tileops._ops.moe.contracts import MaskedLayoutSpec
+
+    cls = type("MoEPrePermuteFwdOp", (), {})
+    install(cls, _ENTRIES["MoEPrePermuteFwdOp"], _CASES["adts"])
+    op = cls()
+    vars(op).update(layout=MaskedLayoutSpec(max_m=4), num_local_experts=2)
+    op._check_construction()
+    op.layout = type("Impostor", (), {"kind": "masked", "max_m": 4})()
+    with pytest.raises(ValueError, match="is not an object of a MGroupedLayout constructor"):
+        op._check_construction()
+
+
+def test_every_manifest_construction_point_emits():
+    """A point's checks are emitted on the first construction there; emitting every point of
+    every manifest entry keeps one that no other test constructs compiling."""
+    adts = load_adts()
+    for name, entry in load_manifest().items():
+        try:
+            plan = _SignaturePlan(entry_plan(name, entry, adts))
+        except SignatureError:
+            continue
+        for key in list(plan._pending):
+            plan._emit(key)
+        assert not plan._pending, name
+
+
+def test_axes_nothing_reads_emit_no_checks():
+    signature = {
+        **_VEC,
+        "params": {f"unused{i}": {"type": "bool"} for i in range(12)},
+        "outputs": {"y": {"dtype": "T", "shape": "[M]"}},
+    }
+    cls = type("ProbeUnusedFwdOp", (), {})
+    install(cls, {"signature": signature}, {})
+    assert len(cls._signature.effects) == 1
+
+
+def test_an_output_present_with_out_has_its_own_operator():
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    signature = {
+        **_VEC,
+        "outputs": {
+            "y": {"dtype": "T", "shape": "[M]", "buffer": "out"},
+            "aux": {"dtype": "T", "shape": "[M]", "nullable": "present(out)"},
+        },
+    }
+
+    def eager(self, x, out=None):
+        if out is None:
+            return x + 1, None
+        out.copy_(x + 1)
+        return out, x + 2
+
+    op = _probe("ProbeOutAuxFwdOp", signature, eager, boundary=True)()
+    x, out = torch.zeros(2, dtype=torch.float16), torch.empty(2, dtype=torch.float16)
+    y, aux = op(x, out)
+    assert y is out and aux.tolist() == [2, 2]
+    with FakeTensorMode() as mode:
+        _, aux = op(mode.from_tensor(x), mode.from_tensor(out))
+    assert tuple(aux.shape) == (2,)
+    torch._dynamo.reset()
+    y, aux = torch.compile(op, fullgraph=True)(x, out)
+    assert aux.tolist() == [2, 2]
+
+
+def test_one_instance_takes_its_own_branch_per_presence():
+    """An effect branch is a function of what the call passed, not of the instance. One
+    instance that first omits two optional inputs, then passes them, takes the branch that
+    writes one and emits the output the other gates, and takes the first branch again when
+    the next call omits them."""
+    signature = {
+        "forall": {"M": "Dim", "T": "DType[float16]"},
+        "inputs": {
+            "x": {"dtype": "T", "shape": "[M]"},
+            "bias": {"dtype": "T", "shape": "[M]", "optional": True},
+            "acc": {"dtype": "T", "shape": "[M]", "optional": True, "mutated": "present(acc)"},
+        },
+        "outputs": {
+            "y": {"dtype": "T", "shape": "[M]"},
+            "aux": {"dtype": "T", "shape": "[M]", "nullable": "present(bias)"},
+        },
+    }
+
+    def eager(self, x, bias=None, acc=None):
+        if acc is not None:
+            acc.add_(x)
+        return x + (1 if bias is None else bias), (None if bias is None else bias + 1)
+
+    op = _probe("ProbeBranchPerPresenceFwdOp", signature, eager, boundary=True)()
+    x = torch.ones(2, dtype=torch.float16)
+    bias = torch.full((2,), 3, dtype=torch.float16)
+    acc = torch.zeros(2, dtype=torch.float16)
+    y, aux = op(x)
+    assert y.tolist() == [2, 2] and aux is None and acc.tolist() == [0, 0]
+    y, aux = op(x, bias, acc)
+    assert y.tolist() == [4, 4] and aux.tolist() == [4, 4] and acc.tolist() == [1, 1]
+    y, aux = op(x)
+    assert y.tolist() == [2, 2] and aux is None and acc.tolist() == [1, 1]
+
+
+def test_a_cpu_construction_tensor_takes_its_declared_dtype():
+    signature = {
+        **_VEC,
+        "params": {"table": {"dtype": "float16", "shape": "[4]", "device": "cpu"}},
+        "outputs": {"y": {"dtype": "T", "shape": "[M]"}},
+    }
+    op = _probe("ProbeTableFwdOp", signature, lambda self, x: x.clone())(table=torch.zeros(4))
+    op(torch.zeros(2, dtype=torch.float16))
+    assert op.table.dtype == torch.float16 and op.table.device.type == "cpu"
+
+
+def test_a_roofline_func_must_yield_two_ints(monkeypatch):
+    import tileops._perf.formulas
+
+    monkeypatch.setattr(tileops._perf.formulas, "probe_float", lambda call: (1.5, 2), raising=False)
+    signature = {**_VEC, "outputs": {"y": {"dtype": "T", "shape": "[M]"}}}
+    op = _probe(
+        "ProbeFloatRoofFwdOp",
+        signature,
+        lambda self, x: x.clone(),
+        roofline={"func": "tileops._perf.formulas.probe_float"},
+    )()
+    op(torch.zeros(2, dtype=torch.float16))
+    with pytest.raises(TypeError, match="not \\(flops: int, bytes: int\\)"):
+        op.eval_roofline()
+
+
+def test_a_fresh_output_owns_its_storage():
+    signature = {**_VEC, "outputs": {"y": {"dtype": "T", "shape": "[M]"}}}
+    op = _probe("ProbeReturnsInputFwdOp", signature, lambda self, x: x)()
+    with pytest.raises(ValueError, match="y shares storage"):
+        op(torch.zeros(2, dtype=torch.float16))
+    held = {**signature, "params": {"table": {"dtype": "T", "shape": "[M]"}}}
+    table = torch.zeros(2, dtype=torch.float16)
+    op = _probe("ProbeHeldFwdOp", held, lambda self, x: self.table)(table=table)
+    with pytest.raises(ValueError, match="y shares storage"):
+        op(torch.zeros(2, dtype=torch.float16))
+
+
+def test_generated_methods_bind_inputs_by_name():
+    signature = {
+        **_VEC,
+        "inputs": {**_VEC["inputs"], "w": {"dtype": "T", "shape": "[M]", "optional": True}},
+        "outputs": {"y": {"dtype": "T", "shape": "[M]"}},
+    }
+    op = _probe("ProbeNamedFwdOp", signature, lambda self, x, w=None: x + 1)()
+    x = torch.zeros(2, dtype=torch.float16)
+    op(x, w=x)
+    with pytest.raises(ValueError, match="'x' is not a tensor"):
+        type(op)._signature.check(op, {"x": 3, "w": None})
+    assert op._infer_output_shapes(x=(2,)) == {"y": (2,)}
+    with pytest.raises(TypeError):
+        op._infer_output_shapes((2,), (9,), (1,))
+
+
+def test_a_kw_only_input_is_taken_by_name_after_out():
+    """The boundary, the body and `_infer_output_shapes` take a `kw_only` input after `out`,
+    keyword-only, so a positional `out` binds `out`."""
+    signature = {
+        **_VEC,
+        "inputs": {
+            **_VEC["inputs"],
+            "w": {"dtype": "T", "shape": "[M]", "optional": True, "kw_only": True},
+        },
+        "outputs": {"y": {"dtype": "T", "shape": "[M]", "buffer": "out"}},
+    }
+
+    def eager(self, x, out=None, *, w=None):
+        y = x + 1 if w is None else x + w
+        return y if out is None else out.copy_(y)
+
+    op = _probe("ProbeKeywordFwdOp", signature, eager, boundary=True)()
+    x, w = torch.ones(2, dtype=torch.float16), torch.full((2,), 5, dtype=torch.float16)
+    out = torch.zeros(2, dtype=torch.float16)
+    assert op(x, out) is out and out.tolist() == [2, 2]
+    assert op(x, out, w=w) is out and out.tolist() == [6, 6]
+    with pytest.raises(TypeError):
+        op(x, out, w)
+    assert op._infer_output_shapes((2,), w=(2,)) == {"y": (2,)}
+    with pytest.raises(TypeError):
+        op._infer_output_shapes((2,), (2,))
+
+
+def test_a_roofline_reads_the_presence_of_out():
+    signature = {**_VEC, "outputs": {"y": {"dtype": "T", "shape": "[M]", "buffer": "out"}}}
+
+    def eager(self, x, out=None):
+        return x + 1 if out is None else out.copy_(x + 1)
+
+    op = _probe(
+        "ProbeOutRoofFwdOp", signature, eager, roofline={"flops": "1 if present(out) else 2"}
+    )()
+    x = torch.zeros(2, dtype=torch.float16)
+    op(x)
+    assert op.eval_roofline()[0] == 2
+    op(x, torch.empty(2, dtype=torch.float16))
+    assert op.eval_roofline()[0] == 1
+
+
+def test_one_output_at_most_takes_the_out_buffer():
+    from tileops.manifest._plan import effect_errors
+    from tileops.manifest._signature import parse_signature
+
+    buffered = {"dtype": "T", "shape": "[M]", "buffer": "out"}
+    signature = {**_VEC, "outputs": {"y": buffered, "z": buffered}}
+    sig = parse_signature("ProbeTwoOutFwdOp", {"signature": signature}, {})
+    assert effect_errors(sig) == [
+        "outputs ['y', 'z']: one output takes the `out` buffer, not several"
+    ]
+
+
+def test_a_non_tensor_out_fails_by_name():
+    signature = {**_VEC, "outputs": {"y": {"dtype": "T", "shape": "[M]", "buffer": "out"}}}
+    op = _probe("ProbeIntOutFwdOp", signature, lambda self, x, out=None: x.clone())()
+    with pytest.raises(ValueError, match="'out' is not a tensor"):
+        op(torch.zeros(2, dtype=torch.float16), 3)
+
+
+def test_a_failed_evaluation_names_its_declaration():
+    signature = {
+        "forall": {"A": "Shape", "B": "Shape", "T": "DType[float16]"},
+        "inputs": {"x": {"dtype": "T", "shape": "[*A]"}, "y": {"dtype": "T", "shape": "[*B]"}},
+        "outputs": {"z": {"dtype": "T", "shape": "[*broadcast(A, B)]"}},
+    }
+    op = _probe("ProbeBroadcastFwdOp", signature, lambda self, x, y: x + y)()
+    x, y = torch.zeros(2, dtype=torch.float16), torch.zeros(3, dtype=torch.float16)
+    with pytest.raises(
+        CheckError, match="ProbeBroadcastFwdOp: tensor 'z' shape: .*not broadcastable"
+    ):
+        op(x, y)
+
+
+def test_a_construction_tensor_spliced_by_a_call_index_is_checked_per_call():
+    signature = {
+        "forall": {"S": "Shape", "T": "DType[float16]"},
+        "inputs": {"x": {"dtype": "T", "shape": "[*S]"}},
+        "params": {"table": {"dtype": "T", "shape": "[*broadcast(S, S)]"}},
+        "outputs": {"y": {"dtype": "T", "shape": "[*S]"}},
+    }
+    probe = _probe("ProbeSplicedFwdOp", signature, lambda self, x: x.clone())
+    op = probe(table=torch.zeros(2, 3, dtype=torch.float16))
+    op(torch.zeros(2, 3, dtype=torch.float16))
+    with pytest.raises(ValueError, match="table has the wrong rank|table shape does not match"):
+        op(torch.zeros(2, 3, 1, dtype=torch.float16))
+
+
+def test_an_obligation_a_call_time_presence_activates_waits_for_the_call():
+    signature = {
+        **_VEC,
+        "params": {"p": {"type": "int", "default": -1}},
+        "inputs": {**_VEC["inputs"], "w": {"dtype": "T", "shape": "[p]", "optional": True}},
+        "outputs": {"y": {"dtype": "T", "shape": "[M]"}},
+        "shape_rules": ["not present(w) or p >= 0"],
+    }
+    op = _probe("ProbeDeferredFwdOp", signature, lambda self, x, w=None: x + 1)(p=-1)
+    op(torch.zeros(2, dtype=torch.float16))
+    with pytest.raises(ValueError, match="w shape does not match p"):
+        op(torch.zeros(2, dtype=torch.float16), torch.zeros(0, dtype=torch.float16))
+
+
+def test_a_construction_time_tensor_is_given_exactly_where_its_presence_holds():
+    signature = {
+        **_VEC,
+        "params": {
+            "flag": {"type": "bool"},
+            "table": {"dtype": "T", "shape": "[M]", "optional": "flag"},
+        },
+        "outputs": {"y": {"dtype": "T", "shape": "[M]"}},
+    }
+    probe = _probe("ProbeGatedFwdOp", signature, lambda self, x: x + 1)
+    with pytest.raises(ValueError, match="'table' is given where its presence condition is false"):
+        probe(flag=False, table=torch.zeros(2, dtype=torch.float16))
+    with pytest.raises(ValueError, match="construction-time tensor 'table' is required"):
+        probe(flag=True, table=None)
+
+
+def test_the_checked_call_holds_generated_construction_time_tensors():
+    signature = {
+        **_VEC,
+        "forall": {**_VEC["forall"], "L": "Seq[Int]", "N": "Dim"},
+        "params": {"table": {"dtype": "int32", "shape": "[N]", "values": "as_tensor(L)"}},
+        "outputs": {"y": {"dtype": "T", "shape": "[M]"}},
+    }
+    table = torch.tensor([3, 1], dtype=torch.int32)
+    op = _probe("ProbeTableValuesFwdOp", signature, lambda self, x: x + 1)(table=table)
+    op(torch.zeros(2, dtype=torch.float16))
+    assert op.last_call.metadata_values("table") == [3, 1]
+
+
+def test_shape_inference_binds_dtype_indices_from_the_dtypes_passed():
+    signature = {
+        "forall": {"M": "Dim", "T": "DType[float16 | float32]"},
+        "inputs": {"x": {"dtype": "T", "shape": "[M]"}},
+        "let": {"H": "M // 2 if T == 'float16' else M"},
+        "outputs": {"y": {"dtype": "T", "shape": "[H]"}},
+    }
+    op = _probe("ProbePackedFwdOp", signature, lambda self, x: x[: x.shape[0] // 2].clone())()
+    assert op._infer_output_shapes((4,), dtypes={"x": torch.float16}) == {"y": (2,)}
+    with pytest.raises(ValueError, match="let H: .*'T'"):
+        op._infer_output_shapes((4,))
+
+
+def test_an_entry_with_a_call_time_input_and_no_composition_has_a_compile_boundary():
+    source = {
+        "forall": {"T": "DType[float16]"},
+        "params": {"n": {"type": "int"}},
+        "outputs": {"y": {"dtype": "T", "shape": "[n]"}},
+    }
+    # `boundary=True` leaves the composition out, so only the missing input decides here.
+    assert (
+        _probe("ProbeSourceFwdOp", source, lambda self: None, boundary=True).compile_op_names == ()
+    )
+    assert _probe("ProbeComposedFwdOp", _SILU, lambda self, x: None).compile_op_names == ()
+    leaf = _probe("ProbeLeafFwdOp", _SILU, lambda self, x: None, boundary=True)
+    assert leaf.compile_op_names == ("tileops::probe_leaf_fwd",)
+
+
+@pytest.fixture
+def acme():
+    """Return ``serve(op_name, build)``, which has the target ``acme`` serve a probe op."""
+    from tileops.backend import _registry as registry
+
+    state = registry.snapshot()
+    registry.DETECTORS.clear()
+    registry.BUILDERS.clear()
+    registry.default_target, registry._loaded = None, True
+    registry.register_detector("acme", lambda device: True)
+
+    def serve(op_name, build):
+        # A probe op has no manifest entry, which `register_kernel_builder` requires.
+        registry.BUILDERS[(op_name, "acme")] = build
+
+    yield serve
+    registry.restore(state)
+
+
+def test_a_target_served_call_leaves_constructor_attributes_alone(acme):
+    acme("ProbeTargetDtypeFwdOp", lambda *i, **p: lambda x: x[:, : x.shape[1] // 2].clone())
+    op = _probe("ProbeTargetDtypeFwdOp", _SILU, lambda self, x: None)
+    op = op(dtype=torch.float32)
+    op(torch.zeros(3, 8, dtype=torch.float16))
+    assert op.serving_target == "acme"
+    assert op.dtype == torch.float32
+
+
+def test_a_target_served_spec_only_call_is_checked_before_the_target_is_asked(acme):
+    asked = []
+    acme("ProbeSpecOnlyFwdOp", lambda *i, **p: asked.append(i) or (lambda x: x))
+    op = _probe("ProbeSpecOnlyFwdOp", _SILU, lambda self, x: None, status="spec-only")()
+    with pytest.raises(ValueError, match="x dtype"):
+        op(torch.zeros(3, 8, dtype=torch.float32))
+    assert asked == []
+
+
+@pytest.mark.parametrize("boundary", [False, True])
+def test_a_call_on_meta_tensors_completes_and_is_priced(boundary):
+    forward = lambda self, x: x[:, : x.shape[1] // 2].clone()  # noqa: E731
+    name = f"ProbeMeta{'Boundary' if boundary else ''}FwdOp"
+    op = _probe(name, _SILU, forward, boundary=boundary, roofline={"flops": "M * N"})()
+    op(torch.empty(3, 8, dtype=torch.float16, device="meta"))
+    assert op.eval_roofline() == (12, (3 * 8 + 3 * 4) * 2)
+
+
+def test_an_op_without_a_boundary_traces_inside_a_compiled_caller():
+    op = _probe("ProbeInlineFwdOp", _SILU, lambda self, x: x[:, : x.shape[1] // 2] * 2)()
+    torch._dynamo.reset()
+    compiled = torch.compile(lambda x: op(x) + 1, fullgraph=True)
+    assert compiled(torch.ones(3, 8, dtype=torch.float16)).tolist() == [[3] * 4] * 3
+
+
+def test_a_traced_first_call_binds_the_target_and_passes_its_execution_arguments(acme, monkeypatch):
+    flags = []
+
+    def kernel(x, *, flag=False):
+        flags.append(flag)
+        return x[:, : x.shape[1] // 2].clone()
+
+    def forward(self, x, flag: bool = False):
+        raise AssertionError("the in-tree forward ran for a target-served op")
+
+    acme("ProbeTracedTargetFwdOp", lambda *i, **p: kernel)
+    op = _probe("ProbeTracedTargetFwdOp", _SILU, forward)()
+    # The branch a call takes while Dynamo traces it, on an op without a compile boundary.
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    op(torch.zeros(3, 8, dtype=torch.float16), flag=True)
+    assert op.serving_target == "acme" and flags == [True]
+
+
+def test_a_meta_call_holds_no_metadata_values():
+    from tileops._ops._signature_codegen import SignatureCall
+    from tileops.backend import OpNotAvailableError
+
+    ids = torch.empty(2, 2, dtype=torch.int32, device="meta")
+    call = SignatureCall({}, {"ids": ((2, 2), "int32")}, (), metadata={"ids": ids})
+    with pytest.raises(OpNotAvailableError, match="holds no values"):
+        call.metadata_values("ids")
+    assert SignatureCall({}, {}, (), metadata={"ids": torch.ones(2)}).metadata_values("ids") == [
+        1.0,
+        1.0,
+    ]
+
+
+def _staged_parent(name: str, forward, *, boundary=False):
+    leaf_cls = _probe(f"{name}LeafFwdOp", _SILU, lambda self, x: x[:, : x.shape[1] // 2] * 1)
+    parent_cls = _probe(f"{name}FwdOp", _SILU, forward, boundary=boundary)
+    parent_cls.delegate_types = {"leaf": leaf_cls}
+    return parent_cls()
+
+
+def test_a_composite_call_carries_only_the_stage_calls_it_ran():
+    # A boundary parent's meta call completes in its fake, which runs no sub-op.
+    parent = _staged_parent(
+        "ProbeStaged", lambda self, x: self.delegate_for("leaf", None)(x), boundary=True
+    )
+    parent(torch.ones(3, 8, dtype=torch.float16))
+    (leaf_call,) = parent.last_call.stages["leaf"]
+    assert leaf_call is parent._held_delegates()[0].last_call
+    parent(torch.ones(2, 8, dtype=torch.float16, device="meta"))
+    assert parent.last_call.stages == {"leaf": ()}
+
+
+def test_a_composite_call_carries_every_call_of_a_stage():
+    def forward(self, x):
+        leaf = self.delegate_for("leaf", None)
+        leaf(x[:1].contiguous())
+        return leaf(x)
+
+    parent = _staged_parent("ProbeTwice", forward)
+    parent(torch.ones(3, 8, dtype=torch.float16))
+    assert [c.indices["M"] for c in parent.last_call.stages["leaf"]] == [1, 3]
+
+
+def test_a_meta_call_of_an_op_returning_nothing_completes_and_is_priced():
+    signature = {
+        "forall": {"M": "Dim", "N": "Dim", "T": "DType[float16 | float32]"},
+        "inputs": {
+            "result": {"dtype": "T", "shape": "[M, N]", "mutated": True, "write_only": True},
+            "x": {"dtype": "T", "shape": "[M, N]"},
+        },
+        "outputs": {},
+    }
+    op = _probe(
+        "ProbeWriteOnlyFwdOp",
+        signature,
+        lambda self, result, x: (result.copy_(x), None)[1],
+        boundary=True,
+        roofline={"flops": "M * N"},
+    )()
+    x = torch.empty(3, 8, dtype=torch.float16, device="meta")
+    assert op(torch.empty_like(x), x) is None
+    assert op.eval_roofline() == (24, 2 * 3 * 8 * 2)
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "family, class_name, expected",
+    [
+        ("norm", "RMSNormFwdOp", "norm_rms_norm_fwd"),
+        ("convolution", "Conv2dFwdOp", "convolution_conv2d_fwd"),
+        ("moe", "MoEPrePermuteFwdOp", "moe_pre_permute_fwd"),
+    ],
+)
+def test_the_operator_names_its_family_once(family: str, class_name: str, expected: str) -> None:
+    assert operator_name(family, class_name) == expected
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "family, class_name, expected",
+    [
+        # One capital inside the abbreviation, which the case split would otherwise take.
+        ("moe", "FusedMoEExpertsFwdOp", "moe_fused_moe_experts_fwd"),
+        # A digit on each side of the capital.
+        ("gemm", "GEMMW4A16FwdOp", "gemm_w4a16_fwd"),
+        ("gemm", "GEMMINT8W8A8FwdOp", "gemm_int8_w8a8_fwd"),
+        # Two abbreviations, one of them the family's own name.
+        ("fft", "FFTC2CFwdOp", "fft_c2c_fwd"),
+        # Two abbreviations in a row.
+        ("sampling", "TopKTopPMaskFwdOp", "sampling_topk_topp_mask_fwd"),
+    ],
+)
+def test_an_abbreviation_stays_one_word(family: str, class_name: str, expected: str) -> None:
+    assert operator_name(family, class_name) == expected
+
+
+def test_fresh_output_rejects_overlapping_dlpack_storage():
+    signature = {**_VEC, "outputs": {"y": {"dtype": "T", "shape": "[M]"}}}
+    buffer = torch.zeros(8, dtype=torch.float16)
+    x = torch.from_dlpack(buffer[:4])
+    y = torch.from_dlpack(buffer[2:6])
+    op = _probe("ProbeImportedAliasFwdOp", signature, lambda self, x: y)()
+    with pytest.raises(ValueError, match="y shares storage"):
+        op(x)
+
+
+def test_fresh_output_accepts_disjoint_dlpack_storage():
+    signature = {**_VEC, "outputs": {"y": {"dtype": "T", "shape": "[M]"}}}
+    buffer = torch.zeros(8, dtype=torch.float16)
+    x = torch.from_dlpack(buffer[:4])
+    separate = torch.from_dlpack(buffer[4:])
+    op = _probe("ProbeImportedDisjointFwdOp", signature, lambda self, x: separate)()
+    assert op(x) is separate
+
+
+def test_storage_ownership_matches_enumerated_imported_bytes():
+    """Imported storage ownership matches byte-set intersection on all small slices."""
+    from tileops._ops._signature_codegen import _owns_storage_apart
+
+    buffer = torch.zeros(4, dtype=torch.uint8)
+    views = [
+        (torch.from_dlpack(buffer[start:end]), set(range(start, end)))
+        for start in range(buffer.numel() + 1)
+        for end in range(start, buffer.numel() + 1)
+    ]
+    for first, first_bytes in views:
+        for second, second_bytes in views:
+            assert _owns_storage_apart(first, (second,)) is not bool(first_bytes & second_bytes)
+
+
+def test_fresh_output_rejects_disjoint_views_of_one_owned_storage():
+    """Disjoint tensor spans still share ownership when they use the same storage."""
+    signature = {**_VEC, "outputs": {"y": {"dtype": "T", "shape": "[M]"}}}
+    buffer = torch.zeros(8, dtype=torch.float16)
+    op = _probe("ProbeSharedOwnerFwdOp", signature, lambda self, x: buffer[4:])()
+    with pytest.raises(ValueError, match="y shares storage"):
+        op(buffer[:4])
+
+
+def test_a_repeated_layout_reuses_its_plan_and_another_layout_resolves_one():
+    signature = {
+        "forall": {"M": "Dim", "N": "Dim", "T": "DType[float16]"},
+        "inputs": {"x": {"dtype": "T", "shape": "[M, N]", "contiguous": True}},
+        "outputs": {"y": {"dtype": "T", "shape": "[M, N]"}},
+    }
+    op = _probe("ProbeRepeatFwdOp", signature, lambda self, x: x.clone(), boundary=True)()
+    op(torch.zeros(3, 2, dtype=torch.float16))
+    first = op.last_call
+    plan = type(op)._signature
+
+    def check(*args, **kwargs):
+        raise AssertionError("a repeated layout runs the checks again")
+
+    plan.check = check
+    try:
+        op(torch.ones(3, 2, dtype=torch.float16))
+    finally:
+        del plan.check
+    # Each call keeps a record of its own, with the facts the plan holds.
+    assert op.last_call is not first and op.last_call == first
+    op(torch.zeros(4, 2, dtype=torch.float16))
+    assert op.last_call.indices["M"] == 4
+    with pytest.raises(ValueError, match="x must be contiguous"):
+        op(torch.zeros(2, 4, dtype=torch.float16).t())
+
+
+def _inplace_probe():
+    signature = {
+        "forall": {"M": "Dim", "T": "DType[float16]"},
+        "params": {"inplace": {"type": "bool"}},
+        "inputs": {"x": {"dtype": "T", "shape": "[M]", "mutated": "inplace"}},
+        "outputs": {"y": {"dtype": "T", "shape": "[M]", "alias": "x"}},
+    }
+    return _probe("ProbeEagerInplaceFwdOp", signature, lambda self, x: x.add_(1), boundary=True)(
+        inplace=True
+    )
+
+
+def test_an_eager_call_outside_any_mode_versions_its_written_input_as_the_dispatcher_does():
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class Passthrough(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            return func(*args, **(kwargs or {}))
+
+    op = _inplace_probe()
+    x = torch.zeros(2, dtype=torch.float16)
+    before = x._version
+    with Passthrough():
+        op(x)
+    dispatched = x._version - before
+    boundary = type(op)._call_boundary.__globals__["_boundary"]
+    saved = dict(boundary.branches)
+
+    def undispatched(*args):
+        raise AssertionError("a plain eager call reached the dispatcher")
+
+    for effect, branch in saved.items():
+        boundary.branches[effect] = (undispatched, *branch[1:])
+    try:
+        before = x._version
+        op(x)
+    finally:
+        boundary.branches.update(saved)
+    assert x._version - before == dispatched
+    assert x.tolist() == [2, 2]
+
+
+def test_an_eager_call_missing_a_written_input_raises_its_check():
+    """A call that omits an input its branch writes fails on the signature check, as the
+    dispatched call does, rather than on versioning the absent input."""
+    signature = {
+        "forall": {"M": "Dim", "T": "DType[float16]"},
+        "inputs": {
+            "x": {"dtype": "T", "shape": "[M]"},
+            "mean": {"dtype": "T", "shape": "[M]", "optional": True, "mutated": "present(mean)"},
+            "var": {
+                "dtype": "T",
+                "shape": "[M]",
+                "optional": "present(mean)",
+                "mutated": "present(mean)",
+            },
+        },
+        "outputs": {"y": {"dtype": "T", "shape": "[M]"}},
+    }
+
+    def forward(self, x, mean=None, var=None):
+        mean.add_(1)
+        var.add_(1)
+        return x + 1
+
+    op = _probe("ProbeMissingWrittenFwdOp", signature, forward, boundary=True)()
+    x, mean = torch.zeros(2, dtype=torch.float16), torch.zeros(2, dtype=torch.float16)
+    with pytest.raises(ValueError, match="'var' is required"):
+        op(x, mean)
+
+
+def test_a_failed_eager_call_versions_the_input_it_wrote():
+    signature = {
+        "forall": {"M": "Dim", "T": "DType[float16]"},
+        "params": {"inplace": {"type": "bool"}},
+        "inputs": {"x": {"dtype": "T", "shape": "[M]", "mutated": "inplace"}},
+        "outputs": {"y": {"dtype": "T", "shape": "[M]", "alias": "x"}},
+    }
+
+    def forward(self, x):
+        x.add_(1)
+        raise RuntimeError("after the write")
+
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class Passthrough(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            return func(*args, **(kwargs or {}))
+
+    op = _probe("ProbeFailingInplaceFwdOp", signature, forward, boundary=True)(inplace=True)
+    x = torch.zeros(2, dtype=torch.float16)
+    before = x._version
+    with pytest.raises(RuntimeError, match="after the write"), Passthrough():
+        op(x)
+    dispatched = x._version - before
+    before = x._version
+    with pytest.raises(RuntimeError, match="after the write"):
+        op(x)
+    assert x._version - before == dispatched
+
+
+def test_a_call_under_a_dispatch_mode_reaches_the_operator():
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    seen = []
+
+    class Recorder(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            seen.append(str(func))
+            return func(*args, **(kwargs or {}))
+
+    op = _inplace_probe()
+    with Recorder():
+        op(torch.zeros(2, dtype=torch.float16))
+    assert any(name.startswith("tileops.probe_eager_inplace_fwd") for name in seen), seen
+
+
+@pytest.mark.parametrize(
+    "second, message",
+    [
+        (lambda x: x, "shares storage"),
+        (lambda x: x.clone().float(), "has dtype"),
+        (lambda x: x[:, :1].clone(), "has shape"),
+    ],
+)
+def test_a_repeated_call_still_checks_what_forward_returns(second, message):
+    signature = {
+        "forall": {"M": "Dim", "N": "Dim", "T": "DType[float16]"},
+        "inputs": {"x": {"dtype": "T", "shape": "[M, N]"}},
+        "outputs": {"y": {"dtype": "T", "shape": "[M, N]"}},
+    }
+    returns = [lambda x: x.clone(), second]
+    op = _probe(
+        "ProbeRepeatResultFwdOp", signature, lambda self, x: returns.pop(0)(x), boundary=True
+    )()
+    x = torch.zeros(3, 2, dtype=torch.float16)
+    op(x)
+    with pytest.raises(ValueError, match=message):
+        op(x)
+
+
+def test_a_param_changed_after_construction_is_checked_on_the_next_call():
+    signature = {
+        "forall": {"M": "Dim", "T": "DType[float16]"},
+        "params": {"flag": {"type": "bool"}},
+        "inputs": {"x": {"dtype": "T", "shape": "[M]"}},
+        "outputs": {"y": {"dtype": "T", "shape": "[M]"}},
+        "shape_rules": ["flag"],
+    }
+    op = _probe("ProbeParamRuleFwdOp", signature, lambda self, x: x.clone(), boundary=True)(
+        flag=True
+    )
+    x = torch.zeros(4, dtype=torch.float16)
+    op(x)
+    op.flag = False
+    with pytest.raises(ValueError, match="flag"):
+        op(x)
+
+
+def test_a_check_is_looked_up_once_per_presence():
+    signature = {
+        "forall": {"M": "Dim", "T": "DType[float16]"},
+        "inputs": {"x": {"dtype": "T", "shape": "[M]"}},
+        "outputs": {"y": {"dtype": "T", "shape": "[M]"}},
+    }
+    op = _probe("ProbeLookupOnceFwdOp", signature, lambda self, x: x.clone(), boundary=True)()
+    op(torch.zeros(3, dtype=torch.float16))
+    plan = type(op)._signature
+
+    def lookup(*args):
+        raise AssertionError("the check was looked up again")
+
+    plan._lookup = lookup
+    try:
+        op(torch.zeros(5, dtype=torch.float16))
+    finally:
+        del plan._lookup
+    assert op.last_call.indices["M"] == 5
+
+
+def test_an_effect_param_changed_after_construction_takes_its_branch_on_the_next_call():
+    signature = {
+        "forall": {"M": "Dim", "T": "DType[float16]"},
+        "params": {"inplace": {"type": "bool"}},
+        "inputs": {"x": {"dtype": "T", "shape": "[M]", "mutated": "inplace"}},
+        "outputs": {"y": {"dtype": "T", "shape": "[M]", "alias": "x"}},
+    }
+    op = _probe(
+        "ProbeEffectParamFwdOp",
+        signature,
+        lambda self, x: x.add_(1) if self.inplace else x + 1,
+        boundary=True,
+    )(inplace=False)
+    x = torch.zeros(2, dtype=torch.float16)
+    assert op(x) is not x
+    op.inplace = True
+    before = x._version
+    assert op(x) is x
+    assert x._version - before == 1 and x.tolist() == [1, 1]
+
+
+@pytest.mark.parametrize("emit", [False, True])
+def test_a_repeated_call_returns_an_absent_nullable_output_absent(emit):
+    signature = {
+        "forall": {"M": "Dim", "T": "DType[float16]"},
+        "params": {"emit": {"type": "bool"}},
+        "inputs": {"x": {"dtype": "T", "shape": "[M]"}},
+        "outputs": {"y": {"dtype": "T", "shape": "[M]", "nullable": "emit"}},
+    }
+    op = _probe(
+        "ProbeNullableRepeatFwdOp",
+        signature,
+        lambda self, x: x.clone() if self.emit else None,
+        boundary=True,
+    )(emit=emit)
+    x = torch.zeros(3, dtype=torch.float16)
+    for _ in range(2):
+        y = op(x)
+        assert (y is not None) == emit
+
+
+@pytest.mark.skipif(
+    not run_device_available() or torch.device(run_device()).type == "cpu",
+    reason="needs a device besides the CPU",
+)
+def test_a_repeat_places_a_call_without_device_bearing_inputs_on_the_current_device(monkeypatch):
+    import tileops._ops._signature_codegen as codegen
+
+    signature = {
+        "forall": {"M": "Dim", "T": "DType[int32]"},
+        "inputs": {"lengths": {"dtype": "T", "shape": "[M]", "device": "cpu"}},
+        "outputs": {"y": {"dtype": "T", "shape": "[M]"}},
+    }
+    op = _probe(
+        "ProbeCurrentDeviceRepeatFwdOp",
+        signature,
+        lambda self, lengths: lengths.to(codegen.current_device(), copy=True),
+        boundary=True,
+    )()
+    lengths = torch.zeros(3, dtype=torch.int32)
+    monkeypatch.setattr(codegen, "current_device", lambda: torch.device("cpu"))
+    assert op(lengths).device.type == "cpu"
+    device = torch.empty(0, device=run_device()).device
+    monkeypatch.setattr(codegen, "current_device", lambda: device)
+    assert op(lengths).device == device
+
+
+def test_a_list_param_edited_in_place_is_checked_on_the_next_call():
+    signature = {
+        "forall": {"M": "Dim", "T": "DType[float16]"},
+        "params": {"shape": {"type": "list[int]"}},
+        "inputs": {"x": {"dtype": "T", "shape": "[M, *shape]"}},
+        "outputs": {"y": {"dtype": "T", "shape": "[M, *shape]"}},
+    }
+    op = _probe("ProbeListParamFwdOp", signature, lambda self, x: x.clone(), boundary=True)(
+        shape=[2, 3]
+    )
+    x = torch.zeros(4, 2, 3, dtype=torch.float16)
+    op(x)
+    op.shape[:] = [3, 2]
+    with pytest.raises(ValueError):
+        op(x)
+
+
+def test_a_param_snapshot_differs_once_a_field_is_edited_in_place():
+    from types import SimpleNamespace
+
+    from tileops._ops._signature_codegen import param_state
+    from tileops.manifest._values import ADTValue
+
+    class Layout:
+        def __init__(self, max_m):
+            self.max_m = max_m
+
+    class SlottedLayout:
+        __slots__ = "max_m"
+
+        def __init__(self, max_m):
+            self.max_m = max_m
+
+    op = SimpleNamespace(
+        shape=[2, 3],
+        adt=ADTValue("Layout", {"masked": {"max_m": 4}}),
+        obj=Layout(4),
+        slotted=SlottedLayout(4),
+    )
+    sig = SimpleNamespace(
+        params={"shape": {}, "adt": {}, "obj": {}, "slotted": {}}, ctor_tensors={}
+    )
+    before = param_state(op, sig)
+    for edit in (
+        lambda: op.shape.append(1),
+        lambda: op.adt.fields.update(max_m=8),
+        lambda: setattr(op.obj, "max_m", 8),
+        lambda: setattr(op.slotted, "max_m", 8),
+    ):
+        edit()
+        assert param_state(op, sig) != before
+        before = param_state(op, sig)
+
+
+def test_a_tensor_slot_holding_another_value_reaches_the_operator():
+    signature = {
+        "forall": {"M": "Dim", "T": "DType[float16]"},
+        "inputs": {"x": {"dtype": "T", "shape": "[M]"}},
+        "outputs": {"y": {"dtype": "T", "shape": "[M]"}},
+    }
+    op = _probe("ProbeNotTensorFwdOp", signature, lambda self, x: x.clone(), boundary=True)()
+    op(torch.zeros(3, dtype=torch.float16))
+    with pytest.raises((TypeError, RuntimeError), match="Tensor|tensor"):
+        op([0.0, 0.0, 0.0])
+
+
+def test_a_param_snapshot_counts_constructor_tensor_presence():
+    from types import SimpleNamespace
+
+    from tileops._ops._signature_codegen import param_state
+
+    op = SimpleNamespace(table=None)
+    sig = SimpleNamespace(params={}, ctor_tensors={"table": None})
+    before = param_state(op, sig)
+    op.table = torch.zeros(2)
+    assert param_state(op, sig) != before
+
+
+def test_a_call_in_an_autocast_region_reaches_the_operator():
+    signature = {
+        "forall": {"M": "Dim", "T": "DType[float16]"},
+        "inputs": {"x": {"dtype": "T", "shape": "[M]"}},
+        "outputs": {"y": {"dtype": "T", "shape": "[M]"}},
+    }
+    op = _probe("ProbeAutocastFwdOp", signature, lambda self, x: x.clone(), boundary=True)()
+    x = torch.zeros(3, dtype=torch.float16)
+    op(x)
+    boundary = type(op)._call_boundary.__globals__["_boundary"]
+    saved = dict(boundary.branches)
+    reached = []
+
+    def operator(*args):
+        reached.append(True)
+        return saved_operator(*args)
+
+    ((effect, branch),) = saved.items()
+    saved_operator = branch[0]
+    boundary.branches[effect] = (operator, *branch[1:])
+    try:
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            op(x)
+    finally:
+        boundary.branches.update(saved)
+    assert reached
+
+
+def test_an_invalid_execution_argument_reaches_the_operator():
+    signature = {
+        "forall": {"M": "Dim", "T": "DType[float16]"},
+        "inputs": {"x": {"dtype": "T", "shape": "[M]"}},
+        "outputs": {"y": {"dtype": "T", "shape": "[M]"}},
+    }
+
+    def forward(self, x, scale: int = 1):
+        return x * scale
+
+    op = _probe("ProbeExecutionArgFwdOp", signature, forward, boundary=True)()
+    x = torch.ones(3, dtype=torch.float16)
+    assert op(x, scale=2).tolist() == [2, 2, 2]
+    with pytest.raises((TypeError, RuntimeError)):
+        op(x, scale=1.5)
+
+
+def test_a_constructor_tensor_set_after_construction_takes_a_new_check():
+    signature = {
+        **_VEC,
+        "params": {
+            "table": {"dtype": "float16", "shape": "[4]", "device": "cpu", "optional": True}
+        },
+        "outputs": {"y": {"dtype": "T", "shape": "[M]"}},
+    }
+    op = _probe("ProbeOptionalTableFwdOp", signature, lambda self, x: x.clone(), boundary=True)(
+        table=None
+    )
+    x = torch.zeros(2, dtype=torch.float16)
+    op(x)
+    plan = type(op)._signature
+    looked_up = []
+    lookup = plan._lookup
+
+    def counting(*args):
+        looked_up.append(True)
+        return lookup(*args)
+
+    plan._lookup = counting
+    try:
+        op.table = torch.zeros(4, dtype=torch.float16)
+        op(x)
+    finally:
+        del plan._lookup
+    assert looked_up
+
+
+def test_a_held_tensor_requiring_grad_leaves_the_result_untracked_as_the_dispatcher_does():
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class Passthrough(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            return func(*args, **(kwargs or {}))
+
+    signature = {
+        "forall": {"M": "Dim", "T": "DType[float32]"},
+        "inputs": {"x": {"dtype": "T", "shape": "[M]"}},
+        "outputs": {"y": {"dtype": "T", "shape": "[M]"}},
+    }
+    op = _probe("ProbeHeldGradFwdOp", signature, lambda self, x: x * self.w, boundary=True)()
+    op.w = torch.ones(1, requires_grad=True)
+    with Passthrough():
+        dispatched = op(torch.ones(3))
+    for m in (4, 4):
+        assert op(torch.ones(m)).requires_grad == dispatched.requires_grad
+
+
+def test_a_negative_view_is_resolved_as_the_dispatcher_does():
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class Passthrough(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            return func(*args, **(kwargs or {}))
+
+    signature = {
+        "forall": {"M": "Dim", "T": "DType[float16]"},
+        "inputs": {"x": {"dtype": "T", "shape": "[M]"}},
+        "outputs": {"y": {"dtype": "T", "shape": "[M]"}},
+    }
+    seen = []
+
+    def forward(self, x):
+        seen.append(x.is_neg())
+        return x.clone()
+
+    op = _probe("ProbeNegViewFwdOp", signature, forward, boundary=True)()
+    x = torch._neg_view(torch.ones(3, dtype=torch.float16))
+    with Passthrough():
+        op(x)
+    op(x)
+    op(x)
+    assert seen == [seen[0]] * 3
+
+
+def test_a_target_served_op_repeats_on_the_target_kernel(acme):
+    ran = []
+
+    def kernel(x):
+        ran.append(True)
+        return x[:, : x.shape[1] // 2].clone()
+
+    def forward(self, x):
+        raise AssertionError("the in-tree forward ran for a target-served op")
+
+    acme("ProbeTargetRepeatFwdOp", lambda *i, **p: kernel)
+    op = _probe("ProbeTargetRepeatFwdOp", _SILU, forward, boundary=True)()
+    x = torch.zeros(3, 8, dtype=torch.float16)
+    op(x)
+    op(x)
+    assert len(ran) == 2 and op.serving_target == "acme"
+
+
+def test_a_conjugate_view_is_left_to_the_dispatcher():
+    signature = {
+        "forall": {"M": "Dim", "T": "DType[float16]"},
+        "inputs": {"x": {"dtype": "T", "shape": "[M]"}},
+        "outputs": {"y": {"dtype": "T", "shape": "[M]"}},
+    }
+    op = _probe("ProbeConjugateFwdOp", signature, lambda self, x: x.clone(), boundary=True)()
+    z = torch.ones(2, dtype=torch.complex64)
+    assert op._observe((z,), {}, {}, direct=True) is not None
+    assert op._observe((z.conj(),), {}, {}, direct=True) is None
+    assert op._observe((torch._neg_view(z.real),), {}, {}, direct=True) is None
+
+
+def test_an_output_sharing_an_empty_input_storage_is_rejected():
+    signature = {
+        "forall": {"M": "Dim", "N": "Dim", "T": "DType[float16]"},
+        "inputs": {"x": {"dtype": "T", "shape": "[M]"}, "e": {"dtype": "T", "shape": "[N]"}},
+        "outputs": {"y": {"dtype": "T", "shape": "[M]"}},
+    }
+    returns = [lambda x, e: x.clone(), lambda x, e: e.as_strided(x.shape, (1,))]
+    op = _probe(
+        "ProbeEmptyAliasFwdOp", signature, lambda self, x, e: returns.pop(0)(x, e), boundary=True
+    )()
+    x = torch.zeros(3, dtype=torch.float16)
+    e = torch.zeros(3, dtype=torch.float16)[:0]
+    op(x, e)
+    with pytest.raises(RuntimeError, match="alias"):
+        op(x, e)
+    returns.append(lambda x, e: e.as_strided(x.shape, (1,)))
+    with pytest.raises(RuntimeError, match="alias"):
+        op(torch.zeros(4, dtype=torch.float16), torch.zeros(8, dtype=torch.float16)[:0])
+
+
+def test_a_negative_view_call_reaches_the_operator():
+    from tileops._ops._signature_codegen import _CompileBoundary
+
+    signature = {
+        "forall": {"M": "Dim", "T": "DType[float16]"},
+        "inputs": {"x": {"dtype": "T", "shape": "[M]"}},
+        "outputs": {"y": {"dtype": "T", "shape": "[M]"}},
+    }
+    op = _probe("ProbeViewBitFwdOp", signature, lambda self, x: x.clone(), boundary=True)()
+    boundary = type(op)._call_boundary.__globals__["_boundary"]
+    assert isinstance(boundary, _CompileBoundary)
+    ((effect, branch),) = boundary.branches.items()
+    reached = []
+
+    def operator(*args):
+        reached.append(True)
+        return branch[0](*args)
+
+    boundary.branches[effect] = (operator, *branch[1:])
+    try:
+        op(torch.ones(2, dtype=torch.float16))
+        assert not reached
+        op(torch._neg_view(torch.ones(2, dtype=torch.float16)))
+        assert reached
+    finally:
+        boundary.branches[effect] = branch
+
+
+def test_a_none_for_a_required_input_reaches_the_operator():
+    signature = {
+        "forall": {"M": "Dim", "T": "DType[float16]"},
+        "inputs": {"x": {"dtype": "T", "shape": "[M]"}},
+        "outputs": {"y": {"dtype": "T", "shape": "[M]"}},
+    }
+    op = _probe("ProbeRequiredNoneFwdOp", signature, lambda self, x: x.clone(), boundary=True)()
+    op(torch.zeros(2, dtype=torch.float16))
+    boundary = type(op)._call_boundary.__globals__["_boundary"]
+    ((effect, branch),) = boundary.branches.items()
+    reached = []
+
+    def operator(*args):
+        reached.append(True)
+        return branch[0](*args)
+
+    boundary.branches[effect] = (operator, *branch[1:])
+    try:
+        with pytest.raises((TypeError, RuntimeError, ValueError)):
+            op(None)
+    finally:
+        boundary.branches[effect] = branch
+    assert reached
+
+
+@pytest.mark.parametrize("view", [False, True])
+def test_eager_rejects_aliases_between_empty_outputs(view):
+    signature = {
+        "forall": {"M": "Dim", "T": "DType[float16]"},
+        "inputs": {"x": {"dtype": "T", "shape": "[M]"}},
+        "outputs": {
+            "y": {"dtype": "T", "shape": "[M]"},
+            "z": {"dtype": "T", "shape": "[0]"},
+            "w": {"dtype": "T", "shape": "[0]"},
+        },
+    }
+
+    def forward(self, x):
+        empty = x.new_empty(0)
+        return x.clone(), empty, empty.view(0) if view else empty
+
+    op = _probe("ProbeEmptyOutputAliasFwdOp", signature, forward, boundary=True)()
+    with pytest.raises(RuntimeError, match="alias"):
+        op(torch.ones(3, dtype=torch.float16))
