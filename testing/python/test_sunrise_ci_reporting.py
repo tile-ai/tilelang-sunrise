@@ -11,7 +11,8 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
-CI_LIB = ROOT / "ci" / "lib.sh"
+CI = ROOT / "ci"
+CI_LIB = CI / "lib.sh"
 CI_RUN = ROOT / "ci" / "run.sh"
 JUNIT_GENERATOR = ROOT / "ci" / "junit_from_jsonl.py"
 
@@ -508,6 +509,7 @@ def test_failed_recovery_stops_execution_and_reports_unrun_cases(tmp_path, recov
     launches = tmp_path / "launches"
     script = f"""
 source {shlex.quote(str(CI_LIB))}
+ci_assert_runtime_stack () {{ :; }}
 ci_check_card_state () {{ :; }}
 ci_run_timed () {{
     echo invoked >> {shlex.quote(str(launches))}
@@ -555,3 +557,167 @@ def test_not_run_requires_failed_recovery_evidence(tmp_path):
     completed = _run_generator(report_dir, 2)
     assert completed.returncode != 0
     assert not (report_dir / "junit-tilelang.xml").exists()
+
+
+@pytest.fixture
+def runner(tmp_path):
+    project = tmp_path / "project"
+    scripts = project / "ci"
+    scripts.mkdir(parents=True)
+    for name in ("run.sh", "junit_from_jsonl.py", "pytest_node_audit.py"):
+        shutil.copy2(CI / name, scripts / name)
+    library = (
+        (CI / "lib.sh").read_text()
+        + """
+ci_configure_ptcc () { :; }
+ci_assert_runtime_stack () { :; }
+ci_check_card_state () { echo checked >> "$CI_FAILURE_REPORT_DIR/card-checks"; }
+"""
+    )
+    (scripts / "lib.sh").write_text(library)
+    env = {
+        **os.environ,
+        "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"],
+        "TMPDIR": str(tmp_path),
+        "CI_FAILURE_REPORT_DIR": str(tmp_path / "reports"),
+        "TILELANG_CACHE_DIR": str(tmp_path / "cache"),
+        "PYTHONPATH": str(scripts),
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+        "PYTEST_AUDIT_PLUGIN_ARGS": "-p pytest_instafail -p pytest_node_audit",
+        "PYTEST_NODE_AUDIT_PATH": str(tmp_path / "reports/tilelang_nodes.jsonl"),
+        "PYTEST_NODE_AUDIT_SUITE": "tilelang",
+        "CI_PIPELINE_ID": "fixture-pipeline",
+        "CI_JOB_ID": "fixture-job",
+        "CI_COMMIT_SHA": "fixture-sha",
+        "CASE_REPEAT": "2",
+        "TEST_MARKER": "",
+    }
+    env.pop("CI_FAILURE_REPORTS_INITIALIZED", None)
+    env.pop("PYTEST_ADDOPTS", None)
+
+    def run(content=None, args=(), prelude=None, mode="pytest"):
+        if content is not None:
+            (project / "cases.txt").write_text(content)
+        if prelude is None:
+            command = ["bash", str(scripts / "run.sh")]
+            command += list(args) if args else ["--list", str(project / "cases.txt")]
+        else:
+            script = f"source {shlex.quote(str(scripts / 'lib.sh'))}\n{prelude}\n"
+            script += f"ci_run_test_list cases.txt {mode} tilelang\n"
+            command = ["bash", "-c", script]
+        result = subprocess.run(command, cwd=project, env=env, text=True, capture_output=True, timeout=45)
+        (tmp_path / "runner.log").write_text(result.stdout + result.stderr)
+        return result
+
+    return project, tmp_path / "reports", env, run
+
+
+def records(report_dir):
+    return [json.loads(line) for line in (report_dir / "tilelang.jsonl").read_text().splitlines()]
+
+
+@pytest.mark.parametrize(
+    "mode,content",
+    [
+        ("pytest", " # missing.py\n# python missing_script.py\n# a description of missing.py\n# ----\n\n"),
+        ("command", "# python missing.py\n # pytest missing_script.py -m tang_s3\n# notes missing.py\n"),
+        ("puzzle", "# solutions/missing.py\n  # solutions/missing_script.py\n# notes missing.py\n"),
+    ],
+)
+def test_shared_runner_all_comments_never_checks_device_or_launches(runner, mode, content):
+    _, report, _, run = runner
+    completed = run(
+        content,
+        mode=mode,
+        prelude="""
+ci_check_card_state () { exit 98; }
+ci_run_timed () { exit 99; }
+""",
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "Total: 2   Success: 0   Failed: 0   Skipped: 2" in completed.stdout
+    assert len(records(report)) == 2
+    assert all(r["skip_origin"] == "list_comment" for r in records(report))
+    assert all(r["record_kind"] == "case_result" and r["executed"] is False for r in records(report))
+    assert all(r["elapsed_seconds"] == 0 for r in records(report))
+    assert _run_generator(report, 2).returncode == 0
+    suite = ElementTree.parse(report / "junit-tilelang.xml").getroot().find("testsuite")
+    assert suite.attrib["skipped"] == "2"
+    assert all(item.find("properties/property[@name='attempts_used']").attrib["value"] == "0" for item in suite.findall("testcase"))
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_dedup_active_wins_and_distinct_selectors_remain(runner, legacy):
+    _, report, _, run = runner
+    content = (
+        "# same.py\nother.py\n./same.py\nsame.py\n# same.py\n"
+        "# selected.py\nselected.py -m tang_s3\n# selected.py -m tang_s3\n"
+        "# selected.py::test_one\n# selected.py::test_two\n"
+    )
+    if legacy:
+        completed = run(content, prelude='ci_run_timed () { echo "1 passed" > "$2"; }')
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        result = records(report)
+        assert len([r for r in result if r["record_kind"] == "case_result"]) == 6
+        assert [r["status"] for r in result if r["record_kind"] == "case_result"] == [
+            "PASS",
+            "PASS",
+            "SKIPPED",
+            "PASS",
+            "SKIPPED",
+            "SKIPPED",
+        ]
+    else:
+        completed = run(content, args=["--list", "cases.txt", "--dry-run"])
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        assert "Dry-run plan (6 case(s))" in completed.stdout
+        assert completed.stdout.count("[SKIPPED]") == 3
+
+
+def test_explicit_case_overrides_comment_and_no_default_entries_leak(runner):
+    project, _, env, run = runner
+    (project / "case.py").write_text("pass\n")
+    (project / "ci_test_case_list_tilelang.txt").write_text("# unrelated.py\n")
+    result = run("# case.py\n", args=["--list", "cases.txt", "--case", "case.py", "--dry-run"])
+    assert result.returncode == 0, result.stderr
+    assert "[SKIPPED]" not in result.stdout and "Dry-run plan (1 case(s))" in result.stdout
+    result = run(args=["--case", "case.py", "--dry-run"])
+    assert "unrelated.py" not in result.stdout and "[SKIPPED]" not in result.stdout
+    env["TEST_MARKER"] = "cpu"
+    (project / "cases_timeouts.tsv").write_text("disabled.py\t99\n")
+    result = run("# disabled.py\ncase.py\n", args=["--list", "cases.txt", "--dry-run"])
+    assert result.returncode == 0, result.stderr
+    assert "disabled.py" not in result.stdout
+
+
+@pytest.mark.parametrize("corruption", ["executed", "elapsed_seconds", "status", "skip_origin"])
+def test_junit_rejects_forged_comment_results(runner, corruption):
+    _, report, _, run = runner
+    assert run("# missing.py\n").returncode == 0
+    record = records(report)[0]
+    record[corruption] = {"executed": True, "elapsed_seconds": 1, "status": "PASS", "skip_origin": "pytest"}[corruption]
+    (report / "tilelang.jsonl").write_text(json.dumps(record) + "\n")
+    generated = subprocess.run(
+        [sys.executable, str(CI / "junit_from_jsonl.py"), "--suite", "tilelang", "--report-dir", str(report), "--expected-cases", "1"],
+        text=True,
+        capture_output=True,
+    )
+    assert generated.returncode == 1
+    assert not (report / "junit-tilelang.xml").exists()
+
+
+def test_xfail_xpass_and_deselected_keep_separate_node_details(runner):
+    project, report, _, run = runner
+    pytest.importorskip("pytest_instafail")
+    (project / "nodes.py").write_text(
+        "import pytest\n"
+        "@pytest.mark.xfail(reason='known')\ndef test_xfail(): assert False\n"
+        "@pytest.mark.xfail(reason='known')\ndef test_xpass(): pass\n"
+        "@pytest.mark.skip(reason='unsupported')\ndef test_skip(): pass\n"
+    )
+    result = run("nodes.py\nnodes.py -m never_selected\n# disabled.py\n")
+    assert result.returncode == 0, result.stdout + result.stderr
+    nodes = [json.loads(line) for line in (report / "tilelang_nodes.jsonl").read_text().splitlines()]
+    assert {r["pytest_outcome"] for r in nodes if r["event"] == "outcome"} >= {"xfailed", "xpassed", "skipped"}
+    assert len([r for r in nodes if r["event"] == "deselected"]) == 3
+    assert all(r.get("skip_origin") != "list_comment" for r in records(report) if r["case"].startswith("nodes.py"))

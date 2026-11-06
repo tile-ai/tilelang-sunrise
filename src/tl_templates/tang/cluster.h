@@ -52,4 +52,14 @@ template <typename T> TL_DEVICE void cluster_store(T *smem, int rank, T value) {
   *remote = value;
 }
 
+// Remote mbarrier arrive for cluster copy: map the barrier into the peer CTA's
+// address space (__set_block_rank_mbarrier) and arrive once, signalling that
+// the producer's element-wise stores are visible. The destination CTA waits on
+// its local copy of the barrier with mbarrier_wait_parity. Requires the LLVM
+// dev_dshm branch (DSHM mbarrier builtins).
+TL_DEVICE void cluster_arrive_barrier(void *bar, int rank) {
+  auto *remote = __set_block_rank_mbarrier(bar, static_cast<unsigned>(rank));
+  __mbarrier_dshm_arrive(__dshm_as_ptr(remote), 1u);
+}
+
 } // namespace tl

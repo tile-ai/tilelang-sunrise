@@ -49,7 +49,8 @@ def test_matrix_frontend_apis_exist():
     """tang_ st/ld matrix 前端接口可用,且 ptx_ldmatrix 未被 shadow。"""
     assert callable(T.tang_stmatrix)
     assert callable(T.tang_ldmatrix)
-    # 上游 ptx_ldmatrix intrinsic 仍在(CUDA mma 加载路径依赖它),未被前端覆盖。
+    # The upstream ptx_ldmatrix intrinsic is still present (the CUDA MMA load
+    # path depends on it) and is not shadowed by the frontend.
     assert callable(T.ptx_ldmatrix)
     assert T.ptx_ldmatrix is tilelang.language.ptx_ldmatrix
 
@@ -251,7 +252,8 @@ def test_ldmatrix_lowering_backend_wip():
         with tvm.target.Target(STCUV2_TARGET):
             tilelang.lower(_make_tang_ldmatrix_kernel(4), target=STCUV2_TARGET)
     except AssertionError:
-        # 后端未就绪时 lowering 内部断言失败是预期行为
+        # An internal assertion failure in lowering is the expected outcome while
+        # the backend is not ready.
         pytest.skip("stcuv2 ld/st matrix backend lowering not ready (assertion)")
     except Exception as e:
         pytest.skip(f"stcuv2 ld/st matrix backend not ready: {e}")

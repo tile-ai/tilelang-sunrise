@@ -34,6 +34,45 @@ std::pair<int, int> ComputeWarpPartition(const GemmWarpPolicyNode &policy,
   int n_warp = 1;
 
   if (gemm_inst == kTangTCGEN5 || gemm_inst == kTangTCGEN5BlockScaled) {
+    // tcgen5 issues one MMA per warp over a slice of N, so the shape the
+    // emitter can drive is a 1 x num_warps split. An explicit partition
+    // (`GemmWarpPolicy.from_warp_partition`) is honoured as long as it keeps
+    // that shape: that is how a caller asks for a *smaller* MMA warp set, e.g.
+    // (1, 2) with a 4-warp block, which is what a warp-specialised kernel wants
+    // when it hands the MMA to some of its warps. Anything else is refused
+    // rather than silently turned into a full-width N split.
+    if (policy.IsFree()) {
+      const int m = policy.m_warp;
+      const int n = policy.n_warp;
+      ICHECK_EQ(m, 1)
+          << "TANG tcgen5 partitions N only, but the requested partition is "
+          << m << "x" << n << " warps";
+      ICHECK_GT(n, 0) << "TANG tcgen5 needs at least one MMA warp";
+      ICHECK_LE(n, num_warps)
+          << "TANG tcgen5 was asked for " << n << " MMA warps, but the block "
+          << "only has " << num_warps;
+      ICHECK_EQ(N % n, 0) << "TANG tcgen5 cannot split N=" << N << " over " << n
+                          << " warps";
+      policy.m_warp = 1;
+      policy.n_warp = n;
+      return {1, n};
+    }
+    if (!policy.IsFullCol()) {
+      // Square / FullRow would have to split M, which this emitter does not
+      // drive yet (the descriptors carry sub_m, but no ISS test covers an M
+      // split). Say so instead of quietly producing the full-width N split.
+      // Note that GemmWarpPolicy has no way to request a *smaller* N split
+      // either: from_warp_partition(1, k) collapses to FullCol, whose n_warp is
+      // this block's warp count. A caller that wants the MMA on k of the warps
+      // narrows the thread extent instead (a T.ws region of k warps), which is
+      // what the emitter derives its partition from.
+      LOG(WARNING)
+          << "TANG tcgen5 GEMM: policy " << policy.policy_type
+          << " is not supported and falls back to splitting N over all "
+          << num_warps
+          << " warps; to run the MMA on fewer warps, narrow the thread "
+             "region instead (T.ws with a k-warp group)";
+    }
     policy.m_warp = 1;
     policy.n_warp = num_warps;
     return {1, num_warps};
@@ -102,6 +141,20 @@ std::pair<int, int> ComputeWarpPartition(const GemmWarpPolicyNode &policy,
 
 String SelectInst(const GemmNode &op, int block_size, Target target) {
   ICHECK(TargetIsTang(target));
+  if (op.isTcgen05_) {
+    ICHECK(TargetTangIsSTCUV2(target))
+        << "T.tcgen05_gemm requires tang -arch=stcuv2";
+    ICHECK(op.c_.scope() == "shared.tmem")
+        << "T.tcgen05_gemm requires C in shared.tmem, but got "
+        << op.c_.scope();
+    ICHECK(IsSharedBuffer(op.a_) || op.a_.scope() == "shared.tmem")
+        << "T.tcgen05_gemm requires A in shared or shared.tmem, but got "
+        << op.a_.scope();
+    ICHECK(IsSharedBuffer(op.b_))
+        << "T.tcgen05_gemm requires B in shared memory, but got "
+        << op.b_.scope();
+    return kTangTCGEN5;
+  }
   if (TargetTangIsSTCUV2(target)) {
     if (op.c_.scope() == "shared.tmem") {
       return kTangTCGEN5;
@@ -133,6 +186,15 @@ String SelectBlockScaledInst(const GemmBlockScaled &op, int,
       << "TANG block-scaled GEMM requires shared A and B";
   ICHECK(op->c_.scope() == "shared.tmem")
       << "TANG block-scaled GEMM requires C in shared.tmem";
+  if (op->isTcgen05_ && !op->scaleWorkspaceRegion_.defined()) {
+    ICHECK(op->sfaRegion_->buffer.scope() == "shared.tmem")
+        << "T.tcgen05_gemm_blockscaled requires SFA in shared.tmem, but got "
+        << op->sfaRegion_->buffer.scope();
+    ICHECK(op->sfbRegion_->buffer.scope() == "shared.tmem")
+        << "T.tcgen05_gemm_blockscaled requires SFB in shared.tmem, but got "
+        << op->sfbRegion_->buffer.scope();
+    return kTangTCGEN5BlockScaled;
+  }
   ICHECK(op->scaleWorkspaceRegion_.defined())
       << "TANG block-scaled GEMM requires a scale_tmem workspace";
   ICHECK(op->scaleWorkspaceRegion_->buffer.scope() == "shared.tmem")

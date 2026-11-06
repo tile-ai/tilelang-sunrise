@@ -9,7 +9,7 @@ from tilelang.language.gemm_op import GemmWarpPolicy, _gemm_blockscaled_impl, _g
 from tilelang.language.utils import _normalize_annotations, buffer_region_to_tile_region
 from tilelang.utils.language import to_buffer_region
 
-__all__ = ["gemm", "gemm_blockscaled"]
+__all__ = ["gemm", "tcgen05_gemm", "gemm_blockscaled", "tcgen05_gemm_blockscaled"]
 
 
 def gemm(
@@ -84,6 +84,48 @@ def gemm(
     return _gemm_impl("tl.tileop.gemm", A, B, C, transpose_A, transpose_B, policy, clear_accum, mbar, annotations=ann)
 
 
+def tcgen05_gemm(
+    A: BufferLikeType,
+    B: BufferLikeType,
+    C: BufferLikeType,
+    transpose_A: bool = False,
+    transpose_B: bool = False,
+    policy: GemmWarpPolicy = GemmWarpPolicy.Square,
+    clear_accum: bool = False,
+    *,
+    mbar: BarrierType | None,
+    use_2cta: bool = False,
+    annotations: dict | None = None,
+) -> tirx.PrimExpr:
+    """Explicit asynchronous S3 tcgen5 GEMM without an implicit wait.
+
+    This interface forces the ``tang.tcgen5`` path on ``tang -arch=stcuv2``.
+    ``mbar`` publishes completion through the TANG fence/mbarrier protocol;
+    waiting remains the caller's responsibility. ``mbar=None`` may be used for
+    an intermediate issue in the same ordered stream.
+
+    S3 has no 2-CTA equivalent. Passing ``use_2cta=True`` is preserved in the
+    operator annotations so TANG lowering can reject it with a target-specific
+    diagnostic.
+    """
+    ann = _normalize_annotations(annotations)
+    ann["is_tcgen05"] = 1
+    if use_2cta:
+        ann["use_2cta"] = 1
+    return _gemm_impl(
+        "tl.tileop.tcgen05_gemm",
+        A,
+        B,
+        C,
+        transpose_A,
+        transpose_B,
+        policy,
+        clear_accum,
+        mbar,
+        annotations=ann,
+    )
+
+
 def gemm_blockscaled(
     A: BufferLikeType,
     B: BufferLikeType,
@@ -149,4 +191,55 @@ def gemm_blockscaled(
         *call.args,
         buffer_region_to_tile_region(workspace, "rw", [r.extent for r in workspace.region]),
         annotations=call.annotations,
+    )
+
+
+def tcgen05_gemm_blockscaled(
+    A: BufferLikeType,
+    B: BufferLikeType,
+    C: BufferLikeType,
+    SFA_tmem: BufferLikeType,
+    SFB_tmem: BufferLikeType,
+    transpose_A: bool = False,
+    transpose_B: bool = False,
+    clear_accum: bool = False,
+    wg_wait: int = 0,
+    mbar: BarrierType | None = None,
+    *,
+    k_start: int | tirx.PrimExpr,
+    sf_a_granularity_k: int,
+    sf_b_granularity_k: int,
+    use_2cta: bool = False,
+) -> tirx.PrimExpr:
+    """Explicit asynchronous S3 block-scaled tcgen5 GEMM.
+
+    A/B are shared-memory operands; C, SFA and SFB are already resident in
+    TMEM. Unlike ``gemm_blockscaled``, this direct form skips scale staging and
+    does not require a combined ``scale_tmem`` workspace. Completion published
+    through ``mbar`` is not followed by an implicit wait.
+
+    S3 has no 2-CTA equivalent. ``use_2cta=True`` is preserved for the TANG
+    lowering to reject with its target-specific diagnostic.
+    """
+    ann: dict = {"is_tcgen05": 1}
+    if use_2cta:
+        ann["use_2cta"] = 1
+    if wg_wait != 0:
+        ann["wg_wait"] = int(wg_wait)
+    return _gemm_blockscaled_impl(
+        "tl.tileop.tcgen05_gemm_blockscaled",
+        A,
+        B,
+        C,
+        SFA_tmem,
+        SFB_tmem,
+        transpose_A,
+        transpose_B,
+        GemmWarpPolicy.Square,
+        clear_accum,
+        mbar,
+        k_start=k_start,
+        sf_a_granularity_k=sf_a_granularity_k,
+        sf_b_granularity_k=sf_b_granularity_k,
+        annotations=ann,
     )

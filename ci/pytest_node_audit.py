@@ -82,6 +82,11 @@ def pytest_collection_modifyitems(items) -> None:
         )
 
 
+def pytest_deselected(items) -> None:
+    for item in items:
+        _write({"event": "deselected", "nodeid": item.nodeid, "outcome": "deselected"})
+
+
 def pytest_collectreport(report) -> None:
     if report.failed:
         _write(
@@ -109,6 +114,8 @@ def pytest_runtest_logreport(report) -> None:
             "nodeid": report.nodeid,
             "phase": report.when,
             "outcome": report.outcome,
+            "wasxfail": getattr(report, "wasxfail", None),
+            "pytest_outcome": ("xfailed" if report.skipped else "xpassed") if hasattr(report, "wasxfail") else report.outcome,
             "reason": reason,
             "duration_seconds": report.duration,
         }

@@ -44,6 +44,10 @@ TANG_ONLY_NAMES = {
 TANG_SHADOWED_NAMES = {
     "gemm",
     "gemm_blockscaled",
+    "tcgen05_gemm",
+    "tcgen05_gemm_blockscaled",
+    "tcgen05_mma",
+    "tcgen05_mma_blockscaled",
     "tcgen05_after_thread_sync",
     "tcgen05_before_thread_sync",
     # TANG adds a keyword-only warp_group_size (single-warp 32) that the CUDA
@@ -54,7 +58,7 @@ TANG_SHADOWED_NAMES = {
 
 # The two fence re-bindings are the ones with fence-specific semantics; the
 # fence parametrized tests below must not pick up the warpgroup shadow.
-_FENCE_SHADOWED_NAMES = sorted(name for name in TANG_SHADOWED_NAMES if name.startswith("tcgen05_"))
+_FENCE_SHADOWED_NAMES = sorted(name for name in TANG_SHADOWED_NAMES if name.endswith("_thread_sync"))
 
 OTHER_DIALECT_MODULES = [
     "tilelang.language",
@@ -91,12 +95,70 @@ def test_tang_dialect_shares_the_common_surface():
 
     assert set(T.__all__) >= set(T_comm.__all__)
     assert T.copy is cuda_language.copy
-    for name in ("gemm", "gemm_blockscaled"):
+    for name in (
+        "gemm",
+        "gemm_blockscaled",
+        "tcgen05_gemm",
+        "tcgen05_gemm_blockscaled",
+        "tcgen05_mma",
+        "tcgen05_mma_blockscaled",
+    ):
         assert getattr(T, name).__module__ == "tilelang.tang.language.gemm_op"
         assert getattr(T, name) is not getattr(cuda_language, name)
+    assert T.tcgen05_mma is T.tcgen05_gemm
+    assert T.tcgen05_mma_blockscaled is T.tcgen05_gemm_blockscaled
     # Everything TANG does not override is the very same object as in CUDA.
     for name in set(cuda_language.__all__) - TANG_SHADOWED_NAMES:
         assert getattr(T, name) is getattr(cuda_language, name), name
+
+
+def test_tang_tcgen05_gemm_constructs_explicit_node():
+    from tilelang.tang import language as T
+    from tilelang.tileop import Gemm
+    from tvm import tirx
+
+    a = tirx.decl_buffer((128, 64), "float16", name="A", scope="shared")
+    b = tirx.decl_buffer((64, 128), "float16", name="B", scope="shared")
+    c = tirx.decl_buffer((128, 128), "float32", name="C", scope="shared.tmem")
+    call = T.tcgen05_gemm(a, b, c, mbar=None)
+    annotations = {str(k): v for k, v in call.annotations.items()}
+    op = call.op.get_attr("TLOpBuilder")(call.args, annotations)
+
+    assert call.op.name == "tl.tileop.tcgen05_gemm"
+    assert isinstance(op, Gemm)
+    assert op.isTcgen05
+
+
+def test_tang_tcgen05_gemm_blockscaled_constructs_direct_tmem_node():
+    from tilelang.tang import language as T
+    from tilelang.tileop import GemmBlockScaled
+    from tvm import tirx
+
+    a = tirx.decl_buffer((128, 128), "float8_e4m3fn", name="A", scope="shared")
+    b = tirx.decl_buffer((128, 128), "float8_e4m3fn", name="B", scope="shared")
+    c = tirx.decl_buffer((128, 128), "float32", name="C", scope="shared.tmem")
+    sfa = tirx.decl_buffer((128, 4), "uint32", name="SFA", scope="shared.tmem")
+    sfb = tirx.decl_buffer((128, 4), "uint32", name="SFB", scope="shared.tmem")
+    call = T.tcgen05_gemm_blockscaled(
+        a,
+        b,
+        c,
+        sfa,
+        sfb,
+        mbar=None,
+        k_start=0,
+        sf_a_granularity_k=128,
+        sf_b_granularity_k=128,
+    )
+    annotations = {str(k): v for k, v in call.annotations.items()}
+    op = call.op.get_attr("TLOpBuilder")(call.args, annotations)
+
+    assert call.op.name == "tl.tileop.tcgen05_gemm_blockscaled"
+    assert isinstance(op, GemmBlockScaled)
+    assert op.isTcgen05
+    assert not op.scaleWorkspaceRegion
+    assert op.sfaRegion.buffer.scope() == "shared.tmem"
+    assert op.sfbRegion.buffer.scope() == "shared.tmem"
 
 
 @pytest.mark.parametrize("kwargs", [{}, {"coalesced_width": 4}, {"annotations": {"coalesced_width": 4}}])

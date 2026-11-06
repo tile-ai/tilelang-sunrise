@@ -92,6 +92,18 @@ def _validate_record(record, line_number, suite):
     if status in FAILURE_STATUSES and not reason:
         raise ReportError(f"line {line_number}: {status} record has no failure_reason")
 
+    if record.get("skip_origin") == "list_comment" and (
+        kind != "case_result"
+        or status != "SKIPPED"
+        or record.get("executed") is not False
+        or record["elapsed_seconds"] != 0
+        or record["exit_code"] != 0
+        or not reason
+        or record["log_tail"]
+        or "timeout_seconds" in record
+    ):
+        raise ReportError(f"line {line_number}: invalid list_comment result")
+
     if status == "NOT_RUN" and (kind != "case_result" or record["elapsed_seconds"] != 0 or record["exit_code"] == 0):
         raise ReportError(f"line {line_number}: invalid NOT_RUN result")
 
@@ -166,6 +178,11 @@ def load_cases(jsonl_path, suite, expected_cases):
                 if state["result"] is not None:
                     raise ReportError(f"line {line_number}: duplicate case_result for {case_id!r}")
                 attempts = state["attempts"]
+                if record.get("skip_origin") == "list_comment":
+                    if attempts:
+                        raise ReportError(f"line {line_number}: list_comment result has attempts")
+                    state["result"] = record
+                    continue
                 if not attempts:
                     aborted = any(
                         prior["result"] is not None
@@ -267,6 +284,9 @@ def render(suite, cases):
         lines.append(f'        <property name="attempt_limit" value="{attempts[0]["total_attempts"] if attempts else 0}"/>')
         lines.append(f'        <property name="attempt_statuses" value={quoteattr(_clean(statuses))}/>')
         lines.append(f'        <property name="attempt_durations_seconds" value={quoteattr(durations)}/>')
+        for key in ("counting_policy", "skip_origin"):
+            if key in result:
+                lines.append(f'        <property name="{key}" value={quoteattr(_clean(result[key]))}/>')
         if "timeout_seconds" in result:
             lines.append(f'        <property name="timeout_seconds" value="{result["timeout_seconds"]}"/>')
         if case["recoveries"]:
@@ -280,7 +300,12 @@ def render(suite, cases):
             )
         elif status == "SKIPPED":
             lines.append(f"      <skipped message={quoteattr(_clean(result['failure_reason']))}/>")
-        lines.append(f"      <system-out>{escape(_clean(_attempt_history(attempts, case['recoveries'])))}</system-out>")
+        history = (
+            "Not executed: disabled by test list comment."
+            if result.get("skip_origin") == "list_comment"
+            else _attempt_history(attempts, case["recoveries"])
+        )
+        lines.append(f"      <system-out>{escape(_clean(history))}</system-out>")
         lines.append("    </testcase>")
     lines.extend(("  </testsuite>", "</testsuites>"))
     return "\n".join(lines) + "\n"

@@ -1,5 +1,5 @@
 /*!
- *  \file lower_shared_tmem.cc
+ *  \file lower_s3_shared_tmem.cc
  *  \brief TANG TMEM (Tensor Memory) lowering passes.
  *
  *  This file consolidates the two TMEM-related TIR passes that together
@@ -14,15 +14,15 @@
  *    2. LowerTangTmemDrain - Rewrite the TMEM->global drain loop (produced by
  *                            T.copy(C_tmem, C_global)) into the
  *                            tang_tmem_drain_16x256b_to_global intrinsic.
- *                            stcuv2-only.  The intrinsic's loop nest is then
- *                            materialised in IR by ExpandTangTmemDrain
- *                            (expand_tang_tmem_drain.cc), so the code generator
- *                            only prints statements.
+ *                            stcuv2-only.
  *
- *  NOTE: these remain TWO SEPARATE passes (registered independently and
+ *    3. ExpandS3TmemDrain    - Materialise that fused drain as its final TIR
+ *                             loop nest after synchronization cleanup.
+ *
+ *  NOTE: these remain THREE SEPARATE passes (registered independently and
  *  scheduled at different points in tilelang/tang/pipeline.py).  They are
- * co-located in one translation unit for cohesion; they CANNOT be fused into a
- * single pass invocation because:
+ *  co-located in one translation unit for cohesion; they CANNOT be fused into
+ *  a single pass invocation because:
  *    - they run at different pipeline positions (LowerSharedTmem early, before
  *      the target-specific middle pipeline; LowerTangTmemDrain after it);
  *    - LowerTangTmemDrain is additionally gated to stcuv2;
@@ -59,6 +59,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace tvm {
 namespace tl {
@@ -328,9 +329,13 @@ private:
                           IntImm(tmem_dtype_, col_offsets[i]),
                       {PrimExpr(0)}));
     }
-    new_body.push_back(
-        Evaluate(Call(DataType::Handle(), builtin::tvm_storage_sync(),
-                      {StringImm("shared")})));
+    // No barrier after the reservation. On stcuv2 ``tc_alloc<N>(holder[0])`` is
+    // issued by every thread and each of them writes the same base address into
+    // that word; the derived holder stores above copy that value verbatim. A
+    // later reader therefore reads a value it wrote itself, so there is no
+    // cross-thread dependency here for a block rendezvous to order -- emitting
+    // one only serialises the prologue. (The barrier before ``tc_dealloc``
+    // below is a different case: it is a real collective-release rendezvous.)
     new_body.push_back(block->body);
     // Barrier before the collective tc_dealloc (correctness). On stcuv2
     // tc_dealloc is issued unconditionally by ALL threads (single-reservation
@@ -494,8 +499,8 @@ PrimFunc LowerSharedTmem(PrimFunc f) {
 //   element-wise loop.  This pass detects such loops and replaces them with a
 //   proper step-16 warp-collective drain loop using the
 //   tang_tmem_ld_16x256b_x16 intrinsic -- as a single fused intrinsic, whose
-//   expansion into the loop nest below is done in IR by ExpandTangTmemDrain
-//   (expand_tang_tmem_drain.cc).
+//   expansion into the loop nest below is done later in this file by
+//   ExpandS3TmemDrain.
 //
 //   The reference pattern (for BM x BN fp32 TMEM):
 //     uint32_t _out[64];
@@ -512,6 +517,13 @@ PrimFunc LowerSharedTmem(PrimFunc f) {
 //       }
 //     }
 // ===========================================================================
+
+// Column granularity of the drain, shared with the detection pass above so the
+// two cannot disagree about what a drainable width is: one ``ldt_16x256b`` atom
+// is 8 fp32 columns (32 bytes) of a row and there is no narrower instruction,
+// so a write-back region whose column extent is not a multiple of this cannot
+// be drained at all.
+constexpr int kLdtColsPerChunk = 8;
 
 // Does this subtree store to global from a shared.tmem load, i.e. hold an
 // un-rewritten TMEM->global drain?
@@ -798,8 +810,29 @@ private:
     int N_tile = 128;
     if (nidx >= 2) {
       int cols = intra_extent(tmem_store->indices[nidx - 1]);
-      if (cols > 0)
+      if (cols > 0) {
         N_tile = cols;
+        // A width the drain has no instruction for is a property of the
+        // write-back region the user wrote, so report it here, where the
+        // destination still has a name, rather than leaving the expansion's
+        // internal check to fire.
+        if (N_tile % kLdtColsPerChunk != 0) {
+          LOG(FATAL)
+              << "TANG STCUV2: the promoted accumulator is written back to '"
+              << global_buf->name << "' over " << N_tile << " columns, which "
+              << "is not a multiple of " << kLdtColsPerChunk << ".\n"
+              << "  The tensor-memory drain reads the accumulator in "
+              << kLdtColsPerChunk
+              << "-column units (a 32-byte LDT atom per row) and there is no "
+                 "narrower instruction to finish a remainder with, so the "
+                 "write-back region's column extent must be a multiple of "
+              << kLdtColsPerChunk
+              << ": [:, 0:96] is drainable, [:, 0:100] is "
+                 "not.\n"
+              << "  Copy the whole accumulator, or slice on a multiple of "
+              << kLdtColsPerChunk << " columns.";
+        }
+      }
     }
     int BN = 128; // fallback
     if (global_buf->shape.size() >= 2) {
@@ -843,11 +876,15 @@ private:
     arith::Analyzer ana;
     PrimExpr base_offset = ana.Simplify(Substitute(flat_index, zero_intra));
 
-    LOG(INFO) << "LowerTangTmemDrain: detected TMEM drain loop!"
-              << " BM=" << BM << " BN=" << BN
-              << " global_shape=" << global_buf->shape
-              << " tmem_shape=" << tmem_buf->shape
-              << " base_offset=" << base_offset;
+    // Per-instance progress: one line per drain in a kernel, so it stays off
+    // the default log. A debug build with TVM_LOG_DEBUG, or
+    // TVM_LOG_DEBUG=lower_s3_shared_tmem.cc:1, turns both this and the
+    // expansion's counterpart back on.
+    VLOG(1) << "LowerTangTmemDrain: detected TMEM drain loop!"
+            << " BM=" << BM << " BN=" << BN << " N_tile=" << N_tile
+            << " global_shape=" << global_buf->shape
+            << " tmem_shape=" << tmem_buf->shape
+            << " base_offset=" << base_offset;
 
     // -- Replace with the tang_tmem_drain_16x256b_to_global intrinsic --
     // Pass C_tmem[0] (value, not pointer) as the TMEM base address
@@ -855,10 +892,8 @@ private:
     // The 5th arg carries the ACCUMULATOR's element type (via a typed zero) so
     // codegen knows how to read back each 32-bit word ldt returns: fp32 and
     // int32 accumulators fill the word, while a 16-bit accumulator occupies its
-    // low half. Narrowing to the C buffer's own type then happens in the store.
-    // This used to pass the C buffer's type as a stand-in, which is only the
-    // same thing when the accumulator is 32-bit: a 16-bit accumulator read as
-    // fp32 yields a denormal, and the store flushes the whole tile to zero.
+    // low half. Narrowing to the C buffer's own type then happens in the store;
+    // using the output type here would corrupt 16-bit accumulators.
     // The BM/16 row-strips are round-robin distributed across `nwarps` warps
     // (matches the golden reference's multi-drain-warp epilogue). The intrinsic
     // emits its own block-wide __syncthreads (all threads reach it -- the drain
@@ -877,18 +912,361 @@ private:
     }
     if (nwarps < 1)
       nwarps = 1;
-    Stmt drain_call = Evaluate(
-        Call(DataType::Handle(), tang_tmem_drain_16x256b_to_global(),
-             {tmem_base,
-              global_buf.access_ptr(2, DataType::Handle(), 1, base_offset),
-              IntImm(DataType::Int(32), BM), IntImm(DataType::Int(32), BN),
-              make_zero(accum_dtype_), IntImm(DataType::Int(32), nwarps),
-              IntImm(DataType::Int(32), N_tile)}));
+    // Rows this block actually owns: the destination's row extent minus the
+    // tile's row origin. A dynamic row bound (`num_tokens`) is not a multiple
+    // of the tile, so the last tile is partial, and the drain -- unlike the
+    // shared -> global copy path, which predicates itself -- writes raw buffer
+    // stores. Without the count it writes all BM rows and clobbers whatever
+    // follows the tensor (the next batch / split / row tile), which is a silent
+    // and racy corruption. Only passed when the tile is not provably inside the
+    // destination, so in-bounds kernels keep their exact code.
+    Array<PrimExpr> drain_args{
+        tmem_base,
+        global_buf.access_ptr(2, DataType::Handle(), 1, base_offset),
+        IntImm(DataType::Int(32), BM),
+        IntImm(DataType::Int(32), BN),
+        make_zero(accum_dtype_),
+        IntImm(DataType::Int(32), nwarps),
+        IntImm(DataType::Int(32), N_tile)};
+    if (global_buf->shape.size() >= 2 && nidx >= 2) {
+      PrimExpr row_origin =
+          ana.Simplify(Substitute(tmem_store->indices[row_pos], zero_intra));
+      PrimExpr row_extent = global_buf->shape[global_buf->shape.size() - 2];
+      PrimExpr rows_owned = ana.Simplify(row_extent - row_origin);
+      if (!ana.CanProve(rows_owned >= BM)) {
+        drain_args.push_back(rows_owned);
+      }
+    }
+    Stmt drain_call = Evaluate(Call(
+        DataType::Handle(), tang_tmem_drain_16x256b_to_global(), drain_args));
 
     processed_[op] = drain_call;
     return drain_call;
   }
 };
+
+// ===========================================================================
+// Pass 3: ExpandS3TmemDrain
+//   Materialize the fused drain as ordinary TIR after synchronization cleanup.
+// ===========================================================================
+
+namespace {
+
+constexpr int kLdtRows = 16;
+// One ``ldt_16x256b_x{N}`` call reads 16 rows x (8*N) fp32 columns into 4*N
+// registers per lane. The toolchain only provides N = 1, 2, 4, 8, 16, 32, so a
+// tile that is not a power-of-two number of 8-column units is drained with
+// several calls rather than one over-wide call.
+// Widest LDT this pass emits; also the chunk width used for wide tiles.
+constexpr int kLdtMaxChunks = 16;
+constexpr int kLdtChunkCols = kLdtColsPerChunk * kLdtMaxChunks; // 128 columns
+constexpr int kWarpSize = 32;
+
+inline PrimExpr I32(int64_t value) { return IntImm(DataType::Int(32), value); }
+
+class TangTmemDrainExpander : public StmtExprMutator {
+public:
+  static Stmt Expand(const Stmt &body) {
+    TangTmemDrainExpander expander;
+    expander.CollectUsedNames(body);
+    return expander(body);
+  }
+
+private:
+  Stmt VisitStmt_(const ForNode *op) final {
+    ++loop_depth_;
+    Stmt body = VisitStmt(op->body);
+    --loop_depth_;
+    For node = GetRef<For>(op);
+    node.CopyOnWrite()->body = body;
+    return Stmt(node);
+  }
+
+  Stmt VisitStmt_(const AttrStmtNode *op) final {
+    if (op->attr_key == tirx::attr::thread_extent) {
+      IterVar iv = Downcast<IterVar>(op->node);
+      if (iv->thread_tag == "threadIdx.x") {
+        thread_x_.push_back(iv->var);
+        Stmt body = StmtExprMutator::VisitStmt_(op);
+        thread_x_.pop_back();
+        return body;
+      }
+    }
+    return StmtExprMutator::VisitStmt_(op);
+  }
+
+  Stmt VisitStmt_(const EvaluateNode *op) final {
+    Stmt stmt = StmtExprMutator::VisitStmt_(op);
+    const auto *eval = stmt.as<EvaluateNode>();
+    if (eval == nullptr) {
+      return stmt;
+    }
+    const auto *call = eval->value.as<CallNode>();
+    if (call == nullptr ||
+        !call->op.same_as(tang_tmem_drain_16x256b_to_global())) {
+      return stmt;
+    }
+    return ExpandDrain(call);
+  }
+
+  void CollectUsedNames(const Stmt &body) {
+    PostOrderVisit(body, [this](const ObjectRef &node) {
+      if (const auto *load = node.as<BufferLoadNode>()) {
+        used_names_.insert(load->buffer->data->name_hint);
+      } else if (const auto *store = node.as<BufferStoreNode>()) {
+        used_names_.insert(store->buffer->data->name_hint);
+      } else if (const auto *decl = node.as<DeclBufferNode>()) {
+        used_names_.insert(decl->buffer->data->name_hint);
+      } else if (const auto *call = node.as<CallNode>()) {
+        if (call->op.same_as(builtin::tvm_access_ptr()) &&
+            call->args.size() >= 2) {
+          if (const auto *var = call->args[1].as<VarNode>()) {
+            used_names_.insert(var->name_hint);
+          }
+        }
+      }
+    });
+  }
+
+  std::string FreshOutName() {
+    std::string base = "_out";
+    if (!used_names_.count(base)) {
+      return base;
+    }
+    for (int i = 1;; ++i) {
+      std::string candidate = base + "_" + std::to_string(i);
+      if (!used_names_.count(candidate)) {
+        return candidate;
+      }
+    }
+  }
+
+  static Buffer GlobalBufferOf(const CallNode *access, PrimExpr *base_offset,
+                               DataType *elem_dtype) {
+    ICHECK(access->args.size() >= 4U)
+        << "tvm_access_ptr expects 5 arguments, got " << access->args.size();
+    const auto *annotation = access->args[0].as<CallNode>();
+    const auto *annotation_op =
+        annotation != nullptr ? annotation->op.as<OpNode>() : nullptr;
+    ICHECK(annotation_op != nullptr &&
+           annotation_op->name == "tirx.type_annotation")
+        << "tvm_access_ptr arg0 must be a TypeAnnotation call";
+    *elem_dtype = access->args[0].dtype();
+    const Var &data = Downcast<Var>(access->args[1]);
+    *base_offset = access->args[2];
+    PrimExpr extent = access->args[3];
+    return Buffer(data, *elem_dtype, {extent}, /*strides=*/{}, I32(0),
+                  data->name_hint, /*data_alignment=*/0, /*offset_factor=*/0,
+                  BufferType::kDefault);
+  }
+
+  Stmt ExpandDrain(const CallNode *call) {
+    ICHECK(call->args.size() == 6U || call->args.size() == 7U ||
+           call->args.size() == 8U)
+        << "tang_tmem_drain_16x256b_to_global expects 6, 7 or 8 arguments, got "
+        << call->args.size();
+    ICHECK(!thread_x_.empty())
+        << "ExpandS3TmemDrain: a TMEM->global drain outside any threadIdx.x "
+           "extent cannot be expanded";
+    const Var &thread_x = thread_x_.back();
+
+    const PrimExpr &tmem_base = call->args[0];
+    const auto *access = call->args[1].as<CallNode>();
+    ICHECK(access != nullptr && access->op.same_as(builtin::tvm_access_ptr()))
+        << "ExpandS3TmemDrain: drain arg1 must be a tvm_access_ptr";
+    PrimExpr base_offset;
+    DataType elem_dtype;
+    Buffer global = GlobalBufferOf(access, &base_offset, &elem_dtype);
+
+    const auto *bm_imm = call->args[2].as<IntImmNode>();
+    const auto *bn_imm = call->args[3].as<IntImmNode>();
+    const auto *nwarps_imm = call->args[5].as<IntImmNode>();
+    ICHECK(bm_imm != nullptr && bn_imm != nullptr && nwarps_imm != nullptr)
+        << "ExpandS3TmemDrain: the drain's BM/BN/nwarps must be constants";
+    const int bm = static_cast<int>(bm_imm->value);
+    const int bn = static_cast<int>(bn_imm->value);
+    int nwarps = static_cast<int>(nwarps_imm->value);
+    if (nwarps < 1) {
+      nwarps = 1;
+    }
+    const DataType accum_dtype = call->args[4].dtype();
+    int n_tile = kLdtChunkCols;
+    // `>= 7`, not `== 7`: the rows-this-tile-owns argument below appends to the
+    // call, and an exact-count test silently fell back to the 128-column
+    // default -- one ldt_16x256b_x16 reading past the accumulator's columns.
+    if (call->args.size() >= 7U) {
+      const auto *n_tile_imm = call->args[6].as<IntImmNode>();
+      ICHECK(n_tile_imm != nullptr)
+          << "ExpandS3TmemDrain: the drain's N_tile must be a constant";
+      n_tile = static_cast<int>(n_tile_imm->value);
+    }
+    // Rows the tile owns at this block's origin, when the detection pass could
+    // not prove the whole tile fits; absent otherwise (an in-bounds drain emits
+    // exactly the stores it always did).
+    PrimExpr rows_owned;
+    if (call->args.size() == 8U) {
+      rows_owned = call->args[7];
+    }
+    // A tile narrower than one 128-column LDT must NOT be widened to it: that
+    // call would read columns past the accumulator's tensor-memory allocation
+    // and its stores would walk past the tile. Drain the real column span as a
+    // sequence of descending power-of-two LDT widths instead.
+    if (n_tile <= 0) {
+      n_tile = kLdtChunkCols;
+    }
+    // Backstop: LowerTangTmemDrain rejects an undrainable width with the
+    // destination's name, so reaching this means some other path built the
+    // intrinsic. Keep the message user-facing anyway.
+    if (n_tile % kLdtColsPerChunk != 0) {
+      LOG(FATAL)
+          << "TANG STCUV2: this block's accumulator tile is drained over "
+          << n_tile << " columns, which is not a multiple of "
+          << kLdtColsPerChunk << ".\n"
+          << "  The drain reads the accumulator in " << kLdtColsPerChunk
+          << "-column units (a 32-byte LDT atom per row) and there is no "
+             "narrower instruction to finish a remainder with. Pad the "
+             "accumulator, or slice the write-back on a multiple of "
+          << kLdtColsPerChunk << " columns.";
+    }
+    std::vector<int> chunk_steps; // 8-column units loaded by each LDT call
+    for (int remaining = n_tile / kLdtColsPerChunk; remaining > 0;) {
+      int step = 1;
+      while (step * 2 <= remaining && step * 2 <= kLdtMaxChunks)
+        step *= 2;
+      chunk_steps.push_back(step);
+      remaining -= step;
+    }
+    const int max_chunks = chunk_steps.front();
+    {
+      std::string steps;
+      for (size_t i = 0; i < chunk_steps.size(); ++i)
+        steps += (i ? "x" : "") + std::to_string(chunk_steps[i]);
+      VLOG(1) << "ExpandS3TmemDrain: N_tile=" << n_tile
+              << " ldt_steps=" << steps << " (x" << kLdtColsPerChunk
+              << " columns each)";
+    }
+
+    // The per-step address below is ``row << 16 | column`` (see the note on the
+    // TMEM address format above TangTmemDrainRewriter), so the column field is
+    // 16 bits wide and must not carry into the row half.
+    ICHECK_LT(n_tile, 1 << 16)
+        << "ExpandS3TmemDrain: the drained tile is " << n_tile
+        << " columns wide, which does not fit the 16-bit column field of a "
+           "tensor-memory address.";
+
+    const std::string out_name = FreshOutName();
+    Var out_data(out_name, PointerType(PrimType(DataType::UInt(32)), "local"));
+    Buffer out_buf(out_data, DataType::UInt(32), {I32(4 * max_chunks)},
+                   /*strides=*/{}, I32(0), out_name, /*data_alignment=*/0,
+                   /*offset_factor=*/0, BufferType::kDefault);
+
+    PrimExpr warp = floordiv(thread_x, I32(kWarpSize));
+    PrimExpr lane = floormod(thread_x, I32(kWarpSize));
+
+    Var k("k", DataType::Int(32));
+    PrimExpr r_min = warp * I32(kLdtRows);
+    PrimExpr r_step = I32(nwarps * kLdtRows);
+    PrimExpr r_trip = floordiv(I32(bm) - r_min + r_step - I32(1), r_step);
+    r_trip = max(r_trip, I32(0));
+    PrimExpr r = r_min + k * r_step;
+
+    PrimExpr row_lo = r + floordiv(lane, I32(4));
+    PrimExpr row_hi = row_lo + I32(8);
+    PrimExpr bn_expr = I32(bn);
+    PrimExpr col_lo = floormod(lane, I32(4)) * I32(2);
+    auto element = [&](const Var &c, int64_t word) {
+      PrimExpr value = BufferLoad(out_buf, {c * I32(4) + I32(word)});
+      ICHECK(accum_dtype.bits() == 32 || accum_dtype.bits() == 16)
+          << "ExpandS3TmemDrain: a " << accum_dtype.bits()
+          << "-bit TMEM accumulator is not supported by the drain";
+      if (accum_dtype.bits() < 32) {
+        value = Cast(DataType::UInt(16), value);
+      }
+      value = reinterpret(accum_dtype, value);
+      if (!(value.dtype() == elem_dtype)) {
+        value = Cast(elem_dtype, value);
+      }
+      return value;
+    };
+    auto store = [&](const Var &c, const PrimExpr &col_base,
+                     const PrimExpr &row, const PrimExpr &col, int64_t word) {
+      PrimExpr index =
+          base_offset + row * bn_expr + col_base + c * I32(8) + col;
+      return BufferStore(global, element(c, word), {index});
+    };
+
+    // One LDT plus its store loop per column step. ``c`` counts the 8-column
+    // chunks inside the step, so the per-lane word offset stays c*4 + word and
+    // the column offset advances by the step's width.
+    Array<Stmt> drain_steps;
+    PrimExpr col_base = I32(0);
+    for (int step : chunk_steps) {
+      PrimExpr taddr = tmem_base + ((r << I32(16)) | col_base);
+      drain_steps.push_back(
+          Evaluate(Call(DataType::Handle(), tang_tmem_ld_16x256b(),
+                        {out_buf->data, taddr, I32(step)})));
+      // A fresh loop var per step: sibling copies must not share one, or bound
+      // inference sees a single var with two extents.
+      Var c("c", DataType::Int(32));
+      Stmt strip =
+          For(c, I32(0), I32(step), ForKind::kSerial,
+              SeqStmt({store(c, col_base, row_lo, col_lo, 0),
+                       store(c, col_base, row_lo, col_lo + I32(1), 1),
+                       store(c, col_base, row_hi, col_lo, 2),
+                       store(c, col_base, row_hi, col_lo + I32(1), 3)}));
+      if (rows_owned.defined()) {
+        // One compare per 16-row strip, not one per store: the upper half is
+        // writable exactly when row_hi is, and a boundary strip -- row_hi out
+        // but row_lo in -- takes the narrow branch with its two stores.
+        Var c_tail("c_tail", DataType::Int(32));
+        Stmt lower_half =
+            For(c_tail, I32(0), I32(step), ForKind::kSerial,
+                SeqStmt({store(c_tail, col_base, row_lo, col_lo, 0),
+                         store(c_tail, col_base, row_lo, col_lo + I32(1), 1)}));
+        strip = IfThenElse(row_hi < rows_owned, strip,
+                           IfThenElse(row_lo < rows_owned, lower_half, Stmt()));
+      }
+      drain_steps.push_back(strip);
+      col_base = col_base + I32(step * kLdtColsPerChunk);
+    }
+    Stmt strip_loop =
+        For(k, I32(0), r_trip, ForKind::kSerial, SeqStmt(drain_steps));
+    Stmt warp_guard = IfThenElse(warp < I32(nwarps), strip_loop, Stmt());
+    Stmt out_decl = SeqStmt(
+        {AllocBuffer(out_buf), DeclBuffer(out_buf), std::move(warp_guard)});
+
+    if (nwarps > 1) {
+      Array<Stmt> sequence{
+          Evaluate(Call(DataType::Handle(), builtin::tvm_storage_sync(),
+                        {StringImm("shared")})),
+          std::move(out_decl)};
+      if (loop_depth_ > 0) {
+        sequence.push_back(
+            Evaluate(Call(DataType::Handle(), builtin::tvm_storage_sync(),
+                          {StringImm("shared")})));
+      }
+      return SeqStmt(sequence);
+    }
+    return out_decl;
+  }
+
+  std::vector<Var> thread_x_;
+  std::unordered_set<std::string> used_names_;
+  int loop_depth_{0};
+};
+
+PrimFunc ExpandS3TmemDrainPrimFunc(PrimFunc f) {
+  auto target_opt = f->GetAttr<Target>(tvm::attr::kTarget);
+  if (!target_opt.defined() || !TargetTangIsSTCUV2(target_opt.value())) {
+    return f;
+  }
+  if (f->body.defined()) {
+    f.CopyOnWrite()->body = TangTmemDrainExpander::Expand(f->body);
+  }
+  return f;
+}
+
+} // namespace
 
 // ===========================================================================
 // Pass registration
@@ -916,11 +1294,20 @@ tvm::transform::Pass LowerTangTmemDrain() {
   return CreatePrimFuncPass(pass_func, 0, "tl.LowerTangTmemDrain", {});
 }
 
+tvm::transform::Pass ExpandS3TmemDrain() {
+  auto pass_func = [](PrimFunc f, const IRModule &, const PassContext &) {
+    return ExpandS3TmemDrainPrimFunc(std::move(f));
+  };
+  return CreatePrimFuncPass(pass_func, 0, "tl.tang.transform.ExpandS3TmemDrain",
+                            {});
+}
+
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef()
       .def("tl.tang.transform.LowerSharedTmem", LowerSharedTmem)
-      .def("tl.tang.transform.LowerTangTmemDrain", LowerTangTmemDrain);
+      .def("tl.tang.transform.LowerTangTmemDrain", LowerTangTmemDrain)
+      .def("tl.tang.transform.ExpandS3TmemDrain", ExpandS3TmemDrain);
 }
 
 } // namespace transform

@@ -1,7 +1,7 @@
 /*!
- * \file inject_tcgen05_fence.cc
- * \brief Inject ``fence_tc<fg>()`` / ``fence_tmem<fg>()`` at conservative
- *        TCGEN05/TMEM synchronization boundaries on stcuv2 (S3) targets.
+ * \file finalize_s3_thread_syncs.cc
+ * \brief Finalize TCGEN05/TMEM fences and certificate-aware ThreadSync
+ *        barriers on stcuv2 (S3) targets.
  *
  * Counterpart of ``tl.cuda.transform.InjectTcgen05Fence``
  * ------------------------------------------------------
@@ -35,7 +35,7 @@
  *   1. a ``tvm_storage_sync("shared")`` / ``("shared.dyn")`` gets a fence on
  *      the side(s) where a TCGEN05/TMEM use is adjacent in the linear region;
  *   2. insert a fence after ``mbarrier_wait_parity`` / ``tang_sync_wait`` when
- * a forward scan reaches a TCGEN05/TMEM use before the next boundary;
+ *      a forward scan reaches a TCGEN05/TMEM use before the next boundary;
  *   3. insert a fence before ``ptx_arrive_barrier`` / ``tang_sync_arrive`` when
  *      a backward scan reaches a TCGEN05/TMEM use after the previous boundary.
  *
@@ -55,21 +55,19 @@
  * per domain: a fence the kernel placed by hand (``tang_fence_tc`` /
  * ``tang_tmem_fence``) is never duplicated, but a hand-written ``fence_tc``
  * does not suppress the ``fence_tmem`` that a TMEM neighbour still needs -- the
- * two domains are retired independently. ``tang_fence_tc_arrive`` /
- * ``tang_fence_g2s_arrive`` are treated as arrives that already contain their
- * fence.
+ * two domains are retired independently.
  *
- * Out of scope (no fence injected, see docs/tang_tcgen05_fence_injection.md):
- * the async copy engines. The global<->shared bulk helpers retire their own
- * transfer with ``fence_mem(fg_g2s_default / fg_s2g_default)``, and
- * ``copy_tmem_shm.h`` documents that smem<->tmem completion is drained with
- * ``fence_mem`` on ``fg_t2s_default`` / ``fg_s2t_default`` -- the mem domain,
- * which is neither ``fence_tc`` nor ``fence_tmem``.
+ * The async copy engines are out of scope. The global<->shared bulk helpers
+ * retire their own
+ * transfer with ``fence_mem(fg_g2s_default / fg_s2g_default)``, and the
+ * smem<->tmem copy engines drain with ``fence_mem`` on ``fg_t2s_default`` /
+ * ``fg_s2t_default``. Those operations belong to the mem domain, not
+ * ``fence_tc`` or ``fence_tmem``.
  *
- * Gates
- * -----
- * * target arch is stcuv2 -- TMEM exists on no other TANG arch;
- * * the function body actually contains a TCGEN05/TMEM operation.
+ * Fence injection is gated on stcuv2 plus the presence of a TCGEN05/TMEM
+ * operation. The pass still runs S3 certificate-aware ThreadSync finalization
+ * on stcuv2 functions without such operations, and the two phases have
+ * independent pass-config switches.
  *
  * Group choice stays inside the defaults above. Other groups remain reachable
  * through the explicit ``T.tcgen05_*_thread_sync(fence_group)`` primitives
@@ -81,6 +79,8 @@
 #include "support/check.h"
 #include "tang/op/builtin.h"
 #include "tang/target_utils.h"
+#include "tang/transform/s3_async_pipeline_sync_schema.h"
+#include "tang/transform/s3_redundant_sync_remover.h"
 
 #include <tvm/ir/transform.h>
 #include <tvm/tirx/builtin.h>
@@ -88,6 +88,7 @@
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
 
+#include <unordered_set>
 #include <utility>
 
 namespace tvm {
@@ -133,12 +134,10 @@ bool IsMbarrierWaitParity(const CallNode *call) {
   return call && call->op.same_as(mbarrier_wait_parity());
 }
 
-/*! \brief TANG named-barrier wait (consumer side of a TMEM handoff). */
 bool IsTangSyncWait(const CallNode *call) {
   return call && call->op.same_as(tang_sync_wait());
 }
 
-/*! \brief TANG named-barrier arrive (producer side of a TMEM handoff). */
 bool IsTangSyncArrive(const CallNode *call) {
   return call && call->op.same_as(tang_sync_arrive());
 }
@@ -147,15 +146,6 @@ bool IsTangSyncArrive(const CallNode *call) {
  */
 bool IsPlainBarrierArrive(const CallNode *call) {
   return call && call->op.same_as(builtin::ptx_arrive_barrier());
-}
-
-/*!
- * \brief Arrives that already carry their own TC fence, so rule 3 must not add
- *        another before them.
- */
-bool IsFencedArrive(const CallNode *call) {
-  return call && (call->op.same_as(tang_fence_tc_arrive()) ||
-                  call->op.same_as(tang_fence_g2s_arrive()));
 }
 
 bool IsFenceTcCall(const CallNode *call) {
@@ -219,8 +209,7 @@ constexpr int kSttFenceGroup = 2; // fg_stt_default
  *   * the fences themselves, so an existing fence never counts as a use.
  */
 int DomainOfCall(const CallNode *call) {
-  if (!call || IsFenceTcCall(call) || IsFenceTmemCall(call) ||
-      IsFencedArrive(call)) {
+  if (!call || IsFenceTcCall(call) || IsFenceTmemCall(call)) {
     return kDomainNone;
   }
   if (call->op.same_as(tl_tang_gemm()) ||
@@ -259,7 +248,7 @@ bool IsTmemAddressOnlyCall(const CallNode *call) {
 bool IsFenceSyncBoundary(const CallNode *call) {
   return IsSharedStorageSync(call) || IsMbarrierWaitParity(call) ||
          IsTangSyncWait(call) || IsPlainBarrierArrive(call) ||
-         IsTangSyncArrive(call) || IsFencedArrive(call) ||
+         IsTangSyncArrive(call) ||
          (call && call->op.same_as(tang_tcgen05_mma_arrive()));
 }
 
@@ -402,8 +391,6 @@ DomainCollector ScanRegion(const Stmt &stmt) {
  * \brief Domains an already-present fence retires, or kDomainNone.
  *
  * ``fence_tmem`` retires the whole tmem domain, so it covers both directions.
- * ``tang_fence_g2s_arrive`` belongs to the mem domain, which this pass does not
- * manage, so it contributes no domain.
  */
 int FenceDomainsOf(const CallNode *call) {
   if (IsFenceTcCall(call)) {
@@ -411,9 +398,6 @@ int FenceDomainsOf(const CallNode *call) {
   }
   if (IsFenceTmemCall(call)) {
     return kDomainTmemRead | kDomainTmemWrite;
-  }
-  if (call && call->op.same_as(tang_fence_tc_arrive())) {
-    return kDomainTc;
   }
   return kDomainNone;
 }
@@ -628,23 +612,87 @@ private:
   bool in_seq_rewrite_{false};
 };
 
-tvm::transform::Pass InjectTcgen05Fence() {
-  auto pass_func = [](PrimFunc f, const IRModule &, const PassContext &) {
+bool IsS3OrderingOnlyCall(const CallNode *call) {
+  return call != nullptr &&
+         (call->op.same_as(tang_fence_tc()) ||
+          call->op.same_as(tang_tmem_fence()) ||
+          call->op.same_as(tang_fence_mem()) ||
+          call->op.same_as(tang_sync_wait()) ||
+          call->op.same_as(tang_mbar_wait_parity()) ||
+          call->op.same_as(tang_fence_barrier_init()) ||
+          call->op.same_as(builtin::create_barriers()) ||
+          call->op.same_as(builtin::ptx_init_barrier_thread_count()) ||
+          call->op.same_as(tang_tmem_drain_16x256b_to_global()) ||
+          call->op.same_as(mbarrier_wait_parity()) ||
+          call->op.same_as(tang_fence_g2s_arrive_mbarrier()) ||
+          call->op.same_as(tang_fence_tc_arrive_mbarrier()));
+}
+
+bool IsS3BarrierInitFence(const CallNode *call) {
+  return call != nullptr && call->op.same_as(tang_fence_barrier_init());
+}
+
+std::unordered_set<int64_t> ParseCertifiedAsyncEdges(const PrimFunc &f) {
+  std::unordered_set<int64_t> edges;
+  auto facts = f->GetAttr<Map<String, Array<Integer>>>(
+      tang::transform::kAsyncEdgeFactsAttr);
+  if (!facts.has_value()) {
+    return edges;
+  }
+  for (const auto &entry : facts.value()) {
+    tang::transform::AsyncEdgeFact fact;
+    if (!tang::transform::ParseAsyncEdgeFact(entry.second, &fact)) {
+      continue;
+    }
+    edges.insert(
+        tang::transform::AsyncEdgeKey(tang::transform::EncodeAsyncEdgeAnchor(
+            fact.loop_uid, fact.buffer_uid,
+            tang::transform::AsyncEdgeAnchorRole::kCopyWrite)));
+  }
+  return edges;
+}
+
+Stmt FinalizeCertifiedS3ThreadSyncs(const PrimFunc &f, Stmt body) {
+  tang::transform::S3RedundantSyncRemovalOptions options;
+  options.certified_edges = ParseCertifiedAsyncEdges(f);
+  options.enable_async_edge_certificates = true;
+  options.preserve_uncertified_loop_barriers = true;
+  options.async_edge_anchor_attr = tang::transform::kAsyncEdgeAnchorAttr;
+  options.async_copy_write_role =
+      static_cast<int64_t>(tang::transform::AsyncEdgeAnchorRole::kCopyWrite);
+  options.async_consumer_read_role =
+      static_cast<int64_t>(tang::transform::AsyncEdgeAnchorRole::kMmaRead);
+  options.is_ordering_only_call = IsS3OrderingOnlyCall;
+  options.requires_following_sync_call = IsS3BarrierInitFence;
+  return tang::transform::RemoveCertifiedS3Syncs(body, std::move(options));
+}
+
+tvm::transform::Pass FinalizeS3ThreadSyncs() {
+  auto pass_func = [](PrimFunc f, const IRModule &, const PassContext &ctx) {
     // TMEM only exists on stcuv2; stcu and every non-TANG target are untouched.
     Optional<Target> opt_target = f->GetAttr<Target>(tvm::attr::kTarget);
     if (!opt_target.defined() || !TargetTangIsSTCUV2(opt_target.value())) {
       return f;
     }
-    // Only apply if the function actually uses TCGEN05 / TMEM operations.
-    if (!HasTcgen05Operations(f->body)) {
+    Stmt body = f->body;
+    const bool inject_fences =
+        ctx->GetConfig<Bool>(kEnableTangInjectTcgen05Fence, Bool(true)).value();
+    if (inject_fences && HasTcgen05Operations(body)) {
+      TangTcgen05FenceRewriter rewriter;
+      body = rewriter(body);
+    }
+    if (!ctx->GetConfig<Bool>(kDisableRemoveRedundantSyncs, Bool(false))
+             .value()) {
+      body = FinalizeCertifiedS3ThreadSyncs(f, std::move(body));
+    }
+    if (body.same_as(f->body)) {
       return f;
     }
-    TangTcgen05FenceRewriter rewriter;
-    f.CopyOnWrite()->body = rewriter(f->body);
+    f.CopyOnWrite()->body = std::move(body);
     return f;
   };
-  return tirx::transform::CreatePrimFuncPass(pass_func, 0,
-                                             "tl.tang.InjectTcgen05Fence", {});
+  return tirx::transform::CreatePrimFuncPass(
+      pass_func, 0, "tl.tang.FinalizeS3ThreadSyncs", {});
 }
 
 } // namespace
@@ -653,8 +701,8 @@ TVM_REGISTER_PASS_CONFIG_OPTION(kEnableTangInjectTcgen05Fence, Bool);
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
-  refl::GlobalDef().def("tl.tang.transform.InjectTcgen05Fence",
-                        InjectTcgen05Fence);
+  refl::GlobalDef().def("tl.tang.transform.FinalizeS3ThreadSyncs",
+                        FinalizeS3ThreadSyncs);
 }
 
 } // namespace tl

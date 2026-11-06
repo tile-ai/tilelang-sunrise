@@ -563,14 +563,43 @@ private:
   }
 
   Stmt VisitStmt_(const ForNode *op) final {
-    if (analyzer_->CanProve(op->extent <= 0)) {
+    // Simplify the bounds in the enclosing scope, *before* entering the loop's
+    // own constraint scope. The loop's assumptions (`extent > 0` and
+    // `min <= var < min + extent`) only hold for the body: assuming
+    // `extent > 0` while simplifying `extent` itself is circular and collapses
+    // a tripped count such as `ceildiv(num_experts - lane_idx, warp_size)` to
+    // the constant 1 as soon as the loop can run, so lanes whose own trip count
+    // is 0 still execute the body. That produced an out-of-bounds shared-memory
+    // write (`T.serial(lane_idx, num_experts, warp_size)` with
+    // num_experts < warp_size) in test_expand_to_fused /
+    // test_get_fused_mapping.
+    PrimExpr min = this->VisitExpr(op->min);
+    PrimExpr extent = this->VisitExpr(op->extent);
+    if (analyzer_->CanProve(extent <= 0)) {
       // Remove loops with non-positive extent
       return Evaluate(0);
     }
-    With<ConstraintContext> ctx1(analyzer_, op->loop_var >= op->min);
-    With<ConstraintContext> ctx2(analyzer_,
-                                 op->loop_var < op->min + op->extent);
-    return Parent::VisitStmt_(op);
+    Range dom = Range::FromMinExtent(min, extent);
+    // Mirror IRMutatorWithAnalyzer::VisitStmt_(ForNode) step for step -- bind
+    // the iterator, record it in iter_vars_ and enter the loop's constraints --
+    // but only around the body. Using the same scope stack means nested
+    // statements still push and pop their constraints against the loop's,
+    // exactly as the base traversal does.
+    Stmt body = constraint_scope_.WithNewScope([&]() -> Stmt {
+      analyzer_->Bind(op->loop_var, dom);
+      iter_vars_.Set(op->loop_var, dom);
+      constraint_scope_.Current().Emplace(analyzer_, extent > 0);
+      constraint_scope_.Current().Emplace(analyzer_, op->loop_var >= min);
+      constraint_scope_.Current().Emplace(analyzer_,
+                                          op->loop_var < min + extent);
+      return this->VisitStmt(op->body);
+    });
+    if (min.same_as(op->min) && extent.same_as(op->extent) &&
+        body.same_as(op->body)) {
+      return ffi::GetRef<Stmt>(op);
+    }
+    return For(op->loop_var, min, extent, op->kind, body, op->thread_binding,
+               op->annotations, op->step, op->span);
   }
 
   bool CanInlineBind(const BindNode *op) {

@@ -117,12 +117,21 @@ def _reject_scopes(name: str, dst: BufferLikeType, src: BufferLikeType, want_dst
     raise AssertionError(f"{name}(dst, src) needs dst scope '{want_dst}' and src scope '{want_src}', but got dst='{d}', src='{s}'.{hint}")
 
 
-def tcgen05_cp(dst: BufferLikeType, src: BufferLikeType) -> tir.PrimExpr | tir.Stmt:
+def tcgen05_cp(
+    dst: BufferLikeType,
+    src: BufferLikeType,
+    *,
+    annotations: dict | None = None,
+) -> tir.PrimExpr | tir.Stmt:
     """Copy a tile from shared memory into tensor memory (stcuv2 cps2t).
 
     Args:
         dst: destination TMEM buffer (``T.alloc_tmem``, scope ``shared.tmem``).
         src: source shared-memory buffer.
+        annotations: extra copy annotations. ``{"tang_swizzle_atom_bytes": 32}``
+            declares that the shared tile was filled by a sw128a32 bulk copy, so
+            the engine has to undo that permutation in software; leave it out
+            when the tile took the unswizzled 1D staging copy.
 
     This is the shared->TMEM copy engine, used to stage an MMA **A operand**
     without a register-file round trip. It is the only supported spelling; a
@@ -135,10 +144,19 @@ def tcgen05_cp(dst: BufferLikeType, src: BufferLikeType) -> tir.PrimExpr | tir.S
     The lowering enforces the copy engine's contract and reports violations at
     compile time: the source must have been filled by a sw128a32 bulk copy, its
     rows must be a multiple of 32, and its row pitch a whole number of 128-byte
-    swizzle units. See ``docs/s3_tmem_shared_cpt2s_cps2t_layout.md`` §6.2.
+    swizzle units.
+
+    Whether the swizzle has to be undone is decided from two signals, and they
+    must agree with how the tile was actually filled -- a mismatch is a silent
+    mis-read, not an error: the buffer's inferred layout (it is also a GEMM
+    operand) or ``annotations`` above. The same key is what the matching global
+    store carries on the cpt2s side (``T.tang_cp_tmem_to_shared``).
     """
     _reject_scopes("tcgen05_cp", dst, src, _TMEM_SCOPE, _SHARED_SCOPES)
-    return _copy(src, dst, annotations=dict(_TCGEN05_CP_MARKER))
+    marker = dict(_TCGEN05_CP_MARKER)
+    if annotations:
+        marker.update(annotations)
+    return _copy(src, dst, annotations=marker)
 
 
 def tang_cp_tmem_to_shared(dst: BufferLikeType, src: BufferLikeType) -> tir.PrimExpr | tir.Stmt:
@@ -155,13 +173,12 @@ def tang_cp_tmem_to_shared(dst: BufferLikeType, src: BufferLikeType) -> tir.Prim
 
     Carries the ``tang_`` prefix because this direction has **no CUDA
     counterpart**: tcgen05 has no TMEM->shared instruction, and on Blackwell
-    data leaves TMEM only through registers (``tcgen05.ld``). See
-    ``docs/s3_tmem_shared_cpt2s_cps2t_layout.md`` §6.3.
+    data leaves TMEM only through registers (``tcgen05.ld``).
 
     The lowering requires a 32-bit shared tile of exactly 128 bytes per row and
     a row count that is a multiple of 64. Note the follow-up shared->global copy
     must be tagged ``annotations={"tang_swizzle_atom_bytes": 8}`` to match the
-    swizzle cpt2s writes -- see §6.1, this is a known footgun.
+    swizzle cpt2s writes.
     """
     _reject_scopes("tang_cp_tmem_to_shared", dst, src, _SHARED_SCOPES, _TMEM_SCOPE)
     return _copy(src, dst, annotations=dict(_TCGEN05_CP_MARKER))
