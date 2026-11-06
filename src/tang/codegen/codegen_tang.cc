@@ -176,6 +176,48 @@ GetAtomicAccessPtrElementType(const PrimExpr &expr) {
   return std::nullopt;
 }
 
+static std::optional<std::string>
+GetAtomicAccessPtrStorageScope(const PrimExpr &expr) {
+  const auto get_buffer_scope =
+      [](const BufferLoadNode *load) -> std::optional<std::string> {
+    if (load == nullptr) {
+      return std::nullopt;
+    }
+    return std::string(load->buffer.scope());
+  };
+  const auto get_var_scope =
+      [](const PrimExpr &value) -> std::optional<std::string> {
+    const auto *var = value.as<VarNode>();
+    if (var == nullptr) {
+      return std::nullopt;
+    }
+    const auto *ptr = var->type_annotation.as<PointerTypeNode>();
+    if (ptr == nullptr) {
+      return std::nullopt;
+    }
+    return std::string(ptr->storage_scope);
+  };
+
+  const auto *ptr_call = expr.as<CallNode>();
+  if (ptr_call == nullptr) {
+    return get_var_scope(expr);
+  }
+  if (ptr_call->op.same_as(builtin::address_of())) {
+    ICHECK_EQ(ptr_call->args.size(), 1U);
+    return get_buffer_scope(ptr_call->args[0].as<BufferLoadNode>());
+  }
+  if (ptr_call->op.same_as(builtin::tvm_access_ptr())) {
+    ICHECK_GE(ptr_call->args.size(), 2U);
+    return get_var_scope(ptr_call->args[1]);
+  }
+  if (ptr_call->op.same_as(tl::access_ptr())) {
+    ICHECK_EQ(ptr_call->args.size(), 3U)
+        << "tl.access_ptr expects 3 args: (BufferLoad, extent, rw_mask)";
+    return get_buffer_scope(ptr_call->args[0].as<BufferLoadNode>());
+  }
+  return std::nullopt;
+}
+
 static std::string GetFP8Type(DataType type) {
   std::stringstream stream;
   int32_t lanes = type.lanes();
@@ -682,14 +724,6 @@ std::string CodeGenTileLangTANG::Finish() {
     decl_stream << "#include <cccl/tang/ptx>\n";
   }
 
-  if (need_cp_async_bulk_h_) {
-    decl_stream << "#include <tl_templates/tang/copy_global_shm.h>\n";
-  }
-
-  if (need_cp_tmem_smem_h_) {
-    decl_stream << "#include <tl_templates/tang/copy_tmem_shm.h>\n";
-  }
-
   if (need_barrier_h_) {
     decl_stream << "#include <tl_templates/tang/barrier.h>\n";
   }
@@ -1069,22 +1103,6 @@ void CodeGenTileLangTANG::PrintType(DataType t, std::ostream &os) { // NOLINT(*)
 void CodeGenTileLangTANG::PrintVecBinaryOp(const std::string &op, DataType t,
                                            PrimExpr lhs, PrimExpr rhs,
                                            std::ostream &os) { // NOLINT(*)
-  // Fast-path for packed FP32x2 arithmetic (stcuv2 only).
-  Target cur_target = Target::Current(/*allow_not_defined=*/true);
-  bool target_supports_f32x2_packed =
-      cur_target.defined() && tl::TargetTangIsSTCUV2(cur_target);
-  if (target_supports_f32x2_packed && t.is_float() && t.bits() == 32 &&
-      t.lanes() == 2) {
-    if (op == "+") {
-      os << "tl::fadd2(" << PrintExpr(lhs) << ", " << PrintExpr(rhs) << ")";
-      return;
-    }
-    if (op == "*") {
-      os << "tl::fmul2(" << PrintExpr(lhs) << ", " << PrintExpr(rhs) << ")";
-      return;
-    }
-  }
-
   // Declare the result.
   std::string sret = name_supply_->FreshName("_");
   this->PrintIndent();
@@ -1313,14 +1331,40 @@ void CodeGenTileLangTANG::PrintStorageSync(const CallNode *op) {
     if (args.size() == 1) {
       this->stream << "__syncthreads();\n";
     } else {
-      // TANG (stcuv2) has no named/partial barriers. ThreadSyncPlanner only
-      // emits a partial sync (scope, barrier_id, thread_count) inside a
-      // divergent thread guard, where a full __syncthreads() would deadlock:
-      // the unguarded threads never reach the barrier. TANG's guarded regions
-      // are always a single warp, so __syncwarp() has the same semantics and
-      // every thread in the guard can reach it.
+      // This generic storage-sync path can print only __syncthreads() (whole
+      // block) or __syncwarp() (one warp). S3 materializes compiler-generated
+      // partial rendezvous as mbarriers; explicit language-level handoffs use
+      // tang_sync_arrive / tang_sync_wait.
+      //
+      // ThreadSyncPlanner emits a partial sync (scope, barrier_id,
+      // thread_count) only inside a divergent thread guard, where a full
+      // __syncthreads() would deadlock: the unguarded threads never reach the
+      // barrier. A single-warp guard can use __syncwarp(), but a wider partial
+      // group has no representation on this path.
+      int64_t thread_count = 0;
+      if (args.size() >= 3) {
+        const auto *count = args[2].as<IntImmNode>();
+        if (count != nullptr) {
+          thread_count = count->value;
+        }
+      }
+      if (thread_count != 32) {
+        LOG(FATAL)
+            << "TANG partial storage sync requires exactly 32 threads on "
+               "this codegen path, got "
+            << thread_count
+            << ". Materialize wider partial synchronization with an mbarrier "
+               "before code generation.";
+      }
       this->stream << "__syncwarp();\n";
     }
+  } else if (sync == "cluster") {
+    // Cluster-scoped storage sync: publish (e.g. a barrier init) to every CTA
+    // in the cluster. LowerSharedBarrier emits this for shared.cluster_barrier
+    // allocations so peer CTAs observe the init before a remote arrive.
+    need_cluster_h_ = true;
+    this->PrintIndent();
+    this->stream << "tl::cluster_sync();\n";
   } else if (sync == "global") {
     if (!need_global_barrier_) {
       need_global_barrier_ = true;
@@ -2397,6 +2441,29 @@ void CodeGenTileLangTANG::PrintVecStore(const BufferNode *buffer, DataType t,
                << ");\n";
 }
 
+// tcgen05 MMA descriptor operands, shared by the tang_tcgen05_mma_ss / _ts /
+// _scale handlers. The operand value comes from the `tang_mma_data_desc` /
+// `tang_mma_instr_desc` / `tang_mma_scale_instr_desc` expression branches of
+// VisitExpr_ (below), which print the marker intrinsics the STCU TCProcess pass
+// reads structurally; binding them to locals here keeps a single descriptor
+// feeding both `mma<true>` and `mma<false>`.
+void CodeGenTileLangTANG::PrintMmaDescriptorOperand(const std::string &name,
+                                                    const PrimExpr &value) {
+  // Spelled out instead of via PrintType: the descriptor markers have always
+  // been declared as `uint32_t` / `uint64_t` in the generated source.
+  std::string type;
+  if (value.dtype() == DataType::UInt(64)) {
+    type = "uint64_t";
+  } else if (value.dtype() == DataType::UInt(32)) {
+    type = "uint32_t";
+  } else {
+    ICHECK(false) << "unexpected tcgen05 MMA descriptor operand type "
+                  << value.dtype();
+  }
+  this->stream << "  " << type << " " << name << " = " << this->PrintExpr(value)
+               << ";\n";
+}
+
 /**
  * @brief Emit TANG/TensorLib-specific code for a call expression.
  *
@@ -2429,6 +2496,64 @@ void CodeGenTileLangTANG::PrintVecStore(const BufferNode *buffer, DataType t,
  *            expects an expression result (some paths write directly to the
  *            member stream instead).
  */
+
+// The predicated arrive form has no remote counterpart: a DSHM mbarrier
+// arrive is unconditional, so only the local cta_id == 0 is accepted here and
+// the predicate is honoured. A predicated remote arrive is rejected rather
+// than silently dropping the predicate.
+// LOG(FATAL) rather than ICHECK: a failed check must not fall through into a
+// local arrive.
+static void RequireLocalCtaArrive(const PrimExpr &cta_id) {
+  const auto *imm = cta_id.as<IntImmNode>();
+  const DataType dtype = cta_id.dtype();
+  if (imm == nullptr || !dtype.is_scalar() ||
+      !(dtype.is_int() || dtype.is_uint()) || imm->value != 0) {
+    LOG(FATAL) << "TANG predicated mbarrier arrive only accepts a scalar "
+                  "integer cta_id == 0 (the local CTA): a DSHM remote arrive "
+                  "is unconditional. Use the two-argument "
+                  "T.mbarrier_arrive(mbar, cta_id) form for a remote arrive. "
+                  "Got cta_id="
+               << cta_id;
+  }
+}
+
+// pred is the CUDA 0/1 arrive predicate. Any other constant would otherwise
+// be treated as "always arrive" and drop the predicate on the floor.
+static bool ArrivePredConstant(const PrimExpr &pred, int64_t *value) {
+  const DataType dtype = pred.dtype();
+  if (!dtype.is_scalar() ||
+      !(dtype.is_int() || dtype.is_uint() || dtype.is_bool())) {
+    LOG(FATAL) << "TANG mbarrier arrive pred must be a scalar integer or "
+                  "bool. Got "
+               << pred << " of dtype " << dtype;
+  }
+  const auto *imm = pred.as<IntImmNode>();
+  if (imm == nullptr) {
+    return false;
+  }
+  if (imm->value != 0 && imm->value != 1) {
+    LOG(FATAL) << "TANG mbarrier arrive pred must be 0 or 1, got "
+               << imm->value;
+  }
+  *value = imm->value;
+  return true;
+}
+
+static void RequireNonNegativeTransactionBytes(const PrimExpr &tx) {
+  const DataType dtype = tx.dtype();
+  if (!dtype.is_scalar() || !(dtype.is_int() || dtype.is_uint())) {
+    LOG(FATAL) << "TANG mbarrier transaction count must be a scalar integer "
+                  "byte count, got "
+               << tx << " of dtype " << dtype;
+  }
+  if (const auto *imm = tx.as<IntImmNode>()) {
+    if (imm->value < 0) {
+      LOG(FATAL) << "TANG mbarrier transaction count must be >= 0, got "
+                 << imm->value;
+    }
+  }
+}
+
 void CodeGenTileLangTANG::VisitExpr_(const CallNode *op, std::ostream &os) {
   if (op->op.same_as(builtin::bitwise_not()) && op->dtype.is_bool()) {
     ICHECK_EQ(op->args.size(), 1U);
@@ -2474,6 +2599,93 @@ void CodeGenTileLangTANG::VisitExpr_(const CallNode *op, std::ostream &os) {
        << PrintExpr(op->args[0]) << ", " << PrintExpr(op->args[1]) << ")";
     return;
   }
+  if (op->op.same_as(tl::add2()) || op->op.same_as(tl::sub2()) ||
+      op->op.same_as(tl::mul2()) || op->op.same_as(tl::fma2()) ||
+      op->op.same_as(tl::max2()) || op->op.same_as(tl::min2()) ||
+      op->op.same_as(tl::max2_nan()) || op->op.same_as(tl::min2_nan()) ||
+      op->op.same_as(tl::abs2())) {
+    ICHECK_EQ(op->dtype.lanes(), 2)
+        << "TANG packed pair intrinsics require an x2 dtype";
+    ICHECK((op->dtype.is_float() &&
+            (op->dtype.bits() == 16 || op->dtype.bits() == 32)) ||
+           op->dtype.is_bfloat16())
+        << "Unsupported TANG packed pair dtype " << op->dtype;
+
+    std::string op_name;
+    if (op->op.same_as(tl::add2()))
+      op_name = "add2";
+    else if (op->op.same_as(tl::sub2()))
+      op_name = "sub2";
+    else if (op->op.same_as(tl::mul2()))
+      op_name = "mul2";
+    else if (op->op.same_as(tl::fma2()))
+      op_name = "fma2";
+    else if (op->op.same_as(tl::max2()))
+      op_name = "max2";
+    else if (op->op.same_as(tl::min2()))
+      op_name = "min2";
+    else if (op->op.same_as(tl::max2_nan()))
+      op_name = "max2_nan";
+    else if (op->op.same_as(tl::min2_nan()))
+      op_name = "min2_nan";
+    else
+      op_name = "abs2";
+
+    // `add2(mul2(a, b), c)` is a fused multiply-add spelled the long way. CUDA
+    // rewrites exactly this shape to fma2 in its codegen, so do the same here
+    // rather than leave the contraction to the backend: the backend fuses the
+    // f32 form today and leaves the f16 form as mul+add.
+    std::vector<PrimExpr> packed_args(op->args.begin(), op->args.end());
+    if (op->op.same_as(tl::add2()) && op->args.size() == 2) {
+      auto try_fuse_mul_add = [&](const PrimExpr &mul_expr,
+                                  const PrimExpr &addend) -> bool {
+        const auto *mul_call = mul_expr.as<CallNode>();
+        if (mul_call == nullptr || !mul_call->op.same_as(tl::mul2()) ||
+            mul_call->args.size() != 2 || mul_call->dtype != op->dtype ||
+            addend.dtype() != op->dtype) {
+          return false;
+        }
+        op_name = "fma2";
+        packed_args = {mul_call->args[0], mul_call->args[1], addend};
+        return true;
+      };
+      if (!try_fuse_mul_add(op->args[0], op->args[1])) {
+        try_fuse_mul_add(op->args[1], op->args[0]);
+      }
+    }
+
+    if (op->dtype.is_float16()) {
+      enable_fp16_ = true;
+    } else if (op->dtype.is_bfloat16()) {
+      enable_bf16_ = true;
+    }
+
+    std::string result = name_supply_->FreshName("_packed_pair");
+    PrintIndent();
+    PrintType(op->dtype, stream);
+    stream << " " << result << ";\n";
+
+    std::vector<std::string> args;
+    for (size_t i = 0; i < packed_args.size(); ++i) {
+      args.push_back(
+          SSAGetID(PrintExpr(packed_args[i]), packed_args[i].dtype()));
+    }
+
+    // Which instruction a pair operation becomes is the backend's decision, so
+    // state the operation once, on the toolchain's vector API, instead of
+    // expanding two lanes here: the per-lane form is the shape LLVM does not
+    // merge, and the packed form it does pick is not ours to promise.
+    const char *suffix = op->dtype.is_float16()    ? "_f16"
+                         : op->dtype.is_bfloat16() ? "_bf16"
+                                                   : "_f32";
+    stream << result << " = tl::packed_" << op_name << suffix << "(";
+    for (size_t i = 0; i < args.size(); ++i) {
+      stream << (i == 0 ? "" : ", ") << args[i];
+    }
+    stream << ");\n";
+    os << result;
+    return;
+  }
   auto print_pointer = [&](const PrimExpr &expr) {
     if (const auto *call = expr.as<CallNode>()) {
       if (call->op.same_as(builtin::tvm_access_ptr())) {
@@ -2498,6 +2710,16 @@ void CodeGenTileLangTANG::VisitExpr_(const CallNode *op, std::ostream &os) {
   auto print_mbarrier_ptr = [&](const PrimExpr &barrier) {
     if (barrier.as<IntImmNode>()) {
       return "&(" + mbarrier_name_ + "[" + PrintExpr(barrier) + "])";
+    }
+    // get_mbarrier(i) already prints as an element of the shared array, so take
+    // the address of that element: the generic path below would ask for a
+    // pointer to its *value*, which print_pointer cannot form. This is the
+    // shape the async-copy pass emits for a barrier indexed by a runtime stage
+    // expression.
+    if (const auto *call = barrier.as<CallNode>()) {
+      if (call->op.same_as(tl::get_mbarrier()) && call->args.size() == 1) {
+        return "&(" + mbarrier_name_ + "[" + PrintExpr(call->args[0]) + "])";
+      }
     }
     return "reinterpret_cast<" + mbarrier_dtype_ + " *>(" +
            print_pointer(barrier) + ")";
@@ -2561,7 +2783,6 @@ void CodeGenTileLangTANG::VisitExpr_(const CallNode *op, std::ostream &os) {
     stream << "*reinterpret_cast<unsigned int*>(" << pointer << ") = " << value
            << ";\n";
   } else if (op->op.same_as(builtin::ptx_cp_async())) {
-    // NOT used, will be deleted in the future.
     std::string dst = this->PrintExpr(op->args[0]);
     std::string dst_offset = this->PrintExpr(op->args[1]);
     std::string src = this->PrintExpr(op->args[2]);
@@ -2646,27 +2867,120 @@ void CodeGenTileLangTANG::VisitExpr_(const CallNode *op, std::ostream &os) {
     stream << ");\n";
     return;
   } else if (op->op.same_as(tl::atomic_load_elem_op())) {
-    LOG(FATAL) << "TANG STCU S2 does not support atomic_load; the Tang 0.25 "
-                  "compiler cannot select an atomic load instruction";
+    ICHECK_EQ(op->args.size(), 2U)
+        << "atomic_load expects address and memory order";
+    need___clang_tang_builtin_vars_h = true;
+    Target cur_target = Target::Current(/*allow_not_defined=*/true);
+    ICHECK(cur_target.defined() && tl::TargetTangIsSTCUV2(cur_target))
+        << "TANG atomic_load requires arch=stcuv2";
+    auto element_type = GetAtomicAccessPtrElementType(op->args[0]);
+    ICHECK(element_type.has_value() && element_type.value().is_scalar() &&
+           (element_type.value().bits() == 16 ||
+            element_type.value().bits() == 32 ||
+            element_type.value().bits() == 64))
+        << "TANG STCUV2 atomic_load supports naturally aligned scalar "
+           "16/32/64-bit values";
+    if (auto scope = GetAtomicAccessPtrStorageScope(op->args[0])) {
+      ICHECK(scope.value().empty() || scope.value() == "global" ||
+             scope.value() == "shared" || scope.value() == "shared.dyn")
+          << "TANG STCUV2 atomic_load does not support storage scope '"
+          << scope.value()
+          << "'; only global/shared/generic memory is "
+             "supported";
+    }
+    os << "tl::atomic_load(" << print_pointer(op->args[0]) << ", "
+       << PrintExpr(op->args[1]) << ")";
+    return;
   } else if (op->op.same_as(tl::atomic_store_elem_op())) {
-    LOG(FATAL) << "TANG STCU S2 does not support atomic_store; the Tang 0.25 "
-                  "compiler cannot select an atomic store instruction";
+    ICHECK_EQ(op->args.size(), 3U)
+        << "atomic_store expects address, value, and memory order";
+    need___clang_tang_builtin_vars_h = true;
+    Target cur_target = Target::Current(/*allow_not_defined=*/true);
+    ICHECK(cur_target.defined() && tl::TargetTangIsSTCUV2(cur_target))
+        << "TANG atomic_store requires arch=stcuv2";
+    auto element_type = GetAtomicAccessPtrElementType(op->args[0]);
+    ICHECK(element_type.has_value() && element_type.value().is_scalar() &&
+           (element_type.value().bits() == 16 ||
+            element_type.value().bits() == 32 ||
+            element_type.value().bits() == 64))
+        << "TANG STCUV2 atomic_store supports naturally aligned scalar "
+           "16/32/64-bit values";
+    if (auto scope = GetAtomicAccessPtrStorageScope(op->args[0])) {
+      ICHECK(scope.value().empty() || scope.value() == "global" ||
+             scope.value() == "shared" || scope.value() == "shared.dyn")
+          << "TANG STCUV2 atomic_store does not support storage scope '"
+          << scope.value()
+          << "'; only global/shared/generic memory is "
+             "supported";
+    }
+    PrintIndent();
+    stream << "tl::atomic_store(" << print_pointer(op->args[0]) << ", "
+           << PrintExpr(op->args[1]) << ", " << PrintExpr(op->args[2])
+           << ");\n";
+    return;
   } else if (op->op.same_as(tl::atomic_addx2_elem_op()) ||
-             op->op.same_as(tl::atomic_addx4_elem_op())) {
+             op->op.same_as(tl::atomic_addx4_elem_op()) ||
+             op->op.same_as(tl::atomic_addx2_ret_elem_op()) ||
+             op->op.same_as(tl::atomic_addx4_ret_elem_op())) {
     ICHECK(op->args.size() == 2 || op->args.size() == 3)
         << "vector atomic add expects destination and source pointers";
     need___clang_tang_builtin_vars_h = true;
     std::string dst = print_pointer(op->args[0]);
     std::string src = print_pointer(op->args[1]);
-    int lanes = op->op.same_as(tl::atomic_addx2_elem_op()) ? 2 : 4;
+    bool width_two = op->op.same_as(tl::atomic_addx2_elem_op()) ||
+                     op->op.same_as(tl::atomic_addx2_ret_elem_op());
+    bool returns_value = op->op.same_as(tl::atomic_addx2_ret_elem_op()) ||
+                         op->op.same_as(tl::atomic_addx4_ret_elem_op());
+    int lanes = width_two ? 2 : 4;
     auto dst_type = GetAtomicAccessPtrElementType(op->args[0]);
     ICHECK(dst_type.has_value())
         << "vector atomic add expects a typed destination access pointer";
-    if (dst_type.value().is_float16() || dst_type.value().is_bfloat16()) {
-      LOG(FATAL) << "TANG vector atomicAdd does not support float16 or "
-                    "bfloat16; the local atomic contract has no packed-CAS "
-                    "fallback";
+
+    Target cur_target = Target::Current(/*allow_not_defined=*/true);
+    bool use_native_vector =
+        cur_target.defined() && tl::TargetTangIsSTCUV2(cur_target) &&
+        ((dst_type.value().is_float() &&
+          (dst_type.value().bits() == 16 || dst_type.value().bits() == 32)) ||
+         dst_type.value().is_bfloat16());
+    if (use_native_vector) {
+      std::string suffix;
+      if (dst_type.value().is_float16()) {
+        enable_fp16_ = true;
+        suffix = "f16";
+      } else if (dst_type.value().is_bfloat16()) {
+        enable_bf16_ = true;
+        suffix = "bf16";
+      } else {
+        suffix = "f32";
+      }
+      std::ostringstream call;
+      call << "tl::atomic_addx" << lanes << "_" << suffix << "(" << dst << ", "
+           << src << ")";
+      if (returns_value) {
+        if (suffix == "f16" || suffix == "bf16") {
+          std::string result = name_supply_->FreshName("_atomic_result");
+          PrintIndent();
+          PrintType(op->dtype, stream);
+          stream << " " << result << ";\n";
+          PrintIndent();
+          stream << "tl::atomic_addx" << lanes << "_ret_" << suffix << "("
+                 << dst << ", " << src << ", &" << result << ");\n";
+          os << result;
+        } else {
+          os << call.str();
+        }
+      } else {
+        PrintIndent();
+        stream << call.str() << ";\n";
+      }
+      return;
     }
+
+    ICHECK(!returns_value)
+        << "TANG vector atomic add with return value requires arch=stcuv2 "
+           "and float32, float16, or bfloat16 elements";
+    ICHECK(!(dst_type.value().is_float16() || dst_type.value().is_bfloat16()))
+        << "TANG fp16/bf16 vector atomic add requires arch=stcuv2";
     for (int lane = 0; lane < lanes; ++lane) {
       PrintIndent();
       stream << "atomicAdd(" << dst << " + " << lane << ", *(" << src << " + "
@@ -3161,15 +3475,9 @@ void CodeGenTileLangTANG::VisitExpr_(const CallNode *op, std::ostream &os) {
     }
     return;
   } else if (op->op.same_as(builtin::create_barriers())) {
+    // The array is already declared in AddFunction, ahead of the dynamic shared
+    // memory buffer -- see the comment there for why the position matters.
     need_barrier_h_ = true;
-    this->PrintIndent();
-    int barrier_count = Downcast<IntImm>(op->args[0])->value;
-    auto mbarrier_storage_name = mbarrier_name_ + "_mem";
-    this->stream << "__shared__ uint64_t " << mbarrier_storage_name << "["
-                 << barrier_count << "];\n";
-    this->PrintIndent();
-    this->stream << "auto " << mbarrier_name_ << " = reinterpret_cast<"
-                 << mbarrier_dtype_ << "*>(" << mbarrier_storage_name << ");\n";
   } else if (op->op.same_as(tl::get_mbarrier())) {
     ICHECK_EQ(op->args.size(), 1);
     std::string barrier_id = this->PrintExpr(op->args[0]);
@@ -3181,17 +3489,50 @@ void CodeGenTileLangTANG::VisitExpr_(const CallNode *op, std::ostream &os) {
       auto mbarrier_obj = print_mbarrier_obj(op->args[0]);
       this->stream << mbarrier_obj << ".arrive();\n";
     } else if (op->args.size() == 3) {
-      // The three-argument form is mbarrier.arrive.cluster with a cta_id and a
-      // predicate. TANG has no cluster level and no cta_id operand on arrive,
-      // so there is nothing to lower this to.
-      LOG(FATAL) << "TANG codegen: T.mbarrier_arrive(mbar, cta_id, pred) is a "
-                    "cluster-scoped arrive, which TANG does not have (no "
-                    "cluster level, and mbarrier.arrive takes no cta_id "
-                    "operand). Use the single-argument T.mbarrier_arrive(mbar) "
-                    "for block-scoped synchronisation.";
+      // mbarrier.arrive(mbar, cta_id, pred). Only cta_id == 0 is accepted:
+      // that is the local shared mbarrier, and pred gates the arrive. A
+      // non-zero rank is __set_block_rank + DSHM __mbarrier_arrive, which is
+      // not enabled. LowerSharedBarrier rewrites this form before codegen;
+      // this arm is the same rule if the call still arrives here.
+      RequireLocalCtaArrive(op->args[1]);
+      need_barrier_h_ = true;
+      auto mbarrier_obj = print_mbarrier_obj(op->args[0]);
+      int64_t pred_value = 0;
+      if (ArrivePredConstant(op->args[2], &pred_value)) {
+        if (pred_value != 0) {
+          this->PrintIndent();
+          this->stream << mbarrier_obj << ".arrive();\n";
+        }
+      } else {
+        this->PrintIndent();
+        this->stream << "if (" << this->PrintExpr(op->args[2]) << ") "
+                     << mbarrier_obj << ".arrive();\n";
+      }
     } else {
       LOG(FATAL) << "Invalid parameter  for tl::arrive_barrier "
                  << op->args.size();
+    }
+  } else if (op->op.same_as(tl::ptx_arrive_cluster_barrier())) {
+    // T.mbarrier_arrive(mbar, cta_id), also emitted by
+    // T.copy_cluster(dst_block=..., remote_barrier=...). A constant 0 is this
+    // CTA's own shared mbarrier and keeps the cheap local arrive. Any other
+    // rank is a remote arrive: map the barrier into the peer CTA's address
+    // space and issue a DSHM mbarrier arrive (tl::cluster_arrive_barrier in
+    // cluster.h, backed by the DSHM builtins on LLVM develop).
+    // args: (mbarrier, cta_id).
+    ICHECK_EQ(op->args.size(), 2U)
+        << "ptx_arrive_cluster_barrier requires 2 args (mbarrier, cta_id)";
+    const auto *cta_imm = op->args[1].as<IntImmNode>();
+    if (cta_imm != nullptr && cta_imm->value == 0) {
+      need_barrier_h_ = true;
+      this->PrintIndent();
+      this->stream << print_mbarrier_obj(op->args[0]) << ".arrive();\n";
+    } else {
+      need_cluster_h_ = true;
+      this->PrintIndent();
+      this->stream << "tl::cluster_arrive_barrier("
+                   << print_pointer(op->args[0]) << ", (int)("
+                   << this->PrintExpr(op->args[1]) << "));\n";
     }
   } else if (op->op.same_as(builtin::ptx_init_barrier_thread_count())) {
     ICHECK_EQ(op->args.size(), 2);
@@ -3201,27 +3542,57 @@ void CodeGenTileLangTANG::VisitExpr_(const CallNode *op, std::ostream &os) {
     auto arrive_count = this->PrintExpr(op->args[1]);
     this->stream << mbarrier_obj << ".init(" << arrive_count << ");\n";
   } else if (op->op.same_as(builtin::ptx_arrive_barrier_expect_tx())) {
-    // TANG has no fused arrive.expect_tx: expect_tx and arrive are separate
-    // instructions. Splitting the fused builtin here would silently drop its
-    // atomicity, and the fused form only exists to serve the expect_tx /
-    // complete_tx transaction protocol, whose hardware counter is documented as
-    // unreliable on this silicon. See docs/tang_mbarrier.md.
-    LOG(FATAL) << "TANG codegen: T.mbarrier_arrive_expect_tx is not supported. "
-                  "TANG has no fused arrive.expect_tx instruction, and the "
-                  "transaction-count protocol it belongs to is unreliable on "
-                  "current hardware. Publish async-copy completion with a "
-                  "fence group bound to the barrier instead; see "
-                  "docs/tang_mbarrier.md.";
-  } else if (op->op.same_as(builtin::ptx_cp_async_barrier()) ||
-             op->op.same_as(tl::ptx_cp_async_barrier_noinc())) {
-    // cp.async.mbarrier.arrive makes a non-bulk cp.async group signal an
-    // mbarrier on completion. TANG's PTX layer leaves that instruction
-    // unwired (cp_async_mbarrier_arrive.h is commented out of the umbrella
-    // header), so there is no instruction to emit.
-    LOG(FATAL) << "TANG codegen: cp.async.mbarrier.arrive is not available on "
-                  "TANG, so a cp.async group cannot signal an mbarrier "
-                  "directly. Drain the copy with its fence group instead; see "
-                  "docs/tang_mbarrier.md.";
+    // Shared-memory __mbarrier_arrive_expect_tx. The device library composes
+    // expect_tx then arrive; there is no fused opcode, so the two updates are
+    // not one atomic RMW. The transaction counter is the same unreliable one
+    // as mbarrier_expect_tx. The 4-arg form is the cluster variant.
+    if (op->args.size() == 2) {
+      RequireNonNegativeTransactionBytes(op->args[1]);
+      need_barrier_h_ = true;
+      this->PrintIndent();
+      auto mbarrier_obj = print_mbarrier_obj(op->args[0]);
+      auto transaction_bytes = this->PrintExpr(op->args[1]);
+      this->stream << mbarrier_obj << ".arrive_expect_tx(" << transaction_bytes
+                   << ");\n";
+    } else if (op->args.size() == 3) {
+      LOG(FATAL) << "TANG codegen: T.mbarrier_arrive_expect_tx does not take a "
+                    "separate arrive count. The device call uses count=1. Got "
+                 << op->args.size() << " arguments.";
+    } else if (op->args.size() == 4) {
+      LOG(FATAL) << "TANG codegen: T.mbarrier_arrive_expect_tx(mbar, tx, "
+                    "cta_id, pred) is a cluster-scoped arrive, which TANG does "
+                    "not have. Use the two-argument form for the block-scoped "
+                    "shared mbarrier.";
+    } else {
+      LOG(FATAL) << "TANG codegen: T.mbarrier_arrive_expect_tx expects "
+                    "(mbarrier, tx_bytes), got "
+                 << op->args.size() << " arguments.";
+    }
+  } else if (op->op.same_as(tl::ptx_cp_async_barrier_noinc())) {
+    // No cp.async.mbarrier.arrive opcode. The .noinc replacement is
+    // fence.arrive_mbar.mem on fg_g2s_default: one arrive per calling warp
+    // when that fence group retires. See tl::cp_async_arrive_noinc.
+    if (op->args.size() != 1) {
+      LOG(FATAL) << "TANG codegen: T.cp_async_barrier_noinc expects exactly "
+                    "the mbarrier, got "
+                 << op->args.size() << " arguments.";
+    }
+    Target cur_target = Target::Current(/*allow_not_defined=*/true);
+    if (!cur_target.defined() || !tl::TargetTangIsSTCUV2(cur_target)) {
+      LOG(FATAL) << "TANG codegen: T.cp_async_barrier_noinc requires "
+                    "arch=stcuv2. It lowers to fence.arrive_mbar.noinc.mem "
+                    "on the g2s fence group, which stcu does not have.";
+    }
+    need_barrier_h_ = true;
+    this->PrintIndent();
+    this->stream << print_mbarrier_obj(op->args[0])
+                 << ".cp_async_arrive_noinc();\n";
+  } else if (op->op.same_as(builtin::ptx_cp_async_barrier())) {
+    // The non-.noinc form would post a different arrival count. TANG's
+    // fence.arrive_mbar helpers are the .noinc form only.
+    LOG(FATAL) << "TANG codegen: cp.async.mbarrier.arrive without .noinc is "
+                  "not available. Use T.cp_async_barrier_noinc, which binds "
+                  "the g2s fence group to the mbarrier.";
   } else if (op->op.same_as(tl::tcgen05_mma_arrive())) {
     // Blackwell's tcgen05.commit.*.mbarrier makes the MMA publish its own
     // completion into an mbarrier. TANG's counterpart is a fence that arrives:
@@ -3252,7 +3623,7 @@ void CodeGenTileLangTANG::VisitExpr_(const CallNode *op, std::ostream &os) {
     ICHECK_EQ(op->args.size(), 2);
     // The instruction exists and is emitted, but the transaction counter it
     // feeds is unreliable on current hardware, so this must not be relied on to
-    // detect async-copy completion. See docs/tang_mbarrier.md.
+    // detect async-copy completion.
     need_barrier_h_ = true;
     this->PrintIndent();
     auto mbarrier_obj = print_mbarrier_obj(op->args[0]);
@@ -3594,6 +3965,57 @@ void CodeGenTileLangTANG::VisitExpr_(const CallNode *op, std::ostream &os) {
     enable_sparse_gemm_ = true;
     this->PrintCallExtern(GetType(tvm::ffi::GetRef<PrimExpr>(op)),
                           op_instance->value, op->args, true, os);
+  } else if (op->op.same_as(tl::tang_mma_data_desc())) {
+    // tcgen05 MMA shared-memory operand descriptor: a *value* in the IR, whose
+    // C++ text is the `mma_data_desc<>` marker the STCU TCProcess pass reads
+    // structurally, so the argument order/text must stay verbatim.
+    // args: [ptr, LBO, SBO, SW] or [ptr, offset, LBO, SBO, SW]; the offset form
+    // folds the offset into the pointer expression (`ptr + off`).
+    ICHECK(op->args.size() == 4U || op->args.size() == 5U)
+        << "tang_mma_data_desc expects 4 or 5 arguments "
+           "<ptr[, offset], LBO, SBO, SW>, but got "
+        << op->args.size();
+    size_t base = op->args.size() == 5U ? 1U : 0U;
+    os << "tang::ptx::mma_data_desc<" << this->PrintExpr(op->args[base + 1])
+       << ", " << this->PrintExpr(op->args[base + 2])
+       << ", (tang::ptx::SwizzleMode)" << this->PrintExpr(op->args[base + 3])
+       << ">(" << this->PrintExpr(op->args[0]);
+    if (base == 1U) {
+      os << " + " << this->PrintExpr(op->args[1]);
+    }
+    os << ")";
+  } else if (op->op.same_as(tl::tang_mma_instr_desc())) {
+    // tcgen05 MMA instruction descriptor: a *value* in the IR, printed as the
+    // `mma_desc<>` marker. args: [D_FMT, A_FMT, B_FMT, AMaj, BMaj, M, N, K].
+    ICHECK_EQ(op->args.size(), 8U)
+        << "tang_mma_instr_desc expects 8 arguments "
+           "<D_FMT, A_FMT, B_FMT, AMaj, BMaj, M, N, K>, but got "
+        << op->args.size();
+    os << "tang::ptx::mma_desc<(tang::ptx::TmemType)"
+       << this->PrintExpr(op->args[0]) << ", (tang::ptx::EleType)"
+       << this->PrintExpr(op->args[1]) << ", (tang::ptx::EleType)"
+       << this->PrintExpr(op->args[2]) << ", " << this->PrintExpr(op->args[3])
+       << ", " << this->PrintExpr(op->args[4]) << ", "
+       << this->PrintExpr(op->args[5]) << ", " << this->PrintExpr(op->args[6])
+       << ", " << this->PrintExpr(op->args[7]) << ">()";
+  } else if (op->op.same_as(tl::tang_mma_scale_instr_desc())) {
+    // Block-scaled instruction descriptor: a *value* in the IR, printed as the
+    // `mma_scale_desc<>` marker. args: [D_FMT, A_FMT, B_FMT, AMaj, BMaj, M, N,
+    // K, scale_vec, scale_format].
+    ICHECK_EQ(op->args.size(), 10U)
+        << "tang_mma_scale_instr_desc expects 10 arguments "
+           "<D_FMT, A_FMT, B_FMT, AMaj, BMaj, M, N, K, scale_vec, "
+           "scale_format>, but got "
+        << op->args.size();
+    os << "tang::ptx::mma_scale_desc<(tang::ptx::TmemType)"
+       << this->PrintExpr(op->args[0]) << ", (tang::ptx::EleType)"
+       << this->PrintExpr(op->args[1]) << ", (tang::ptx::EleType)"
+       << this->PrintExpr(op->args[2]) << ", " << this->PrintExpr(op->args[3])
+       << ", " << this->PrintExpr(op->args[4]) << ", "
+       << this->PrintExpr(op->args[5]) << ", " << this->PrintExpr(op->args[6])
+       << ", " << this->PrintExpr(op->args[7]) << ", (tang::ptx::ScaleVecType)"
+       << this->PrintExpr(op->args[8]) << ", (bool)"
+       << this->PrintExpr(op->args[9]) << ", 0, 0>()";
   } else if (op->op.same_as(tl::tang_tcgen05_mma_ss())) {
     LOG(FATAL) << "STCUV2 GEMM is not supported";
   } else if (op->op.same_as(tl::tang_tcgen05_mma_ts())) {
@@ -3670,49 +4092,100 @@ void CodeGenTileLangTANG::VisitExpr_(const CallNode *op, std::ostream &os) {
                  << out_ref << "), " << taddr << ");\n";
     this->PrintIndent();
     this->stream << "tang::ptx::fence_ldt();\n";
-  } else if (op->op.same_as(tl::tang_cp_tmem_to_shared())) {
-    // TANG stcuv2 tensor memory -> shared memory copy via the cpt2s engine.
-    //   tl::tang_cp_tmem_to_shared_sw128a8(smem, taddr, rows)
-    // args: [smem_ptr, tmem_addr, rows].
-    ICHECK_EQ(op->args.size(), 3U)
-        << "tang_cp_tmem_to_shared expects 3 arguments";
-    std::string smem = this->PrintExpr(op->args[0]);
-    std::string taddr = this->PrintExpr(op->args[1]);
-    std::string rows = this->PrintExpr(op->args[2]);
-    need_cp_tmem_smem_h_ = true;
-    this->PrintIndent();
-    this->stream << "tl::tang_cp_tmem_to_shared_sw128a8("
-                 << "reinterpret_cast<void *>(" << smem << "), "
-                 << "(uint32_t)(" << taddr << "), "
-                 << "(uint32_t)(" << rows << ")"
-                 << ");\n";
-  } else if (op->op.same_as(tl::tang_cp_shared_to_tmem())) {
-    LOG(FATAL) << "STCUV2 GEMM operand staging is not supported";
-    // TANG stcuv2 shared memory -> tensor memory copy via the cps2t engine.
-    //   tl::tang_cp_shared_to_tmem_{linear,sw128a32}(smem, taddr, rows, cols,
-    //                                                row_words)
-    // args: [smem_ptr, tmem_addr, rows, cols, row_words, swizzled_source];
-    // rows/cols/row_words count 32-bit words. `swizzled_source` selects how the
-    // shared tile was filled: 0 = unswizzled 1D staging copy (the default for a
-    // plain T.copy(global, shared)), 1 = sw128a32 bulk copy.
+  } else if (op->op.same_as(tl::tang_cpt2s_16x64b_2d())) {
+    // TANG stcuv2 cpt2s: one tensor-memory -> shared-memory instruction.
+    //   tang::ptx::cpt2s_16x64b_2d<swizzle, fg>(smem_ptr + off,
+    //                                          taddr + (row << 16))
+    // args: [smem_access_ptr, smem_off_bytes, tmem_addr, tmem_row_off, swizzle,
+    // fg]. The pointer stays an access_ptr so the sync analysis still sees the
+    // shared write; only the byte offset that the row loop advances is applied
+    // here, and the row offset stays in rows because the address high half is
+    // where the engine reads it.
     ICHECK_EQ(op->args.size(), 6U)
-        << "tang_cp_shared_to_tmem expects 6 arguments";
+        << "tang_cpt2s_16x64b_2d expects 6 arguments";
     std::string smem = this->PrintExpr(op->args[0]);
-    std::string taddr = this->PrintExpr(op->args[1]);
-    std::string rows = this->PrintExpr(op->args[2]);
-    std::string cols = this->PrintExpr(op->args[3]);
-    std::string row_words = this->PrintExpr(op->args[4]);
-    int swizzled_source = Downcast<IntImm>(op->args[5])->value;
-    need_cp_tmem_smem_h_ = true;
+    std::string off = this->PrintExpr(op->args[1]);
+    std::string taddr = this->PrintExpr(op->args[2]);
+    std::string row = this->PrintExpr(op->args[3]);
+    int swizzle = Downcast<IntImm>(op->args[4])->value;
+    int fg = Downcast<IntImm>(op->args[5])->value;
+    ICHECK_EQ(swizzle, 0)
+        << "tang_cpt2s_16x64b_2d: swizzle must be 0 (sw128a8), got " << swizzle;
+    ICHECK_EQ(fg, 2) << "tang_cpt2s_16x64b_2d: fg must be 2 (fg_t2s_default), "
+                        "got "
+                     << fg;
+    need_tcgen05_common_h_ = true;
     this->PrintIndent();
-    this->stream << (swizzled_source ? "tl::tang_cp_shared_to_tmem_sw128a32("
-                                     : "tl::tang_cp_shared_to_tmem_linear(")
-                 << "reinterpret_cast<void *>(" << smem << "), "
-                 << "(uint32_t)(" << taddr << "), "
-                 << "(uint32_t)(" << rows << "), "
-                 << "(uint32_t)(" << cols << "), "
-                 << "(uint32_t)(" << row_words << ")"
-                 << ");\n";
+    this->stream << "tang::ptx::cpt2s_16x64b_2d<tang::ptx::sw128a8, "
+                 << "tang::ptx::fg_t2s_default>(reinterpret_cast<char *>("
+                 << smem << ") + (" << off << "), (uint32_t)(" << taddr
+                 << ") + (uint32_t)((" << row << ") << 16));\n";
+  } else if (op->op.same_as(tl::tang_stvm_set_mem_dim0_s2t())) {
+    // TANG stcuv2 cps2t address-mode setup:
+    //   __stvm_set_mem_dim0_s2t(tmem_stride, smem_stride, size)
+    // args: [tmem_stride, smem_stride, size], all immarg. Per-lane strides in
+    // 32-bit words; this is what makes the cps2t `shm_off` operand below a row
+    // stride instead of the lane id. Emitted per iteration on purpose: it is a
+    // mode register the engine's *next* call consumes, not durable state.
+    ICHECK_EQ(op->args.size(), 3U)
+        << "tang_stvm_set_mem_dim0_s2t expects 3 arguments";
+    std::string tmem_stride = this->PrintExpr(op->args[0]);
+    std::string smem_stride = this->PrintExpr(op->args[1]);
+    std::string size = this->PrintExpr(op->args[2]);
+    need_tcgen05_common_h_ = true;
+    this->PrintIndent();
+    this->stream << "__stvm_set_mem_dim0_s2t(" << tmem_stride << ", "
+                 << smem_stride << ", " << size << ");\n";
+  } else if (op->op.same_as(tl::tang_cps2t_1d())) {
+    // TANG stcuv2 cps2t: one shared-memory -> tensor-memory instruction.
+    //   __stvm_cps2t_1d(taddr + (row << 16) + col, smem_base, shm_off, sft,
+    //                   imm16, shape, sw, fg)
+    // args: [smem_access_ptr, smem_off_words, tmem_addr, tmem_row_off,
+    // tmem_col_off, sw, fg]. The pointer stays an access_ptr so the sync
+    // analysis still sees the shared read; the word offset goes in the engine's
+    // per-lane `shm_off` operand (cps2t takes it as a register, not a stride),
+    // and the row offset stays in rows because the address high half is where
+    // the engine reads it. `sft` = 2 keeps shm_off in 32-bit words; it is not a
+    // usable knob (raising it is silently ignored), so the stride lives in the
+    // operand itself.
+    ICHECK_EQ(op->args.size(), 7U) << "tang_cps2t_1d expects 7 arguments";
+    std::string smem = this->PrintExpr(op->args[0]);
+    std::string word = this->PrintExpr(op->args[1]);
+    std::string taddr = this->PrintExpr(op->args[2]);
+    std::string row = this->PrintExpr(op->args[3]);
+    std::string col = this->PrintExpr(op->args[4]);
+    int sw = Downcast<IntImm>(op->args[5])->value;
+    int fg = Downcast<IntImm>(op->args[6])->value;
+    ICHECK_EQ(sw, 0)
+        << "tang_cps2t_1d: sw must be 0 (SwizzleMode::NONE -- a swizzle mode\n"
+           "cannot be combined with a per-lane shm offset), got "
+        << sw;
+    ICHECK_EQ(fg, 3) << "tang_cps2t_1d: fg must be 3 (fg_s2t_default), got "
+                     << fg;
+    need_tcgen05_common_h_ = true;
+    this->PrintIndent();
+    this->stream << "__stvm_cps2t_1d((uint32_t)(" << taddr << ") + (uint32_t)(("
+                 << row << ") << 16) + (uint32_t)(" << col
+                 << "), tang::ptx::__as_ptr_smem(" << smem << "), (uint32_t)("
+                 << word
+                 << "), 2, 0, 0 /* shape_32x32b */, 0 /* SwizzleMode::NONE "
+                    "*/, static_cast<int>(tang::ptx::fg_s2t_default));\n";
+  } else if (op->op.same_as(tl::tang_publish_tmem_operand())) {
+    // A marker, not an instruction: it stands for "publish the TMEM traffic
+    // staged at this point". tl.tang.transform.MaterializeTangMbarriers
+    // materialises it as an mbarrier arrive, plus a wait in front of whoever
+    // first reads the staged tile, plus the block-scope barrier prologue
+    // implemented by materialize_s3_mbarriers.cc.
+    //
+    // There is deliberately no fallback here. The arrive needs both the barrier
+    // array the pass declares and the count it initialises, and the staging it
+    // publishes may sit inside a region guard, where a block-wide barrier is
+    // illegal. A marker that survives to codegen means the pass did not run.
+    LOG(FATAL)
+        << "the TMEM publish marker (tang_publish_tmem_operand) reached "
+           "the code generator: tl.tang.transform.MaterializeTangMbarriers did "
+           "not materialise it, so the cps2t staging it publishes has no "
+           "publish edge";
   } else if (op->op.same_as(tl::tang_tmem_ld_16x256b_x16())) {
     // TANG stcuv2 warp-collective TMEM load (fp32): ldt_16x256b_x16(out, taddr)
     // args: [out_ref, taddr, num_elems] — num_elems determines _out[64]
@@ -3731,17 +4204,14 @@ void CodeGenTileLangTANG::VisitExpr_(const CallNode *op, std::ostream &os) {
   } else if (op->op.same_as(tl::tang_tmem_drain_16x256b_to_global())) {
     // TANG stcuv2 TMEM→global drain.
     //
-    // The drain used to be expanded here (warp split, 16-row strip loop,
-    // warp-collective `ldt_16x256b_x16` + `fence_ldt()`, per-lane stores, and
-    // the MMA-publish `__syncthreads()` a multi-warp writeback needs). That
-    // geometry is now ordinary TIR, produced by
-    // `tl.tang.transform.ExpandTangTmemDrain`
-    // (src/tang/transform/expand_tang_tmem_drain.cc), so the generator only
+    // The drain geometry is ordinary TIR produced by
+    // `tl.tang.transform.ExpandS3TmemDrain`
+    // (src/tang/transform/lower_s3_shared_tmem.cc), so the generator only
     // prints statements. Reaching this point means the pass did not run -- for
     // example because a caller assembled the TANG pipeline without it.
     ICHECK(false)
         << "the fused TMEM->global drain (tang_tmem_drain_16x256b_to_global) "
-           "must be expanded by tl.tang.transform.ExpandTangTmemDrain before "
+           "must be expanded by tl.tang.transform.ExpandS3TmemDrain before "
            "code generation; it reached the TANG code generator, so the pass "
            "did not run";
   } else if (op->op.same_as(tl::tang_tmem_st())) {
@@ -3791,165 +4261,122 @@ void CodeGenTileLangTANG::VisitExpr_(const CallNode *op, std::ostream &os) {
     }
     this->PrintIndent();
     this->stream << "tang::ptx::fence_tmem<" << fg << ">();\n";
-  } else if (op->op.same_as(tl::tang_cp_async_bulk())) {
-    LOG(FATAL) << "STCUV2 bulk copy is not supported";
-    // TANG stcuv2 swizzled async bulk copy (global ↔ shared).
-    // args: [direction, dst, src, rows, col_bytes]
-    // direction: 0 = g2s (global → shared), 1 = s2g (shared → global)
-    // Emits the self-contained, mbarrier-synchronized helper from
-    // tl_templates/tang/copy_global_shm.h, which wraps tang::ptx::fcpg2s /
-    // fcps2g (sw128bytes_atom32bytes) with a separate global row pitch so
-    // K-subtiles of a wider matrix copy correctly. args: [direction, dst, src,
-    // rows, smem_col_bytes, gmem_row_bytes,
-    //        num_threads]
-    ICHECK_EQ(op->args.size(), 7U) << "tang_cp_async_bulk expects 7 arguments";
-    int direction = Downcast<IntImm>(op->args[0])->value;
-    std::string dst = this->PrintExpr(op->args[1]);
-    std::string src = this->PrintExpr(op->args[2]);
-    std::string rows = this->PrintExpr(op->args[3]);
-    std::string col_bytes = this->PrintExpr(op->args[4]);
-    std::string gmem_row_bytes = this->PrintExpr(op->args[5]);
-    // Warp count is a codegen-time constant (blockDim is unreliable on the
-    // stcuv2 ISS); the helper partitions the tile across this many warps.
-    int num_threads = Downcast<IntImm>(op->args[6])->value;
-    int nwarps = num_threads / 32;
-    need_cp_async_bulk_h_ = true;
+  } else if (op->op.same_as(tl::tang_bulk_async_commit())) {
+    // A bulk-copy record, not an instruction: the async handshake pass consumes
+    // it and turns the copy's drain into a barrier arrival. Printing nothing is
+    // deliberate. If one reaches codegen, the handshake pass did not consume
+    // it and the kernel remains in its blocking form.
+  } else if (op->op.same_as(tl::tang_fcpg2s_1d()) ||
+             op->op.same_as(tl::tang_fcps2g_1d())) {
+    // TANG stcuv2: exactly one 1D bulk-copy instruction. The warp gate, the
+    // row split, the per-row loop and the fence-group drain are IR around it,
+    // so this branch prints one call and nothing else.
+    // args: [smem, gmem, smem_off_bytes, gmem_off_bytes, nbytes]  (g2s)
+    //       [gmem, smem, gmem_off_bytes, smem_off_bytes, nbytes]  (s2g)
+    const bool g2s = op->op.same_as(tl::tang_fcpg2s_1d());
+    ICHECK_EQ(op->args.size(), 5U)
+        << "tang_fcpg2s_1d / tang_fcps2g_1d expect 5 arguments";
+    std::string ptr0 = this->PrintExpr(op->args[0]);
+    std::string ptr1 = this->PrintExpr(op->args[1]);
+    std::string off0 = this->PrintExpr(op->args[2]);
+    std::string off1 = this->PrintExpr(op->args[3]);
+    std::string nbytes = this->PrintExpr(op->args[4]);
+    need_tcgen05_common_h_ = true;
     this->PrintIndent();
-    if (direction == 0) {
-      // g2s: dst = shared, src = global
-      this->stream << "tl::tang_bulk_g2s<tang::ptx::sw128a32>("
-                   << "reinterpret_cast<void *>(" << dst << "), "
-                   << "reinterpret_cast<const void *>(" << src << "), "
-                   << "(uint32_t)(" << rows << "), "
-                   << "(uint32_t)(" << col_bytes << "), "
-                   << "(uint32_t)(" << gmem_row_bytes << "), "
-                   << "(uint32_t)(" << nwarps << ")"
-                   << ");\n";
+    // The offsets are byte counts, so the base pointers are cast to char first:
+    // `void * + int` is not valid C++.
+    this->stream << "tang::ptx::" << (g2s ? "fcpg2s" : "fcps2g") << "("
+                 << "reinterpret_cast<char *>(" << ptr0 << ") + (" << off0
+                 << "), "
+                 << "reinterpret_cast<const char *>(" << ptr1 << ") + (" << off1
+                 << "), "
+                 << "(uint32_t)(" << nbytes << "));\n";
+  } else if (op->op.same_as(tl::tang_fcpg2s_3d()) ||
+             op->op.same_as(tl::tang_fcps2g_3d())) {
+    // TANG stcuv2: exactly one swizzled 3D bulk-copy instruction. The stripe
+    // split, the warp gate, the fence-group drain and the block barrier are IR
+    // around it, so this branch prints one call and nothing else.
+    //
+    // The two instruction shapes differ in a way worth keeping visible here:
+    // the load takes both row pitches, the store derives the shared pitch from
+    // the swizzle mode and is given only the global one.
+    // args (g2s): [smem, gmem, smem_off_bytes, gmem_off_bytes, rows,
+    //              smem_row_bytes, gmem_row_bytes, swizzle_mode, pack_mode]
+    // args (s2g): [gmem, smem, gmem_off_bytes, smem_off_bytes, rows,
+    //              gmem_row_bytes, swizzle_mode]
+    const bool g2s = op->op.same_as(tl::tang_fcpg2s_3d());
+    ICHECK_EQ(op->args.size(), g2s ? 9U : 7U)
+        << "tang_fcpg2s_3d expects 9 arguments, tang_fcps2g_3d expects 7";
+    std::string ptr0 = this->PrintExpr(op->args[0]);
+    std::string ptr1 = this->PrintExpr(op->args[1]);
+    std::string off0 = this->PrintExpr(op->args[2]);
+    std::string off1 = this->PrintExpr(op->args[3]);
+    std::string rows = this->PrintExpr(op->args[4]);
+    std::string smem_row_bytes;
+    std::string gmem_row_bytes;
+    int swizzle_mode = 0;
+    int pack_mode = 0;
+    if (g2s) {
+      smem_row_bytes = this->PrintExpr(op->args[5]);
+      gmem_row_bytes = this->PrintExpr(op->args[6]);
+      swizzle_mode = Downcast<IntImm>(op->args[7])->value;
+      pack_mode = Downcast<IntImm>(op->args[8])->value;
     } else {
-      // s2g: dst = global, src = shared
-      this->stream << "tl::tang_bulk_s2g<tang::ptx::sw128a32>("
-                   << "reinterpret_cast<void *>(" << dst << "), "
-                   << "reinterpret_cast<const void *>(" << src << "), "
-                   << "(uint32_t)(" << rows << "), "
-                   << "(uint32_t)(" << col_bytes << "), "
-                   << "(uint32_t)(" << gmem_row_bytes << "), "
-                   << "(uint32_t)(" << nwarps << ")"
-                   << ");\n";
+      gmem_row_bytes = this->PrintExpr(op->args[5]);
+      swizzle_mode = Downcast<IntImm>(op->args[6])->value;
     }
-  } else if (op->op.same_as(tl::tang_cp_async_bulk_1d())) {
-    LOG(FATAL) << "STCUV2 bulk copy is not supported";
-    // TANG stcuv2 unswizzled 1D bulk copy (global <-> shared). Same argument
-    // shape as tang_cp_async_bulk; the helper picks a flat or per-row transfer
-    // from the two pitches at runtime.
-    // args: [direction, dst, src, rows, smem_row_bytes, gmem_row_bytes,
-    //        num_threads]
-    ICHECK_EQ(op->args.size(), 7U)
-        << "tang_cp_async_bulk_1d expects 7 arguments";
-    int direction = Downcast<IntImm>(op->args[0])->value;
-    std::string dst = this->PrintExpr(op->args[1]);
-    std::string src = this->PrintExpr(op->args[2]);
-    std::string rows = this->PrintExpr(op->args[3]);
-    std::string col_bytes = this->PrintExpr(op->args[4]);
-    std::string gmem_row_bytes = this->PrintExpr(op->args[5]);
-    int num_threads = Downcast<IntImm>(op->args[6])->value;
-    int nwarps = num_threads / 32;
-    need_cp_async_bulk_h_ = true;
+    need_tcgen05_common_h_ = true;
     this->PrintIndent();
-    this->stream << (direction == 0 ? "tl::tang_bulk_g2s_1d("
-                                    : "tl::tang_bulk_s2g_1d(")
-                 << "reinterpret_cast<void *>(" << dst << "), "
-                 << "reinterpret_cast<const void *>(" << src << "), "
-                 << "(uint32_t)(" << rows << "), "
-                 << "(uint32_t)(" << col_bytes << "), "
-                 << "(uint32_t)(" << gmem_row_bytes << "), "
-                 << "(uint32_t)(" << nwarps << ")"
-                 << ");\n";
-  } else if (op->op.same_as(tl::tang_cp_async_bulk_sw())) {
-    LOG(FATAL) << "STCUV2 bulk copy is not supported";
-    // TANG stcuv2 swizzled async bulk copy with explicit swizzle and pack mode.
-    // args: [direction, dst, src, rows, col_bytes, gmem_row_bytes,
-    //        num_threads, swizzle_mode, pack_mode]
-    ICHECK_EQ(op->args.size(), 9U)
-        << "tang_cp_async_bulk_sw expects 9 arguments";
-    int direction = Downcast<IntImm>(op->args[0])->value;
-    std::string dst = this->PrintExpr(op->args[1]);
-    std::string src = this->PrintExpr(op->args[2]);
-    std::string rows = this->PrintExpr(op->args[3]);
-    std::string col_bytes = this->PrintExpr(op->args[4]);
-    std::string gmem_row_bytes = this->PrintExpr(op->args[5]);
-    // Warp count is a codegen-time constant (blockDim is unreliable on the
-    // stcuv2 ISS); the helper partitions the tile across this many warps.
-    int num_threads = Downcast<IntImm>(op->args[6])->value;
-    int nwarps = num_threads / 32;
-    int swizzle_mode = Downcast<IntImm>(op->args[7])->value;
-    int pack_mode = Downcast<IntImm>(op->args[8])->value;
-    need_cp_async_bulk_h_ = true;
-    this->PrintIndent();
-    // Allow-list of tang::ptx::SwizzleMode enumerators the lowering can emit.
-    // The device side is a single templated core (tl::tang_bulk_{g2s,s2g}<SW>)
-    // whose stripe geometry (512 / atom_bytes) is the ISA's own general
-    // formula, so widening this list is a one-line change plus an ISS test --
-    // but a mode must not become reachable before it has one, hence the hard
-    // failure below rather than a silent fallback to sw128a32.
+    // Same allow-list discipline as the wrapper branch above: a swizzle mode
+    // must not become reachable before it has an ISS test, so an unknown value
+    // is a hard failure rather than a silent fallback to sw128a32.
     const char *sw_enum = nullptr;
     switch (swizzle_mode) {
-    // The swizzle a cpt2s-staged tile is written with: an 8-byte atom keeps
-    // one tensor memory row per atom (wider atoms interleave atom/8 rows).
     case 4:
-      sw_enum = "sw128a8";
+      sw_enum = "sw128a8"; // the layout a cpt2s-staged tile is read with
       break;
-    // fp16/bf16 (any major) + tf32/int8 K-major (TN). Default path.
     case 6:
-      sw_enum = "sw128a32";
+      sw_enum = "sw128a32"; // fp16/bf16, tf32/int8 K-major
       break;
-    // tf32/int8 N-major (MN_major), i.e. the NN GEMM B operand.
     case 7:
-      sw_enum = "sw128a64";
+      sw_enum = "sw128a64"; // tf32/int8 N-major
       break;
     default:
-      LOG(FATAL) << "tang_cp_async_bulk_sw: swizzle mode " << swizzle_mode
+      LOG(FATAL) << "tang_fcpg2s_3d / tang_fcps2g_3d: swizzle mode "
+                 << swizzle_mode
                  << " has no validated device path (only sw128a8=4, "
                     "sw128a32=6, sw128a64=7 are exercised). Add an ISS test "
                     "before enabling it here.";
     }
-    // Same allow-list discipline for the pack mode. b4p4x16 (packed fp4 ->
-    // unpacked shared) is the only one wired up, and only on the load side:
-    // the s2g repack has no validated pairing.
-    std::string pp_targ;
-    switch (pack_mode) {
-    case 0:
-      break;
-    case 1:
-      ICHECK_EQ(direction, 0)
-          << "tang_cp_async_bulk_sw: pack mode b4p4x16 is load-only, got a "
-             "shared->global store";
-      pp_targ = ", tang::ptx::b4p4x16";
-      break;
-    default:
-      LOG(FATAL) << "tang_cp_async_bulk_sw: pack mode " << pack_mode
-                 << " has no validated device path (only no_pack=0 and "
-                    "b4p4x16=1 are exercised). Add an ISS test before "
-                    "enabling it here.";
-    }
-    if (direction == 0) {
-      this->stream << "tl::tang_bulk_g2s<tang::ptx::" << sw_enum << pp_targ
-                   << ">("
-                   << "reinterpret_cast<void *>(" << dst << "), "
-                   << "reinterpret_cast<const void *>(" << src << "), "
-                   << "(uint32_t)(" << rows << "), "
-                   << "(uint32_t)(" << col_bytes << "), "
+    // Both offsets are byte counts, so the base pointers are cast to char
+    // first: `void * + int` is not valid C++.
+    if (g2s) {
+      std::string pp_targ;
+      switch (pack_mode) {
+      case 0:
+        break;
+      case 1:
+        pp_targ = ", tang::ptx::b4p4x16";
+        break;
+      default:
+        LOG(FATAL)
+            << "tang_fcpg2s_3d: pack mode " << pack_mode
+            << " has no validated device path (only no_pack=0 and "
+               "b4p4x16=1 are exercised). Add an ISS test before enabling it.";
+      }
+      this->stream << "tang::ptx::fcpg2s<tang::ptx::" << sw_enum << pp_targ
+                   << ">(" << "reinterpret_cast<char *>(" << ptr0 << ") + ("
+                   << off0 << "), " << "reinterpret_cast<const char *>(" << ptr1
+                   << ") + (" << off1 << "), "
                    << "(uint32_t)(" << gmem_row_bytes << "), "
-                   << "(uint32_t)(" << nwarps << ")"
-                   << ");\n";
+                   << "(uint32_t)(" << smem_row_bytes << "), "
+                   << "(uint32_t)(" << rows << "));\n";
     } else {
-      this->stream << "tl::tang_bulk_s2g<tang::ptx::" << sw_enum << ">("
-                   << "reinterpret_cast<void *>(" << dst << "), "
-                   << "reinterpret_cast<const void *>(" << src << "), "
-                   << "(uint32_t)(" << rows << "), "
-                   << "(uint32_t)(" << col_bytes << "), "
-                   << "(uint32_t)(" << gmem_row_bytes << "), "
-                   << "(uint32_t)(" << nwarps << ")"
-                   << ");\n";
+      this->stream << "tang::ptx::fcps2g<tang::ptx::" << sw_enum << ">("
+                   << "reinterpret_cast<char *>(" << ptr0 << ") + (" << off0
+                   << "), " << "reinterpret_cast<const char *>(" << ptr1
+                   << ") + (" << off1 << "), " << "(uint32_t)(" << rows << "), "
+                   << "(uint32_t)(" << gmem_row_bytes << "));\n";
     }
   } else if (op->op.same_as(tl::tang_fence_tc())) {
     // TANG stcuv2 TC fence: fence_tc<fg>()
@@ -3960,23 +4387,62 @@ void CodeGenTileLangTANG::VisitExpr_(const CallNode *op, std::ostream &os) {
     }
     this->PrintIndent();
     this->stream << "tang::ptx::fence_tc<" << fg << ">();\n";
-  } else if (op->op.same_as(tl::tang_fence_tc_arrive())) {
-    // TANG stcuv2 TC fence arrive: fence_tc_arrive(bar)
-    ICHECK_EQ(op->args.size(), 1U) << "tang_fence_tc_arrive expects 1 argument";
-    std::string bar = this->PrintExpr(op->args[0]);
+  } else if (op->op.same_as(tl::tang_fence_mem())) {
+    // TANG stcuv2 fence-group drain: fence_mem(fg). Not a barrier -- it waits
+    // for this warp's own outstanding copies in that group.
+    // args: [fg] with 0 = fg_g2s_default, 1 = fg_s2g_default, 2 =
+    // fg_t2s_default (tmem -> shared), 3 = fg_s2t_default (shared -> tmem).
+    ICHECK_EQ(op->args.size(), 1U) << "tang_fence_mem expects 1 argument";
+    int fg = Downcast<IntImm>(op->args[0])->value;
+    static const char *kFenceGroupNames[] = {
+        "fg_g2s_default", "fg_s2g_default", "fg_t2s_default", "fg_s2t_default"};
+    ICHECK(fg >= 0 && fg < 4)
+        << "tang_fence_mem: fg must be 0 (g2s), 1 (s2g), 2 (t2s) or 3 (s2t), "
+           "got "
+        << fg;
     need_tcgen05_common_h_ = true;
     this->PrintIndent();
-    this->stream << "tang::ptx::fence_tc_arrive(" << bar << ");\n";
-  } else if (op->op.same_as(tl::tang_fence_g2s_arrive())) {
-    // TANG stcuv2 G2S fence arrive: fence_g2s_arrive(bar)
+    this->stream << "tang::ptx::fence_mem(tang::ptx::" << kFenceGroupNames[fg]
+                 << ");\n";
+  } else if (op->op.same_as(tl::tang_fence_g2s_arrive_mbarrier())) {
+    // TANG stcuv2 G2S fence arrive into a shared mbarrier: warp-level, one
+    // arrive, non-blocking. Emitted through the Barrier object because
+    // create_barriers declares the array as Barrier*, not __mbarrier_t*.
     ICHECK_EQ(op->args.size(), 1U)
-        << "tang_fence_g2s_arrive expects 1 argument";
-    std::string bar = this->PrintExpr(op->args[0]);
-    need_tcgen05_common_h_ = true;
+        << "tang_fence_g2s_arrive_mbarrier expects 1 argument";
+    need_barrier_h_ = true;
     this->PrintIndent();
-    this->stream << "tang::ptx::fence_g2s_arrive(" << bar << ");\n";
+    this->stream << print_mbarrier_obj(op->args[0])
+                 << ".arrive_on_g2s_fence();\n";
+  } else if (op->op.same_as(tl::tang_fence_s2t_arrive_mbarrier())) {
+    // TANG stcuv2 S2T fence arrive into a shared mbarrier: the shared->tensor
+    // memory engine's publish, warp-level, one arrive, non-blocking.
+    ICHECK_EQ(op->args.size(), 1U)
+        << "tang_fence_s2t_arrive_mbarrier expects 1 argument";
+    need_barrier_h_ = true;
+    this->PrintIndent();
+    this->stream << print_mbarrier_obj(op->args[0])
+                 << ".arrive_on_s2t_fence();\n";
+  } else if (op->op.same_as(tl::tang_mbar_wait_parity())) {
+    // TANG stcuv2 parity wait on an indexed mbarrier (Barrier::wait spins on
+    // the phase bits): the barrier-index form of mbarrier_wait_parity.
+    ICHECK_EQ(op->args.size(), 2U)
+        << "tang_mbar_wait_parity expects 2 arguments";
+    need_barrier_h_ = true;
+    this->PrintIndent();
+    this->stream << print_mbarrier_obj(op->args[0]) << ".wait("
+                 << this->PrintExpr(op->args[1]) << ");\n";
+  } else if (op->op.same_as(tl::tang_fence_tc_arrive_mbarrier())) {
+    // TANG stcuv2 TC fence arrive into a shared mbarrier: the tensor-core
+    // counterpart of the g2s form above, for a free edge whose waiters are the
+    // copy warps.
+    ICHECK_EQ(op->args.size(), 1U)
+        << "tang_fence_tc_arrive_mbarrier expects 1 argument";
+    need_barrier_h_ = true;
+    this->PrintIndent();
+    this->stream << print_mbarrier_obj(op->args[0])
+                 << ".arrive_on_tc_fence<0>();\n";
   } else if (op->op.same_as(tl::tang_sync_wait())) {
-    // TANG stcuv2 sync wait: sync_wait(bar, pcnt, ccnt)
     ICHECK_EQ(op->args.size(), 3U) << "tang_sync_wait expects 3 arguments";
     std::string bar = this->PrintExpr(op->args[0]);
     std::string pcnt = this->PrintExpr(op->args[1]);
@@ -3985,7 +4451,6 @@ void CodeGenTileLangTANG::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->stream << "sync_wait(" << bar << ", " << pcnt << ", " << ccnt
                  << ");\n";
   } else if (op->op.same_as(tl::tang_sync_arrive())) {
-    // TANG stcuv2 sync arrive: sync_arrive(bar)
     ICHECK_EQ(op->args.size(), 1U) << "tang_sync_arrive expects 1 argument";
     std::string bar = this->PrintExpr(op->args[0]);
     this->PrintIndent();
@@ -4140,6 +4605,52 @@ void CodeGenTileLangTANG::VisitExpr_(const CallNode *op, std::ostream &os) {
   } else if (op->op.same_as(tl::match_any_sync())) {
     os << "__match_any_sync(" << PrintExpr(op->args[0]) << ", "
        << PrintExpr(op->args[1]) << ")";
+  } else if (op->op.same_as(tl::any_sync()) || op->op.same_as(tl::all_sync()) ||
+             op->op.same_as(tl::ballot_sync()) ||
+             op->op.same_as(tl::ballot()) || op->op.same_as(tl::activemask()) ||
+             op->op.same_as(tl::match_all_sync())) {
+    Target cur_target = Target::Current(/*allow_not_defined=*/true);
+    ICHECK(cur_target.defined() && tl::TargetTangIsSTCUV2(cur_target))
+        << "TANG warp vote intrinsics require arch=stcuv2";
+    need___clang_tang_builtin_vars_h = true;
+    if (op->op.same_as(tl::any_sync())) {
+      ICHECK_EQ(op->args.size(), 2U)
+          << "tl.any_sync expects <mask, predicate>.";
+      os << "__any_sync(" << PrintExpr(op->args[0]) << ", "
+         << PrintExpr(op->args[1]) << ")";
+    } else if (op->op.same_as(tl::all_sync())) {
+      ICHECK_EQ(op->args.size(), 2U)
+          << "tl.all_sync expects <mask, predicate>.";
+      os << "__all_sync(" << PrintExpr(op->args[0]) << ", "
+         << PrintExpr(op->args[1]) << ")";
+    } else if (op->op.same_as(tl::ballot_sync())) {
+      ICHECK_EQ(op->args.size(), 2U)
+          << "tl.ballot_sync expects <mask, predicate>.";
+      os << "((unsigned long long)__ballot_sync(" << PrintExpr(op->args[0])
+         << ", " << PrintExpr(op->args[1]) << "))";
+    } else if (op->op.same_as(tl::ballot())) {
+      ICHECK_EQ(op->args.size(), 1U) << "tl.ballot expects <predicate>.";
+      os << "((unsigned long long)__ballot_sync(0xFFFFFFFFu, "
+         << PrintExpr(op->args[0]) << "))";
+    } else if (op->op.same_as(tl::activemask())) {
+      ICHECK(op->args.empty()) << "tl.activemask takes no arguments.";
+      os << "((unsigned long long)__activemask())";
+    } else {
+      ICHECK_EQ(op->args.size(), 2U)
+          << "tl.match_all_sync expects <mask, value>.";
+      DataType value_type = op->args[1].dtype();
+      ICHECK(value_type.is_scalar() &&
+             (value_type.is_int() || value_type.is_uint()) &&
+             (value_type.bits() == 32 || value_type.bits() == 64))
+          << "TANG match_all_sync supports scalar int32, uint32, int64, or "
+             "uint64, but got "
+          << value_type;
+      // The device API writes its predicate through an out-parameter. The
+      // returned mask is already zero when the lanes disagree.
+      os << "([&]() -> unsigned { int _tl_pred = 0; return __match_all_sync("
+         << PrintExpr(op->args[0]) << ", " << PrintExpr(op->args[1])
+         << ", &_tl_pred); }())";
+    }
   } else if (op->op.same_as(tl::shfl_sync())) {
     ICHECK_EQ(op->args.size(), 4U)
         << "tl.shfl_sync expects <mask, value, src_lane, width>.";
@@ -5292,6 +5803,30 @@ void CodeGenTileLangTANG::AddFunction(const GlobalVar &gvar,
     stream << ' ' << vid;
   }
   stream << ") {\n";
+  // Declare mbarrier storage before the dynamic shared memory buffer.
+  {
+    int barrier_count = 0;
+    tirx::PostOrderVisit(f->body, [&barrier_count](const ObjectRef &n) {
+      const auto *call = n.as<CallNode>();
+      if (call == nullptr || !call->op.same_as(builtin::create_barriers())) {
+        return;
+      }
+      if (call->args.size() == 1) {
+        if (const auto *imm = call->args[0].as<IntImmNode>()) {
+          // Several barrier groups share one array in this codegen; size it by
+          // the largest request instead of the last one seen.
+          barrier_count = std::max(barrier_count, static_cast<int>(imm->value));
+        }
+      }
+    });
+    if (barrier_count > 0) {
+      need_barrier_h_ = true;
+      stream << "  __shared__ uint64_t " << mbarrier_name_ << "_mem["
+             << barrier_count << "];\n";
+      stream << "  auto " << mbarrier_name_ << " = reinterpret_cast<"
+             << mbarrier_dtype_ << "*>(" << mbarrier_name_ << "_mem);\n";
+    }
+  }
   // Declare the Tang RNG state at function scope. Sync-insertion
   // passes may split the block holding rng_init across __syncthreads(),
   // so a call-site declaration can go out of scope before later

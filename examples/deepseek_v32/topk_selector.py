@@ -32,6 +32,8 @@ def tl_topk_impl(input, index, starts, ends, threads=1024, in_dtype=T.float32, o
     seq_len = T.dynamic("seq_len")
     RADIX = _RADIX
     histogram_size = RADIX * 2 if threads == RADIX else RADIX + 1
+    radix_barrier_id = None if threads == RADIX else 3
+    radix_arrive_count = None if threads == RADIX else RADIX
     SMEM_INPUT_SIZE = 4096  # assume the threshold bucket size after first pass is less than 4K
 
     input: T.Tensor[(batch, seq_len), in_dtype]
@@ -87,15 +89,15 @@ def tl_topk_impl(input, index, starts, ends, threads=1024, in_dtype=T.float32, o
         if tx < RADIX:
             for i in T.serial(8):
                 offset = 1 << i
-                T.sync_threads(3, RADIX)
+                T.sync_threads(radix_barrier_id, radix_arrive_count)
                 if tx < RADIX - offset:
                     l_val = s_histogram[tx] + s_histogram[tx + offset]
-                T.sync_threads(3, RADIX)
+                T.sync_threads(radix_barrier_id, radix_arrive_count)
                 if tx < RADIX - offset:
                     s_histogram[tx] = l_val
 
             # find threshold bin id
-            T.sync_threads(3, RADIX)
+            T.sync_threads(radix_barrier_id, radix_arrive_count)
             # s_histogram[tx] is the suffix count for bins >= tx. Use >=/< to
             # also catch the exact-boundary case where that count equals topk.
             if s_histogram[tx] >= l_new_topk and s_histogram[tx + 1] < l_new_topk:
@@ -150,15 +152,15 @@ def tl_topk_impl(input, index, starts, ends, threads=1024, in_dtype=T.float32, o
             if tx < RADIX:
                 for i in T.serial(8):
                     offset = 1 << i
-                    T.sync_threads(3, RADIX)
+                    T.sync_threads(radix_barrier_id, radix_arrive_count)
                     if tx < RADIX - offset:
                         l_val = s_histogram[tx] + s_histogram[tx + offset]
-                    T.sync_threads(3, RADIX)
+                    T.sync_threads(radix_barrier_id, radix_arrive_count)
                     if tx < RADIX - offset:
                         s_histogram[tx] = l_val
 
                 # find threshold bin id
-                T.sync_threads(3, RADIX)
+                T.sync_threads(radix_barrier_id, radix_arrive_count)
                 # s_histogram[tx] is the suffix count for bins >= tx. Use >=/< to
                 # also catch the exact-boundary case where that count equals topk.
                 if s_histogram[tx] >= l_new_topk and s_histogram[tx + 1] < l_new_topk:
@@ -191,11 +193,9 @@ def tl_topk_impl(input, index, starts, ends, threads=1024, in_dtype=T.float32, o
 def tl_topk(input, starts, ends, topk):
     batch, seq_len = input.shape
     indexes = torch.zeros(batch, topk, dtype=torch.int32, device=input.device)
-    # CUDA supports named barriers for the 256-thread radix subgroup. HIP
-    # currently lowers that synchronization to a full workgroup barrier, so
-    # launch exactly the radix participants there to keep every barrier
-    # convergent without changing the tuned CUDA configuration.
-    threads = _RADIX if torch.version.hip is not None else 1024
+    # HIP and STCU require full-block synchronization for the radix scan.
+    # Launch exactly its 256 participants; CUDA keeps its named subgroup.
+    threads = _RADIX if torch.version.hip is not None or input.device.type == "ptpu" else 1024
     tl_topk_impl(input, indexes, starts, ends, threads=threads)
     return indexes
 

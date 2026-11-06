@@ -21,7 +21,6 @@ from tilelang.backend.pass_pipeline.pipeline_utils import (
     should_enable_aggressive_merge,
     should_enable_hoist_copy_addresses,
     should_enable_race_check,
-    should_enable_tang_inject_tcgen05_fence,
     should_force_let_inline,
 )
 
@@ -36,11 +35,10 @@ def _module_has_shared_barrier(
     """Whether any function allocates a barrier buffer in one of ``scopes``
     (i.e. uses ``T.alloc_barrier`` / ``T.alloc_cluster_barrier``).
 
-    TANG rejects barrier allocations an arch has no hardware for here so the
-    generated code fails fast with a clear message instead of deep inside ptcc.
-    Called twice with different ``scopes``: once narrowed to cluster barriers,
-    which TANG has no level for at all, and once for any barrier, which needs
-    stcuv2.
+    TANG rejects a barrier allocation on an arch that has no mbarrier hardware,
+    so the failure names the arch instead of dying inside ptcc. Both barrier
+    scopes count: a cluster barrier is a shared mbarrier too, and the whole
+    ``__mbarrier_*`` family is gated on ``__Tang_ARCH__ >= 200``.
     """
     found = False
 
@@ -85,7 +83,9 @@ def TANGPassPipelineBodyPrologue(mod: IRModule, target: Target) -> IRModule:
 
     mod = tilelang.transform.IfStmtBinding()(mod)
     mod = tilelang.transform.PipelinePlanning()(mod)
+    mod = pass_filter(tilelang.tang.transform.AnnotateS3PipelinePlan, S.STCUV2)()(mod)
     mod = tilelang.transform.InjectSoftwarePipeline()(mod)
+    mod = pass_filter(tilelang.tang.transform.FinalizeS3PipelineInjection, S.STCUV2)()(mod)
     mod = tilelang.transform.Simplify()(mod)
 
     # Shared tile lowering and vector planning consult Target::Current while
@@ -101,7 +101,26 @@ def TANGPassPipelineBodyPrologue(mod: IRModule, target: Target) -> IRModule:
             if not should_disable_gemm_pad(pass_ctx=pass_ctx):
                 mod = tilelang.transform.PadGemmTail()(mod)
         LayoutVisual(mod)
+        # One buffer, one swizzle: every bulk copy of a shared buffer must agree
+        # on `tang_swizzle_atom_bytes`, otherwise the swizzled write is read back
+        # unswizzled and the data is silently scrambled.
+        # Checked before LowerTileOp, while the copies and their annotations
+        # still exist: src/tang/transform/verify_s3_shared_swizzle.cc.
+        mod = pass_filter(tilelang.tang.transform.VerifySharedSwizzle, S.STCUV2)()(mod)
         mod = tilelang.transform.LowerTileOp()(mod)
+        # Pipelined bulk copies commit into a named sync barrier (fence.arrive)
+        # instead of stalling the warp in fence_mem + __syncthreads, and the
+        # consuming MMA waits on that barrier's parity: no block-wide sync and
+        # the DMA of the next tile stays in flight. Runs after LowerTileOp
+        # (which creates the copies) and before LowerAccessPtr below (while the
+        # buffer version is still an access_ptr offset argument).
+        # src/tang/transform/inject_s3_async_copy.cc
+        #
+        # ISP also preserves the loop region's warp-role declaration, so this
+        # late pass only materializes the declared protocol.
+        mod = pass_filter(tilelang.tang.transform.InjectS3AsyncCopy, S.STCUV2)()(mod)
+        # Consume tl.tang_bulk_async_commit records before LowerAccessPtr
+        # rewrites the access_ptr offset that identifies each buffer version.
         mod = tilelang.transform.VerifyReducerConsumed()(mod)
         mod = tilelang.transform.DecoupleTypeCast()(mod)
         mod = tilelang.transform.LegalizeVectorizedLoop()(mod)
@@ -119,15 +138,12 @@ def TANGPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
 
     mod = tilelang.tang.transform.LowerSharedTmem()(mod)
     mod = tilelang.transform.PlanAndUpdateBufferAllocationLocation()(mod)
-    # TANG has no cluster level, so a cluster-scoped barrier has no counterpart
-    # at any arch: mbarrier.arrive takes no cta_id operand and there is no
-    # cluster-wide storage sync to publish the init with.
-    if _module_has_shared_barrier(mod, ("shared.cluster_barrier",)):
-        raise ValueError(
-            "T.alloc_cluster_barrier() has no TANG equivalent: TANG has no cluster "
-            "level, and mbarrier.arrive takes no cta_id operand. Use "
-            "T.alloc_barrier() for block-scoped synchronisation."
-        )
+    # T.alloc_cluster_barrier lowers to a shared.cluster_barrier allocation.
+    # LowerSharedBarrier publishes its init with a cluster-scoped storage sync
+    # (tl::cluster_sync), and T.mbarrier_arrive(mbar, cta_id) with a non-zero
+    # rank -- as emitted by T.copy_cluster(remote_barrier=...) -- lowers to a
+    # DSHM remote mbarrier arrive (tl::cluster_arrive_barrier). That path needs
+    # the DSHM builtins/intrinsics/ISel, which are on LLVM develop.
     # TANG mbarriers exist only on stcuv2: the whole __mbarrier_* family is
     # gated on __Tang_ARCH__ >= 200. Reject T.alloc_barrier on stcu here rather
     # than letting ptcc fail on the gated builtins with no mention of the arch.
@@ -188,24 +204,35 @@ def TANGPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     )(mod)
     mod = tilelang.transform.ThreadSync("shared")(mod)
     mod = tilelang.transform.ThreadSync("shared.dyn")(mod)
-    # Auto-inject the per-domain TCGEN05/TMEM fences at conservative handoff
-    # points (src/tang/transform/inject_tcgen05_fence.cc). Must run after
-    # ThreadSync so the tvm_storage_sync calls it wraps already exist. On by
-    # default for stcuv2, like the CUDA pipeline's unconditional
-    # InjectTcgen05Fence; opt out with tl.enable_tang_inject_tcgen05_fence=False.
-    if should_enable_tang_inject_tcgen05_fence(pass_ctx=pass_ctx):
-        mod = pass_filter(tilelang.tang.transform.InjectTcgen05Fence, S.STCUV2)()(mod)
+    # Finalize S3 synchronization after ThreadSync has emitted its conservative
+    # rendezvous: first attach TC/TMEM domain fences, then remove only barriers
+    # covered by complete S3 ready/free certificates. The pass itself honors
+    # the fence-injection and redundant-sync debug configs independently.
+    mod = pass_filter(tilelang.tang.transform.FinalizeS3ThreadSyncs, S.STCUV2)()(mod)
     mod = tilelang.transform.MergeIfStmt()(mod)
     mod = pass_filter(tilelang.tang.transform.InjectPTSAsyncCopy, S.STCU)()(mod)
-    if not should_disable_remove_redundant_syncs(pass_ctx=pass_ctx):
+    # STCU has no S3 handshake and still needs the ordinary cleanup after its
+    # PTS async-copy rewrite.
+    if subtarget_matches(target, S.STCU) and not should_disable_remove_redundant_syncs(pass_ctx=pass_ctx):
         mod = tilelang.transform.RemoveRedundantSyncs()(mod)
     # Expand the fused TMEM->global drain into its loop nest in IR, so the code
-    # generator only prints statements (src/tang/transform/expand_tang_tmem_drain.cc).
+    # generator only prints statements (src/tang/transform/lower_s3_shared_tmem.cc).
     # Deliberately late: after RemoveRedundantSyncs, so the MMA-publish barrier
     # the drain needs (nwarps > 1) cannot be elided, and before MakePackedAPI,
     # which is where the global buffer's flat store indices are still the ones
     # the fused intrinsic carried.
-    mod = pass_filter(tilelang.tang.transform.ExpandTangTmemDrain, S.STCUV2)()(mod)
+    mod = pass_filter(tilelang.tang.transform.ExpandS3TmemDrain, S.STCUV2)()(mod)
+    # Materialise the two late mbarrier protocols with one slot plan/prologue:
+    # shared->TMEM engine publication, which ThreadSync cannot model, and
+    # surviving partial shared syncs wider than one warp. Late on purpose: only
+    # syncs that survived every elision pass are rewritten.
+    mod = pass_filter(tilelang.tang.transform.MaterializeTangMbarriers, S.STCUV2)()(mod)
+    # Last IR-level check before codegen: every tcgen05 MMA descriptor operand
+    # must still be the descriptor value op the STCU backend's TCProcess pass
+    # reads (src/tang/transform/verify_s3_mma_descriptors.cc). It is a no-op on
+    # well-formed IR; it turns "a pass bound/cast a descriptor" into a TIR
+    # diagnostic instead of an unattributable backend failure.
+    mod = pass_filter(tilelang.tang.transform.VerifyMmaDescriptors, S.STCUV2)()(mod)
     mod = tilelang.transform.MakePackedAPI()(mod)
     mod = tilelang.transform.Simplify()(mod)
     mod = tilelang.transform.LowerDeviceKernelLaunch()(mod)

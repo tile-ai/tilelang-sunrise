@@ -22,6 +22,7 @@ fi
 
 # ---- 2. Source the single shared lib.sh ----
 source "$TILELANG_CI_DIR/lib.sh"
+source "$SCRIPT_DIR/test_logging.sh"
 
 # ---- 3. Obtain the tilelang whl (standalone builds it in an isolated BUILD env) ----
 if [ -z "${TILELANG_WHL_DIR:-}" ]; then
@@ -40,15 +41,16 @@ ci_install_tilelang_whl "$TILELANG_WHL_DIR"
 echo "================================ Installing TileOPs ================================"
 cd "$TILEOPS_HOME"
 check_exec pip install -e . -v
-pip install pytest-xdist pyyaml
+pip install pytest-xdist pyyaml ruff==0.14.13 "pytest-timeout>=2.3"
 }
 
+tileops_prepare_test_log
 time {
 PYTHONPATH="$TILEOPS_HOME:$TILELANG_CI_DIR${PYTHONPATH:+:$PYTHONPATH}" \
-PYTEST_AUDIT_PLUGIN_ARGS="${PYTEST_AUDIT_PLUGIN_ARGS:+$PYTEST_AUDIT_PLUGIN_ARGS }-p pytest_node_audit" \
+PYTEST_AUDIT_PLUGIN_ARGS="${PYTEST_AUDIT_PLUGIN_ARGS:+$PYTEST_AUDIT_PLUGIN_ARGS }-p pytest_node_audit --tileops-device=ptpu --tileops-target=builtin" \
 PYTEST_NODE_AUDIT_SOURCE_ROOT="$TILEOPS_HOME" \
 PYTEST_NODE_AUDIT_SUITE=tileops \
 PYTEST_NODE_AUDIT_PATH="$TILEOPS_HOME/ci_failure_reports/tileops-pytest.jsonl" \
     ci_run_test_list "$TILEOPS_HOME/ci_test_case_list_tileops.txt" pytest
-}
+} > "$TILEOPS_TEST_LOG" 2>&1
 exit $?

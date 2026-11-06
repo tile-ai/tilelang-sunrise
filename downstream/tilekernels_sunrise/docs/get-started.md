@@ -141,7 +141,7 @@ bash ./one_click_install.sh
 
 ### Benchmarks
 
-The repo ships a benchmark plugin (`tests/pytest_benchmark_plugin.py`) that:
+The repo ships a benchmark plugin (`tile_kernels/testing/pytest/benchmark.py`) that:
 
 - Skips `@pytest.mark.benchmark` tests unless `--run-benchmark` is passed.
 - Writes results to a JSONL file via `--benchmark-output`.

@@ -162,20 +162,6 @@ def test_tang_pipeline_lowers_scalar_atomic_builtins():
     assert "atomicOr(" in source
 
 
-@pytest.mark.parametrize("operation", ["load", "store"])
-def test_tang_pipeline_rejects_unsupported_atomic_load_store(operation):
-    @T.prim_func
-    def main(A: T.Tensor((2,), "int32"), B: T.Tensor((2,), "int32")):
-        with T.Kernel(1, threads=1):
-            if operation == "load":
-                B[0] = T.atomic_load(A[0], memory_order="acquire")
-            else:
-                T.atomic_store(B[0], A[0], memory_order="release")
-
-    with pytest.raises(tvm.error.InternalError, match=f"does not support atomic_{operation}"):
-        _lower_tang_source(main)
-
-
 def test_tang_pipeline_lowers_tile_atomic_add():
     @T.prim_func
     def main(A: T.Tensor((4,), "float32"), B: T.Tensor((4,), "float32")):
