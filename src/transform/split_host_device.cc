@@ -77,6 +77,10 @@ public:
     smem_alignment_map_ = std::move(smem_alignment_map);
   }
 
+  void SetAsyncEdgeFacts(Map<String, Array<Integer>> facts) {
+    async_edge_facts_ = std::move(facts);
+  }
+
   void SetHostFuncSignature(const tirx::PrimFunc &func) {
     host_buffer_map_ = func->buffer_map;
   }
@@ -243,6 +247,10 @@ private:
   // Per-buffer shared-memory alignment requirements (kSmemAlignmentMap)
   // propagated from the host PrimFunc onto each split device kernel.
   Map<String, IntImm> smem_alignment_map_;
+  // Dependency certificates belong to the anchored device statements. Keep
+  // them with those statements across host/device splitting so the late
+  // synchronization fixpoint can validate the anchors.
+  Map<String, Array<Integer>> async_edge_facts_;
   Optional<String> code_block_source_{std::nullopt};
   Optional<String> code_block_entry_name_{std::nullopt};
 
@@ -538,6 +546,9 @@ private:
     if (!smem_alignment_map_.empty()) {
       device_attrs.Set(tl::kSmemAlignmentMap, smem_alignment_map_);
     }
+    if (!async_edge_facts_.empty()) {
+      device_attrs.Set("tl.tang_async_edge_facts", async_edge_facts_);
+    }
     if (code_block_source_) {
       device_attrs.Set(tl::attr::kCodeBlockSource, code_block_source_.value());
     }
@@ -606,6 +617,11 @@ tirx::PrimFunc SplitHostDevice(tirx::PrimFunc func, IRModule *device_mod,
   if (auto opt = func->GetAttr<Map<String, IntImm>>(tl::kSmemAlignmentMap)) {
     splitter.SetSmemAlignmentMap(opt.value());
     func = tvm::WithoutAttr(std::move(func), tl::kSmemAlignmentMap);
+  }
+  if (auto opt = func->GetAttr<Map<String, Array<Integer>>>(
+          "tl.tang_async_edge_facts")) {
+    splitter.SetAsyncEdgeFacts(opt.value());
+    func = tvm::WithoutAttr(std::move(func), "tl.tang_async_edge_facts");
   }
 
   if (auto body = splitter(func->body); !body.same_as(func->body)) {

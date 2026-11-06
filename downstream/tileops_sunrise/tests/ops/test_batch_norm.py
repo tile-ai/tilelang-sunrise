@@ -1,24 +1,32 @@
-"""Tests for BatchNormFwdOp and BatchNormBwdOp.
-
-Correctness is validated against torch.nn.functional.batch_norm and the
-analytical gradient via torch.autograd.
-
-Run:
-    conda run -n tileops python -m pytest tests/ops/test_batch_norm.py -vvs
+"""Tests for BatchNormFwdOp and BatchNormBwdOp, against torch.nn.functional.batch_norm and the analytical
+gradient from torch.autograd.
 """
 
+import math
 import re
 
 import pytest
 import torch
 
-from tests.test_base import FixtureBase, TestBase
-from tileops.ops.norm.batch_norm import BatchNormBwdOp, BatchNormFwdOp
-from workloads.normalization import (
+from tests.compile_contract import compile_fullgraph
+from tests.workload_test_base import FixtureBase, TestBase
+from tileops._kernels.kernel_base import Kernel
+from tileops._kernels.norm.call_spec import (
+    BatchNormBwdInterface,
+    BatchNormCall,
+)
+from tileops._ops.norm.batch_norm import BatchNormBwdOp, BatchNormFwdOp
+from workloads.device import host_if_ptpu, run_device, run_device_available
+from workloads.norm import (
     BatchNormBwdWorkload,
     BatchNormFwdWorkload,
+    batch_norm_backward,
+    batch_norm_backward_verification,
+    batch_norm_forward_result,
+    batch_norm_forward_verification,
     batch_norm_fwd_ref,
 )
+from workloads.numerics import compare_outputs, reference_for
 
 
 class BatchNormBwdTest(BatchNormBwdWorkload, TestBase):
@@ -39,6 +47,7 @@ class BatchNormFwdFixture(FixtureBase):
                 # BatchNorm1d – (N, C)
                 pytest.param(32, 64, (), torch.float16, True, marks=pytest.mark.smoke),
                 pytest.param(32, 64, (), torch.bfloat16, True, marks=pytest.mark.smoke),
+                pytest.param(4, 256, (28, 28), torch.float32, True, marks=pytest.mark.smoke),
                 pytest.param(32, 64, (), torch.float16, False, marks=pytest.mark.full),
                 pytest.param(32, 256, (), torch.bfloat16, True, marks=pytest.mark.full),
                 # BatchNorm1d – (N, C, L)
@@ -48,8 +57,9 @@ class BatchNormFwdFixture(FixtureBase):
                 pytest.param(4, 64, (64, 64), torch.float16, True, marks=pytest.mark.full),
                 # BatchNorm2d – (N, C, H, W)
                 pytest.param(8, 64, (1024, 1024), torch.float16, True, marks=pytest.mark.full),
-                # Keep the spatial path within the CPU reference memory budget.
-                pytest.param(2, 64, (2048, 2048), torch.float16, False, marks=pytest.mark.full),
+                # N*C*H*W = 2**31, one past INT32_MAX: a flat index over these extents does
+                # not fit a signed 32-bit integer. Costs 60 GiB, the largest case in the suite.
+                pytest.param(8, 64, (2048, 2048), torch.float16, False, marks=pytest.mark.full),
                 pytest.param(4, 128, (32, 32), torch.bfloat16, True, marks=pytest.mark.full),
                 # Non-aligned spatial: H*W=900, exercises partial-tile path
                 pytest.param(8, 64, (30, 30), torch.float16, True, marks=pytest.mark.full),
@@ -59,6 +69,9 @@ class BatchNormFwdFixture(FixtureBase):
                 # The streamed path, which no other case reaches: a channel too long to
                 # hold in registers (L = 131072) and too many channels to split (C >= 1024).
                 pytest.param(2048, 1024, (64,), torch.float16, True, marks=pytest.mark.full),
+                # The split path with a chunk no vector step divides: a block must stop at
+                # its own chunk rather than sum into the next one's.
+                pytest.param(3, 5, (300, 301), torch.float16, True, marks=pytest.mark.full),
             ],
         ),
     ]
@@ -73,13 +86,20 @@ class BatchNormBwdFixture(FixtureBase):
             [
                 pytest.param(32, 64, (), torch.float16, marks=pytest.mark.smoke),
                 pytest.param(32, 64, (), torch.bfloat16, marks=pytest.mark.smoke),
+                pytest.param(4, 256, (28, 28), torch.float32, marks=pytest.mark.smoke),
                 pytest.param(8, 64, (32, 32), torch.float16, marks=pytest.mark.full),
                 pytest.param(4, 128, (32, 32), torch.bfloat16, marks=pytest.mark.full),
-                # Non-persistent backward path (L=16384 > 8192).
+                # A register-held channel taking several steps per thread.
                 pytest.param(4, 64, (64, 64), torch.float16, marks=pytest.mark.full),
-                # Non-aligned spatial: H*W=900, exercises partial-tile path
+                # Non-aligned spatial: H*W=900, a vector narrower than the dtype allows.
                 pytest.param(8, 64, (30, 30), torch.float16, marks=pytest.mark.full),
                 pytest.param(8, 64, (30, 30), torch.bfloat16, marks=pytest.mark.full),
+                # The split path with a chunk no vector step divides: a block must stop at
+                # its own chunk rather than sum into the next one's.
+                pytest.param(3, 5, (300, 301), torch.bfloat16, marks=pytest.mark.full),
+                # The streamed tiled path: a channel too long for registers (L = 73728, odd
+                # spatial run) and too many channels to split (C >= 1024).
+                pytest.param(8192, 1024, (9,), torch.float16, marks=pytest.mark.full),
             ],
         ),
     ]
@@ -88,155 +108,127 @@ class BatchNormBwdFixture(FixtureBase):
 @BatchNormFwdFixture
 def test_batch_norm_fwd(N, C, spatial, dtype, training):
     test = BatchNormFwdTest(N, C, spatial, dtype, training)
-    x, weight, bias, running_mean, running_var = test.gen_inputs()
-
-    # Clone before op call so reference sees the same initial state.
-    running_mean_ref = running_mean.clone()
-    running_var_ref = running_var.clone()
-
+    inputs = test.gen_inputs()
     op = BatchNormFwdOp(training=training)
-    # Manifest input order: (x, running_mean, running_var, weight, bias).
-    y = op(x, running_mean, running_var, weight, bias)
-
-    torch.ptpu.synchronize()
-    y_cpu = y.cpu()
-
-    ref_y, ref_rm, ref_rv = batch_norm_fwd_ref(
-        x.cpu(),
-        weight.cpu(),
-        bias.cpu(),
-        running_mean_ref.cpu(),
-        running_var_ref.cpu(),
-        training=training,
-    )
-
-    # float16 accumulates more error; use loose tolerances.
-    atol, rtol = (1e-2, 1e-2) if dtype == torch.float16 else (2e-2, 2e-2)
-    max_err = (y_cpu.float() - ref_y.float()).abs().max()
-    assert torch.allclose(y_cpu.float(), ref_y.float(), atol=atol, rtol=rtol), (
-        f"fwd mismatch (training={training}): max_err={max_err:.4e}"
-    )
+    test.check(op, *inputs, runs=lambda *args: batch_norm_forward_result(op, *args))
 
     if training:
-        # allclose is masked when running_mean starts near the batch mean; check determinism.
-        rm2, rv2 = running_mean_ref.clone(), running_var_ref.clone()
-        op(x, rm2, rv2, weight, bias)
-        torch.ptpu.synchronize()
-        running_mean_cpu = running_mean.cpu()
-        running_var_cpu = running_var.cpu()
-        rm2_cpu = rm2.cpu()
-        rv2_cpu = rv2.cpu()
-        det_err = (running_mean_cpu.float() - rm2_cpu.float()).abs().max()
-        assert torch.equal(running_mean_cpu, rm2_cpu) and torch.equal(
-            running_var_cpu,
-            rv2_cpu,
-        ), f"running stats non-deterministic across runs: max_err={det_err:.4e}"
-
-        rm_err = (running_mean_cpu.float() - ref_rm.float()).abs().max()
-        assert torch.allclose(
-            running_mean_cpu.float(),
-            ref_rm.float(),
-            atol=atol,
-            rtol=rtol,
-        ), f"running_mean mismatch: max_err={rm_err:.4e}"
-        rv_err = (running_var_cpu.float() - ref_rv.float()).abs().max()
-        assert torch.allclose(
-            running_var_cpu.float(),
-            ref_rv.float(),
-            atol=atol,
-            rtol=rtol,
-        ), f"running_var mismatch: max_err={rv_err:.4e}"
+        # Repeat from the same initial statistics to detect update races separately.
+        x, mean, var, weight, bias = inputs
+        mean2, var2 = mean.clone(), var.clone()
+        op(x, mean, var, weight, bias)
+        op(x, mean2, var2, weight, bias)
+        assert torch.equal(mean, mean2) and torch.equal(var, var2)
 
 
 @BatchNormBwdFixture
 def test_batch_norm_bwd(N, C, spatial, dtype):
     test = BatchNormBwdTest(N, C, spatial, dtype)
-    grad_out, x, weight, mean, rstd = test.gen_inputs()
-
-    op = BatchNormBwdOp()
-    grad_x, grad_weight, grad_bias = op(grad_out, x, weight, mean, rstd)
-
-    torch.ptpu.synchronize()
-    ref_gx, ref_gw, ref_gb = test.ref_program(
-        grad_out.cpu(),
-        x.cpu(),
-        weight.cpu(),
-        mean.cpu(),
-        rstd.cpu(),
-    )
-    grad_x_cpu = grad_x.cpu()
-    grad_weight_cpu = grad_weight.cpu()
-    grad_bias_cpu = grad_bias.cpu()
-
-    atol, rtol = (1e-2, 1e-2) if dtype == torch.float16 else (2e-2, 2e-2)
-
-    for name, got, ref in [
-        ("grad_x", grad_x_cpu.float(), ref_gx.float()),
-        ("grad_weight", grad_weight_cpu.float(), ref_gw.float()),
-        ("grad_bias", grad_bias_cpu.float(), ref_gb.float()),
-    ]:
-        max_err = (got - ref).abs().max()
-        assert torch.allclose(got, ref, atol=atol, rtol=rtol), (
-            f"bwd {name} mismatch: max_err={max_err:.4e}"
-        )
+    test.check(BatchNormBwdOp(), *test.gen_inputs())
 
 
 @pytest.mark.smoke
-def test_batch_norm_fwd_returns_single_tensor() -> None:
-    """BatchNormFwdOp forward must produce one tensor — manifest declares
-    a single output. ``training`` is bound at ctor; the runtime kwarg is
-    no longer accepted."""
-    if not torch.ptpu.is_available():
-        pytest.skip("PTPU required for forward call")
+def test_batch_norm_fwd_infer_returns_no_saved_stats() -> None:
+    """Without training the forward returns ``(output, None, None)``: there are no batch
+    statistics to save."""
+    if not run_device_available():
+        pytest.skip("the run device is not available")
 
     N, C, H, W = 4, 8, 4, 4
     op = BatchNormFwdOp(training=False)
-    x = torch.randn(N, C, H, W, device="ptpu", dtype=torch.float16)
-    weight = torch.randn(C, device="ptpu", dtype=torch.float32)
-    bias = torch.randn(C, device="ptpu", dtype=torch.float32)
-    rm = torch.zeros(C, device="ptpu", dtype=torch.float32)
-    rv = torch.ones(C, device="ptpu", dtype=torch.float32)
+    x = torch.randn(N, C, H, W, device=run_device(), dtype=torch.float16)
+    weight = torch.randn(C, device=run_device(), dtype=torch.float32)
+    bias = torch.randn(C, device=run_device(), dtype=torch.float32)
+    rm = torch.zeros(C, device=run_device(), dtype=torch.float32)
+    rv = torch.ones(C, device=run_device(), dtype=torch.float32)
 
-    y = op(x, rm, rv, weight, bias)
+    y, save_mean, save_invstd = op(x, rm, rv, weight, bias)
     assert isinstance(y, torch.Tensor)
     assert y.shape == x.shape
+    assert save_mean is None and save_invstd is None
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "shape, dtype",
+    [
+        pytest.param((32, 64), torch.float32, id="whole"),
+        pytest.param((8, 16, 32, 32), torch.float16, id="wide"),
+        pytest.param((4, 4, 256, 512), torch.bfloat16, id="split"),
+    ],
+)
+@pytest.mark.parametrize("affine", [True, False])
+def test_training_forward_feeds_backward_like_autograd(shape, dtype, affine) -> None:
+    """The statistics the training forward returns drive BatchNormBwdOp to torch
+    autograd's gradients of F.batch_norm, with a scale and shift or without."""
+    c = shape[1]
+    x = torch.randn(shape, dtype=dtype, device=run_device())
+    weight = torch.rand(c, device=run_device()) + 0.5 if affine else None
+    bias = torch.randn(c, device=run_device()) if affine else None
+    grad_out = torch.randn_like(x)
+
+    y, save_mean, save_invstd = BatchNormFwdOp(training=True)(x, None, None, weight, bias)
+    dinput, dweight, dbias = BatchNormBwdOp()(grad_out, x, save_mean, save_invstd, weight=weight)
+
+    # torch_ptpu rejects batch_norm in training mode, so the autograd reference runs on the host.
+    host = host_if_ptpu()
+    x32 = x.float().to(host).requires_grad_(True)
+    ones = torch.ones(c, device=host)
+    w32 = (weight.to(host) if affine else ones).clone().requires_grad_(True)
+    b32 = (bias.to(host) if affine else ones - 1).clone().requires_grad_(True)
+    with torch.enable_grad():
+        y32 = torch.nn.functional.batch_norm(x32, None, None, w32, b32, training=True)
+    y32.backward(grad_out.float().to(host))
+    verification = batch_norm_forward_verification(dtype)
+    device = run_device()
+    compare_outputs(y, y32.detach().to(dtype).to(device), verification)
+    compare_outputs(
+        (dinput, dweight, dbias),
+        (x32.grad.to(dtype).to(device), w32.grad.to(device), b32.grad.to(device)),
+        batch_norm_backward_verification(dtype),
+    )
 
 
 @pytest.mark.smoke
 def test_training_updates_a_non_contiguous_running_stat() -> None:
     """Contiguity normalization must not swallow the write a mutated input promises."""
-    if not torch.ptpu.is_available():
-        pytest.skip("PTPU required for forward call")
+    if not run_device_available():
+        pytest.skip("the run device is not available")
 
     N, C, H, W = 4, 8, 4, 4
     op = BatchNormFwdOp(training=True)
-    x = torch.randn(N, C, H, W, device="ptpu", dtype=torch.float16)
-    weight = torch.ones(C, device="ptpu", dtype=torch.float32)
-    bias = torch.zeros(C, device="ptpu", dtype=torch.float32)
+    x = torch.randn(N, C, H, W, device=run_device(), dtype=torch.float16)
+    weight = torch.ones(C, device=run_device(), dtype=torch.float32)
+    bias = torch.zeros(C, device=run_device(), dtype=torch.float32)
     # Every other element of a wider buffer: a view the kernel cannot be handed as is.
-    rm = torch.zeros(2 * C, device="ptpu", dtype=torch.float32)[::2]
-    rv = torch.ones(2 * C, device="ptpu", dtype=torch.float32)[::2]
+    rm = torch.zeros(2 * C, device=run_device(), dtype=torch.float32)[::2]
+    rv = torch.ones(2 * C, device=run_device(), dtype=torch.float32)[::2]
     assert not rm.is_contiguous()
 
-    op(x, rm, rv, weight, bias)
-
-    expected_mean = op.momentum * x.cpu().float().transpose(0, 1).reshape(C, -1).mean(dim=1)
-    torch.testing.assert_close(rm.cpu(), expected_mean, atol=1e-3, rtol=1e-3)
-    assert not torch.equal(rv, torch.ones_like(rv)), "running_var was not written either"
+    workload = BatchNormFwdTest(N, C, (H, W), x.dtype, training=True)
+    workload.check(
+        op,
+        x,
+        rm,
+        rv,
+        weight,
+        bias,
+        runs=lambda *args: batch_norm_forward_result(op, *args),
+    )
 
 
 @pytest.mark.smoke
 def test_training_rejects_one_value_per_channel() -> None:
     """Bessel's correction divides by L - 1; torch refuses the same call."""
-    if not torch.ptpu.is_available():
-        pytest.skip("PTPU required for forward call")
+    if not run_device_available():
+        pytest.skip("the run device is not available")
 
     C = 4
-    x = torch.randn(1, C, 1, 1, device="ptpu", dtype=torch.float32)
-    weight = torch.ones(C, device="ptpu", dtype=torch.float32)
-    bias = torch.zeros(C, device="ptpu", dtype=torch.float32)
-    rm = torch.zeros(C, device="ptpu", dtype=torch.float32)
-    rv = torch.ones(C, device="ptpu", dtype=torch.float32)
+    x = torch.randn(1, C, 1, 1, device=run_device(), dtype=torch.float32)
+    weight = torch.ones(C, device=run_device(), dtype=torch.float32)
+    bias = torch.zeros(C, device=run_device(), dtype=torch.float32)
+    rm = torch.zeros(C, device=run_device(), dtype=torch.float32)
+    rv = torch.ones(C, device=run_device(), dtype=torch.float32)
 
     torch_message = ""
     try:
@@ -245,13 +237,319 @@ def test_training_rejects_one_value_per_channel() -> None:
         torch_message = str(exc)
     assert torch_message, "torch accepted L=1 in training; the guard's premise is gone"
 
-    with pytest.raises(ValueError, match=re.escape(torch_message)):
+    with pytest.raises(ValueError, match=re.escape("B * prod(L) != 1")):
         BatchNormFwdOp(training=True)(x, rm, rv, weight, bias)
 
     # Inference applies no correction; torch normalizes the same shape.
     infer = BatchNormFwdOp(training=False)
-    y = infer(x, rm, rv, weight, bias)
-    expected = torch.nn.functional.batch_norm(
-        x, rm, rv, weight, bias, training=False, eps=infer.eps
+    expected = reference_for(
+        batch_norm_fwd_ref, x, weight, bias, rm, rv, training=False, eps=infer.eps
     )
-    torch.testing.assert_close(y, expected, atol=1e-3, rtol=1e-3)
+    compare_outputs(
+        batch_norm_forward_result(infer, x, rm, rv, weight, bias),
+        expected,
+        batch_norm_forward_verification(x.dtype),
+    )
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("shape", [(2, 8, 5, 6), (3, 4, 97, 101)], ids=["short", "long"])
+def test_a_channel_length_no_tile_divides_matches_torch(shape) -> None:
+    """The training forward (no statistics, no affine) and the backward cover a channel
+    length no tile divides."""
+    x = torch.randn(shape, dtype=torch.float16, device=run_device())
+    c = shape[1]
+    op = BatchNormFwdOp(training=True)
+    compare_outputs(
+        batch_norm_forward_result(op, x, None, None, None, None),
+        reference_for(batch_norm_fwd_ref, x, None, None, None, None, training=True),
+        batch_norm_forward_verification(x.dtype),
+    )
+    grad_out, weight = torch.randn_like(x), torch.randn(c, device=run_device())
+    var, mean = reference_for(lambda x: torch.var_mean(x.float(), dim=[0, 2, 3], correction=0), x)
+    var, mean = var.to(x.device), mean.to(x.device)
+    rstd = torch.rsqrt(var + 1e-5)
+    inputs = grad_out, x, mean, rstd
+    compare_outputs(
+        BatchNormBwdOp()(*inputs, weight=weight),
+        reference_for(batch_norm_backward, *inputs, weight),
+        batch_norm_backward_verification(x.dtype),
+    )
+
+
+@pytest.mark.parametrize("absent", ["weight", "bias"])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        pytest.param((16, 32), marks=pytest.mark.smoke, id="whole"),
+        pytest.param((8, 16, 32, 32), marks=pytest.mark.smoke, id="wide"),
+        pytest.param((4, 4, 256, 512), marks=pytest.mark.smoke, id="split"),
+        # 1024 channels of an odd 65537-element run: too many to split, too long to hold.
+        pytest.param((1, 1024, 65537), marks=pytest.mark.full, id="tiled"),
+    ],
+)
+def test_training_forward_built_without_a_tensor_matches_torch(shape, absent) -> None:
+    """A training program built without one affine tensor, and without running
+    statistics, scales by one or shifts by zero in its place."""
+    x = torch.randn(shape, dtype=torch.float16, device=run_device())
+    c = shape[1]
+    weight = None if absent == "weight" else torch.rand(c, device=run_device()) + 0.5
+    bias = None if absent == "bias" else torch.randn(c, device=run_device())
+    op = BatchNormFwdOp(training=True)
+    compare_outputs(
+        batch_norm_forward_result(op, x, None, None, weight, bias),
+        reference_for(batch_norm_fwd_ref, x, weight, bias, None, None, training=True),
+        batch_norm_forward_verification(x.dtype),
+    )
+
+
+def _off_a_vector_boundary(shape: tuple) -> torch.Tensor:
+    """A contiguous float16 tensor whose storage starts one element past a 16-byte boundary."""
+    x = torch.randn(math.prod(shape) + 1, dtype=torch.float16, device=run_device())[1:]
+    return x.view(shape)
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "training, shape",
+    [
+        pytest.param(True, (8, 16, 32, 32), id="wide"),
+        pytest.param(True, (4, 4, 256, 512), id="split"),
+        pytest.param(False, (8, 16, 32, 32), id="infer"),
+    ],
+)
+def test_forward_input_off_a_vector_boundary_matches_torch(training, shape) -> None:
+    """A contiguous input starting one element past a 16-byte boundary matches torch."""
+    x = _off_a_vector_boundary(shape)
+    c = shape[1]
+    weight, bias = torch.rand(c, device=run_device()) + 0.5, torch.randn(c, device=run_device())
+    rm, rv = torch.randn(c, device=run_device()), torch.rand(c, device=run_device()) + 0.5
+    op = BatchNormFwdOp(training=training)
+    compare_outputs(
+        batch_norm_forward_result(op, x, rm.clone(), rv.clone(), weight, bias),
+        reference_for(
+            batch_norm_fwd_ref, x, weight, bias, rm.clone(), rv.clone(), training=training
+        ),
+        batch_norm_forward_verification(x.dtype),
+    )
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "shape",
+    [
+        pytest.param((8, 16, 32, 32), id="wide"),
+        pytest.param((4, 4, 256, 512), id="split"),
+    ],
+)
+def test_backward_inputs_off_a_vector_boundary_match_torch(shape) -> None:
+    """A grad_out and an x starting one element past a 16-byte boundary match torch."""
+    grad_out, x = _off_a_vector_boundary(shape), _off_a_vector_boundary(shape)
+    weight = torch.rand(shape[1], device=run_device()) + 0.5
+    var, mean = reference_for(lambda x: torch.var_mean(x.float(), dim=[0, 2, 3], correction=0), x)
+    var, mean = var.to(x.device), mean.to(x.device)
+    inputs = grad_out, x, mean, torch.rsqrt(var + 1e-5)
+    bwd = BatchNormBwdOp()
+    compare_outputs(
+        bwd(*inputs, weight=weight),
+        reference_for(batch_norm_backward, *inputs, weight),
+        batch_norm_backward_verification(x.dtype),
+    )
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "shape",
+    [
+        # A channel a 16-byte vector divides: each piece read a vector at a time.
+        pytest.param((4, 4, 256, 512), id="vector"),
+        # An odd spatial extent: a vector would straddle two batch items, so one element.
+        pytest.param((4, 4, 255, 513), id="element"),
+    ],
+)
+def test_channels_split_across_blocks_match_torch(shape) -> None:
+    """The split training forward and backward, a channel summed across blocks, match
+    torch whether a piece is read a vector or an element at a time."""
+    x = torch.randn(shape, dtype=torch.float16, device=run_device())
+    c = shape[1]
+    weight, bias = torch.rand(c, device=run_device()) + 0.5, torch.randn(c, device=run_device())
+    op = BatchNormFwdOp(training=True)
+    compare_outputs(
+        batch_norm_forward_result(op, x, None, None, weight, bias),
+        reference_for(batch_norm_fwd_ref, x, weight, bias, None, None, training=True),
+        batch_norm_forward_verification(x.dtype),
+    )
+    grad_out = torch.randn_like(x)
+    var, mean = reference_for(lambda x: torch.var_mean(x.float(), dim=[0, 2, 3], correction=0), x)
+    var, mean = var.to(x.device), mean.to(x.device)
+    inputs = grad_out, x, mean, torch.rsqrt(var + 1e-5)
+    bwd = BatchNormBwdOp()
+    compare_outputs(
+        bwd(*inputs, weight=weight),
+        reference_for(batch_norm_backward, *inputs, weight),
+        batch_norm_backward_verification(x.dtype),
+    )
+
+
+# Input validation and torch.compile.
+@pytest.mark.smoke
+class TestBatchNormFwdValidation:
+    def _make_op(self):
+        from tileops._ops.norm.batch_norm import BatchNormFwdOp
+
+        return BatchNormFwdOp()
+
+    def _make_inputs(self, device=None, dtype=torch.float16):
+        device = device or run_device()
+        x = torch.randn(4, 8, 4, 4, device=device, dtype=dtype)
+        weight = torch.randn(8, device=device, dtype=torch.float32)
+        bias = torch.randn(8, device=device, dtype=torch.float32)
+        rm = torch.zeros(8, device=device, dtype=torch.float32)
+        rv = torch.ones(8, device=device, dtype=torch.float32)
+        return x, weight, bias, rm, rv
+
+    def test_rejects_wrong_dtype(self):
+        from tileops._ops.norm.batch_norm import BatchNormFwdOp
+
+        op = BatchNormFwdOp()
+        device = "cpu" if torch.device(run_device()).type == "ptpu" else run_device()
+        x_wrong = torch.randn(4, 8, 4, 4, device=device, dtype=torch.float64)
+        _, weight, bias, rm, rv = self._make_inputs(device=device)
+        with pytest.raises(ValueError, match="dtype"):
+            op(x_wrong, rm, rv, weight, bias)
+
+    def test_rejects_wrong_shape(self):
+        op = self._make_op()
+        x_wrong = torch.randn(4, 16, 4, 4, device=run_device(), dtype=torch.float16)
+        _, weight, bias, rm, rv = self._make_inputs()
+        with pytest.raises(ValueError, match="shape|channel|Channel"):
+            op(x_wrong, rm, rv, weight, bias)
+
+
+@pytest.mark.smoke
+@pytest.mark.usefixtures("isolated_dynamo")
+class TestBatchNormCustomOp:
+    def test_fwd_torch_compile_smoke(self):
+        from tileops._ops.norm.batch_norm import BatchNormFwdOp
+
+        op = BatchNormFwdOp(training=True)
+        x = torch.randn(4, 8, 4, 4, device=run_device(), dtype=torch.float16)
+        weight = torch.randn(8, device=run_device(), dtype=torch.float32)
+        bias = torch.randn(8, device=run_device(), dtype=torch.float32)
+        rm = torch.zeros(8, device=run_device(), dtype=torch.float32)
+        rv = torch.ones(8, device=run_device(), dtype=torch.float32)
+
+        compiled = compile_fullgraph(op, fullgraph=False)
+        # Manifest input order: (x, running_mean, running_var, weight, bias).
+        y, save_mean, save_invstd = compiled(x, rm, rv, weight, bias)
+        assert y.shape == x.shape
+        assert save_mean.shape == save_invstd.shape == (8,)
+
+    def test_bwd_torch_compile_smoke(self):
+        from tileops._ops.norm.batch_norm import BatchNormBwdOp
+
+        N, C, H, W = 4, 8, 4, 4
+        op = BatchNormBwdOp()
+        grad_out = torch.randn(N, C, H, W, device=run_device(), dtype=torch.float16)
+        x = torch.randn(N, C, H, W, device=run_device(), dtype=torch.float16)
+        weight = torch.randn(C, device=run_device(), dtype=torch.float32)
+        x32 = x.float()
+        x_cl = x32.permute(1, 0, 2, 3).reshape(C, -1).contiguous()
+        mean = reference_for(lambda x: x.mean(dim=1), x_cl).to(x.device)
+        rstd = reference_for(
+            lambda x: 1.0 / torch.sqrt(x.var(dim=1, unbiased=False) + 1e-5), x_cl
+        ).to(x.device)
+
+        compiled = compile_fullgraph(op, fullgraph=False)
+        gx, gw, gb = compiled(grad_out, x, mean, rstd, weight=weight)
+        assert gx.shape == x.shape
+
+
+def _to_cl(x: torch.Tensor) -> torch.Tensor:
+    return x.permute(1, 0, *range(2, x.ndim)).reshape(x.shape[1], -1).contiguous()
+
+
+def _from_cl(x_cl: torch.Tensor, orig_shape: torch.Size) -> torch.Tensor:
+    n = orig_shape[0]
+    c = orig_shape[1]
+    spatial = orig_shape[2:]
+    return x_cl.reshape(c, n, *spatial).permute(1, 0, *range(2, len(orig_shape))).contiguous()
+
+
+class _FakeKernel(Kernel):
+    general = True
+
+    def __init__(self, call: BatchNormCall) -> None:
+        super().__init__()
+        self.L = call.n * call.spatial
+        self.dtype = call.dtype
+        self.eps = call.eps
+        self.momentum = call.momentum
+
+
+class _FakeBatchNormBwdKernel(_FakeKernel, BatchNormBwdInterface):
+    def forward(
+        self,
+        grad_out: torch.Tensor,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        mean: torch.Tensor,
+        rstd: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        grad_out_cl = _to_cl(grad_out)
+        x_cl = _to_cl(x)
+        grad_out_f = grad_out_cl.float()
+        x_hat = (x_cl.float() - mean[:, None]) * rstd[:, None]
+        grad_bias = grad_out_f.sum(dim=1)
+        grad_weight = (grad_out_f * x_hat).sum(dim=1)
+        grad_x = (
+            weight[:, None]
+            * rstd[:, None]
+            * (self.L * grad_out_f - grad_bias[:, None] - x_hat * grad_weight[:, None])
+            / self.L
+        )
+        return _from_cl(grad_x.to(self.dtype), x.shape), grad_weight, grad_bias
+
+
+def _batch_norm_infer_ref(
+    x: torch.Tensor,
+    running_mean: torch.Tensor,
+    running_var: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    affine_shape = (1, x.shape[1]) + (1,) * (x.ndim - 2)
+    y = (x.float() - running_mean.reshape(affine_shape)) * torch.rsqrt(
+        running_var.reshape(affine_shape) + eps
+    )
+    y = y * weight.reshape(affine_shape) + bias.reshape(affine_shape)
+    return y.to(x.dtype)
+
+
+def _batch_norm_train_ref(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    x_cl = _to_cl(x)
+    mean = x_cl.float().mean(dim=1)
+    var = x_cl.float().var(dim=1, unbiased=False)
+    rstd = torch.rsqrt(var + eps)
+    y_cl = (x_cl.float() - mean[:, None]) * rstd[:, None]
+    y_cl = y_cl * weight[:, None] + bias[:, None]
+    return _from_cl(y_cl.to(x.dtype), x.shape), mean, rstd
+
+
+def _batch_norm_bwd_ref(
+    grad_out: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    mean: torch.Tensor,
+    rstd: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    n, c = x.shape[0], x.shape[1]
+    call = BatchNormCall(n=n, c=c, spatial=x.numel() // (n * c), dtype=x.dtype)
+    kernel = _FakeBatchNormBwdKernel(call)  # lint: test-placement allow: torch reference double
+    return kernel(grad_out, x, weight, mean, rstd)

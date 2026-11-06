@@ -5,16 +5,13 @@ Routes through `mma_atmem` (A in TMEM, B in shared). A is staged by
 A-operand packed layout (`.32x32b`, lane == row, two 16-bit elements per cell),
 which is unrelated to the accumulator's `.16x256b` layout.
 
-Hardware constraints and the restrictions still in place are documented in
-docs/s3_tmem_a_operand_atmem_layout.md. The first version supports single-warp,
-K-major A, and 8/16-bit A only.
+The implementation supports single-warp, K-major A with 8/16-bit elements.
 
 The frontend is always `T.tcgen05_gemm` (S3 only supports tcgen05 GEMM); `T.gemm`
 is an early leftover spelling and is not used by new cases.
 
-§1 Lowering assertions  test_atmem_lowering_*  (no ISS, regex over the source)
-§2 Numeric (via ISS)    test_atmem_numeric_*
-§3 Negative cases       test_atmem_*_rejected  (no ISS)
+§1 Lowering assertions  test_atmem_lowering_*  (regex over the source)
+§3 Negative cases       test_atmem_*_rejected
 """
 
 import re
@@ -26,7 +23,6 @@ import tilelang
 import tilelang.testing
 import tilelang.tang.language as T
 from tilelang import tvm as tvm
-from tilelang.jit import JITKernel
 
 STCUV2_TARGET = {"kind": "tang", "arch": "stcuv2"}
 
@@ -35,12 +31,6 @@ _TL_DTYPE = {
     "bfloat16": T.bfloat16,
     "int8": T.int8,
     "uint8": T.uint8,
-}
-_PT_DTYPE = {
-    "float16": torch.float16,
-    "bfloat16": torch.bfloat16,
-    "int8": torch.int8,
-    "uint8": torch.uint8,
 }
 # Integer MMA accumulates into int32, floating point into fp32.
 _ACC_DTYPE = {
@@ -85,36 +75,16 @@ def _lower_source(kernel):
         return tilelang.lower(kernel, target=STCUV2_TARGET).kernel_source
 
 
-def _rand_operand(rows, cols, dtype):
-    pt = _PT_DTYPE[dtype]
-    if dtype == "int8":
-        return torch.randint(-8, 8, (rows, cols), dtype=pt)
-    if dtype == "uint8":
-        return torch.randint(0, 16, (rows, cols), dtype=pt)
-    return torch.randn(rows, cols, dtype=torch.float32).to(pt)
-
-
-def _sim_run(kernel, M, N, K, dtype, trans_B=True):
-    """Run on the ISS and return the relative error against a torch reference."""
-    torch.manual_seed(0)
-    A = _rand_operand(M, K, dtype)
-    B = _rand_operand(N, K, dtype) if trans_B else _rand_operand(K, N, dtype)
-    ref = A.float() @ (B.float().T if trans_B else B.float())
-    jit = JITKernel(kernel, out_idx=[-1], target=STCUV2_TARGET, execution_backend="simulator", verbose=False)
-    C = jit(A.ptpu(), B.ptpu()).cpu().float()
-    return (C - ref).abs().max().item() / (ref.abs().max().item() + 1e-6)
-
-
 # ===========================================================================
 # §1 Lowering assertions
 # ===========================================================================
 
 
 def test_atmem_lowering_emits_atmem_template():
-    """TS must use mma_atmem, not the SS mma that takes a shared-memory
+    """TS must use the atmem wrapper, not the SS one that takes a shared-memory
     descriptor."""
     src = _lower_source(_make_atmem_kernel(128, 64, 64, 32, "float16"))
-    assert re.search(r"tang::ptx::mma_atmem<", src)
+    assert re.search(r"tl::tang_tcgen05_mma_ts\(", src)
     # The SS mma must not appear alongside it; if it does, the kernel is
     # still going through the shared-A path.
     assert not re.search(r"tang::ptx::mma<", src)
@@ -157,83 +127,15 @@ def test_atmem_lowering_a_and_c_share_one_tc_alloc():
     assert len(re.findall(r"tc_alloc<", src)) == 1
 
 
-# ===========================================================================
-# §2 Numeric (via ISS)
-# ===========================================================================
-
-
-@pytest.mark.parametrize(
-    "M,N,K,dtype",
-    [
-        (128, 64, 64, "float16"),
-        (128, 64, 64, "bfloat16"),
-        (96, 64, 64, "float16"),
-        (64, 64, 64, "float16"),
-        (32, 64, 64, "float16"),
-        (32, 32, 64, "float16"),
-        (128, 64, 128, "int8"),
-        (128, 64, 128, "uint8"),
-        (64, 64, 128, "int8"),
-        (32, 64, 128, "uint8"),
-    ],
-)
-def test_atmem_numeric(M, N, K, dtype):
-    """The TS result must match A@B^T."""
-    rel = _sim_run(_make_atmem_kernel(M, N, K, 32, dtype), M, N, K, dtype)
-    assert rel < 1e-2, f"rel_err too large: {rel:.3e}"
-
-
-def test_atmem_large_tile_is_toolchain_limited():
-    """Record the largest tile a single-warp TS drain sustains -- but that limit
-    belongs to ptcc, not to TileLang.
-
-    A 128x128 fp32 accumulator has to squeeze through the registers of 32 lanes.
-    Whether it fits is decided by ptcc's register allocator: the ptcc shipped
-    with the simulator reports 'ran out of registers', while the one on CI
-    compiles it and produces correct numbers.
-
-    So "must fail" cannot be written as an assertion. This case used to be a
-    strict xfail, which turned into an XPASS(strict) failure the moment CI
-    compiled it -- and the failure was reported against a reason that reads like
-    a known limitation, which invites the conclusion that the drain broke.
-
-    Both outcomes are accepted, and both keep an assertion: either the known
-    register-allocation limit is hit, or the kernel compiles and the numbers are
-    correct. A third outcome (compiles but wrong numbers) still fails.
-
-    The limit itself belongs to the drain, not to atmem; TS is single-warp for
-    now, so the multi-warp drain is not available either.
-    """
-    try:
-        rel = _sim_run(_make_atmem_kernel(128, 128, 64, 32, "float16"), 128, 128, 64, "float16")
-    except RuntimeError as exc:
-        assert "ran out of registers" in str(exc), (
-            f"expected the known register-allocation limit, but ptcc failed for another reason:\n{exc}"
-        )
-        return
-    assert rel < 1e-2, f"rel_err too large: {rel:.3e}"
-
-
-@pytest.mark.xfail(
-    reason="K=32 with f16 leaves B's shared row at only 64 bytes, and ptcc "
-    "reports 'Unsupported B matrix swizzle layout'. This is a pre-existing "
-    "constraint on the B side, unrelated to A living in TMEM.",
-    strict=True,
-    raises=RuntimeError,
-)
-def test_atmem_numeric_short_k_breaks_b_swizzle():
-    """Record the lower bound on B's shared row width."""
-    rel = _sim_run(_make_atmem_kernel(64, 64, 32, 32, "float16"), 64, 64, 32, "float16")
-    assert rel < 1e-2, f"rel_err too large: {rel:.3e}"
-
-
 def test_atmem_b_still_caps_k():
-    """A is exempt from the 128-byte row cap, but B is still in shared memory,
-    so the cap on K is not raised.
+    """A is exempt from the 128-byte row cap, but the TS path still caps K.
 
-    Recorded to prevent the assumption that TS can take a longer K.
+    B is in shared memory, so a K-major B over the cap is normally split into
+    128-byte segments; here A cannot follow, because a tensor-memory A is one
+    indivisible operand. Both operands of an MMA have to cover the same K, so the
+    cap stands on this path -- for the A side rather than the B side.
     """
-    with pytest.raises(Exception, match=r"operand B .*128-byte cap"):
+    with pytest.raises(Exception, match=r"A in tensor memory is one indivisible operand"):
         _lower_source(_make_atmem_kernel(128, 64, 128, 32, "float16"))
 
 
@@ -294,6 +196,143 @@ def test_atmem_subbyte_a_rejected():
             T.copy(C_f, C)
 
     with pytest.raises(Exception, match="8/16/32-bit A"):
+        _lower_source(kernel)
+
+
+# ===========================================================================
+# §4 A K window into a staged tile (the one operand slice stcuv2 can express)
+# ===========================================================================
+
+
+def _make_atmem_k_window_kernel(k0, M=64, N=64, K=64, KF=128):
+    """A is staged whole (M, KF) into TMEM; the GEMM reads a K=K window of it.
+
+    A in tensor memory is K-major and unswizzled, so the window is a plain
+    column offset: ``offset_A`` elements become ``offset_A / elems_per_cell``
+    32-bit cells added to A's TMEM address. Nothing else about the operand is
+    region dependent (M/N/K come from the instruction descriptor), which is why
+    this works where a shared descriptor cannot.
+    """
+    dt = T.float16
+
+    @T.prim_func
+    def kernel(
+        A: T.Tensor((M, KF), dt),
+        B: T.Tensor((N, K), dt),
+        C: T.Tensor((M, N), T.float32),
+    ):
+        with T.Kernel(1, 1, threads=32):
+            A_s = T.alloc_shared((M, KF), dt)
+            A_t = T.alloc_tmem((M, KF), dt)
+            B_s = T.alloc_shared((N, K), dt)
+            C_t = T.alloc_tmem((M, N), T.float32)
+            C_f = T.alloc_fragment((M, N), T.float32)
+            T.copy(A, A_s)
+            T.tcgen05_cp(A_t, A_s)
+            T.copy(B, B_s)
+            T.tcgen05_gemm(
+                A_t[:, k0 : k0 + K],
+                B_s,
+                C_t,
+                transpose_B=True,
+                clear_accum=True,
+                mbar=None,
+            )
+            T.tcgen05_ld(C_f, C_t)
+            T.copy(C_f, C)
+
+    return kernel
+
+
+@pytest.mark.parametrize("k0,offset", [(0, None), (64, 32)])
+def test_atmem_lowering_k_window_offsets_the_a_address(k0, offset):
+    """The K origin reaches the MMA as a TMEM cell offset, not as nothing.
+
+    f16 packs 2 elements per 32-bit cell, so K origin 64 is +32 cells. Before
+    this was wired through, the origin was dropped entirely and the MMA quietly
+    read from column 0.
+    """
+    src = _lower_source(_make_atmem_k_window_kernel(k0))
+    assert re.search(r"tl::tang_tcgen05_mma_ts\(", src)
+    if offset is None:
+        assert not re.search(r"a_tmem = [^;]*\+", src)
+    else:
+        assert re.search(rf"a_tmem = [^;]*\+ {offset};", src)
+
+
+def test_atmem_unaligned_k_origin_rejected():
+    """The origin has to land on a cell boundary (f16: every 2 elements)."""
+    with pytest.raises(Exception, match=r"not a multiple of 2"):
+        _lower_source(_make_atmem_k_window_kernel(1))
+
+
+def test_atmem_m_origin_rejected():
+    """Only a K window is expressible: A's row (M) axis has no offset encoding."""
+    dt = T.float16
+    M, N, K, KF = 128, 64, 64, 128
+
+    @T.prim_func
+    def kernel(
+        A: T.Tensor((M, KF), dt),
+        B: T.Tensor((N, K), dt),
+        C: T.Tensor((M // 2, N), T.float32),
+    ):
+        with T.Kernel(1, 1, threads=32):
+            A_s = T.alloc_shared((M, KF), dt)
+            A_t = T.alloc_tmem((M, KF), dt)
+            B_s = T.alloc_shared((N, K), dt)
+            C_t = T.alloc_tmem((M // 2, N), T.float32)
+            C_f = T.alloc_fragment((M // 2, N), T.float32)
+            T.copy(A, A_s)
+            T.tcgen05_cp(A_t, A_s)
+            T.copy(B, B_s)
+            T.tcgen05_gemm(
+                A_t[M // 2 : M, 0:K],
+                B_s,
+                C_t,
+                transpose_B=True,
+                clear_accum=True,
+                mbar=None,
+            )
+            T.tcgen05_ld(C_f, C_t)
+            T.copy(C_f, C)
+
+    with pytest.raises(Exception, match=r"operand A is a slice of its buffer"):
+        _lower_source(kernel)
+
+
+def test_atmem_sliced_b_rejected():
+    """B stays a shared descriptor, whose geometry is taken from the buffer."""
+    dt = T.float16
+    M, N, K, KF = 64, 64, 64, 128
+
+    @T.prim_func
+    def kernel(
+        A: T.Tensor((M, K), dt),
+        B: T.Tensor((N, KF), dt),
+        C: T.Tensor((M, N), T.float32),
+    ):
+        with T.Kernel(1, 1, threads=32):
+            A_s = T.alloc_shared((M, K), dt)
+            A_t = T.alloc_tmem((M, K), dt)
+            B_s = T.alloc_shared((N, KF), dt)
+            C_t = T.alloc_tmem((M, N), T.float32)
+            C_f = T.alloc_fragment((M, N), T.float32)
+            T.copy(A, A_s)
+            T.tcgen05_cp(A_t, A_s)
+            T.copy(B, B_s)
+            T.tcgen05_gemm(
+                A_t,
+                B_s[:, 0:K],
+                C_t,
+                transpose_B=True,
+                clear_accum=True,
+                mbar=None,
+            )
+            T.tcgen05_ld(C_f, C_t)
+            T.copy(C_f, C)
+
+    with pytest.raises(Exception, match=r"operand B is a slice of its buffer"):
         _lower_source(kernel)
 
 

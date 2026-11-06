@@ -1,130 +1,70 @@
 """Benchmarks for softmax-family ops (softmax, log_softmax, logsumexp).
 
-Measures latency, TFLOPS, and DRAM bandwidth against PyTorch baselines.
-Workload shapes and roofline formulas are loaded from the ops manifest (src/tileops/manifest/).
+Measures latency, TFLOPS, and DRAM bandwidth against PyTorch baselines. Each case is one
+manifest call (src/tileops/manifest/); the roofline comes from ``op.eval_roofline()``.
 
 softmax and log_softmax are timed against flag_gems' Triton kernels as well as
-torch, eager and compiled. logsumexp has no flag_gems entry point.
+torch, eager and compiled, except on a row passing ``dtype``, which flag_gems' entry points
+do not take. logsumexp has no flag_gems entry point.
 """
 
 import pytest
 import torch
-import torch.nn.functional as F
 
+from benchmarks import api as bench
 from benchmarks.baselines import (
     FLAGGEMS_TAG,
+    QUACK_TAG,
     TORCH_COMPILE_TAG,
-    assert_matches_reference,
     compiled_reference,
     flaggems_op,
-    reference_tolerance,
+    quack_op,
 )
-from benchmarks.benchmark_base import ManifestBenchmark, workloads_to_params
-from tileops.ops.reduction.softmax import LogSoftmaxFwdOp, LogSumExpFwdOp, SoftmaxFwdOp
-from workloads.reduction import (
-    LogSoftmaxWorkload,
-    LogSumExpWorkload,
-    SoftmaxWorkload,
-)
+from tileops._ops.reduction.softmax import LogSoftmaxFwdOp, LogSumExpFwdOp, SoftmaxFwdOp
 
 
-def _flaggems_softmax(name: str, dim: int):
-    """Bind a flag_gems softmax entry point to *dim*."""
-    fn = flaggems_op(name)
+def _bench(op_cls: type, case: bench.Case, flaggems_name: "str | None") -> None:
+    baseline_fn = case.torch
+    inputs = case.inputs
+    op = op_cls(**case.arguments)
+    op.request_tune()
+    implementations = {}
+    if flaggems_name is not None and (not case.params.get("dtype")):
+        fn = flaggems_op(flaggems_name)
+        dim = case.params["dim"]
 
-    def baseline_fn(x):
-        return fn(x, dim)
+        def flaggems_fn(x):
+            return fn(x, dim)
 
-    return baseline_fn
+        implementations[FLAGGEMS_TAG] = flaggems_fn
+    if op_cls is SoftmaxFwdOp and case.params["dim"] % inputs[0].ndim == inputs[0].ndim - 1:
+        softmax = quack_op("softmax")
+        dtype = _dtype(case.params)
 
+        def quack_fn(x):
+            values = x.to(dtype) if dtype is not None else x
+            return softmax(values.reshape(-1, values.shape[-1])).reshape_as(values)
 
-@pytest.mark.parametrize("shape, dtype", workloads_to_params(SoftmaxFwdOp))
-def test_softmax_bench(shape: tuple, dtype: torch.dtype) -> None:
-    test = SoftmaxWorkload(shape, dtype)
-    inputs = test.gen_inputs()
-
-    op = SoftmaxFwdOp(dim=-1, tune=True)
-    bm = ManifestBenchmark(op, test)
-
-    def baseline_fn(x):
-        return F.softmax(x, dim=-1)
-
-    flaggems_fn = _flaggems_softmax("softmax", -1)
-    assert_matches_reference(flaggems_fn, baseline_fn, *inputs, **reference_tolerance(dtype))
-
-    try:
-        bm.compare(
-            {
-                "tileops": op,
-                FLAGGEMS_TAG: flaggems_fn,
-                "torch": baseline_fn,
-                TORCH_COMPILE_TAG: compiled_reference(baseline_fn),
-            },
-            *inputs,
-        )
-    except ValueError as exc:
-        if "No configurations to tune" in str(exc):
-            pytest.skip(f"Kernel does not support this shape: {exc}")
-        raise
+        implementations[QUACK_TAG] = quack_fn
+    implementations["torch"] = baseline_fn
+    implementations[TORCH_COMPILE_TAG] = compiled_reference(baseline_fn)
+    bench.Runner(op, case).compare(implementations)
 
 
-@pytest.mark.parametrize("shape, dtype", workloads_to_params(LogSoftmaxFwdOp))
-def test_log_softmax_bench(shape: tuple, dtype: torch.dtype) -> None:
-    test = LogSoftmaxWorkload(shape, dtype)
-    inputs = test.gen_inputs()
-
-    op = LogSoftmaxFwdOp(dim=-1, tune=True)
-    bm = ManifestBenchmark(op, test)
-
-    def baseline_fn(x):
-        return F.log_softmax(x, dim=-1)
-
-    flaggems_fn = _flaggems_softmax("log_softmax", -1)
-    assert_matches_reference(flaggems_fn, baseline_fn, *inputs, **reference_tolerance(dtype))
-
-    try:
-        bm.compare(
-            {
-                "tileops": op,
-                FLAGGEMS_TAG: flaggems_fn,
-                "torch": baseline_fn,
-                TORCH_COMPILE_TAG: compiled_reference(baseline_fn),
-            },
-            *inputs,
-        )
-    except ValueError as exc:
-        if "No configurations to tune" in str(exc):
-            pytest.skip(f"Kernel does not support this shape: {exc}")
-        raise
+def _dtype(params: dict) -> "torch.dtype | None":
+    return getattr(torch, params["dtype"]) if params.get("dtype") else None
 
 
-@pytest.mark.parametrize(
-    "shape, dtype, op_params",
-    workloads_to_params(LogSumExpFwdOp, include_extra=True),
-)
-def test_logsumexp_bench(shape: tuple, dtype: torch.dtype, op_params: dict) -> None:
-    test = LogSumExpWorkload(shape, dtype)
-    inputs = test.gen_inputs()
+@pytest.mark.parametrize("case", bench.cases(SoftmaxFwdOp), ids=lambda case: case.id)
+def test_softmax_bench(case) -> None:
+    _bench(SoftmaxFwdOp, case, "softmax")
 
-    op_params.setdefault("dim", -1)
-    op = LogSumExpFwdOp(tune=True, **op_params)
-    bm = ManifestBenchmark(op, test)
-    dim = op_params["dim"]
-    keepdim = op_params.get("keepdim", False)
 
-    def baseline_fn(x):
-        return torch.logsumexp(x, dim=dim, keepdim=keepdim)
+@pytest.mark.parametrize("case", bench.cases(LogSoftmaxFwdOp), ids=lambda case: case.id)
+def test_log_softmax_bench(case) -> None:
+    _bench(LogSoftmaxFwdOp, case, "log_softmax")
 
-    try:
-        bm.compare(
-            {
-                "tileops": op,
-                "torch": baseline_fn,
-                TORCH_COMPILE_TAG: compiled_reference(baseline_fn),
-            },
-            *inputs,
-        )
-    except ValueError as exc:
-        if "No configurations to tune" in str(exc):
-            pytest.skip(f"Kernel does not support this shape: {exc}")
-        raise
+
+@pytest.mark.parametrize("case", bench.cases(LogSumExpFwdOp), ids=lambda case: case.id)
+def test_logsumexp_bench(case) -> None:
+    _bench(LogSumExpFwdOp, case, None)

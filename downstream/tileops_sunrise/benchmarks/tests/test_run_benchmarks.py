@@ -62,6 +62,25 @@ def _cases(out_xml: Path) -> dict[str, ET.Element]:
 
 
 @pytest.mark.smoke
+def test_runtime_warning_does_not_truncate_the_sweep(tmp_path):
+    bench_dir = _write_bench_dir(
+        tmp_path,
+        {
+            "bench_slow.py": "import time\n\ndef test_slow():\n    time.sleep(1)\n",
+            "bench_tail.py": "def test_tail():\n    pass\n",
+        },
+    )
+    proc, out_xml, _ = _run_runner(
+        tmp_path, bench_dir, stall_timeout="120", extra=["--warn-after", "0.01"]
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.count("::warning::Benchmark sweep exceeded") == 1
+    cases = _cases(out_xml)
+    assert len(cases) == 2
+    assert all(len(case) == 0 for case in cases.values())
+
+
+@pytest.mark.smoke
 def test_native_crash_loses_only_the_crashing_file(tmp_path):
     bench_dir = _write_bench_dir(
         tmp_path,
@@ -186,7 +205,7 @@ def test_teardown_deadline_kills_a_stuck_child(tmp_path):
         tmp_path,
         bench_dir,
         stall_timeout="120",
-        extra=["--teardown-timeout", "2", "--prewarm", "0"],
+        extra=["--teardown-timeout", "2"],
     )
 
     assert proc.returncode == 1, proc.stdout + proc.stderr
@@ -197,7 +216,7 @@ def test_teardown_deadline_kills_a_stuck_child(tmp_path):
 
 
 def test_next_file_starts_only_after_the_previous_child_exited(tmp_path):
-    """The GPU stays owned by one file until its process is gone, not until it reported."""
+    """Even collection waits until the previous file releases its GPU context."""
     bench_dir = _write_bench_dir(
         tmp_path,
         {
@@ -213,7 +232,7 @@ def test_next_file_starts_only_after_the_previous_child_exited(tmp_path):
                 "def test_ok():\n    pass\n"
             ),
             "bench_b_next.py": (
-                "import os\ndef test_next():\n    assert os.path.exists('teardown_done')\n"
+                "import os\nassert os.path.exists('teardown_done')\ndef test_next():\n    pass\n"
             ),
         },
     )
@@ -270,10 +289,31 @@ def test_spent_budget_reports_the_files_it_never_reached(tmp_path):
         tmp_path,
         bench_dir,
         stall_timeout="120",
-        extra=["--total-budget", "2", "--prewarm", "0"],
+        extra=["--total-budget", "2"],
     )
 
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert "not benchmarked" in proc.stdout
     skipped = ET.parse(out_xml).getroot().findall(".//skipped")
     assert any("bench_z_never.py" in s.get("message", "") for s in skipped)
+
+
+def test_child_receives_verification_option_and_reports_live_progress(tmp_path):
+    bench_dir = _write_bench_dir(
+        tmp_path,
+        {
+            "bench_verify.py": "import time\ndef test_check(request):\n    assert request.config.getoption('--mode') == 'verify'\n    time.sleep(0.4)\n"
+        },
+    )
+    (bench_dir / "conftest.py").write_text(
+        "def pytest_addoption(parser):\n    parser.addoption('--mode', default='timing')\n"
+        "def pytest_collection_modifyitems(config, items):\n"
+        "    assert config.getoption('--mode') == 'verify'\n"
+    )
+    proc, out_xml, _ = _run_runner(
+        tmp_path, bench_dir, "120", ["--pytest-arg=--mode=verify", "--progress-interval=0.1"]
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "test_check" in proc.stdout
+    assert "RUNNING" in proc.stdout
+    assert len(_cases(out_xml)) == 1

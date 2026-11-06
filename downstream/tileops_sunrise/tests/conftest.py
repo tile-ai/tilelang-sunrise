@@ -1,9 +1,13 @@
+import gc
 from collections import defaultdict
 
 import pytest
 import torch
 
-from tests.test_base import _check_result
+from tests.workload_test_base import _check_result
+from tileops._utils.device import current_accelerator_type
+from tileops.backend import BUILTIN, default_target
+from workloads.device import run_device, run_device_is_cuda
 
 
 def _under_repo_tests(item: pytest.Item) -> bool:
@@ -15,15 +19,14 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     """Register the opt-in in-kernel timeline-trace flag.
 
     Off by default: when ``--trace-kernel`` is absent the process-local trace
-    switch stays off, so trace-dump tests no-op and normal runs are zero cost.
+    switch stays off, so kernels build untraced and normal runs are zero cost.
     (``--trace`` itself is reserved by pytest for its pdb tracer.)
     """
     parser.addoption(
         "--trace-kernel",
         action="store_true",
         default=False,
-        help="Build instrumented kernels with in-kernel tracing and dump their "
-        "timeline (HTML + Chrome JSON) for the trace-dump tests.",
+        help="Build instrumented kernels with in-kernel tracing and dump their timeline as HTML.",
     )
 
 
@@ -42,6 +45,7 @@ def pytest_configure(config: pytest.Config) -> None:
 
 @pytest.fixture(autouse=True)
 def setup() -> None:
+    # Seeds every device's generator, CUDA's and a backend's alike.
     torch.manual_seed(1235)
 
 
@@ -53,6 +57,10 @@ def ptpu_device() -> torch.device:
 
 @pytest.fixture(autouse=True)
 def stream_setup() -> None:
+    from workloads.device import run_device
+
+    if torch.device(run_device()).type != "ptpu":
+        return
     import tvm_ffi
 
     stream = torch.ptpu.current_stream()
@@ -61,6 +69,22 @@ def stream_setup() -> None:
         stream.device.index,
         stream.ptpu_stream,
     )
+
+
+def pytest_runtest_teardown() -> None:
+    """Return a worker's cached device blocks to the driver, after its fixtures have torn down."""
+    # Eight xdist workers share one GPU in CI, and the caching allocator holds every block a worker
+    # ever took until it exits, so the card must fit the sum of eight high-water marks. Releasing
+    # bounds a worker to its current case; it does not bound eight concurrent cases, a few of which
+    # are tens of GiB alone. The threshold is a cost gate, not a limit: zero is equally correct.
+    cache_release_bytes = 2 << 30
+    # torch_ptpu has no DeviceAllocator, so the accelerator memory queries are unavailable.
+    if current_accelerator_type() in (None, "ptpu"):
+        return
+    if torch.accelerator.memory_reserved() < cache_release_bytes:
+        return
+    gc.collect()
+    torch.accelerator.empty_cache()
 
 
 @pytest.fixture
@@ -79,25 +103,6 @@ def isolated_dynamo():
     torch._dynamo.reset()
     yield
     torch._dynamo.reset()
-
-
-NON_RUNTIME_OPS_TIER_FILES = {
-    "tests/ops/test_elementwise_caching_autotune.py",
-    "tests/ops/test_elementwise_compile.py",
-    "tests/ops/test_elementwise_config_dtype.py",
-}
-
-TILELANG_019_SKIP_REASON = (
-    "Skipped under TileLang 0.1.9: known regressions in autodiff/codegen "
-    "lowering produce incorrect numerics or compile failures; re-enable "
-    "when these tests pass against the current tilelang."
-)
-
-TILELANG_019_KNOWN_FAILING_PATH_SUFFIXES = ()
-
-TILELANG_019_KNOWN_FAILING_NODEIDS = set()
-
-TILELANG_019_KNOWN_FAILING_PREFIXES = ()
 
 
 def _get_callspec_params(item: pytest.Item) -> dict | None:
@@ -123,64 +128,87 @@ def _without_dtype(params: dict) -> tuple[tuple[str, object], ...]:
     )
 
 
-def _is_hopper() -> bool:
-    """Whether this machine's first CUDA device is compute capability 9.x."""
-    if not torch.cuda.is_available():
-        return False
-    return torch.cuda.get_device_capability()[0] == 9
+# Each architecture marker and the compute capability (major, minor) it needs. The
+# collection skip, the skip record and the session-end check all read this one table.
+_ARCH_MARKERS = {
+    "sm90": ("compute capability 9.x", lambda capability: capability[0] == 9),
+    "sm89": ("compute capability 8.9", lambda capability: capability == (8, 9)),
+    "sm86": ("compute capability 8.6", lambda capability: capability == (8, 6)),
+    "sm80": ("compute capability 8.0", lambda capability: capability == (8, 0)),
+}
 
 
-_hopper_skipped: list[str] = []
+def _run_capability() -> tuple[int, int] | None:
+    """Compute capability of the device this run places tensors on; ``None`` off CUDA."""
+    if not run_device_is_cuda() or not torch.cuda.is_available():
+        return None
+    return torch.cuda.get_device_capability(torch.device(run_device()))
+
+
+def _serves(marker: str, capability: tuple[int, int] | None) -> bool:
+    return capability is not None and _ARCH_MARKERS[marker][1](capability)
+
+
+_arch_skipped: dict[str, list[str]] = defaultdict(list)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo) -> None:
+    """Carry the test's architecture markers on its report, which xdist ships to the controller."""
+    outcome = yield
+    outcome.get_result().arch_markers = [
+        name for name in _ARCH_MARKERS if item.get_closest_marker(name) is not None
+    ]
 
 
 def pytest_runtest_logreport(report: pytest.TestReport) -> None:
-    """Record a `hopper` test that was skipped, so a Hopper run can refuse it."""
-    if report.when == "setup" and report.skipped and "hopper" in report.keywords:
-        _hopper_skipped.append(report.nodeid)
+    """Record an architecture-marked test that was skipped, so a run on that architecture can refuse it."""
+    if report.skipped and not hasattr(report, "wasxfail"):
+        for marker in getattr(report, "arch_markers", ()):
+            _arch_skipped[marker].append(report.nodeid)
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
-    """On Hopper, a `hopper` test that was skipped is a failed run, not a pass.
+    """On the architecture a marker names, a skipped test with that marker is a failed run.
 
-    The mark exists because the kernel needs Hopper. On the hardware it needs,
-    skipping it would leave the only evidence for that kernel unexercised while
-    the run still reported green. Collection-time skips are covered too: they
-    surface as setup reports. Deselecting the mark outright (``-m "not hopper"``)
-    is not covered, and is not meant to be — that is the operator saying which
-    tests to run, not a run losing its evidence.
+    The mark exists because the path is selected on that architecture. On the hardware it
+    needs, skipping it would leave the only evidence for that path unexercised while the
+    run still reported green. A skip at collection, in a fixture or in the test body all
+    count. Deselecting the mark outright (``-m "not sm90"``) is not covered, and is not
+    meant to be — that is the operator saying which tests to run, not a run losing its
+    evidence.
     """
-    if _hopper_skipped and _is_hopper():
-        session.exitstatus = pytest.ExitCode.TESTS_FAILED
-        raise pytest.UsageError(
-            "hopper-marked tests were skipped on a Hopper device: " + ", ".join(_hopper_skipped)
-        )
+    capability = _run_capability()
+    for marker, skipped in _arch_skipped.items():
+        if skipped and _serves(marker, capability):
+            session.exitstatus = pytest.ExitCode.TESTS_FAILED
+            raise pytest.UsageError(
+                f"{marker}-marked tests were skipped on a {_ARCH_MARKERS[marker][0]} device: "
+                + ", ".join(skipped)
+            )
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
-    """Validate explicit test tier assignments."""
-    tier_errors: list[str] = []
+    """Validate explicit test tier assignments, then drop the tests this run cannot serve."""
+    marker_errors: list[str] = []
     tier_names = ("smoke", "full", "nightly")
-    tilelang_019_skip = pytest.mark.skip(reason=TILELANG_019_SKIP_REASON)
-    non_hopper_skip = pytest.mark.skip(reason="needs compute capability 9.x")
-    on_hopper = _is_hopper()
+    capability = _run_capability()
 
     for item in items:
-        path = str(item.path)
         if not _under_repo_tests(item):
             continue
-        if (
-            item.nodeid in TILELANG_019_KNOWN_FAILING_NODEIDS
-            or any(path.endswith(suffix) for suffix in TILELANG_019_KNOWN_FAILING_PATH_SUFFIXES)
-            or any(item.nodeid.startswith(prefix) for prefix in TILELANG_019_KNOWN_FAILING_PREFIXES)
-        ):
-            item.add_marker(tilelang_019_skip)
-
-        if item.get_closest_marker("hopper") is not None and not on_hopper:
-            item.add_marker(non_hopper_skip)
+        archs = [name for name in _ARCH_MARKERS if item.get_closest_marker(name) is not None]
+        if len(archs) > 1:
+            marker_errors.append(
+                f"{item.nodeid}: expected at most one architecture marker, found {archs}"
+            )
+        for marker in archs:
+            if not _serves(marker, capability):
+                item.add_marker(pytest.mark.skip(reason=f"needs {_ARCH_MARKERS[marker][0]}"))
 
         tiers = [name for name in tier_names if item.get_closest_marker(name) is not None]
         if len(tiers) != 1:
-            tier_errors.append(
+            marker_errors.append(
                 f"{item.nodeid}: expected exactly one tier marker, found {tiers or 'none'}"
             )
 
@@ -193,16 +221,13 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
         ops_groups[(path, test_name)].append(item)
 
     for (_path, _test_name), group in ops_groups.items():
-        if any(_path.endswith(path) for path in NON_RUNTIME_OPS_TIER_FILES):
-            continue
-
         non_xfail_items = [item for item in group if item.get_closest_marker("xfail") is None]
         smoke_items = [item for item in group if item.get_closest_marker("smoke") is not None]
 
         # Smoke cases must never be xfail (checked before tune gate)
         for item in smoke_items:
             if item.get_closest_marker("xfail") is not None:
-                tier_errors.append(f"{item.nodeid}: smoke cases must not be xfail")
+                marker_errors.append(f"{item.nodeid}: smoke cases must not be xfail")
 
         # For count and ordering checks, only consider non-xfail smoke cases
         valid_smoke_items = [
@@ -211,14 +236,14 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
 
         if non_xfail_items:
             if len(valid_smoke_items) < 1:
-                tier_errors.append(
+                marker_errors.append(
                     f"{non_xfail_items[0].nodeid}: each test must have at least one smoke case"
                 )
             else:
                 # All smoke cases must appear as the first N non-xfail items
                 expected_smoke = non_xfail_items[: len(valid_smoke_items)]
                 if valid_smoke_items != expected_smoke:
-                    tier_errors.append(
+                    marker_errors.append(
                         f"{non_xfail_items[0].nodeid}: all smoke cases must appear "
                         f"as the first {len(valid_smoke_items)} non-xfail cases of each test"
                     )
@@ -243,7 +268,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
         if dtype_cases_present:
             missing_smoke_dtypes = dtype_supported - dtype_smoke
             if missing_smoke_dtypes:
-                tier_errors.append(
+                marker_errors.append(
                     f"{non_xfail_items[0].nodeid}: each dtype must have at least one smoke case; "
                     f"missing smoke for {sorted(str(dtype) for dtype in missing_smoke_dtypes)}"
                 )
@@ -257,7 +282,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
                     continue
 
                 if _without_dtype(params) in smoke_signatures:
-                    tier_errors.append(
+                    marker_errors.append(
                         f"{item.nodeid}: full cases must not differ from a smoke case only by dtype"
                     )
 
@@ -271,7 +296,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             tune = params["tune"]
             is_smoke = item.get_closest_marker("smoke") is not None
             if is_smoke and tune is True:
-                tier_errors.append(f"{item.nodeid}: smoke cases must use tune=False")
+                marker_errors.append(f"{item.nodeid}: smoke cases must use tune=False")
             if tune is True:
                 if first_tuned_item is None:
                     first_tuned_item = item
@@ -279,27 +304,50 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
                     full_tuned_items.append(item)
         if first_tuned_item is not None:
             if not full_tuned_items:
-                tier_errors.append(
+                marker_errors.append(
                     f"{first_tuned_item.nodeid}: the first tune=True case must be marked full"
                 )
             elif len(full_tuned_items) > 1:
-                tier_errors.append(
+                marker_errors.append(
                     f"{group[0].path}::{group[0].originalname}: at most one tune=True case may be full"
                 )
             elif full_tuned_items[0] is not first_tuned_item:
-                tier_errors.append(
+                marker_errors.append(
                     f"{first_tuned_item.nodeid}: the first tune=True case must be the only full tuned case"
                 )
 
-    if tier_errors:
+    if marker_errors:
         raise pytest.UsageError(
-            "Invalid explicit test tier assignments detected:\n" + "\n".join(tier_errors)
+            "Invalid explicit test marker assignments detected:\n" + "\n".join(marker_errors)
         )
+
+    # A run on another device drops what needs CUDA; a run on another target drops what
+    # reads the in-tree kernels.
+    marks = []
+    if not run_device_is_cuda():
+        marks.append("cuda_only")
+    if default_target() is not BUILTIN:
+        marks.append("in_tree_kernels")
+    dropped = [
+        item
+        for item in items
+        if _under_repo_tests(item) and any(item.get_closest_marker(m) for m in marks)
+    ]
+    if dropped:
+        dropped[0].config.hook.pytest_deselected(items=dropped)
+        kept = set(map(id, items)) - set(map(id, dropped))
+        items[:] = [item for item in items if id(item) in kept]
 
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_call(item):
-    """After test execution, attach Op metadata from TestBase.check() to the item."""
+    """Record what check() ran and what it measured.
+
+    The op a test establishes something about is read off the Op that check()
+    ran. A test declares it instead only where that object cannot name one: a
+    kernel several ops register, or a compiled callable, which keeps no handle
+    on the Op it wraps.
+    """
     yield
     op_name = getattr(_check_result, "op_name", None)
     if op_name:
@@ -307,9 +355,12 @@ def pytest_runtest_call(item):
         op_module = getattr(_check_result, "op_module", None)
         if op_module:
             item.user_properties.append(("op_module", op_module))
+        checked = getattr(_check_result, "checked_outputs", 0)
+        item.user_properties.append(("checked_outputs", str(checked)))
         max_err = getattr(_check_result, "max_abs_err", None)
         if max_err is not None:
             item.user_properties.append(("max_abs_err", f"{max_err:.2e}"))
+        _check_result.checked_outputs = 0
         _check_result.op_name = None
         _check_result.op_module = None
         _check_result.max_abs_err = None

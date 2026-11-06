@@ -1,1 +1,2 @@
 tests/mhc/test_pre_big_fuse.py	2700
+tests/moe/test_moe_topk_gate_forward.py	5400

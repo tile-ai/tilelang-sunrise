@@ -6,6 +6,18 @@ requires-python = ">=3.10"
 authors = [{ name = "TileLang Contributors" }, { name = "Tile-AI" }]
 maintainers = [{ name = "sunrise AI Compilation Team" }]
 license = "MIT"
+license-files = [
+    "LICENSE",
+    "THIRDPARTYNOTICES.txt",
+    "3rdparty/tvm_sunrise/LICENSE",
+    "3rdparty/tvm_sunrise/NOTICE",
+    "3rdparty/tvm_sunrise/licenses/*",
+    "3rdparty/tvm_sunrise/3rdparty/tvm-ffi/LICENSE",
+    "3rdparty/tvm_sunrise/3rdparty/tvm-ffi/NOTICE",
+    "3rdparty/tvm_sunrise/3rdparty/tvm-ffi/licenses/*",
+    "3rdparty/tvm_sunrise/3rdparty/tvm-ffi/3rdparty/dlpack/LICENSE",
+    "3rdparty/tvm_sunrise/3rdparty/tvm-ffi/3rdparty/libbacktrace/LICENSE",
+]
 keywords = ["BLAS", "CUDA", "HIP", "TANG", "Code Generation", "TVM"]
 classifiers = [
     "Development Status :: 4 - Beta",

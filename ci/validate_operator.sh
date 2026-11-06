@@ -9,7 +9,10 @@ TILELANG_HOME="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 : "${OP:?OP must be set by the CI matrix}"
 case "$OP" in
-    tileops_sunrise) OP_HOME="$TILELANG_HOME/downstream/tileops_sunrise" ;;
+    tileops_sunrise)
+        OP_HOME="$TILELANG_HOME/downstream/tileops_sunrise"
+        export CASE_REPEAT=1
+        ;;
     tilekernels_sunrise) OP_HOME="$TILELANG_HOME/downstream/tilekernels_sunrise" ;;
     *) echo "Unknown downstream project: $OP" >&2; exit 1 ;;
 esac

@@ -1,0 +1,260 @@
+# Quantization and dequantization operators.
+#
+# INT8 is symmetric in [-127, 127]; scales are float32; rounding is half-to-even
+# (torch.round); an all-zero group gets scale 1.0, so dequantization never divides
+# by zero. A scale is the dequantization multiplier: x ~= q * scale.
+
+FP8QuantPerTokenGroupFwdOp:
+  family: quantization
+  status: implemented
+  ref_api: vllm.model_executor.layers.quantization.utils.fp8_utils.per_token_group_quant_fp8
+
+  signature:
+    forall: {batch: Dim, seq_len_kv: Dim, kv_group: Dim, index_dim: Dim, T: "DType[float16 | bfloat16 | float32]"}
+    inputs:
+      x: {dtype: T, shape: "[batch, seq_len_kv, kv_group, index_dim]"}
+    outputs:
+      q: {dtype: float8_e4m3fn, shape: "[batch, seq_len_kv, kv_group, index_dim]"}
+      scale: {dtype: float32, shape: "[batch, seq_len_kv, kv_group]"}
+    shape_rules:
+    - "index_dim > 0"
+
+  workloads:
+  - {batch: 1, seq_len_kv: 8192, kv_group: 1, index_dim: 64, dtype_cases: [{T: float16}, {T: bfloat16}], label: kv-index-8k}
+  - {batch: 1, seq_len_kv: 4096, kv_group: 1, index_dim: 128, dtype_cases: [{T: float32}], label: kv-index-4k}
+  - {batch: 1, seq_len_kv: 3072, kv_group: 1, index_dim: 128, dtype_cases: [{T: float16}, {T: bfloat16}], label: kv-index-context-chunk}
+
+  roofline:
+    # Per element: abs, the row-max comparison, the scaling and the clamp; per row: the amax
+    # floor and the scale.
+    flops: "4 * batch * seq_len_kv * kv_group * index_dim + 2 * batch * seq_len_kv * kv_group"
+
+INT8QuantPerTensorFwdOp:
+  family: quantization
+  status: implemented
+  ref_api: vllm._custom_ops.scaled_int8_quant
+  signature:
+    forall: {M: Dim, K: Dim, T: "DType[float16 | bfloat16 | float32]"}
+    inputs:
+      x: {dtype: T, shape: "[M, K]"}
+    outputs:
+      q: {dtype: int8, shape: "[M, K]"}
+      # amax(|x|) / 127
+      scale: {dtype: float32, shape: "[1]"}
+    shape_rules:
+    - "M > 0 and K > 0"
+  workloads:
+  - {M: 4096, K: 4096, dtype_cases: [{T: float16}, {T: bfloat16}], label: llama-8b-prefill}
+  - {M: 32, K: 4096, dtype_cases: [{T: bfloat16}], label: llama-8b-decode}
+  - {M: 8192, K: 5120, dtype_cases: [{T: bfloat16}, {T: float32}], label: qwen3-32b-prefill}
+  - {M: 17, K: 2880, dtype_cases: [{T: bfloat16}], label: gpt-oss-20b-decode}
+  - {M: 3000, K: 2880, dtype_cases: [{T: bfloat16}], label: gpt-oss-20b-prefill}
+  - {M: 1000, K: 4099, dtype_cases: [{T: float16}], label: odd-hidden-prefill}
+  roofline:
+    # Per element: abs, the max, the scaling, round and clamp; once: the scale and its zero guard.
+    flops: "5 * M * K + 2"
+
+INT8QuantPerChannelFwdOp:
+  family: quantization
+  status: implemented
+  ref_api: vllm.model_executor.layers.quantization.utils.int8_utils.per_token_quant_int8
+  signature:
+    forall: {N: Dim, K: Dim, T: "DType[float16 | bfloat16 | float32]"}
+    inputs:
+      w: {dtype: T, shape: "[N, K]"}
+    outputs:
+      q: {dtype: int8, shape: "[N, K]"}
+      # One per output channel (row): amax(|w[n, :]|) / 127.
+      scale: {dtype: float32, shape: "[N]"}
+    shape_rules:
+    - "K > 0"
+  workloads:
+  - {N: 14336, K: 4096, dtype_cases: [{T: float16}, {T: bfloat16}], label: llama-8b-mlp-up}
+  - {N: 8192, K: 28672, dtype_cases: [{T: bfloat16}], label: llama-70b-mlp-down}
+  - {N: 5120, K: 8192, dtype_cases: [{T: bfloat16}, {T: float32}], label: qwen3-32b-o-proj}
+  - {N: 5760, K: 2880, dtype_cases: [{T: bfloat16}], label: gpt-oss-20b-mlp-up}
+  - {N: 3000, K: 4099, dtype_cases: [{T: float16}], label: ragged-k}
+  - {N: 17, K: 4099, dtype_cases: [{T: bfloat16}], label: ragged-k-few-rows}
+  roofline:
+    # Per element: abs, the max, the scaling, round and clamp; per row: the scale and its zero guard.
+    flops: "5 * N * K + 2 * N"
+
+INT8QuantPerTokenGroupFwdOp:
+  family: quantization
+  status: implemented
+  ref_api: vllm.model_executor.layers.quantization.utils.int8_utils.per_token_group_quant_int8
+  signature:
+    forall: {M: Dim, K: Dim, T: "DType[float16 | bfloat16 | float32]"}
+    inputs:
+      x: {dtype: T, shape: "[M, K]"}
+    outputs:
+      q: {dtype: int8, shape: "[M, K]"}
+      # One per 128 contiguous elements along K; the last block of a row may be partial.
+      scale: {dtype: float32, shape: "[M, ceil_div(K, 128)]"}
+  workloads:
+  - {M: 4096, K: 7168, dtype_cases: [{T: float16}, {T: bfloat16}], label: ds-v3-prefill}
+  - {M: 64, K: 7168, dtype_cases: [{T: bfloat16}], label: ds-v3-decode}
+  - {M: 4096, K: 4096, dtype_cases: [{T: bfloat16}, {T: float32}], label: qwen3-235b-prefill}
+  - {M: 17, K: 7168, dtype_cases: [{T: bfloat16}], label: ds-v3-decode-few-tokens}
+  - {M: 3000, K: 2880, dtype_cases: [{T: bfloat16}], label: gpt-oss-20b-prefill}
+  - {M: 1000, K: 4099, dtype_cases: [{T: float16}], label: ragged-k}
+  roofline:
+    # Per element: abs, the max, the scaling, round and clamp; per block: the scale and its zero guard.
+    flops: "5 * M * K + 2 * M * ceil_div(K, 128)"
+
+INT4QuantPerGroupFwdOp:
+  # DeepSpeed QuantizerBuilder().load().quantize(w, N*K/group_size, 4, Asymmetric).
+  # Codes are clamp(round((w - (hi+lo)/2) * multiplier), -8, 7), multiplier=16/(hi-lo).
+  # Constant groups use multiplier 1; params stores [1/multiplier, (hi+lo)/2].
+  family: quantization
+  status: implemented
+  ref_api: deepspeed.ops.quantizer.quantizer_op.quantize
+  signature:
+    forall: {N: Dim, K: Dim, T: "DType[float16]"}
+    params:
+      group_size: {type: int, default: 128}
+    inputs:
+      w: {dtype: T, shape: "[N, K]"}
+    outputs:
+      # First code in the high nibble; params rows follow flattened input groups.
+      packed_weight: {dtype: int8, shape: "[N, K // 2]"}
+      params: {dtype: float32, shape: "[N * K // group_size, 2]"}
+    shape_rules:
+    - "group_size > 0"
+    - "K % 2 == 0 and K % group_size == 0"
+  workloads:
+  - {N: 14336, K: 4096, dtype_cases: [{T: float16}], label: llama-8b-mlp-up}
+  - {N: 4096, K: 4096, group_size: 64, dtype_cases: [{T: float16}], label: llama-8b-q-proj}
+  - {N: 8192, K: 28672, dtype_cases: [{T: float16}], label: llama-70b-mlp-down}
+  - {N: 5120, K: 8192, dtype_cases: [{T: float16}], label: qwen3-32b-o-proj}
+  - {N: 18944, K: 3584, dtype_cases: [{T: float16}], label: qwen2-7b-mlp-up}
+  - {N: 3584, K: 18944, dtype_cases: [{T: float16}], label: qwen2-7b-mlp-down}
+  - {N: 20480, K: 5120, group_size: 64, dtype_cases: [{T: float16}], label: opt-13b-mlp-up}
+  - {N: 14336, K: 4096, group_size: 4096, dtype_cases: [{T: float16}], label: llama-8b-mlp-up-chan}
+  roofline:
+    flops: "7 * N * K + 6 * (N * K // group_size)"
+
+SmoothQuantFwdOp:
+  # q = quantize_per_row(x / smooth): per-channel smoothing, then symmetric INT8 per row.
+  family: quantization
+  status: implemented
+  ref_api: workloads.quantization.quantize.smooth_quant
+  signature:
+    forall: {M: Dim, K: Dim, T: "DType[float16 | bfloat16]"}
+    inputs:
+      x: {dtype: T, shape: "[M, K]"}
+      smooth: {dtype: float32, shape: "[K]"}
+    outputs:
+      q: {dtype: int8, shape: "[M, K]"}
+      scale: {dtype: float32, shape: "[M]"}
+    shape_rules:
+    - "K > 0"
+  workloads:
+  - {M: 4096, K: 4096, dtype_cases: [{T: float16}, {T: bfloat16}], label: llama-8b-prefill}
+  - {M: 32, K: 4096, dtype_cases: [{T: bfloat16}], label: llama-8b-decode}
+  - {M: 4096, K: 8192, dtype_cases: [{T: bfloat16}], label: llama-70b-prefill}
+  - {M: 3000, K: 2880, dtype_cases: [{T: bfloat16}], label: gpt-oss-20b-prefill}
+  - {M: 1000, K: 4099, dtype_cases: [{T: float16}], label: ragged-k}
+  - {M: 17, K: 4099, dtype_cases: [{T: bfloat16}], label: ragged-k-decode}
+  roofline:
+    # Per element: the smoothing divide, abs, the max, the scaling, round and clamp; per row:
+    # the scale and its zero guard.
+    flops: "6 * M * K + 2 * M"
+
+INT8DequantPerTensorFwdOp:
+  family: quantization
+  status: implemented
+  ref_api: workloads.quantization.int8_dequant.int8_dequant_per_tensor
+  signature:
+    forall: {M: Dim, K: Dim}
+    params:
+      out_dtype: {type: "float16 | bfloat16 | float32"}
+    inputs:
+      q: {dtype: int8, shape: "[M, K]"}
+      scale: {dtype: float32, shape: "[1]"}
+    outputs:
+      x: {dtype: out_dtype, shape: "[M, K]"}
+  workloads:
+  - {M: 4096, K: 4096, out_dtype: bfloat16, label: llama-8b-prefill}
+  - {M: 32, K: 4096, out_dtype: bfloat16, label: llama-8b-decode}
+  - {M: 8192, K: 5120, out_dtype: float16, label: qwen3-32b-prefill}
+  - {M: 8192, K: 5120, out_dtype: float32, label: qwen3-32b-prefill}
+  - {M: 3000, K: 2880, out_dtype: bfloat16, label: gpt-oss-prefill}
+  - {M: 1000, K: 4099, out_dtype: float32, label: ragged-k}
+  - {M: 17, K: 4099, out_dtype: float16, label: ragged-k-few-rows}
+  roofline:
+    # One multiply per element, in float32; the cast is not counted.
+    flops: "M * K"
+
+INT8DequantPerChannelFwdOp:
+  family: quantization
+  status: implemented
+  ref_api: workloads.quantization.int8_dequant.int8_dequant_per_channel
+  signature:
+    forall: {M: Dim, K: Dim}
+    params:
+      out_dtype: {type: "float16 | bfloat16 | float32"}
+    inputs:
+      q: {dtype: int8, shape: "[M, K]"}
+      scale: {dtype: float32, shape: "[M]"}
+    outputs:
+      x: {dtype: out_dtype, shape: "[M, K]"}
+  workloads:
+  - {M: 14336, K: 4096, out_dtype: bfloat16, label: llama-8b-mlp-up}
+  - {M: 14336, K: 4096, out_dtype: float16, label: llama-8b-mlp-up}
+  - {M: 8192, K: 28672, out_dtype: bfloat16, label: llama-70b-mlp-down}
+  - {M: 4096, K: 14336, out_dtype: float32, label: llama-8b-mlp-down}
+  - {M: 5760, K: 2880, out_dtype: bfloat16, label: gpt-oss-20b-mlp-up}
+  - {M: 3000, K: 4099, out_dtype: float16, label: ragged-k}
+  - {M: 17, K: 4099, out_dtype: bfloat16, label: ragged-k-few-rows}
+  roofline:
+    flops: "M * K"
+
+INT8DequantPerBlockFwdOp:
+  family: quantization
+  status: implemented
+  ref_api: workloads.quantization.int8_dequant.int8_dequant_per_block
+  signature:
+    forall: {M: Dim, K: Dim}
+    params:
+      out_dtype: {type: "float16 | bfloat16 | float32"}
+    inputs:
+      q: {dtype: int8, shape: "[M, K]"}
+      # One per 128 contiguous elements along K.
+      scale: {dtype: float32, shape: "[M, ceil_div(K, 128)]"}
+    outputs:
+      x: {dtype: out_dtype, shape: "[M, K]"}
+  workloads:
+  - {M: 4096, K: 7168, out_dtype: bfloat16, label: ds-v3-prefill}
+  - {M: 64, K: 7168, out_dtype: bfloat16, label: ds-v3-decode}
+  - {M: 4096, K: 4096, out_dtype: float16, label: qwen3-235b-prefill}
+  - {M: 3000, K: 2880, out_dtype: bfloat16, label: gpt-oss-prefill}
+  - {M: 1000, K: 4099, out_dtype: float32, label: ragged-k}
+  - {M: 17, K: 4099, out_dtype: float16, label: ragged-k-few-rows}
+  roofline:
+    flops: "M * K"
+
+FP8QuantPerBlockFwdOp:
+  # The 128x128 block-scaled FP8 weight format of DeepSeek-V3 checkpoints; scale is the
+  # dequantization multiplier stored as weight_scale_inv. Edge tiles may be partial.
+  family: quantization
+  status: implemented
+  ref_api: vllm.utils.deep_gemm.per_block_cast_to_fp8
+  signature:
+    forall: {N: Dim, K: Dim, T: "DType[bfloat16 | float16 | float32]"}
+    inputs:
+      w: {dtype: T, shape: "[N, K]"}
+    outputs:
+      q: {dtype: float8_e4m3fn, shape: "[N, K]"}
+      # amax(|tile|) / 448 per 128x128 tile.
+      scale: {dtype: float32, shape: "[ceil_div(N, 128), ceil_div(K, 128)]"}
+  workloads:
+  - {N: 7168, K: 18432, dtype_cases: [{T: bfloat16}], label: ds-v3-mlp-down}
+  - {N: 4096, K: 7168, dtype_cases: [{T: bfloat16}, {T: float32}], label: ds-v3-expert-gate-up}
+  - {N: 9216, K: 4096, dtype_cases: [{T: bfloat16}, {T: float16}], label: qwen3-235b-qkv}
+  - {N: 2880, K: 2880, dtype_cases: [{T: bfloat16}], label: gpt-oss-expert-down}
+  - {N: 1000, K: 4099, dtype_cases: [{T: float16}], label: ragged-k}
+  roofline:
+    # Per element: abs, the max, the scaling and the saturating cast; per tile: the scale and
+    # its zero guard.
+    flops: "4 * N * K + 2 * ceil_div(N, 128) * ceil_div(K, 128)"

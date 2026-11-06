@@ -1,40 +1,44 @@
 # ===================== TileOPs testing ======================
 
+
 # tests
 tests/test_backend.py
-tests/test_base.py
 tests/test_check_bench_coverage.py
 tests/test_check_dist_contents.py
 tests/test_compile.py
-tests/test_compile_boundary.py
-tests/test_compute_roof.py
+tests/test_compile_boundary_instance_key.py
+tests/test_roof_key.py
 tests/test_nightly_report.py
-tests/test_op_backend_seam.py
+tests/test_op_target_kernels.py
 tests/test_op_base.py
 tests/test_ops_manifest.py
 tests/test_profile.py
 tests/test_public_api.py
 tests/test_reclaim_action.py
-tests/test_roofline_codegen.py
+tests/test_signature_codegen.py
 tests/test_roofline_oracle.py
-tests/test_shipped_refs_lint.py
+tests/lint/test_shipped_refs_lint.py
 tests/test_tier_validation.py
-tests/test_tilelang_idioms_lint.py
+tests/lint/test_tilelang_idioms_lint.py
 tests/test_validate_manifest.py
 tests/test_workload_placement.py
 
+# tests/ops
+tests/ops/test_fft.py
+tests/ops/test_group_norm.py
+
 # tests/kernels
-tests/kernels/test_fft_output_layout.py
-tests/kernels/test_group_norm_row_block.py
 tests/kernels/test_grouped_gemm_template.py
-tests/kernels/test_kernel_autotune_binding.py
+
+# tests
+tests/test_kernel_autotune_binding.py
+
+# tests/kernels
 tests/kernels/test_linear_attention_autotune.py
-tests/kernels/test_v_tile.py
 
 # tests/ops
 tests/ops/test_activation.py
 tests/ops/test_ada_layer_norm.py
-tests/ops/test_ada_layer_norm_zero.py
 tests/ops/test_argreduce.py
 tests/ops/test_batch_norm.py
 tests/ops/test_binary_arith.py
@@ -43,110 +47,201 @@ tests/ops/test_bmm.py
 tests/ops/test_comparison.py
 tests/ops/test_convolution.py
 tests/ops/test_cumulative.py
-tests/ops/test_deltanet_autograd.py
-tests/ops/test_deltanet_chunkwise_bwd.py
-tests/ops/test_deltanet_fwd.py
-tests/ops/test_deltanet_recurrence.py
 tests/ops/test_docstring_args_match_signature.py
 tests/ops/test_dropout.py
 tests/ops/test_elementwise_binary_broadcast.py
-tests/ops/test_elementwise_caching_autotune.py
+
+# tests
+tests/test_kernel_dispatch.py
+
+# tests/kernels
+# unknown: Generic elementwise/GEMM/BMM tuned-program assertions inherit module cuda_only; validate these PTPU entries and audit FP8 siblings separately.
+# tests/kernels/test_tune_rebuilds_program.py
+
+# tests/ops
+tests/ops/test_fused_gated.py
 tests/ops/test_elementwise_compile.py
-tests/ops/test_elementwise_config_dtype.py
-tests/ops/test_elementwise_fp8.py
-tests/ops/test_elementwise_independent_fp8.py
-tests/ops/test_elementwise_unary_activation_alignment.py
+tests/ops/test_elementwise_unary_activation_conformance.py
+
+# tests
+tests/test_manifest_signature.py
+tests/test_manifest_contracts.py
+
+# tests/ops
+tests/ops/test_special_elementwise.py
 tests/ops/test_empty_tensor.py
 tests/ops/test_engram.py
 tests/ops/test_family_dispatch.py
-tests/ops/test_fft.py
 tests/ops/test_fp8_lightning_indexer.py
 tests/ops/test_fp8_quant.py
-tests/ops/test_fused_add_layer_norm.py
-tests/ops/test_fused_add_rms_norm.py
-tests/ops/test_fused_gated.py
+tests/ops/test_layer_norm.py
+tests/ops/test_rms_norm.py
+tests/ops/test_norm_conformance.py
 tests/ops/test_fused_moe_experts.py
-tests/ops/test_gated_deltanet_chunkwise_bwd.py
-tests/ops/test_gated_deltanet_fwd.py
-tests/ops/test_gated_deltanet_prefill.py
-tests/ops/test_gated_deltanet_recurrence.py
 tests/ops/test_gemm.py
-tests/ops/test_gla_chunkwise_bwd.py
-tests/ops/test_gla_chunkwise_fwd.py
-tests/ops/test_gla_recurrence.py
-tests/ops/test_group_norm.py
+tests/ops/test_gla.py
 tests/ops/test_grouped_gemm.py
 tests/ops/test_instance_norm.py
-tests/ops/test_kernel_map_install.py
-tests/ops/test_kernel_selection.py
-tests/ops/test_layer_norm.py
+tests/ops/test_implementation_install.py
+tests/ops/test_gqa_paged.py
 tests/ops/test_logical.py
 tests/ops/test_logical_reduce.py
 tests/ops/test_mamba.py
 tests/ops/test_mean_pooling.py
 tests/ops/test_mhc.py
 tests/ops/test_moe_compile.py
-tests/ops/test_moe_fused_moe.py
-tests/ops/test_moe_fused_moe_distributed.py
-tests/ops/test_moe_fused_topk.py
-tests/ops/test_moe_grouped_gemm.py
+tests/ops/test_fused_moe.py
+# capability: Distributed cases require torchrun with >=2 CUDA GPUs and NCCL collectives; this CI scope is one PTPU device.
+# tests/ops/test_moe_fused_moe_distributed.py
+tests/ops/test_moe_fused_moe_distributed.py::test_local_expert_prepare_excludes_nonlocal_routes
+tests/ops/test_moe_fused_moe_distributed.py::test_fused_moe_refuses_global_gating_with_local_weights
+tests/ops/test_fused_topk.py
+tests/ops/test_moe_staged.py
 tests/ops/test_moe_permute_align.py
 tests/ops/test_moe_permute_nopad.py
-tests/ops/test_moe_shared_fused_moe.py
-tests/ops/test_moe_shared_fused_moe_distributed.py
-tests/ops/test_moe_staged_contracts.py
+tests/ops/test_fused_moe_shared_expert.py
+
+# tests
+tests/test_manifest_generators.py
+
+# tests/ops
 tests/ops/test_moe_unpermute.py
 tests/ops/test_multi_dtype_instance.py
 tests/ops/test_norm_compile.py
-tests/ops/test_norm_lazy_cache.py
-tests/ops/test_norm_ops.py
-tests/ops/test_normalization_alignment.py
 tests/ops/test_pool.py
 tests/ops/test_reduce.py
 tests/ops/test_reduce_arithmetic_conformance.py
-tests/ops/test_reduce_boolean_conformance.py
+tests/ops/test_logical_reduce_conformance.py
 tests/ops/test_reduce_dim_none.py
 tests/ops/test_reduce_multidim.py
-tests/ops/test_reduce_scalar_conformance.py
+tests/ops/test_reduction_scalar_input.py
 tests/ops/test_reduce_variance_conformance.py
 tests/ops/test_reduction_compile.py
 tests/ops/test_reduction_defaults.py
-tests/ops/test_reduction_primitives.py
-tests/ops/test_reduction_scalar_input.py
-tests/ops/test_rms_norm.py
 tests/ops/test_rope.py
 tests/ops/test_softmax.py
-tests/ops/test_special_elementwise.py
-tests/ops/test_special_elementwise_conformance.py
-tests/ops/test_topk_selector.py
+tests/ops/test_where_clamp_masked_fill_conformance.py
+tests/ops/test_topk_select.py
 tests/ops/test_unary_math.py
 tests/ops/test_vector_norm.py
 tests/ops/test_welford_non_aligned.py
-
-# tests/ops/attention
-tests/ops/attention/test_deepseek_dsa_decode.py
-tests/ops/attention/test_deepseek_mla_decode.py
-tests/ops/attention/test_deepseek_nsa.py
-tests/ops/attention/test_deepseek_nsa_cmp.py
-tests/ops/attention/test_deepseek_nsa_topk.py
-tests/ops/attention/test_gqa.py
-tests/ops/attention/test_gqa_decode.py
-tests/ops/attention/test_gqa_decode_paged.py
-tests/ops/attention/test_gqa_fp8.py
-tests/ops/attention/test_gqa_prefill_paged.py
-tests/ops/attention/test_gqa_sliding_window.py
-tests/ops/attention/test_gqa_sliding_window_varlen.py
-tests/ops/attention/test_mean_pooling.py
-tests/ops/attention/test_mha.py
-tests/ops/attention/test_mha_decode.py
-tests/ops/attention/test_mha_decode_paged.py
+tests/ops/test_dsa_decode.py
+tests/ops/test_mla_decode.py
+tests/ops/test_nsa.py
+tests/ops/test_gqa.py
+tests/ops/test_gqa_decode_d256.py
+tests/ops/test_gqa_fp8.py
+tests/ops/test_gqa_varlen.py
+tests/ops/test_mha.py
 
 # tests/trace
 tests/trace/test_payload.py
 
 # benchmarks/tests
 benchmarks/tests/test_baselines.py
-benchmarks/tests/test_benchmark_base.py
+benchmarks/tests/test_api.py
+benchmarks/tests/test_timing.py
 benchmarks/tests/test_benchmark_boundaries.py
 benchmarks/tests/test_ptpu_timing.py
 benchmarks/tests/test_run_benchmarks.py
+
+# tests/kernels
+tests/kernels/test_csrc_include.py
+# unknown: Generic prefix-sum semantics are blocked by module cuda_only and offsets.cuda(); port run_device and validate TANG shuffle lowering before enabling.
+# tests/kernels/test_grouped_tiling.py
+
+# tests/ops
+tests/ops/test_compile_boundary.py
+tests/ops/test_gqa_varlen_sinks.py
+tests/ops/test_int8_dequant.py
+tests/ops/test_mla_varlen.py
+tests/ops/test_moe_grouped_gemm_fp8.py::test_fp8_grouped_gemm_config_refusal_covers_the_builder_domain
+tests/ops/test_paged_cache_gather.py
+tests/ops/test_paged_kv_cache_write.py
+tests/ops/test_quantization.py
+tests/ops/test_sampling.py
+tests/ops/test_transform.py
+
+# tests
+tests/test_bench_verification.py
+tests/test_check_contract.py
+tests/lint/test_csrc_names_lint.py
+tests/lint/test_device_literal_lint.py
+tests/test_manifest_workload.py
+tests/lint/test_module_constant_lint.py
+tests/test_moe_permute_align_verification.py
+tests/test_roofline_bytes_audit.py
+tests/test_spec_reference.py
+tests/test_suite_default_target.py
+tests/test_target_conformance.py
+tests/test_validator_malformed_input.py
+tests/test_tang_contract_migration.py
+tests/test_tang_device_contracts.py
+tests/test_entry_contract_migration.py
+
+# tests
+tests/test_call_protocol.py
+tests/test_check_api_compat.py
+tests/test_ci_coverage.py
+tests/test_dsa_verification.py
+tests/test_gemm_w4a16_workload.py
+tests/test_gemm_w4a8_workload.py
+tests/test_installed_surface.py
+tests/test_moe_routed_verification.py
+tests/test_moe_verification_controls.py
+tests/test_paged_kv_workload.py
+
+# tests/lint
+tests/lint/test_baseline_import_lint.py
+tests/lint/test_bench_baseline_lint.py
+tests/lint/test_comment_code_ref_lint.py
+tests/lint/test_comment_narration_lint.py
+tests/lint/test_common.py
+tests/lint/test_device_api_lint.py
+tests/lint/test_file_set_lint.py
+tests/lint/test_interface_names_lint.py
+tests/lint/test_manifest_label_lint.py
+tests/lint/test_op_docstrings_lint.py
+tests/lint/test_op_naming_lint.py
+tests/lint/test_test_placement_lint.py
+tests/lint/test_workload_names_lint.py
+
+# tests/kernels
+tests/kernels/test_autotune_supply_key.py
+tests/kernels/test_buffer_utils.py
+tests/kernels/test_dense_value_wait_anchor.py
+tests/kernels/test_gqa_bwd_delta.py
+tests/kernels/test_kernel_generation.py
+
+# tests/ops
+tests/ops/test_call_protocol_launch.py
+tests/ops/test_causal_conv1d.py
+tests/ops/test_dsa_paged.py
+tests/ops/test_fused_add_rms_norm_per_token_quant.py
+tests/ops/test_fused_qk_norm_rope.py
+tests/ops/test_gemv_sm89.py
+tests/ops/test_gqa_dense_sink_support.py
+tests/ops/test_gqa_paged_autotune.py
+tests/ops/test_hadamard_transform.py
+tests/ops/test_merge_attention_states.py
+tests/ops/test_mla_bwd.py
+tests/ops/test_mla_kv_cache_write.py
+tests/ops/test_mla_paged.py
+tests/ops/test_moe_grouped_gemm_fp8_sm89.py
+tests/ops/test_offset_storage.py
+tests/ops/test_selective_scan.py
+tests/ops/test_ssd_state_passing.py
+
+# tests/trace
+tests/trace/test_build_state.py
+tests/trace/test_gemm_timeline.py
+tests/trace/test_swizzled_rows.py
+
+# benchmarks/tests
+benchmarks/tests/test_moe_baselines.py
+
+# Run the chunk prefill entries after the other test groups.
+tests/ops/test_gdn.py
+tests/ops/test_deltanet.py
+tests/ops/test_kda.py
+tests/test_deltanet_autograd.py

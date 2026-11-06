@@ -114,10 +114,9 @@ def get_ptcc_compiler(arch: str | None = None) -> str:
 
     stcuv2 (S3) is developed against a toolchain that ships separately from the
     installed TANG runtime, so ``TANG_S3_PTCC_PATH`` takes precedence for that
-    arch -- the same variable the simulator execution backend uses. Falling back
-    to whichever ptcc happens to be on PATH would compile S3 kernels with a
-    toolchain that does not carry the S3 headers, which surfaces as a confusing
-    missing-include error rather than a wrong-compiler one.
+    arch. Falling back to whichever ptcc happens to be on PATH would compile S3
+    kernels with a toolchain that does not carry the S3 headers, which surfaces
+    as a confusing missing-include error rather than a wrong-compiler one.
     """
     if arch == _S3_ARCH:
         override = os.environ.get(_ENV_S3_PTCC_PATH)

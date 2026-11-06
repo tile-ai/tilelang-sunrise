@@ -5,6 +5,7 @@ stages:
 
 variables:
   TILELANG_TEST: "true"
+  NO_VERSION_LABEL: "1"
   # Per-case retries on FAIL/TIMEOUT/OOM until PASS/SKIPPED (ci/lib.sh).
   CASE_REPEAT: "3"
 
@@ -43,7 +44,6 @@ default:
   - "requirements*.txt"
   - "ci/**/*"
   - "ci_test_case_list_tilelang.txt"
-  - "ci_test_case_list_tilelang_s3.txt"
   - ".gitlab-ci.yml"
 
 .ci_rules: &ci_rules
@@ -155,36 +155,6 @@ tilelang_test:
     when: always
     expire_in: 4 weeks
   <<: *ci_rules
-
-# Preserve the S3/STCUV2 validation entry as a non-blocking manual job.
-tilelang_test_s3:
-  stage: test
-  needs: ["tilelang_build"]
-  tags: [runtime, pt200]
-  script:
-    - echo "start tilelang S3 ISS simulator test (preserved, unverified)"
-    - bash ./ci/s3/test_s3.sh
-  after_script: *after_script_device_logs
-  allow_failure: true
-  artifacts:
-    name: "${CI_PIPELINE_ID}_${CI_JOB_NAME}_failreport"
-    paths:
-      - ci_failure_reports/
-      - dmesg.log
-      - pt.log
-    when: always
-    expire_in: 4 weeks
-  rules:
-    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS && $CI_PIPELINE_SOURCE == "push"
-      when: never
-    - if: '$TANG_S3_PTCC_PATH == null || $TANG_S3_PTCC_PATH == "" || $TANG_S3_ISS_PATH == null || $TANG_S3_ISS_PATH == "" || $TANG_S3_LOADER_PATH == null || $TANG_S3_LOADER_PATH == ""'
-      when: never
-    - <<: *product_mr_changes
-      when: manual
-    - if: $CI_PIPELINE_SOURCE == "schedule"
-      when: manual
-    - if: $CI_PIPELINE_SOURCE == "web"
-      when: manual
 
 # Validate the two vendored downstream projects against the wheel produced by
 # this TileLang pipeline. Their own lint and standalone CI are not run here.

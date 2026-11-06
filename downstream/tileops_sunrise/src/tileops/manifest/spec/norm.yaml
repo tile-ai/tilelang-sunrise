@@ -1,0 +1,385 @@
+# norm.yaml -- manifest entries for the norm family (docs/design/manifest.md).
+
+RMSNormFwdOp:
+  ref_api: torch.nn.functional.rms_norm
+  family: norm
+  status: implemented
+  signature:
+    forall: {B: Shape, T: "DType[float16 | bfloat16]"}
+    params:
+      normalized_shape: {type: "list[int] | tuple[int, ...]"}
+      eps: {type: "float | None", default: null}
+    inputs:
+      x: {dtype: T, shape: "[*B, *normalized_shape]"}
+      weight: {dtype: T, shape: "[*normalized_shape]", optional: true}
+    outputs:
+      output: {dtype: T, shape: "[*B, *normalized_shape]"}
+    shape_rules:
+    - "len(normalized_shape) > 0"
+  workloads:
+  - {B: [2048], normalized_shape: [4096], eps: 1.0e-6, some: [weight], dtype_cases: [{T: float16}, {T: bfloat16}], label: llama-8b-prefill}
+  - {B: [1], normalized_shape: [4096], eps: 1.0e-6, some: [weight], dtype_cases: [{T: bfloat16}], label: llama-8b-decode}
+  - {B: [2048], normalized_shape: [8192], eps: 1.0e-6, some: [weight], dtype_cases: [{T: float16}, {T: bfloat16}], label: llama-70b-prefill}
+  - {B: [1], normalized_shape: [8192], eps: 1.0e-6, some: [weight], dtype_cases: [{T: bfloat16}], label: llama-70b-decode}
+  - {B: [2048], normalized_shape: [16384], eps: 1.0e-6, some: [weight], dtype_cases: [{T: float16}, {T: bfloat16}], label: llama-405b-prefill}
+  - {B: [1], normalized_shape: [16384], eps: 1.0e-6, some: [weight], dtype_cases: [{T: bfloat16}], label: llama-405b-decode}
+  - {B: [2048], normalized_shape: [5120], some: [weight], dtype_cases: [{T: bfloat16}], label: llama-13b-prefill}
+  - {B: [4, 2048], normalized_shape: [128], dtype_cases: [{T: bfloat16}], label: qk-norm-head}
+  - {B: [32768], normalized_shape: [256], eps: 1.0e-6, some: [weight], dtype_cases: [{T: float16}, {T: bfloat16}], label: quack-throughput-256}
+  - {B: [32768], normalized_shape: [512], eps: 1.0e-6, some: [weight], dtype_cases: [{T: float16}, {T: bfloat16}], label: quack-throughput-512}
+  - {B: [32768], normalized_shape: [1024], eps: 1.0e-6, some: [weight], dtype_cases: [{T: float16}, {T: bfloat16}], label: quack-throughput-1024}
+  - {B: [32768], normalized_shape: [2048], eps: 1.0e-6, some: [weight], dtype_cases: [{T: float16}, {T: bfloat16}], label: quack-throughput-2048}
+  - {B: [32768], normalized_shape: [4096], eps: 1.0e-6, some: [weight], dtype_cases: [{T: float16}, {T: bfloat16}], label: quack-throughput-4096}
+  - {B: [32768], normalized_shape: [8192], eps: 1.0e-6, some: [weight], dtype_cases: [{T: float16}, {T: bfloat16}], label: quack-throughput-8192}
+  - {B: [32768], normalized_shape: [16384], eps: 1.0e-6, some: [weight], dtype_cases: [{T: float16}, {T: bfloat16}], label: quack-throughput-16384}
+  - {B: [32768], normalized_shape: [32768], eps: 1.0e-6, some: [weight], dtype_cases: [{T: float16}, {T: bfloat16}], label: quack-throughput-32768}
+  - {B: [32768], normalized_shape: [65536], eps: 1.0e-6, some: [weight], dtype_cases: [{T: float16}, {T: bfloat16}], label: quack-throughput-65536}
+  - {B: [16384], normalized_shape: [131072], eps: 1.0e-6, some: [weight], dtype_cases: [{T: float16}, {T: bfloat16}], label: quack-throughput-131072}
+  - {B: [8192], normalized_shape: [262144], eps: 1.0e-6, some: [weight], dtype_cases: [{T: float16}, {T: bfloat16}], label: quack-throughput-262144}
+  - {B: [1, 32], normalized_shape: [128], eps: 1.0e-06, some: [weight], dtype_cases: [{T: bfloat16}], label: qwen3-8b-qk-norm-decode}
+  roofline:
+    # Square and accumulate (2), normalize (1), and the weight (1) when present.
+    flops: "(4 if present(weight) else 3) * prod(B) * prod(normalized_shape)"
+
+LayerNormFwdOp:
+  ref_api: torch.nn.functional.layer_norm
+  family: norm
+  status: implemented
+  signature:
+    forall: {B: Shape, T: "DType[float32 | float16 | bfloat16]"}
+    params:
+      normalized_shape: {type: "list[int] | tuple[int, ...]"}
+      eps: {type: float, default: 1.0e-5}
+    inputs:
+      input: {dtype: T, shape: "[*B, *normalized_shape]"}
+      weight: {dtype: T, shape: "[*normalized_shape]", optional: true}
+      bias: {dtype: T, shape: "[*normalized_shape]", optional: true}
+    outputs:
+      output: {dtype: T, shape: "[*B, *normalized_shape]"}
+    shape_rules:
+    - "len(normalized_shape) > 0"
+  workloads:
+  - {B: [2048], normalized_shape: [4096], some: [weight, bias], dtype_cases: [{T: float16}, {T: bfloat16}], label: llama-8b-prefill}
+  - {B: [1], normalized_shape: [4096], some: [weight, bias], dtype_cases: [{T: bfloat16}], label: llama-8b-decode}
+  - {B: [2048], normalized_shape: [8192], some: [weight, bias], dtype_cases: [{T: float16}, {T: bfloat16}], label: llama-70b-prefill}
+  - {B: [1], normalized_shape: [8192], some: [weight, bias], dtype_cases: [{T: bfloat16}], label: llama-70b-decode}
+  - {B: [2048], normalized_shape: [16384], some: [weight, bias], dtype_cases: [{T: float16}, {T: bfloat16}], label: llama-405b-prefill}
+  - {B: [1], normalized_shape: [16384], some: [weight, bias], dtype_cases: [{T: bfloat16}], label: llama-405b-decode}
+  - {B: [2048], normalized_shape: [5120], some: [weight], dtype_cases: [{T: float32}], label: llama-13b-prefill}
+  - {B: [1024], normalized_shape: [1152], dtype_cases: [{T: bfloat16}], label: dit-xl-2}
+  roofline:
+    # Mean (1), centered variance (3), normalize the centered value (1), and one per present
+    # affine tensor.
+    flops: "(5 + (1 if present(weight) else 0) + (1 if present(bias) else 0)) * prod(B) * prod(normalized_shape)"
+
+AdaLayerNormFwdOp:
+  family: norm
+  status: implemented
+  ref_api: workloads.norm.AdaLayerNormWorkload.ref_program
+  signature:
+    forall: {B: Shape, N: Dim, T: "DType[float32 | float16 | bfloat16]"}
+    params:
+      eps: {type: float, default: 1.0e-5}
+    inputs:
+      x: {dtype: T, shape: "[*B, N]"}
+      scale: {dtype: T, shape: "[*B, N]"}
+      shift: {dtype: T, shape: "[*B, N]"}
+    outputs:
+      output: {dtype: T, shape: "[*B, N]"}
+  workloads:
+  - {B: [1024], N: 1152, dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: dit-xl-2}
+  - {B: [2048], N: 4096, dtype_cases: [{T: float16}, {T: bfloat16}], label: llama-8b-prefill}
+  - {B: [1], N: 4096, dtype_cases: [{T: bfloat16}], label: llama-8b-decode}
+  roofline:
+    # LayerNorm without affine (5), then scale and shift (2).
+    flops: "7 * prod(B) * N"
+
+AdaLayerNormZeroFwdOp:
+  family: norm
+  status: implemented
+  ref_api: workloads.norm.AdaLayerNormZeroWorkload.ref_program
+  signature:
+    forall: {B: Shape, N: Dim, T: "DType[float32 | float16 | bfloat16]"}
+    params:
+      eps: {type: float, default: 1.0e-5}
+    inputs:
+      x: {dtype: T, shape: "[*B, N]"}
+      scale: {dtype: T, shape: "[*B, N]"}
+      shift: {dtype: T, shape: "[*B, N]"}
+      gate: {dtype: T, shape: "[*B, N]"}
+    outputs:
+      output: {dtype: T, shape: "[*B, N]"}
+  workloads:
+  - {B: [1024], N: 1152, dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: dit-xl-2}
+  - {B: [2048], N: 4096, dtype_cases: [{T: float16}, {T: bfloat16}], label: llama-8b-prefill}
+  - {B: [1], N: 4096, dtype_cases: [{T: bfloat16}], label: llama-8b-decode}
+  roofline:
+    # LayerNorm without affine (5), then scale, shift and gate (3).
+    flops: "8 * prod(B) * N"
+
+FusedAddLayerNormFwdOp:
+  family: norm
+  status: implemented
+  ref_api: flash_attn.ops.triton.layer_norm.layer_norm_fn
+  signature:
+    forall: {B: Shape, N: Dim, T: "DType[float32 | float16 | bfloat16]"}
+    params:
+      eps: {type: float, default: 1.0e-6}
+    inputs:
+      x: {dtype: T, shape: "[*B, N]"}
+      residual: {dtype: T, shape: "[*B, N]"}
+      weight: {dtype: T, shape: "[N]"}
+      bias: {dtype: T, shape: "[N]"}
+    outputs:
+      output: {dtype: T, shape: "[*B, N]"}
+      residual_out: {dtype: T, shape: "[*B, N]"}
+  workloads:
+  - {B: [2048], N: 4096, dtype_cases: [{T: float16}, {T: bfloat16}], label: llama-8b-prefill}
+  - {B: [1], N: 4096, dtype_cases: [{T: bfloat16}], label: llama-8b-decode}
+  - {B: [2048], N: 8192, dtype_cases: [{T: float16}, {T: bfloat16}], label: llama-70b-prefill}
+  - {B: [1], N: 8192, dtype_cases: [{T: bfloat16}], label: llama-70b-decode}
+  - {B: [2048], N: 5120, dtype_cases: [{T: float32}], label: llama-13b-prefill}
+  roofline:
+    # The residual add (1), then an affine LayerNorm (7).
+    flops: "8 * prod(B) * N"
+
+FusedAddRMSNormFwdOp:
+  family: norm
+  status: implemented
+  ref_api: flashinfer.norm.fused_add_rmsnorm
+  signature:
+    forall: {B: Shape, N: Dim, T: "DType[float16 | bfloat16]"}
+    params:
+      eps: {type: float, default: 1.0e-6}
+    inputs:
+      input: {dtype: T, shape: "[*B, N]"}
+      residual: {dtype: T, shape: "[*B, N]"}
+      weight: {dtype: T, shape: "[N]"}
+    outputs:
+      output: {dtype: T, shape: "[*B, N]"}
+      residual_out: {dtype: T, shape: "[*B, N]"}
+  workloads:
+  - {B: [2048], N: 4096, dtype_cases: [{T: float16}, {T: bfloat16}], label: llama-8b-prefill}
+  - {B: [1], N: 4096, dtype_cases: [{T: bfloat16}], label: llama-8b-decode}
+  - {B: [2048], N: 8192, dtype_cases: [{T: float16}, {T: bfloat16}], label: llama-70b-prefill}
+  - {B: [1], N: 8192, dtype_cases: [{T: bfloat16}], label: llama-70b-decode}
+  - {B: [2048], N: 16384, dtype_cases: [{T: float16}, {T: bfloat16}], label: llama-405b-prefill}
+  - {B: [1], N: 16384, dtype_cases: [{T: bfloat16}], label: llama-405b-decode}
+  - {B: [2048], N: 5120, dtype_cases: [{T: bfloat16}], label: llama-13b-prefill}
+  roofline:
+    flops: "5 * prod(B) * N"
+
+FusedAddRMSNormPerTokenQuantFwdOp:
+  # Residual add, RMSNorm and dynamic per-token quantization in one kernel. `residual_out`
+  # is the sum before normalization, in the input dtype.
+  family: norm
+  status: implemented
+  ref_api: vllm._custom_ops.rms_norm_dynamic_per_token_quant
+  signature:
+    forall: {B: Shape, N: Dim, T: "DType[float16 | bfloat16]"}
+    params:
+      quant_dtype: {type: "float8_e4m3fn | int8", default: float8_e4m3fn}
+      eps: {type: float, default: 1.0e-6}
+      scale_ub: {type: "float | None", default: null}
+    inputs:
+      input: {dtype: T, shape: "[*B, N]"}
+      residual: {dtype: T, shape: "[*B, N]"}
+      weight: {dtype: T, shape: "[N]"}
+    outputs:
+      q: {dtype: quant_dtype, shape: "[*B, N]"}
+      # amax(|normalized|) over the row, divided by the quant dtype's max magnitude, and
+      # clamped above by `scale_ub` when the caller gives one.
+      scale: {dtype: float32, shape: "[*B, 1]"}
+      residual_out: {dtype: T, shape: "[*B, N]"}
+    shape_rules:
+    - "N > 0"
+    - "eps > 0"
+    - "not present(scale_ub) or scale_ub.value > 0"
+    # vLLM bounds the amax for FP8 codes only.
+    - "not present(scale_ub) or quant_dtype == 'float8_e4m3fn'"
+  workloads:
+  - {B: [4096], N: 4096, dtype_cases: [{T: bfloat16}], label: llama-8b-prefill}
+  - {B: [4096], N: 4096, quant_dtype: int8, dtype_cases: [{T: bfloat16}], label: llama-8b-prefill-i8}
+  - {B: [1], N: 4096, dtype_cases: [{T: bfloat16}], label: llama-8b-decode-b1}
+  - {B: [64], N: 4096, dtype_cases: [{T: bfloat16}], label: llama-8b-decode-b64}
+  - {B: [256], N: 4096, dtype_cases: [{T: bfloat16}], label: llama-8b-decode-b256}
+  - {B: [4096], N: 8192, dtype_cases: [{T: bfloat16}], label: llama-70b-prefill}
+  - {B: [4096], N: 8192, quant_dtype: int8, dtype_cases: [{T: float16}], label: llama-70b-prefill-i8}
+  - {B: [1], N: 8192, dtype_cases: [{T: bfloat16}], label: llama-70b-decode-b1}
+  - {B: [64], N: 8192, dtype_cases: [{T: bfloat16}], label: llama-70b-decode-b64}
+  - {B: [256], N: 8192, dtype_cases: [{T: bfloat16}], label: llama-70b-decode-b256}
+  # Below the amax of a standard-normal row, so every row's scale is the bound.
+  - {B: [4096], N: 4096, scale_ub: 2.0, dtype_cases: [{T: bfloat16}], label: clamped-amax}
+  - {B: [2048], N: 5120, dtype_cases: [{T: bfloat16}], label: llama-13b-prefill}
+  roofline:
+    # The residual add, the square, the row sum, the reciprocal root and the weight
+    # multiply; then the quantizer, which the INT8 family counts at one more FLOP per
+    # element than the FP8 one for its explicit clamp.
+    flops: "prod(B) * N * (9 + (1 if quant_dtype == 'int8' else 0))"
+
+BatchNormFwdOp:
+  # Returns what torch.ops.aten.native_batch_norm returns: the output, then the batch mean
+  # and reciprocal standard deviation that BatchNormBwdOp reads. Without training there
+  # are no batch statistics, and the two are None.
+  ref_api: torch.nn.functional.batch_norm
+  family: norm
+  status: implemented
+  signature:
+    forall: {B: Dim, C: Dim, L: Shape, T: "DType[float32 | float16 | bfloat16]"}
+    params:
+      training: {type: bool, default: false}
+      momentum: {type: float, default: 0.1}
+      eps: {type: float, default: 1.0e-5}
+    inputs:
+      input: {dtype: T, shape: "[B, C, *L]"}
+      running_mean: {dtype: float32, shape: "[C]", optional: true, mutated: "training and present(running_mean)"}
+      running_var: {dtype: float32, shape: "[C]", optional: "present(running_mean)", mutated: "training and present(running_mean)"}
+      weight: {dtype: float32, shape: "[C]", optional: true}
+      bias: {dtype: float32, shape: "[C]", optional: true}
+    outputs:
+      output: {dtype: T, shape: "[B, C, *L]"}
+      save_mean: {dtype: float32, shape: "[C]", nullable: "training"}
+      save_invstd: {dtype: float32, shape: "[C]", nullable: "training"}
+    shape_rules:
+    - "training or present(running_mean)"
+    - "not training or B * prod(L) != 1"
+  workloads:
+  - {B: 32, C: 64, L: [], training: true, some: [running_mean, weight, bias], dtype_cases: [{T: float16}], label: resnet-fc}
+  - {B: 8, C: 64, L: [32, 32], training: true, some: [running_mean, weight, bias], dtype_cases: [{T: float16}, {T: bfloat16}], label: resnet-stage1}
+  - {B: 4, C: 128, L: [32, 32], training: true, some: [running_mean, weight, bias], dtype_cases: [{T: float16}], label: resnet-stage2}
+  - {B: 4, C: 256, L: [28, 28], training: true, some: [running_mean, weight, bias], dtype_cases: [{T: float16}, {T: float32}], label: resnet-stage3}
+  - {B: 4, C: 128, L: [1024, 1024], training: true, some: [running_mean, weight, bias], dtype_cases: [{T: float16}], label: large-spatial}
+  - {B: 4, C: 256, L: [28, 28], some: [running_mean, weight, bias], dtype_cases: [{T: float16}], label: resnet-stage3-eval}
+  - {B: 8, C: 64, L: [56, 56], training: true, dtype_cases: [{T: bfloat16}], label: resnet-stem}
+  roofline:
+    # Training: mean (1), centered variance (3), normalize the centered value (1); running
+    # statistics: normalize (2). One more per present affine tensor.
+    flops: "((5 if training else 2) + (1 if present(weight) else 0) + (1 if present(bias) else 0)) * B * C * prod(L)"
+
+BatchNormBwdOp:
+  family: norm
+  status: implemented
+  ref_api: torch.ops.aten.native_batch_norm_backward.default
+  signature:
+    forall: {B: Dim, C: Dim, L: Shape, T: "DType[float32 | float16 | bfloat16]"}
+    inputs:
+      doutput: {dtype: T, shape: "[B, C, *L]"}
+      input: {dtype: T, shape: "[B, C, *L]"}
+      save_mean: {dtype: float32, shape: "[C]"}
+      save_invstd: {dtype: float32, shape: "[C]"}
+      # Absent for a forward called without weight: the unit scale.
+      weight: {dtype: float32, shape: "[C]", optional: true, kw_only: true}
+    outputs:
+      dinput: {dtype: T, shape: "[B, C, *L]"}
+      dweight: {dtype: float32, shape: "[C]"}
+      dbias: {dtype: float32, shape: "[C]"}
+  workloads:
+  - {B: 32, C: 64, L: [], dtype_cases: [{T: float16}], label: resnet-fc}
+  - {B: 8, C: 64, L: [32, 32], some: [weight], dtype_cases: [{T: float16}, {T: bfloat16}], label: resnet-stage1}
+  - {B: 4, C: 128, L: [32, 32], some: [weight], dtype_cases: [{T: float16}], label: resnet-stage2}
+  - {B: 4, C: 256, L: [28, 28], some: [weight], dtype_cases: [{T: float16}, {T: float32}], label: resnet-stage3}
+  - {B: 4, C: 128, L: [1024, 1024], some: [weight], dtype_cases: [{T: float16}], label: large-spatial}
+  roofline:
+    # x_hat (2), the dbias and dweight reductions (3), and dinput from them (4).
+    flops: "9 * B * C * prod(L)"
+
+GroupNormFwdOp:
+  ref_api: flag_gems.ops.group_norm
+  family: norm
+  status: implemented
+  signature:
+    forall: {B: Dim, C: Dim, L: Shape, T: "DType[float32 | float16 | bfloat16]"}
+    params:
+      num_groups: {type: int}
+      eps: {type: float, default: 1.0e-5}
+    inputs:
+      input: {dtype: T, shape: "[B, C, *L]"}
+      weight: {dtype: T, shape: "[C]", optional: true}
+      bias: {dtype: T, shape: "[C]", optional: true}
+    outputs:
+      output: {dtype: T, shape: "[B, C, *L]"}
+    shape_rules:
+    - "num_groups > 0 and C % num_groups == 0"
+    - "B * (C // num_groups) * prod(L) != 1"
+  workloads:
+  - {B: 8, C: 128, L: [32, 32], num_groups: 32, dtype_cases: [{T: float16}, {T: bfloat16}], label: image}
+  - {B: 4, C: 256, L: [28, 28], num_groups: 32, dtype_cases: [{T: float16}, {T: float32}], label: wider-channel}
+  - {B: 4, C: 128, L: [30, 30], num_groups: 16, dtype_cases: [{T: float16}], label: tail-spatial}
+  - {B: 8, C: 128, L: [32, 32], num_groups: 32, some: [weight, bias], dtype_cases: [{T: float16}, {T: bfloat16}], label: image-affine}
+  - {B: 4, C: 256, L: [28, 28], num_groups: 32, some: [weight, bias], dtype_cases: [{T: float16}, {T: float32}], label: wider-channel-affine}
+  - {B: 4, C: 128, L: [30, 30], num_groups: 16, some: [weight, bias], dtype_cases: [{T: float16}], label: tail-spatial-affine}
+  roofline:
+    # Mean (1), centered variance (3), normalize the centered value (1), and one per present
+    # affine tensor.
+    flops: "(5 + (1 if present(weight) else 0) + (1 if present(bias) else 0)) * B * C * prod(L)"
+
+InstanceNormFwdOp:
+  ref_api: torch.nn.functional.instance_norm
+  family: norm
+  status: implemented
+  signature:
+    forall: {B: Dim, C: Dim, L: Shape, T: "DType[float32 | float16 | bfloat16]"}
+    params:
+      use_input_stats: {type: bool, default: true}
+      momentum: {type: float, default: 0.1}
+      eps: {type: float, default: 1.0e-5}
+    inputs:
+      input: {dtype: T, shape: "[B, C, *L]"}
+      running_mean: {dtype: float32, shape: "[C]", optional: true, mutated: "use_input_stats and present(running_mean)"}
+      running_var: {dtype: float32, shape: "[C]", optional: "present(running_mean)", mutated: "use_input_stats and present(running_mean)"}
+      weight: {dtype: T, shape: "[C]", optional: true}
+      bias: {dtype: T, shape: "[C]", optional: true}
+    outputs:
+      output: {dtype: T, shape: "[B, C, *L]"}
+    shape_rules:
+    - "use_input_stats or present(running_mean)"
+    - "not use_input_stats or prod(L) != 1"
+  workloads:
+  - {B: 8, C: 128, L: [32, 32], some: [weight, bias], dtype_cases: [{T: float16}, {T: bfloat16}], label: image-affine}
+  - {B: 4, C: 256, L: [28, 28], some: [weight, bias], dtype_cases: [{T: float16}, {T: float32}], label: wider-channel-affine}
+  - {B: 4, C: 64, L: [30, 30], some: [weight, bias], dtype_cases: [{T: float16}], label: tail-spatial-affine}
+  - {B: 8, C: 128, L: [32, 32], dtype_cases: [{T: float16}, {T: bfloat16}], label: image}
+  - {B: 4, C: 256, L: [28, 28], dtype_cases: [{T: float16}, {T: float32}], label: wider-channel}
+  - {B: 4, C: 64, L: [30, 30], dtype_cases: [{T: float16}], label: tail-spatial}
+  - {B: 8, C: 128, L: [32, 32], some: [running_mean], dtype_cases: [{T: float16}], label: image-track-stats}
+  - {B: 8, C: 128, L: [32, 32], use_input_stats: false, some: [running_mean, weight, bias], dtype_cases: [{T: float16}], label: image-eval}
+  roofline:
+    # Input statistics: mean (1), centered variance (3), normalize the centered value (1);
+    # running statistics: normalize (2). One more per present affine tensor.
+    flops: "((5 if use_input_stats else 2) + (1 if present(weight) else 0) + (1 if present(bias) else 0)) * B * C * prod(L)"
+
+FusedQKNormRoPEFwdOp:
+  # In place on a packed projection qkv = [q heads | k heads | v heads] of width D each:
+  # RMSNorm over each q head (q_weight) and each k head (k_weight), then RoPE at
+  # positions[n] on the first R columns of each q and k head, from cos_sin_cache (cos ‖ sin
+  # halves). The v columns are untouched.
+  family: norm
+  status: implemented
+  ref_api: vllm._custom_ops.fused_qk_norm_rope
+  signature:
+    forall: {N: Dim, D: Dim, P: Dim, R: Dim, T: "DType[float16 | bfloat16]", C: "DType[float16 | bfloat16 | float32]", seq_lens: "Seq[Int]"}
+    params:
+      num_heads: {type: int}
+      num_kv_heads: {type: int}
+      eps: {type: float, default: 1.0e-6}
+      rope_layout: {type: "'neox' | 'interleaved'", default: neox}
+    inputs:
+      qkv: {dtype: T, shape: "[N, (num_heads + 2 * num_kv_heads) * D]", mutated: true, contiguous: true}
+      q_weight: {dtype: T, shape: "[D]"}
+      k_weight: {dtype: T, shape: "[D]"}
+      cos_sin_cache: {dtype: C, shape: "[P, R]"}
+      positions: {dtype: int64, shape: "[N]", values: "packed_positions(seq_lens)", requires: ["in_range(0, P)"]}
+    outputs: {}
+    shape_rules:
+    - "num_heads > 0 and num_kv_heads > 0"
+    - "R > 0 and R % 2 == 0 and R <= D"
+  workloads:
+  - {D: 128, P: 40960, R: 128, num_heads: 32, num_kv_heads: 8, seq_lens: [64], dtype_cases: [{T: bfloat16, C: bfloat16}, {T: float16, C: float32}], label: qwen3-8b-t64}
+  - {D: 128, P: 40960, R: 128, num_heads: 32, num_kv_heads: 8, seq_lens: "repeat(1024, 8)", dtype_cases: [{T: bfloat16, C: bfloat16}], label: qwen3-8b-t8192}
+  - {D: 128, P: 40960, R: 128, num_heads: 64, num_kv_heads: 4, seq_lens: "repeat(1024, 4)", dtype_cases: [{T: bfloat16, C: bfloat16}], label: qwen3-235b-t4096}
+  - {D: 128, P: 131072, R: 64, num_heads: 96, num_kv_heads: 8, seq_lens: "repeat(1024, 4)", dtype_cases: [{T: bfloat16, C: float32}], label: glm-4.5-partial-rope}
+  - {D: 128, P: 40960, R: 128, num_heads: 32, num_kv_heads: 8, seq_lens: [1000, 537, 13], rope_layout: interleaved, dtype_cases: [{T: float16, C: float16}, {T: bfloat16, C: float32}], label: interleaved-ragged}
+  roofline:
+    # The q and k columns are read and written, the v columns not touched, and only the
+    # cos/sin rows the positions name are read.
+    func: "tileops._perf.formulas.fused_qk_norm_rope_roofline"

@@ -14,6 +14,7 @@
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "target/source/codegen_c.h"
 
@@ -108,6 +109,17 @@ private:
   friend void PrintConst(const FloatImmNode *op, std::ostream &os,
                          CodeGenTileLangTANG *p);
 
+  // tcgen05 MMA descriptor operands. In the IR the descriptors are ordinary
+  // values (`tl.tang_mma_data_desc` / `tl.tang_mma_instr_desc` /
+  // `tl.tang_mma_scale_instr_desc`) whose C++ text is printed by the matching
+  // VisitExpr_ branches; the MMA handler only binds each operand to a local so
+  // that one `a_desc` / `b_desc` / `i_desc` feeds both `mma<true>` and
+  // `mma<false>` of the runtime `enable_input_d` branch. The text stays a
+  // marker intrinsic in the generated source -- the STCU TCProcess pass reads
+  // its operands structurally, so nothing here packs descriptor bits.
+  void PrintMmaDescriptorOperand(const std::string &name,
+                                 const PrimExpr &value);
+
   // Whether global barrier is needed.
   bool need_global_barrier_{false};
   // Global barrier state
@@ -145,11 +157,6 @@ private:
   bool need_mma_sm70_instruction_h_{false};
   // whether need tcgen_05 common header
   bool need_tcgen05_common_h_{false};
-  // whether need the TANG swizzled bulk-copy helper header
-  // (tang/copy_global_shm.h)
-  bool need_cp_async_bulk_h_{false};
-  // whether need the TANG tmem<->smem copy helper header (tang/copy_tmem_shm.h)
-  bool need_cp_tmem_smem_h_{false};
   // whether need the TANG mbarrier header (tang/barrier.h), which defines the
   // Barrier type this codegen names in mbarrier_dtype_
   bool need_barrier_h_{false};

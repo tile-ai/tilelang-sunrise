@@ -2,12 +2,10 @@ import torch
 
 
 def expand_to_mhc_ref(hidden: torch.Tensor, mhc_mult: int) -> torch.Tensor:
-    hidden = hidden.cpu()
     return hidden.unsqueeze(-2).expand(*hidden.shape[:-1], mhc_mult, hidden.shape[-1]).contiguous()
 
 
 def sinkhorn_normalize_ref(x: torch.Tensor, repeat: int = 10, eps: float = 1e-6) -> torch.Tensor:
-    x = x.cpu()
     x = x.softmax(-1) + eps
     x = x / (x.sum(-2, keepdim=True) + eps)
     for _ in range(repeat - 1):
@@ -22,9 +20,6 @@ def mhc_head_compute_mix_ref(
     mhc_base: torch.Tensor,
     mhc_pre_eps: float,
 ) -> torch.Tensor:
-    input_mix = input_mix.cpu()
-    mhc_scale = mhc_scale.cpu()
-    mhc_base = mhc_base.cpu()
     mhc_head_layer_mix = input_mix * mhc_scale + mhc_base
     return torch.sigmoid(mhc_head_layer_mix) + mhc_pre_eps
 
@@ -37,9 +32,6 @@ def mhc_pre_split_mixes_ref(
     mhc_post_mult_value: float,
     mhc_pre_eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    input_mixes = input_mixes.cpu()
-    mhc_scale = mhc_scale.cpu()
-    mhc_base = mhc_base.cpu()
     a, b = input_mixes.shape[:2]
     mhc_scale = torch.cat(
         [
@@ -58,8 +50,6 @@ def mhc_pre_split_mixes_ref(
 
 
 def mhc_pre_apply_mix_ref(x: torch.Tensor, mix: torch.Tensor) -> torch.Tensor:
-    x = x.cpu()
-    mix = mix.cpu()
     return (x * mix).sum(-2).bfloat16()
 
 
@@ -69,10 +59,6 @@ def mhc_post_ref(
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
-    x = x.cpu()
-    residual = residual.cpu()
-    post_layer_mix = post_layer_mix.cpu()
-    comb_res_mix = comb_res_mix.cpu()
     term2 = torch.einsum('abmn,abmc->abnc', comb_res_mix, residual.float())
     return (x.float().unsqueeze(-2) * post_layer_mix + term2).bfloat16()
 
@@ -83,10 +69,7 @@ def mhc_pre_norm_fn_ref(
     mhc_norm_weight: torch.Tensor | None,
     mhc_norm_eps: float,
 ) -> torch.Tensor:
-    residual = residual.cpu()
-    mhc_fn = mhc_fn.cpu()
     if mhc_norm_weight is not None:
-        mhc_norm_weight = mhc_norm_weight.cpu()
         mhc_fn = mhc_fn * mhc_norm_weight
     residual = residual.flatten(2, 3).float()
     assert mhc_fn.dtype == residual.dtype == torch.float
@@ -100,3 +83,29 @@ def mhc_pre_norm_fn_ref(
     sqrsum = residual.view(-1, 1, rms_group_size).square().sum(-1)
     mixes = (mixes * (sqrsum.unsqueeze(-1) / rms_group_size + mhc_norm_eps).rsqrt()).sum(-2)
     return mixes.view(*residual.shape[:2], -1)
+
+
+def mhc_pre_norm_fn_partials_ref(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    n_splits: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split-K partials of the prenorm GEMM, built from the torch reference.
+
+    That GEMM now lives in DeepGEMM, so the reduce/rmsnorm operator is driven
+    by reference GEMM outputs: one partial per split of the reduction
+    dimension, matching what the split-K GEMM used to produce.
+    """
+    mhc_mult3, mhc_hidden_size = fn.shape
+    num_tokens = residual.shape[0] * residual.shape[1]
+    split_size = mhc_hidden_size // n_splits
+
+    x_flat = residual.float().flatten(2, 3).reshape(num_tokens, mhc_hidden_size)
+    out_mul = torch.empty(n_splits, num_tokens, 1, mhc_mult3, dtype=torch.float32, device=residual.device)
+    sqrsum = torch.empty(n_splits, num_tokens, 1, dtype=torch.float32, device=residual.device)
+    for i in range(n_splits):
+        x_split = x_flat[:, i * split_size : (i + 1) * split_size].unsqueeze(1)
+        fn_split = fn[:, i * split_size : (i + 1) * split_size].unsqueeze(1)
+        out_mul[i] = torch.einsum('mbk,nbk->mbn', x_split, fn_split)
+        sqrsum[i] = x_split.square().sum(-1)
+    return out_mul, sqrsum

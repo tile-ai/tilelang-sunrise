@@ -2,7 +2,7 @@
 
 T.tcgen05_before_thread_sync / T.tcgen05_after_thread_sync 是 S3 专属的
 tensor-core fence 原语,lower 为 tang::ptx::fence_tc<fg>()。这里只做 lowering
-断言(对生成源码正则匹配),不跑 ISS。
+断言(对生成源码正则匹配)。
 
 两个原语在 TANG 硬件上映射到同一条 ``tang::ptx::fence_tc<fg>()`` 指令,
 区别仅在于 IR 中的**位置**(before/after sync),详见
@@ -12,13 +12,11 @@ docs/tang_tcgen05_fence_semantics.md。
 import re
 
 import pytest
-import torch
 
 import tilelang
 import tilelang.testing
 import tilelang.tang.language as T
 from tilelang import tvm as tvm
-from tilelang.jit import JITKernel
 
 STCUV2_TARGET = {"kind": "tang", "arch": "stcuv2"}
 
@@ -226,7 +224,7 @@ def test_fence_group_out_of_range_rejected():
 
 
 # ===========================================================================
-# §4  S3(stcuv2) exclusive: fence_tc 只应在 stcuv2 上出现
+# §4  S3(stcuv2) exclusive: fence_tc should appear on stcuv2 only
 # ===========================================================================
 
 
@@ -249,115 +247,6 @@ def test_fence_only_on_stcuv2():
 
     src = _lower_src(kernel, target=STCUV2_TARGET)
     _assert_in_ir(src, r"fence_tc<0>\(\)")
-
-
-# ===========================================================================
-# §5  ISS numeric — cross-warp producer→consumer copy with fence_tc
-# ===========================================================================
-#
-# 验证跨 warp 场景: warp 0 将 fragment 写入 TMEM(stt)→ fence_tc→
-# sync_arrive; warp 2 sync_wait→ 从 TMEM 读回(ldt)→ 写 global。
-# fence_tc 保证 producer warp 的 stt 对 consumer warp 的 ldt 可见。
-
-
-def _make_cross_warp_copy_kernel(M: int, N: int, producer_warp: int = 0, consumer_warp: int = 2, barrier_id: int = 1):
-    """Cross-warp fragment→TMEM→fragment copy through tcgen05 primitives.
-
-    Producer warp:  global → fragment → stt(TMEM) → fence_tc → sync_arrive
-    Consumer warp:  sync_wait → ldt(TMEM→fragment) → global
-    """
-
-    @T.prim_func
-    def kernel(A: T.Tensor((M, N), T.float32), B: T.Tensor((M, N), T.float32)):
-        with T.Kernel(1, 1, threads=128):
-            C_t = T.alloc_tmem((M, N), T.float32)
-            C_f_prod = T.alloc_fragment((M, N), T.float32)
-            C_f_cons = T.alloc_fragment((M, N), T.float32)
-
-            # Producer: warp 0 writes data into TMEM
-            with T.ws(producer_warp, warp_group_size=32):
-                T.copy(A, C_f_prod)
-                T.tcgen05_st(C_t, C_f_prod)
-                T.tcgen05_before_thread_sync(0)
-                T.tcgen05_sync_arrive(barrier_id)
-
-            # Consumer: warp 2 reads data from TMEM
-            with T.ws(consumer_warp, warp_group_size=32):
-                T.tcgen05_sync_wait(barrier_id, 1, 1)
-                T.tcgen05_after_thread_sync(0)
-                T.tcgen05_ld(C_f_cons, C_t)
-                T.copy(C_f_cons, B)
-
-    return kernel
-
-
-@pytest.mark.parametrize("M,N", [(128, 64), (64, 64), (128, 128)])
-def test_cross_warp_copy_numeric(M, N):
-    """Cross-warp st→fence_tc→ld copy must be lossless on ISS."""
-    kernel = _make_cross_warp_copy_kernel(M, N)
-    torch.manual_seed(42)
-    A = torch.randn(M, N, dtype=torch.float32)
-    jit = JITKernel(kernel, out_idx=[-1], target=STCUV2_TARGET, execution_backend="simulator", verbose=False)
-    B = jit(A.ptpu()).cpu().float()
-    rel = (B - A).abs().max().item() / (A.abs().max().item() + 1e-6)
-    assert rel < 1e-2, f"cross-warp copy rel_err too large: {rel:.3e}"
-
-
-# ===========================================================================
-# §6  Negative: cross-warp copy WITHOUT fence_tc — xfail until HW/cmodel
-# ===========================================================================
-#
-# 去掉 fence_tc 后, producer warp 的 tcgen05_st 可能尚未完成时 consumer
-# warp 的 tcgen05_ld 就已执行, 读到未初始化的 TMEM 数据。
-#
-# 当前 ISS simulator 对 tcgen05 是同步建模, 无法暴露这个 race, 故标记为
-# xfail(reason="ISS synchronous, HW/cmodel expected to fail").
-# 等 cycle-accurate cmodel 或 S3 硬件就绪后, 去掉 xfail 标记即可验证
-# fence_tc 的必要性。
-
-
-def _make_cross_warp_copy_no_fence_kernel(M: int, N: int):
-    """Same as _make_cross_warp_copy_kernel but WITHOUT fence_tc calls."""
-
-    @T.prim_func
-    def kernel(A: T.Tensor((M, N), T.float32), B: T.Tensor((M, N), T.float32)):
-        with T.Kernel(1, 1, threads=128):
-            C_t = T.alloc_tmem((M, N), T.float32)
-            C_f_prod = T.alloc_fragment((M, N), T.float32)
-            C_f_cons = T.alloc_fragment((M, N), T.float32)
-
-            with T.ws(0, warp_group_size=32):
-                T.copy(A, C_f_prod)
-                T.tcgen05_st(C_t, C_f_prod)
-                # NOTE: NO fence_tc here — deliberately omitted
-                T.tcgen05_sync_arrive(1)
-
-            with T.ws(2, warp_group_size=32):
-                T.tcgen05_sync_wait(1, 1, 1)
-                # NOTE: NO fence_tc here — deliberately omitted
-                T.tcgen05_ld(C_f_cons, C_t)
-                T.copy(C_f_cons, B)
-
-    return kernel
-
-
-@pytest.mark.xfail(reason="ISS synchronous; HW/cmodel expected to fail (fence_tc absent)")
-@pytest.mark.parametrize("M,N", [(128, 64), (64, 64)])
-def test_cross_warp_copy_no_fence(M, N):
-    """Cross-warp st→ld WITHOUT fence_tc — expected to fail on real HW.
-
-    On ISS the stt completes synchronously before the other warp runs, so
-    the test passes.  On cycle-accurate cmodel or S3 silicon, the consumer
-    warp is expected to read stale TMEM, causing a numerical mismatch.
-    Remove the xfail marker when running on those targets.
-    """
-    kernel = _make_cross_warp_copy_no_fence_kernel(M, N)
-    torch.manual_seed(42)
-    A = torch.randn(M, N, dtype=torch.float32)
-    jit = JITKernel(kernel, out_idx=[-1], target=STCUV2_TARGET, execution_backend="simulator", verbose=False)
-    B = jit(A.ptpu()).cpu().float()
-    rel = (B - A).abs().max().item() / (A.abs().max().item() + 1e-6)
-    assert rel < 1e-2, f"cross-warp no-fence copy rel_err too large: {rel:.3e}"
 
 
 if __name__ == "__main__":

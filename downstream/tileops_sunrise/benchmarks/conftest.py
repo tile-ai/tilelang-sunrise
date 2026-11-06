@@ -1,12 +1,22 @@
 import gc
+import json
 
 import pytest
 import torch
 
+import benchmarks.baselines  # noqa: F401
+
 # Imported for its side effect: arming the guard that keeps flag_gems from
 # reaching torch's op registry before vllm. See benchmarks.baselines.
-import benchmarks.baselines  # noqa: F401
+from benchmarks import api
 from benchmarks.report import BenchmarkReport, _bench_results
+from benchmarks.timing import events_fallback_allowed, set_events_fallback_allowed
+from tileops._utils.device import current_accelerator_type
+
+# What a row carries besides its measurements.
+_NOT_A_MEASUREMENT = frozenset(
+    {"tag", "op", "op_module", "ops", "params", "kernel_config", "result"}
+)
 
 
 def pytest_make_parametrize_id(config, val, argname):
@@ -15,7 +25,7 @@ def pytest_make_parametrize_id(config, val, argname):
     A case id is the workload's name everywhere it is read later — the nightly
     report, the published page, the perf history key. This covers the values
     with no readable repr; it does not invent a name for the case, which is the
-    author's job (see .claude/domain-rules/benchmark.md).
+    author's job (see docs/design/manifest.md § Rows).
     """
     if isinstance(val, torch.dtype):
         return str(val).removeprefix("torch.")
@@ -30,10 +40,6 @@ def pytest_make_parametrize_id(config, val, argname):
     return None
 
 
-# What a row carries besides its measurements.
-_NOT_A_MEASUREMENT = frozenset({"tag", "op", "op_module", "ops", "params", "run_config", "result"})
-
-
 def _prop(value) -> str:
     """Format one measurement for the XML.
 
@@ -45,6 +51,8 @@ def _prop(value) -> str:
         return str(value)
     if isinstance(value, float):
         return str(int(value)) if value.is_integer() else f"{value:.6g}"
+    if isinstance(value, dict):
+        return json.dumps(value, sort_keys=True)
     return str(value)
 
 
@@ -56,25 +64,69 @@ def _emit(item, tag: str, entry: dict) -> None:
     here. Hand-listing them is how the report came to publish a quantity the
     benchmark had stopped comparing.
     """
-    measurements = {**entry["result"], "dtype": entry.get("dtype")}
+    measurements = {
+        **entry["result"],
+        "unverified": (entry.get("params") or {}).get("unverified"),
+        "no_ratio": (entry.get("params") or {}).get("no_ratio"),
+    }
     for key, value in measurements.items():
         if key in _NOT_A_MEASUREMENT or value is None:
             continue
         item.user_properties.append((f"{tag}_{key}", _prop(value)))
 
 
-def _release_cuda_cache_after_case() -> None:
-    """Drop per-case Python references and cached PTPU blocks between benchmarks."""
-    gc.collect()
-    if torch.ptpu.is_available():
-        torch.ptpu.empty_cache()
-
-
 @pytest.fixture(autouse=True)
 def setup() -> None:
+    # Seeds every device's generator, CUDA's and a backend's alike.
     torch.manual_seed(1235)
-    if torch.ptpu.is_available():
-        torch.manual_seed(1235)  # PTPU: manual_seed_all not available, using manual_seed instead
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """Register whether a benchmark run may time with CUDA events where CUPTI fails."""
+    parser.addoption(
+        "--tileops-allow-events-fallback",
+        action="store_true",
+        help="Time a case with CUDA events when CUPTI cannot attribute it, instead of "
+        "failing it. Off by default: the report would mix two timing methods.",
+    )
+    parser.addoption(
+        "--tileops-verify",
+        action="store_true",
+        help="Run correctness warmup only, omitting timing. Normal benchmarks also verify "
+        "before sampling.",
+    )
+
+
+# The settings in force before configure, put back at unconfigure.
+_OUTER_EVENTS_FALLBACK = pytest.StashKey[bool]()
+_OUTER_VERIFYING = pytest.StashKey[bool]()
+
+
+def pytest_configure(config):
+    """Refuse a run device that is neither CUDA nor the process's accelerator, and pin the
+    events-fallback setting.
+
+    A CUDA device is timed through CUPTI and another accelerator with its device events.
+    CUDA is accepted on a host without one, where the benchmarks' own tests collect.
+    """
+    device = torch.device(config.getoption("--tileops-device"))
+    if device.type not in ("cuda", current_accelerator_type()):
+        raise pytest.UsageError(
+            f"--tileops-device={device}: benchmarks time on CUDA or on this process's "
+            f"accelerator, which is {current_accelerator_type()}"
+        )
+    config.stash[_OUTER_EVENTS_FALLBACK] = events_fallback_allowed()
+    config.stash[_OUTER_VERIFYING] = api.verifying()
+    api.set_verifying(config.getoption("--tileops-verify"))
+    set_events_fallback_allowed(config.getoption("--tileops-allow-events-fallback"))
+
+
+def pytest_unconfigure(config):
+    """Put back the settings this file replaced."""
+    if _OUTER_EVENTS_FALLBACK in config.stash:
+        set_events_fallback_allowed(config.stash[_OUTER_EVENTS_FALLBACK])
+    if _OUTER_VERIFYING in config.stash:
+        api.set_verifying(config.stash[_OUTER_VERIFYING])
 
 
 def pytest_sessionstart(session):
@@ -129,6 +181,12 @@ def pytest_runtest_call(item):
                 _emit(item, "baseline", be)
             if not tileops_entry:
                 continue
+            # A ratio states that two implementations of one function differ in speed. Where
+            # either side carries an exception, that is not what it would state.
+            if (be.get("params") or {}).get("no_ratio") or (tileops_entry.get("params") or {}).get(
+                "no_ratio"
+            ):
+                continue
             # Ratios compare device_busy_ms: two implementations need not have
             # the same number of gaps between kernels.
             tl = tileops_entry["result"].get("device_busy_ms", 0)
@@ -139,4 +197,11 @@ def pytest_runtest_call(item):
                     item.user_properties.append(("baseline_ratio", f"{bl / tl:.4f}"))
     finally:
         _bench_results.entries = []
-        _release_cuda_cache_after_case()
+        for value in getattr(getattr(item, "callspec", None), "params", {}).values():
+            if isinstance(value, api.Case):
+                value._release()
+        # Drop per-case Python references and the device's cached blocks between benchmarks.
+        gc.collect()
+        # torch_ptpu has no DeviceAllocator, so it has no cache to empty.
+        if current_accelerator_type() not in (None, "ptpu"):
+            torch.accelerator.empty_cache()

@@ -8,32 +8,14 @@ binary logical ops, and all supported dtypes for logical_not.
 import pytest
 import torch
 
-from tests.test_base import FixtureBase, TestBase, exact_compare
-from tileops.ops.elementwise import LogicalAndFwdOp, LogicalNotFwdOp, LogicalOrFwdOp
-from workloads.elementwise import LogicalNotWorkload, LogicalWorkload
+from tests.workload_test_base import FixtureBase, TestBase
+from tileops._ops.elementwise import LogicalAndFwdOp, LogicalNotFwdOp, LogicalOrFwdOp
+from workloads.device import run_device
+from workloads.elementwise import LogicalCase, LogicalNotWorkload
 
 
-def _bool_compare(output: torch.Tensor, output_ref: torch.Tensor) -> None:
-    """Exact comparison for boolean outputs."""
-    assert output.dtype == torch.bool, f"Expected bool dtype, got {output.dtype}"
-    assert torch.equal(output, output_ref), (
-        f"Bool mismatch: {(output != output_ref).sum().item()} elements differ"
-    )
-
-
-class LogicalTest(LogicalWorkload, TestBase):
-    """Reusable test body for logical ops."""
-
-    def __init__(self, n_total: int, dtype: torch.dtype, ref_fn):
-        super().__init__(n_total, dtype)
-        self.ref_fn = ref_fn
-
-    def ref_program(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        device = a.device
-        a = a.cpu()
-        b = b.cpu()
-        ret = self.ref_fn(a.bool(), b.bool())
-        return ret.to(device)
+class LogicalTest(LogicalCase, TestBase):
+    pass
 
 
 class LogicalAndFixture(FixtureBase):
@@ -51,9 +33,9 @@ class LogicalAndFixture(FixtureBase):
 
 @LogicalAndFixture
 def test_logical_and_op(n_total: int, dtype: torch.dtype) -> None:
-    test = LogicalTest(n_total, dtype, torch.logical_and)
+    test = LogicalTest(n_total, dtype, "LogicalAndFwdOp")
     op = LogicalAndFwdOp()
-    test.check(op, *test.gen_inputs(), compare=_bool_compare)
+    test.check(op, *test.gen_inputs())
 
 
 class LogicalOrFixture(FixtureBase):
@@ -71,18 +53,13 @@ class LogicalOrFixture(FixtureBase):
 
 @LogicalOrFixture
 def test_logical_or_op(n_total: int, dtype: torch.dtype) -> None:
-    test = LogicalTest(n_total, dtype, torch.logical_or)
+    test = LogicalTest(n_total, dtype, "LogicalOrFwdOp")
     op = LogicalOrFwdOp()
-    test.check(op, *test.gen_inputs(), compare=_bool_compare)
+    test.check(op, *test.gen_inputs())
 
 
 # Broadcast pattern tests for binary logical ops (L3)
 
-_BROADCAST_PATTERNS = [
-    ((2, 64, 128), (1, 1, 128)),  # bias-add
-    ((2, 64, 128), (2, 64, 1)),  # row broadcast
-    ((64, 128), (1, 1)),  # scalar broadcast
-]
 
 _LOGICAL_OPS = [
     ("logical_and", LogicalAndFwdOp, torch.logical_and),
@@ -91,23 +68,30 @@ _LOGICAL_OPS = [
 
 
 class LogicalBroadcastFixture(FixtureBase):
-    PARAMS = [
-        (
-            "op_name, op_cls, ref_fn, a_shape, b_shape",
-            [
-                pytest.param(
-                    name,
-                    cls,
-                    ref,
-                    a_s,
-                    b_s,
-                    marks=pytest.mark.smoke if i == 0 and j == 0 else pytest.mark.full,
-                )
-                for j, (name, cls, ref) in enumerate(_LOGICAL_OPS)
-                for i, (a_s, b_s) in enumerate(_BROADCAST_PATTERNS)
-            ],
-        ),
-    ]
+    @classmethod
+    def get_params(cls):
+        patterns = [
+            ((2, 64, 128), (1, 1, 128)),  # bias-add
+            ((2, 64, 128), (2, 64, 1)),  # row broadcast
+            ((64, 128), (1, 1)),  # scalar broadcast
+        ]
+        return [
+            (
+                "op_name, op_cls, ref_fn, a_shape, b_shape",
+                [
+                    pytest.param(
+                        name,
+                        cls,
+                        ref,
+                        a_s,
+                        b_s,
+                        marks=pytest.mark.smoke if i == 0 and j == 0 else pytest.mark.full,
+                    )
+                    for j, (name, cls, ref) in enumerate(_LOGICAL_OPS)
+                    for i, (a_s, b_s) in enumerate(patterns)
+                ],
+            ),
+        ]
 
 
 @LogicalBroadcastFixture
@@ -119,15 +103,11 @@ def test_logical_broadcast(
     b_shape,
 ) -> None:
     dtype = torch.float16
-    a = (torch.randn(*a_shape, dtype=dtype) > 0).to(dtype)
-    b = (torch.randn(*b_shape, dtype=dtype) > 0).to(dtype)
+    a = (torch.randn(*a_shape, dtype=dtype, device=run_device()) > 0).to(dtype)
+    b = (torch.randn(*b_shape, dtype=dtype, device=run_device()) > 0).to(dtype)
     op = op_cls()
-    ref = ref_fn(a.bool(), b.bool())
-    with torch.no_grad():
-        out = op(a.ptpu(), b.ptpu())
-
-        out = out.cpu()
-    _bool_compare(out, ref)
+    test = LogicalTest(a.numel(), a.dtype, op_cls.__name__)
+    test.check(op, a, b)
 
 
 @pytest.mark.smoke
@@ -135,13 +115,11 @@ def test_logical_and_bool_broadcast() -> None:
     """Bool-input binary broadcast path uses uint8 storage internally."""
     a_shape = (2, 512, 768)
     b_shape = (1, 1, 768)
-    a = torch.randint(0, 2, a_shape, device="ptpu").to(torch.bool)
-    b = torch.randint(0, 2, b_shape, device="ptpu").to(torch.bool)
+    a = torch.randint(0, 2, a_shape, device=run_device()).to(torch.bool)
+    b = torch.randint(0, 2, b_shape, device=run_device()).to(torch.bool)
     op = LogicalAndFwdOp()
-    ref = torch.logical_and(a, b)
-    with torch.no_grad():
-        out = op(a, b)
-    _bool_compare(out, ref)
+    test = LogicalTest(a.numel(), a.dtype, "LogicalAndFwdOp")
+    test.check(op, a, b)
 
 
 class LogicalFixture(FixtureBase):
@@ -173,7 +151,7 @@ class LogicalNotTest(LogicalNotWorkload, TestBase):
 def test_logical_not(n_total: int, dtype: torch.dtype) -> None:
     test = LogicalNotTest(n_total, dtype)
     op = LogicalNotFwdOp()
-    test.check(op, *test.gen_inputs(), compare=exact_compare)
+    test.check(op, *test.gen_inputs())
 
 
 # Per-dtype correctness across the manifest dtype union for binary logical
@@ -203,8 +181,8 @@ def _gen_int_logical_inputs(
         lo, hi = -8, 8
     else:
         lo, hi = -32, 32
-    a = torch.randint(lo, hi, (n,), dtype=dtype, device="ptpu")
-    b = torch.randint(lo, hi, (n,), dtype=dtype, device="ptpu")
+    a = torch.randint(lo, hi, (n,), dtype=dtype, device=run_device())
+    b = torch.randint(lo, hi, (n,), dtype=dtype, device=run_device())
     # Force a mix of zeros so non-zero truthiness is non-trivial.
     a[::3] = 0
     b[::5] = 0
@@ -235,12 +213,10 @@ def test_logical_int_bool_matrix(
     """Each binary logical op matches torch on every int / bool dtype."""
     n = 4_096
     if dtype == torch.bool:
-        a = torch.randint(0, 2, (n,), device="ptpu").to(torch.bool)
-        b = torch.randint(0, 2, (n,), device="ptpu").to(torch.bool)
+        a = torch.randint(0, 2, (n,), device=run_device()).to(torch.bool)
+        b = torch.randint(0, 2, (n,), device=run_device()).to(torch.bool)
     else:
         a, b = _gen_int_logical_inputs(n, dtype)
     op = op_cls()
-    ref = ref_fn(a, b)
-    with torch.no_grad():
-        out = op(a, b)
-    _bool_compare(out, ref)
+    test = LogicalTest(a.numel(), a.dtype, op_cls.__name__)
+    test.check(op, a, b)

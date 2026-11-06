@@ -21,12 +21,24 @@ TIR_DEFINE_TL_BUILTIN(tl_tang_gemm)
 TIR_DEFINE_TL_BUILTIN(tang_fill_fragment)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
+TIR_DEFINE_TL_BUILTIN(tang_mma_data_desc)
+    .set_num_inputs(5)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+TIR_DEFINE_TL_BUILTIN(tang_mma_instr_desc)
+    .set_num_inputs(8)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+TIR_DEFINE_TL_BUILTIN(tang_mma_scale_instr_desc)
+    .set_num_inputs(10)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
 TIR_DEFINE_TL_BUILTIN(tang_tcgen05_mma_ss)
-    .set_num_inputs(21)
+    .set_num_inputs(6)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 TIR_DEFINE_TL_BUILTIN(tang_tcgen05_mma_ts)
-    .set_num_inputs(14)
+    .set_num_inputs(5)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 TIR_DEFINE_TL_BUILTIN(tang_scale_stage)
@@ -34,7 +46,7 @@ TIR_DEFINE_TL_BUILTIN(tang_scale_stage)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 TIR_DEFINE_TL_BUILTIN(tang_tcgen05_mma_scale)
-    .set_num_inputs(21)
+    .set_num_inputs(6)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 TIR_DEFINE_TL_BUILTIN(tang_init_tensor_memory)
@@ -70,12 +82,24 @@ TIR_DEFINE_TL_BUILTIN(tang_tmem_st)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TL_BUILTIN(tang_cp_tmem_to_shared)
+TIR_DEFINE_TL_BUILTIN(tang_cpt2s_16x64b_2d)
     .set_num_inputs(3)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
-TIR_DEFINE_TL_BUILTIN(tang_cp_shared_to_tmem)
-    .set_num_inputs(6)
+TIR_DEFINE_TL_BUILTIN(tang_cps2t_1d)
+    .set_num_inputs(7)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+TIR_DEFINE_TL_BUILTIN(tang_stvm_set_mem_dim0_s2t)
+    .set_num_inputs(3)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+TIR_DEFINE_TL_BUILTIN(tang_publish_tmem_operand)
+    .set_num_inputs(0)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+TIR_DEFINE_TL_BUILTIN(tang_fence_s2t_arrive_mbarrier)
+    .set_num_inputs(1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
@@ -91,27 +115,46 @@ TIR_DEFINE_TL_BUILTIN(tang_tmem_fence)
     .set_num_inputs(1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
-TIR_DEFINE_TL_BUILTIN(tang_cp_async_bulk)
+TIR_DEFINE_TL_BUILTIN(tang_fcpg2s_1d)
     .set_num_inputs(5)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
-TIR_DEFINE_TL_BUILTIN(tang_cp_async_bulk_sw)
+TIR_DEFINE_TL_BUILTIN(tang_fcps2g_1d)
+    .set_num_inputs(5)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+TIR_DEFINE_TL_BUILTIN(tang_fcpg2s_3d)
     .set_num_inputs(9)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
-TIR_DEFINE_TL_BUILTIN(tang_cp_async_bulk_1d)
+TIR_DEFINE_TL_BUILTIN(tang_fcps2g_3d)
     .set_num_inputs(7)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+TIR_DEFINE_TL_BUILTIN(tang_fence_mem)
+    .set_num_inputs(1)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+// A record for the async handshake pass, not an instruction: no side effects of
+// its own, but kOpaque keeps the passes that prune no-ops from dropping it
+// before the pass that consumes it runs.
+TIR_DEFINE_TL_BUILTIN(tang_bulk_async_commit)
+    .set_num_inputs(-1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 TIR_DEFINE_TL_BUILTIN(tang_fence_tc)
     .set_num_inputs(1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
-TIR_DEFINE_TL_BUILTIN(tang_fence_tc_arrive)
+TIR_DEFINE_TL_BUILTIN(tang_fence_g2s_arrive_mbarrier)
     .set_num_inputs(1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
-TIR_DEFINE_TL_BUILTIN(tang_fence_g2s_arrive)
+TIR_DEFINE_TL_BUILTIN(tang_mbar_wait_parity)
+    .set_num_inputs(2)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+TIR_DEFINE_TL_BUILTIN(tang_fence_tc_arrive_mbarrier)
     .set_num_inputs(1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));

@@ -4,13 +4,10 @@ import tilelang.language as T
 
 from tilelang.backend.target import determine_target
 from tilelang.intrinsics import make_mma_swizzle_layout
-from tilelang.jit import JITKernel
 from tilelang.utils.device import get_current_device
 import pytest
 
 _FLOAT8_E8M0FNU = getattr(torch, "float8_e8m0fnu", None)
-
-STCUV2 = {"kind": "tang", "arch": "stcuv2"}
 
 
 def _target_is_tang():
@@ -233,65 +230,6 @@ def test_vectorize_all_dtypes(dtype, vec_num):
     x = torch.empty((64,), dtype=dtype, device=device)
     kernel = vectorize_test_all_dtypes(dtype, vec_num)
     kernel(x)
-
-
-def _stcuv2_vectorize_gap(dtype, vec_num):
-    """The reason ``dtype`` x ``vec_num`` cannot work on stcuv2 yet, else None."""
-    if dtype in (torch.int64, torch.uint64) and vec_num > 4:
-        # 8 x 64bit = 512bit exceeds the widest vector the codegen will ramp.
-        return "64-bit dtypes cap at 4 lanes (Translate Ramp Node ... lanes <= 4)"
-    if dtype is torch.uint64:
-        return "simulator HBM decoder has no torch.uint64 case yet"
-    if dtype is _FLOAT8_E8M0FNU:
-        return "float8_e8m0fnu has no TANG codegen type (codegen_tang.cc GetFP8Type)"
-    return None
-
-
-@pytest.mark.parametrize(
-    "dtype",
-    [
-        torch.uint8,
-        torch.uint64,
-        torch.int8,
-        torch.int64,
-        torch.float8_e4m3fn,
-        torch.float8_e5m2,
-        pytest.param(
-            _FLOAT8_E8M0FNU,
-            marks=pytest.mark.skipif(_FLOAT8_E8M0FNU is None, reason="torch lacks float8_e8m0fnu"),
-            id="float8_e8m0fnu",
-        ),
-    ],
-)
-@pytest.mark.parametrize("vec_num", [1, 2, 4, 8])
-@tilelang.testing.requires_stcuv2
-def test_vectorize_all_dtypes_stcuv2(dtype, vec_num, request):
-    """Same regression on S3/stcuv2 via the ISS simulator.
-
-    S2 only reaches uint8/int8/int64 at vector width 1-2 (see the skip in
-    ``test_vectorize_all_dtypes``); stcuv2 covers those plus widths 4/8 and both
-    fp8 formats. The remaining holes are marked non-strict xfail so a fix shows
-    up as XPASS instead of silently staying uncovered.
-    """
-    gap = _stcuv2_vectorize_gap(dtype, vec_num)
-    if gap is not None:
-        request.applymarker(pytest.mark.xfail(reason=gap, strict=False))
-
-    # out_idx=[0] lets the simulator adapter allocate the buffer itself; it
-    # requires ptpu tensors, so a hand-built input would have to be moved there
-    # anyway (see testing/python/s3/test_simulator_e2e.py).
-    kernel = JITKernel(
-        vectorize_all_dtypes_kernel(dtype, vec_num),
-        out_idx=[0],
-        target=STCUV2,
-        execution_backend="simulator",
-    )
-    out = kernel().cpu()
-
-    # The kernel writes 1..vec_num into the first vec_num slots, so this also
-    # pins down the float->dtype conversion rather than only that it compiled.
-    expected = torch.arange(1, vec_num + 1, dtype=torch.float32).to(dtype)
-    torch.testing.assert_close(out[:vec_num].float(), expected.float(), atol=0, rtol=0)
 
 
 @tilelang.jit

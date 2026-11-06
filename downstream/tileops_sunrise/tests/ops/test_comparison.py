@@ -7,30 +7,16 @@ and L4 edge case for eq.
 import pytest
 import torch
 
-from tests.test_base import FixtureBase, TestBase
-from tileops.ops.elementwise import EqFwdOp, GeFwdOp, GtFwdOp, LeFwdOp, LtFwdOp, NeFwdOp
-from workloads.elementwise import RandnPairWorkload
+from tests.workload_test_base import FixtureBase, TestBase
+from tileops._ops.elementwise import EqFwdOp, GeFwdOp, GtFwdOp, LeFwdOp, LtFwdOp, NeFwdOp
+from tileops.backend import BUILTIN
+from workloads.device import run_device
+from workloads.elementwise import ComparisonCase, ElementwiseWorkload
+from workloads.numerics import compare_outputs
 
 
-def _bool_compare(output: torch.Tensor, output_ref: torch.Tensor) -> None:
-    """Exact comparison for boolean outputs."""
-    assert output.dtype == torch.bool, f"Expected bool dtype, got {output.dtype}"
-    output_cpu = output.cpu()
-    output_ref_cpu = output_ref.cpu()
-    assert torch.equal(output_cpu, output_ref_cpu), (
-        f"Bool mismatch: {(output_cpu != output_ref_cpu).sum().item()} elements differ"
-    )
-
-
-class ComparisonTest(RandnPairWorkload, TestBase):
-    """Reusable test body for comparison ops."""
-
-    def __init__(self, n_total: int, dtype: torch.dtype, ref_fn):
-        super().__init__(n_total, dtype)
-        self.ref_fn = ref_fn
-
-    def ref_program(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        return self.ref_fn(a, b)
+class ComparisonTest(ComparisonCase, TestBase):
+    pass
 
 
 class EqFixture(FixtureBase):
@@ -48,9 +34,9 @@ class EqFixture(FixtureBase):
 
 @EqFixture
 def test_eq_op(n_total: int, dtype: torch.dtype) -> None:
-    test = ComparisonTest(n_total, dtype, torch.eq)
+    test = ComparisonTest(n_total, dtype, "EqFwdOp")
     op = EqFwdOp()
-    test.check(op, *test.gen_inputs(), compare=_bool_compare)
+    test.check(op, *test.gen_inputs())
 
 
 class NeFixture(FixtureBase):
@@ -68,9 +54,9 @@ class NeFixture(FixtureBase):
 
 @NeFixture
 def test_ne_op(n_total: int, dtype: torch.dtype) -> None:
-    test = ComparisonTest(n_total, dtype, torch.ne)
+    test = ComparisonTest(n_total, dtype, "NeFwdOp")
     op = NeFwdOp()
-    test.check(op, *test.gen_inputs(), compare=_bool_compare)
+    test.check(op, *test.gen_inputs())
 
 
 class GtFixture(FixtureBase):
@@ -88,9 +74,9 @@ class GtFixture(FixtureBase):
 
 @GtFixture
 def test_gt_op(n_total: int, dtype: torch.dtype) -> None:
-    test = ComparisonTest(n_total, dtype, torch.gt)
+    test = ComparisonTest(n_total, dtype, "GtFwdOp")
     op = GtFwdOp()
-    test.check(op, *test.gen_inputs(), compare=_bool_compare)
+    test.check(op, *test.gen_inputs())
 
 
 class LtFixture(FixtureBase):
@@ -108,9 +94,9 @@ class LtFixture(FixtureBase):
 
 @LtFixture
 def test_lt_op(n_total: int, dtype: torch.dtype) -> None:
-    test = ComparisonTest(n_total, dtype, torch.lt)
+    test = ComparisonTest(n_total, dtype, "LtFwdOp")
     op = LtFwdOp()
-    test.check(op, *test.gen_inputs(), compare=_bool_compare)
+    test.check(op, *test.gen_inputs())
 
 
 class GeFixture(FixtureBase):
@@ -128,9 +114,9 @@ class GeFixture(FixtureBase):
 
 @GeFixture
 def test_ge_op(n_total: int, dtype: torch.dtype) -> None:
-    test = ComparisonTest(n_total, dtype, torch.ge)
+    test = ComparisonTest(n_total, dtype, "GeFwdOp")
     op = GeFwdOp()
-    test.check(op, *test.gen_inputs(), compare=_bool_compare)
+    test.check(op, *test.gen_inputs())
 
 
 class LeFixture(FixtureBase):
@@ -148,18 +134,13 @@ class LeFixture(FixtureBase):
 
 @LeFixture
 def test_le_op(n_total: int, dtype: torch.dtype) -> None:
-    test = ComparisonTest(n_total, dtype, torch.le)
+    test = ComparisonTest(n_total, dtype, "LeFwdOp")
     op = LeFwdOp()
-    test.check(op, *test.gen_inputs(), compare=_bool_compare)
+    test.check(op, *test.gen_inputs())
 
 
 # Broadcast pattern tests for all comparison ops (L3)
 
-_BROADCAST_PATTERNS = [
-    ((2, 64, 128), (1, 1, 128)),  # bias-add
-    ((2, 64, 128), (2, 64, 1)),  # row broadcast
-    ((64, 128), (1, 1)),  # scalar broadcast
-]
 
 _CMP_OPS = [
     ("eq", EqFwdOp, torch.eq),
@@ -172,23 +153,30 @@ _CMP_OPS = [
 
 
 class ComparisonBroadcastFixture(FixtureBase):
-    PARAMS = [
-        (
-            "op_name, op_cls, ref_fn, a_shape, b_shape",
-            [
-                pytest.param(
-                    name,
-                    cls,
-                    ref,
-                    a_s,
-                    b_s,
-                    marks=pytest.mark.smoke if i == 0 and j == 0 else pytest.mark.full,
-                )
-                for j, (name, cls, ref) in enumerate(_CMP_OPS)
-                for i, (a_s, b_s) in enumerate(_BROADCAST_PATTERNS)
-            ],
-        ),
-    ]
+    @classmethod
+    def get_params(cls):
+        patterns = [
+            ((2, 64, 128), (1, 1, 128)),  # bias-add
+            ((2, 64, 128), (2, 64, 1)),  # row broadcast
+            ((64, 128), (1, 1)),  # scalar broadcast
+        ]
+        return [
+            (
+                "op_name, op_cls, ref_fn, a_shape, b_shape",
+                [
+                    pytest.param(
+                        name,
+                        cls,
+                        ref,
+                        a_s,
+                        b_s,
+                        marks=pytest.mark.smoke if i == 0 and j == 0 else pytest.mark.full,
+                    )
+                    for j, (name, cls, ref) in enumerate(_CMP_OPS)
+                    for i, (a_s, b_s) in enumerate(patterns)
+                ],
+            ),
+        ]
 
 
 @ComparisonBroadcastFixture
@@ -200,13 +188,11 @@ def test_comparison_broadcast(
     b_shape,
 ) -> None:
     dtype = torch.float16
-    a = torch.randn(*a_shape, dtype=dtype).ptpu()
-    b = torch.randn(*b_shape, dtype=dtype).ptpu()
+    a = torch.randn(*a_shape, dtype=dtype, device=run_device())
+    b = torch.randn(*b_shape, dtype=dtype, device=run_device())
     op = op_cls()
-    ref = ref_fn(a, b)
-    with torch.no_grad():
-        out = op(a, b)
-    _bool_compare(out, ref)
+    test = ComparisonTest(a.numel(), a.dtype, op_cls.__name__)
+    test.check(op, a, b)
 
 
 # L4 edge case: eq with some equal elements
@@ -226,16 +212,16 @@ class EqEdgeCaseFixture(FixtureBase):
 @EqEdgeCaseFixture
 def test_eq_edge_case(n_total: int, dtype: torch.dtype) -> None:
     """L4: eq with known-equal elements at specific positions."""
-    a = torch.randn(n_total, dtype=dtype).ptpu()
+    a = torch.randn(n_total, dtype=dtype, device=run_device())
     b = a.clone()
     # Make some elements differ
-    b[::2] = torch.randn(n_total // 2, dtype=dtype).ptpu()
+    b[::2] = torch.randn(n_total // 2, dtype=dtype, device=run_device())
     op = EqFwdOp()
     ref = torch.eq(a, b)
     with torch.no_grad():
         out = op(a, b)
     assert out.dtype == torch.bool
-    assert torch.equal(out.cpu(), ref.cpu())
+    compare_outputs(out, ref, ElementwiseWorkload(type(op).__name__, (a, b)).verification(*(a, b)))
 
 
 # Per-dtype correctness across the manifest dtype union
@@ -258,8 +244,8 @@ def _gen_int_inputs(n: int, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Ten
         lo, hi = -16, 16
     else:
         lo, hi = -64, 64
-    a = torch.randint(lo, hi, (n,), dtype=dtype, device="ptpu")
-    b = torch.randint(lo, hi, (n,), dtype=dtype, device="ptpu")
+    a = torch.randint(lo, hi, (n,), dtype=dtype, device=run_device())
+    b = torch.randint(lo, hi, (n,), dtype=dtype, device=run_device())
     # Inject some equal positions so eq/ge/le exercise the True branch.
     b[: n // 4] = a[: n // 4]
     return a, b
@@ -280,10 +266,8 @@ def test_comparison_integer_dtype_eq(dtype: torch.dtype) -> None:
     n = 4_096
     a, b = _gen_int_inputs(n, dtype)
     op = EqFwdOp()
-    ref = torch.eq(a, b)
-    with torch.no_grad():
-        out = op(a, b)
-    _bool_compare(out, ref)
+    test = ComparisonTest(a.numel(), a.dtype, "EqFwdOp")
+    test.check(op, a, b)
 
 
 # Op-coverage axis: at a fixed integer dtype, every comparison op must
@@ -308,10 +292,8 @@ def test_comparison_op_int32(op_cls, ref_fn) -> None:
     n = 4_096
     a, b = _gen_int_inputs(n, torch.int32)
     op = op_cls()
-    ref = ref_fn(a, b)
-    with torch.no_grad():
-        out = op(a, b)
-    _bool_compare(out, ref)
+    test = ComparisonTest(a.numel(), a.dtype, op_cls.__name__)
+    test.check(op, a, b)
 
 
 class ComparisonBoolDtypeFixture(FixtureBase):
@@ -330,13 +312,11 @@ class ComparisonBoolDtypeFixture(FixtureBase):
 def test_comparison_bool_dtype(op_cls, ref_fn) -> None:
     """Comparison ops match torch reference on torch.bool inputs."""
     n = 4_096
-    a = torch.randint(0, 2, (n,), device="ptpu").to(torch.bool)
-    b = torch.randint(0, 2, (n,), device="ptpu").to(torch.bool)
+    a = torch.randint(0, 2, (n,), device=run_device()).to(torch.bool)
+    b = torch.randint(0, 2, (n,), device=run_device()).to(torch.bool)
     op = op_cls()
-    ref = ref_fn(a, b)
-    with torch.no_grad():
-        out = op(a, b)
-    _bool_compare(out, ref)
+    test = ComparisonTest(a.numel(), a.dtype, op_cls.__name__)
+    test.check(op, a, b)
 
 
 # Dtype rejection tests (dtypes outside the manifest dtype union: fp8 and
@@ -371,27 +351,19 @@ def test_comparison_rejects_unsupported_dtype(
     """Comparison ops reject dtypes outside the supported set (e.g. complex)."""
     shape = (16,)
     op = op_cls()
-    x = torch.zeros(shape, device="ptpu", dtype=dtype)
-    with pytest.raises(ValueError, match="has dtype|does not support dtype"):
+    x = torch.zeros(shape, device=run_device(), dtype=dtype)
+    with pytest.raises(ValueError, match="dtype is outside"):
         op(x, x)
 
 
+@pytest.mark.in_tree_kernels
 @pytest.mark.smoke
-@pytest.mark.parametrize("strategy", ["explicit_parallel", "direct"])
-def test_comparison_bool_result_per_strategy(strategy: str) -> None:
-    """Every strategy returns the same bool tensor, whatever it stores underneath.
-
-    Every strategy but ``direct`` now writes an int8 buffer the op views back as
-    bool; only ``register_copy`` used to.
-    """
-    from tileops.kernels.elementwise import GtFwdKernel
-
-    shape = (4096,)
-    a = torch.randn(shape, device="ptpu", dtype=torch.float16)
-    b = torch.randn(shape, device="ptpu", dtype=torch.float16)
-    out = GtFwdKernel(shape, shape, torch.float16, config={"strategy": strategy}).forward(a, b)
-    assert out.dtype == torch.bool
-    assert torch.equal(out, torch.gt(a, b))
+def test_comparison_bool_result_from_int8_storage() -> None:
+    """A broadcast comparison writes an int8 buffer the op returns as a bool tensor."""
+    a = torch.randn(2, 64, 128, device=run_device(), dtype=torch.float16)
+    b = torch.randn(1, 1, 128, device=run_device(), dtype=torch.float16)
+    op = GtFwdOp(target=BUILTIN)
+    ComparisonTest(a.numel(), a.dtype, "GtFwdOp").check(op, a, b)
 
 
 @pytest.mark.smoke
@@ -405,8 +377,8 @@ def test_comparison_nan_ordering(dtype: torch.dtype) -> None:
     half formats are where the two can disagree.
     """
     nan = float("nan")
-    a = torch.tensor([nan, nan, 1.0, 1.0, 2.0], device="ptpu", dtype=dtype)
-    b = torch.tensor([nan, 1.0, nan, 1.0, 3.0], device="ptpu", dtype=dtype)
+    a = torch.tensor([nan, nan, 1.0, 1.0, 2.0], device=run_device(), dtype=dtype)
+    b = torch.tensor([nan, 1.0, nan, 1.0, 3.0], device=run_device(), dtype=dtype)
     for op_cls, ref_fn in (
         (EqFwdOp, torch.eq),
         (NeFwdOp, torch.ne),
@@ -415,4 +387,43 @@ def test_comparison_nan_ordering(dtype: torch.dtype) -> None:
         (GtFwdOp, torch.gt),
         (GeFwdOp, torch.ge),
     ):
-        assert torch.equal(op_cls()(a, b), ref_fn(a, b)), op_cls.__name__
+        compare_outputs(
+            op_cls()(a, b),
+            ref_fn(a, b),
+            ElementwiseWorkload(op_cls.__name__, (a, b)).verification(a, b),
+        )
+
+
+_RUN_BROADCAST_CASES = [
+    pytest.param(
+        (8, 1024), (1, 1024), torch.float32, id="full-block-a-streams", marks=pytest.mark.smoke
+    ),
+    pytest.param(
+        (1, 1024), (8, 1024), torch.float32, id="full-block-b-streams", marks=pytest.mark.smoke
+    ),
+    pytest.param(
+        (8, 1024), (1, 1024), torch.float16, id="full-block-plain", marks=pytest.mark.smoke
+    ),
+    pytest.param(
+        (2, 8, 384), (8, 1), torch.float32, id="vector-grid-streams", marks=pytest.mark.smoke
+    ),
+    pytest.param((2, 517), (1, 517), torch.float32, id="ragged-row", marks=pytest.mark.smoke),
+]
+
+
+@pytest.mark.in_tree_kernels
+@pytest.mark.parametrize("a_shape, b_shape, dtype", _RUN_BROADCAST_CASES)
+def test_comparison_run_broadcast(a_shape, b_shape, dtype) -> None:
+    """A row broadcast whose bool result each thread writes from its own contiguous run."""
+    a = torch.randn(*a_shape, dtype=dtype, device=run_device())
+    b = torch.randn(*b_shape, dtype=dtype, device=run_device())
+    ComparisonTest(a.numel(), a.dtype, "LtFwdOp").check(LtFwdOp(target=BUILTIN), a, b)
+
+
+@pytest.mark.in_tree_kernels
+@pytest.mark.smoke
+def test_comparison_offset_view() -> None:
+    """Operands starting off a 16-byte boundary are read in vectors only after a copy."""
+    a = torch.randn(4097, dtype=torch.float32, device=run_device())[1:]
+    b = torch.randn(4097, dtype=torch.float32, device=run_device())[1:]
+    ComparisonTest(a.numel(), a.dtype, "LtFwdOp").check(LtFwdOp(target=BUILTIN), a, b)

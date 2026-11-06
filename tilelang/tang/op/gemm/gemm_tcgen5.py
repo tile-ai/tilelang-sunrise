@@ -120,6 +120,33 @@ def _access_ptr(region, access: str):
     return T.access_ptr(region, access, extent=prod(extents), ignore_last_ndim=2)
 
 
+def _sliced_region_geometry(region, buffer, name: str):
+    """Describe how a 2-D operand region fails to cover its whole buffer.
+
+    Returns ``(origin, extent, want)`` (each a 2-element list) when the region
+    is a proper slice of the buffer, and ``None`` when it covers the whole thing.
+    A non-constant origin/extent also returns ``None``: dynamic geometry is not
+    this check's business, it fails later inside ``_access_ptr`` / layout
+    inference with its own message.
+    """
+    ranges = list(region.region[-2:])
+    shapes = list(buffer.shape[-2:])
+    if len(ranges) != 2 or len(shapes) != 2:
+        return None
+    origin: list[int] = []
+    extent: list[int] = []
+    want: list[int] = []
+    for rng, dim in zip(ranges, shapes):
+        if not isinstance(rng.min, (int, tirx.IntImm)) or not isinstance(rng.extent, (int, tirx.IntImm)):
+            return None
+        origin.append(_as_const_int(rng.min, f"{name} region origin"))
+        extent.append(_as_const_int(rng.extent, f"{name} region extent"))
+        want.append(_as_const_int(dim, f"{name} buffer extent"))
+    if origin == [0, 0] and extent == want:
+        return None
+    return origin, extent, want
+
+
 def _completion_mbarrier(mbar):
     """Normalize the ``mbar=`` argument to a barrier expression or None.
 
@@ -217,12 +244,13 @@ class GemmTangTCGEN5(TangGemmBase):
         Note that staging a fragment into shared does not currently work
         either: the operand has to be filled by the swizzle-aware bulk copy
         from global, and a shared buffer written by an in-kernel copy is read
-        back wrong by the MMA. That is a separate gap, tracked in the S3 TODO
-        list; the error below deliberately does not suggest it as a fix.
+        back wrong by the MMA. The error below therefore does not suggest it as
+        a fix.
 
         A in tensor memory (the TS variant) goes through mma_atmem instead and
         is validated by _check_ts_constraints.
         """
+        self._check_operand_region_is_whole()
         if self.is_gemm_ts():
             self._check_ts_constraints()
             return
@@ -234,6 +262,43 @@ class GemmTangTCGEN5(TangGemmBase):
                 "the operand must additionally be filled by a bulk copy from "
                 "global -- a shared buffer written by an in-kernel copy is not "
                 "yet read back correctly by the MMA."
+            )
+
+    def _check_operand_region_is_whole(self) -> None:
+        """Reject an A/B operand region that is a slice of its buffer.
+
+        stcuv2 derives the data descriptor from the *buffer* geometry: the
+        emitter sets ``lbo = stride * element_bytes`` and picks the swizzle from
+        the dtype/majorness, and the descriptor address is the buffer base
+        (``_access_ptr`` keeps only ``prod(extents)`` of the region, with
+        ``ignore_last_ndim=2``). A region origin therefore never reaches the MMA:
+        a sliced operand would describe the whole buffer rather than the
+        requested region. Reject it before lowering.
+        """
+        # TS K origins are checked separately by lower(); shared operand
+        # regions must cover the whole buffer.
+        a_k_window_allowed = self.is_gemm_ts()
+        for name, region, buf in (
+            ("A", self.ARegion, self.A),
+            ("B", self.BRegion, self.B),
+        ):
+            if region is None:
+                continue
+            mismatch = _sliced_region_geometry(region, buf, name)
+            if mismatch is None:
+                continue
+            origin, extent, want = mismatch
+            if a_k_window_allowed and name == "A" and origin[0] == 0 and extent[0] == want[0]:
+                continue
+            raise ValueError(
+                f"TANG stcuv2 tcgen5 GEMM: operand {name} is a slice of its "
+                f"buffer -- last two dims take origin {origin} / extent "
+                f"{extent}, but the buffer is {want}. The stcuv2 data "
+                "descriptor is built from the buffer geometry and its address "
+                "is the buffer base, so the slice origin never reaches the MMA "
+                "and the kernel would silently compute on the whole buffer. Stage the "
+                "operand into a buffer of its own shape, or size the GEMM's own "
+                "M/N/K to the sub-tile you need."
             )
 
     def _check_ts_constraints(self) -> None:
@@ -254,11 +319,7 @@ class GemmTangTCGEN5(TangGemmBase):
         fragment route has no 32-bit entry point today: an unmarked
         `T.copy(fragment, tmem)` of a 32-bit buffer writes the *accumulator*
         layout and the MMA reads garbage, and the `tang_tmem_a_operand` marker
-        that would override this is not yet exposed by any frontend primitive
-        (tracked as T9 in the doc below).
-
-        See docs/s3_tmem_a_operand_atmem_layout.md for the full constraint list
-        and the open items.
+        that would override this is not yet exposed by any frontend primitive.
         """
         if self.B.scope() not in ("shared", "shared.dyn"):
             raise ValueError(f"TANG stcuv2 tcgen5 GEMM with A in tensor memory needs B in shared memory, got B in '{self.B.scope()}'.")
@@ -333,6 +394,8 @@ class GemmTangTCGEN5(TangGemmBase):
             _check_operand_row_bytes("A", k_const, self.A.dtype.bits)
         _check_operand_row_bytes("B", k_const, self.B.dtype.bits)
         thread_nums = _as_const_int(thread_bounds.extent, "thread extent")
+        # Warp-specialized regions use thread indices relative to the region.
+        region_thread_var = thread_var - thread_bounds.min
         warp_m, warp_n = self._warp_partition(target, thread_nums)
         warp_m, warp_n = self._mn_major_partition(warp_m, warp_n)
         warp_m, warp_n = self._cap_subtile(warp_m, warp_n)
@@ -381,13 +444,23 @@ class GemmTangTCGEN5(TangGemmBase):
                     "nonzero K origin. Keep the staged A tile whole (K origin "
                     "0)."
                 )
-            return self._lower_ts_python_emitter(a_ptr, b_ptr, c_ptr, mbar, thread_var, mbar_phase_expr)
+            return self._lower_ts_python_emitter(a_ptr, b_ptr, c_ptr, mbar, region_thread_var, mbar_phase_expr)
         elif isinstance(self, GemmBlockScaledMixin):
-            if self.SFARegion is None or self.SFBRegion is None or self.SFTmemRegion is None:
-                raise ValueError("TANG block-scaled GEMM requires scale_a, scale_b and scale_tmem regions")
-            return self._lower_blockscaled_python_emitter(a_ptr, b_ptr, c_ptr, mbar, thread_var, mbar_phase_expr)
+            if self.SFARegion is None or self.SFBRegion is None:
+                raise ValueError("TANG block-scaled GEMM requires scale_a and scale_b regions")
+            if self.SFTmemRegion is None and (
+                not self.is_tcgen05 or self.SFARegion.buffer.scope() != "shared.tmem" or self.SFBRegion.buffer.scope() != "shared.tmem"
+            ):
+                raise ValueError(
+                    "TANG block-scaled GEMM without scale_tmem requires the "
+                    "explicit T.tcgen05_gemm_blockscaled interface with SFA "
+                    "and SFB in shared.tmem"
+                )
+            return self._lower_blockscaled_python_emitter(a_ptr, b_ptr, c_ptr, mbar, region_thread_var, mbar_phase_expr)
         else:
-            return self._lower_ss_python_emitter(a_ptr, b_ptr, c_ptr, warp_m, warp_n, mbar, thread_var, mbar_phase_expr, a_format, b_format)
+            return self._lower_ss_python_emitter(
+                a_ptr, b_ptr, c_ptr, warp_m, warp_n, mbar, region_thread_var, mbar_phase_expr, a_format, b_format
+            )
 
     def _lower_ss_python_emitter(
         self, a_ptr, b_ptr, c_ptr, warp_m, warp_n, mbar, thread_var, mbar_phase_expr=None, a_format=-1, b_format=-1
@@ -412,11 +485,17 @@ class GemmTangTCGEN5BlockScaled(GemmBlockScaledMixin, GemmTangTCGEN5):
         super()._check_operand_scopes()
         if self.A.scope() not in ("shared", "shared.dyn"):
             raise ValueError("TANG block-scaled GEMM requires A in shared memory")
+        if self.SFTmemRegion is None and (self.SFARegion.buffer.scope() != "shared.tmem" or self.SFBRegion.buffer.scope() != "shared.tmem"):
+            raise ValueError("T.tcgen05_gemm_blockscaled requires SFA and SFB in shared.tmem")
         if _as_const_int(self.sf_k_start, "k_start") != 0:
             raise ValueError("TANG block-scaled GEMM requires scale regions sliced to the tile and k_start=0")
-        block = _annotation_int(self.annotations, "tang_scale_block", self.sf_a_granularity_k)
-        if self.sf_a_granularity_k != block or self.sf_b_granularity_k != block:
-            raise ValueError("TANG block-scaled GEMM requires equal A/B scale granularity matching scale_block")
+        if self.SFTmemRegion is None:
+            if self.sf_a_granularity_k != self.sf_b_granularity_k:
+                raise ValueError("TANG explicit block-scaled GEMM requires equal A/B scale granularity")
+        else:
+            block = _annotation_int(self.annotations, "tang_scale_block", self.sf_a_granularity_k)
+            if self.sf_a_granularity_k != block or self.sf_b_granularity_k != block:
+                raise ValueError("TANG block-scaled GEMM requires equal A/B scale granularity matching scale_block")
 
 
 class GemmTangWGMMA(TangGemmBase):

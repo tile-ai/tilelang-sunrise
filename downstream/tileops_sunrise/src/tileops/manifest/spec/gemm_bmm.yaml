@@ -1,0 +1,77 @@
+# Batched GEMM. A shard of the gemm family, kept in its own file because the batched entries share
+# a shape contract the dense ones do not.
+
+# Strict 3D-3D batched matrix multiplication.
+BMMFwdOp:
+  ref_api: "torch.bmm"
+  family: gemm
+  status: implemented
+
+  signature:
+    forall: {B: Dim, M: Dim, N: Dim, K: Dim, T: "DType[float16 | bfloat16]"}
+    inputs:
+      a: {dtype: T, shape: "[B, M, K]"}
+      b: {dtype: T, shape: "[B, K, N]"}
+    outputs:
+      d: {dtype: T, shape: "[B, M, N]"}
+
+  workloads:
+  # A representative sweep across small/large batch counts and decode/prefill
+  - {B: 8, M: 128, N: 128, K: 128, dtype_cases: [{T: float16}, {T: bfloat16}], label: square-128}
+  - {B: 8, M: 1024, N: 1024, K: 1024, dtype_cases: [{T: float16}, {T: bfloat16}], label: square-1k}
+  - {B: 16, M: 512, N: 512, K: 512, dtype_cases: [{T: float16}, {T: bfloat16}], label: square-512}
+  - {B: 32, M: 256, N: 256, K: 256, dtype_cases: [{T: float16}, {T: bfloat16}], label: square-256}
+  - {B: 4, M: 4096, N: 4096, K: 4096, dtype_cases: [{T: bfloat16}], label: square-4k}
+  - {B: 8, M: 2048, N: 2048, K: 2048, dtype_cases: [{T: float16}, {T: bfloat16}], label: square-2k}
+  - {B: 64, M: 128, N: 2048, K: 128, dtype_cases: [{T: float16}, {T: bfloat16}], label: mha-decode-qk}
+  - {B: 64, M: 128, N: 128, K: 2048, dtype_cases: [{T: float16}, {T: bfloat16}], label: mha-decode-pv}
+  - {B: 128, M: 512, N: 512, K: 2048, dtype_cases: [{T: bfloat16}], label: moe-prefill}
+
+  roofline:
+    flops: "2 * B * M * N * K"
+
+# Strict 3D-3D batched FP8 GEMM with per-tensor scaling. A single fp32 scalar per operand is shared
+# across the whole batch, mirroring flashinfer.bmm_fp8's A_scale / B_scale signature 1:1.
+BMMFP8FwdOp:
+  family: gemm
+  status: implemented
+  ref_api: flashinfer.gemm.bmm_fp8
+
+  signature:
+    types:
+      # trans_b swaps b's last two axes.
+      BLayout:
+        params: {t: Bool, B: Dim, K: Dim, N: Dim}
+        match: t
+        cases:
+        - {when: false, is: "[B, K, N]"}
+        - {when: true, is: "[B, N, K]"}
+    forall: {B: Dim, M: Dim, N: Dim, K: Dim, T: "DType[float8_e4m3fn]"}
+    params:
+      # flashinfer takes out_dtype with no default; bfloat16 is the dtype its callers pass.
+      out_dtype: {type: "bfloat16 | float16", default: bfloat16}
+      trans_b: {type: bool, default: false}
+    inputs:
+      a: {dtype: T, shape: "[B, M, K]"}
+      b: {dtype: T, shape: "BLayout[trans_b, B, K, N]"}
+      a_scale: {dtype: float32, shape: "[]"}
+      b_scale: {dtype: float32, shape: "[]"}
+    outputs:
+      d: {dtype: out_dtype, shape: "[B, M, N]"}
+
+  workloads:
+  - {B: 4, M: 1024, N: 1024, K: 1024, trans_b: false, dtype_cases: [{T: float8_e4m3fn}], label: square-1k}
+  - {B: 8, M: 2048, N: 2048, K: 2048, trans_b: false, dtype_cases: [{T: float8_e4m3fn}], label: square-2k}
+  - {B: 32, M: 128, N: 128, K: 2048, trans_b: false, dtype_cases: [{T: float8_e4m3fn}], label: mha-decode-pv}
+  - {B: 64, M: 128, N: 2048, K: 128, trans_b: false, dtype_cases: [{T: float8_e4m3fn}], label: mha-decode-qk}
+  - {B: 128, M: 512, N: 512, K: 2048, trans_b: false, dtype_cases: [{T: float8_e4m3fn}], label: moe-prefill}
+  - {B: 4, M: 1024, N: 1024, K: 1024, trans_b: true, dtype_cases: [{T: float8_e4m3fn}], label: square-1k-nk}
+  - {B: 8, M: 2048, N: 2048, K: 2048, trans_b: true, dtype_cases: [{T: float8_e4m3fn}], label: square-2k-nk}
+  - {B: 32, M: 128, N: 128, K: 2048, trans_b: true, dtype_cases: [{T: float8_e4m3fn}], label: mha-decode-pv-nk}
+  - {B: 64, M: 128, N: 2048, K: 128, trans_b: true, dtype_cases: [{T: float8_e4m3fn}], label: mha-decode-qk-nk}
+  - {B: 128, M: 512, N: 512, K: 2048, trans_b: true, dtype_cases: [{T: float8_e4m3fn}], label: moe-prefill-nk}
+  - {B: 4, M: 1024, N: 1024, K: 1024, out_dtype: float16, trans_b: false, dtype_cases: [{T: float8_e4m3fn}], label: square-1k}
+
+  roofline:
+    # The contraction, and the epilogue's two multiplies of each result by a_scale and b_scale.
+    flops: "2 * B * M * N * K + 2 * B * M * N"

@@ -10,7 +10,7 @@ Verifies:
   - TileOPs expert_map local filtering correctness in real multi-GPU setup
   - Each rank owns E_global/world_size experts, computes partial output
   - All-reduce sum matches single-GPU full computation
-  - SharedFusedMoE with shared expert in multi-GPU EP mode
+  - FusedMoESharedExpertFwdOp with shared expert in multi-GPU EP mode
   - TileOPs vs vLLM multi-GPU EP correctness
 """
 
@@ -18,11 +18,17 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from tests.test_base import FixtureBase
-from tileops.ops.moe import FusedMoeFwdOp, SharedFusedMoE
-from tileops.ops.moe.abc import PrepareResult
-from tileops.ops.moe.prepare_finalize.no_dp_ep import MoEPrepareAndFinalizeNoDPEP
-from tileops.ops.moe.routed_expert.fused_routed_expert import FusedMoEExpertsFwdOp
+from tests.workload_test_base import FixtureBase
+from tileops._ops.moe import (
+    FusedMoEFwdOp,
+    FusedMoESharedExpertFwdOp,
+    FusedTopKFwdOp,
+    SharedExpertMLPFwdOp,
+)
+from tileops._ops.moe.abc import PrepareResult
+from tileops._ops.moe.prepare_finalize.no_dp_ep import MoEPrepareAndFinalizeNoDPEP
+from tileops._ops.moe.routed_expert.fused_routed_expert import FusedMoEExpertsFwdOp
+from workloads.device import run_device_available, run_device_is_cuda
 
 
 class _LocalExpertPrepare(MoEPrepareAndFinalizeNoDPEP):
@@ -42,11 +48,22 @@ class _LocalExpertPrepare(MoEPrepareAndFinalizeNoDPEP):
         )
 
 
-# Every test in this module is a multi-GPU / distributed Expert-Parallel test:
+def _local_moe(hidden, gating, w_gate_up, w_down, correction_bias, expert_map, top_k):
+    """Compose public stages where global routing and local expert shapes differ."""
+    routing = FusedTopKFwdOp(top_k=top_k, scoring_func="sigmoid", renormalize=True)
+    weights, ids = routing(gating, correction_bias)
+    prepared = _LocalExpertPrepare(expert_map).prepare(hidden, weights, ids, w_gate_up.shape[0])
+    experts = FusedMoEExpertsFwdOp(routed_scaling_factor=2.827)
+    output = hidden.new_empty(hidden.shape)
+    experts(output, prepared.hidden_q, w_gate_up, w_down, prepared.topk_weights, prepared.topk_ids)
+    return output
+
+
+# The four distributed tests require the original multi-GPU setup:
 # it requires torchrun + NCCL + >=2 CUDA GPUs (dist.init_process_group(backend=
 # "nccl"), dist.all_reduce, cuda:{rank}), none of which exist on S2 (TANG/PTU).
-# S2 does not support multi-GPU test cases, so skip the whole module.
-pytestmark = pytest.mark.skip(reason="S2上不支持多卡测试")
+# Keep the original S2 skip on these distributed cases.
+_requires_multi_gpu = pytest.mark.skip(reason="S2上不支持多卡测试")
 
 # vLLM optional import
 try:
@@ -63,7 +80,7 @@ def setup_distributed():
     if not dist.is_available():
         pytest.skip("torch.distributed not available")
 
-    if not torch.cuda.is_available():
+    if not run_device_is_cuda() or not run_device_available():
         pytest.skip("CUDA not available")
 
     if not dist.is_initialized():
@@ -95,7 +112,7 @@ class DistributedFixture(FixtureBase):
 
 
 class SharedDistributedFixture(FixtureBase):
-    """Fixture for SharedFusedMoE distributed EP tests."""
+    """Fixture for FusedMoESharedExpertFwdOp distributed EP tests."""
 
     PARAMS = [
         (
@@ -121,6 +138,7 @@ class SharedDistributedFixture(FixtureBase):
 
 
 @DistributedFixture
+@_requires_multi_gpu
 def test_kimi_k2_ep_distributed(T, E_global, K, H, F, world_size):
     """Multi-GPU EP test with Kimi K2 config.
 
@@ -133,12 +151,12 @@ def test_kimi_k2_ep_distributed(T, E_global, K, H, F, world_size):
         pytest.skip(f"This test requires {world_size} GPUs, got {actual_world_size}")
 
     dtype = torch.bfloat16
-    dev = f"cuda:{rank}"
+    dev = torch.device(torch.cuda.__name__.removeprefix("torch."), rank)
 
     # All ranks use same seed for reproducibility
     torch.manual_seed(42)
     hidden = torch.randn(T, H, dtype=dtype, device=dev)
-    gating = torch.randn(T, E_global, dtype=dtype, device=dev)
+    gating = torch.randn(T, E_global, dtype=torch.float32, device=dev)
     correction_bias = torch.randn(E_global, dtype=torch.float32, device=dev) * 0.1
 
     # Each rank owns E_local experts
@@ -159,32 +177,18 @@ def test_kimi_k2_ep_distributed(T, E_global, K, H, F, world_size):
     expert_map = torch.full((E_global,), -1, dtype=torch.int32, device=dev)
     expert_map[start_expert:end_expert] = torch.arange(E_local, dtype=torch.int32, device=dev)
 
-    # TileOPs: local computation with expert_map
-    op_local = FusedMoeFwdOp(
-        num_tokens=T,
-        num_experts=E_global,
-        top_k=K,
-        hidden_size=H,
-        ffn_size=F,
-        scoring_func="sigmoid",
-        renormalize=True,
-        routed_scaling_factor=2.827,
-        prepare_finalize=_LocalExpertPrepare(expert_map),
-        experts=FusedMoEExpertsFwdOp(T, E_local, K, H, F, routed_scaling_factor=2.827),
+    # Global routing is separate from the rank-local experts' E dimension.
+    out_local = _local_moe(
+        hidden, gating, w_gate_up_local, w_down_local, correction_bias, expert_map, K
     )
-    out_local = op_local(hidden, gating, w_gate_up_local, w_down_local, correction_bias)
 
     # All-reduce to sum partial outputs
     dist.all_reduce(out_local, op=dist.ReduceOp.SUM)
 
     # Rank-0 computes full reference and compares
     if rank == 0:
-        op_full = FusedMoeFwdOp(
-            num_tokens=T,
-            num_experts=E_global,
+        op_full = FusedMoEFwdOp(
             top_k=K,
-            hidden_size=H,
-            ffn_size=F,
             scoring_func="sigmoid",
             renormalize=True,
             routed_scaling_factor=2.827,
@@ -201,8 +205,9 @@ def test_kimi_k2_ep_distributed(T, E_global, K, H, F, world_size):
 
 
 @SharedDistributedFixture
+@_requires_multi_gpu
 def test_shared_fused_moe_ep_distributed(T, E_global, K, H, F, shared_F, world_size):
-    """Multi-GPU EP test for SharedFusedMoE with shared expert.
+    """Multi-GPU EP test for FusedMoESharedExpertFwdOp with shared expert.
 
     Verifies: sum(rank_routed_outputs) + shared_output == full_output
     """
@@ -212,12 +217,12 @@ def test_shared_fused_moe_ep_distributed(T, E_global, K, H, F, shared_F, world_s
         pytest.skip(f"This test requires {world_size} GPUs, got {actual_world_size}")
 
     dtype = torch.bfloat16
-    dev = f"cuda:{rank}"
+    dev = torch.device(torch.cuda.__name__.removeprefix("torch."), rank)
 
     # All ranks use same seed
     torch.manual_seed(42)
     hidden = torch.randn(T, H, dtype=dtype, device=dev)
-    gating = torch.randn(T, E_global, dtype=dtype, device=dev)
+    gating = torch.randn(T, E_global, dtype=torch.float32, device=dev)
     correction_bias = torch.randn(E_global, dtype=torch.float32, device=dev) * 0.1
 
     # Each rank owns E_local experts
@@ -242,28 +247,9 @@ def test_shared_fused_moe_ep_distributed(T, E_global, K, H, F, shared_F, world_s
     shared_w_gate_up = torch.randn(shared_F * 2, H, dtype=dtype, device=dev) * 0.02
     shared_w_down = torch.randn(H, shared_F, dtype=dtype, device=dev) * 0.02
 
-    # TileOPs: local computation with expert_map + shared expert (tp_size=1, no TP on shared)
-    op_local = SharedFusedMoE(
-        num_tokens=T,
-        num_experts=E_global,
-        top_k=K,
-        hidden_size=H,
-        ffn_size=F,
-        scoring_func="sigmoid",
-        renormalize=True,
-        routed_scaling_factor=2.827,
-        prepare_finalize=_LocalExpertPrepare(expert_map),
-        experts=FusedMoEExpertsFwdOp(T, E_local, K, H, F, routed_scaling_factor=2.827),
-        shared_ffn_size=shared_F,
-    )
-    shared_out, routed_out_local = op_local(
-        hidden,
-        gating,
-        w_gate_up_local,
-        w_down_local,
-        correction_bias,
-        shared_w_gate_up=shared_w_gate_up,
-        shared_w_down=shared_w_down,
+    shared_out = SharedExpertMLPFwdOp()(hidden, shared_w_gate_up, shared_w_down)
+    routed_out_local = _local_moe(
+        hidden, gating, w_gate_up_local, w_down_local, correction_bias, expert_map, K
     )
 
     # All-reduce routed output
@@ -271,16 +257,11 @@ def test_shared_fused_moe_ep_distributed(T, E_global, K, H, F, shared_F, world_s
 
     # Rank-0 computes full reference
     if rank == 0:
-        op_full = SharedFusedMoE(
-            num_tokens=T,
-            num_experts=E_global,
+        op_full = FusedMoESharedExpertFwdOp(
             top_k=K,
-            hidden_size=H,
-            ffn_size=F,
             scoring_func="sigmoid",
             renormalize=True,
             routed_scaling_factor=2.827,
-            shared_ffn_size=shared_F,
         )
         shared_out_full, routed_out_full = op_full(
             hidden,
@@ -308,6 +289,7 @@ def test_shared_fused_moe_ep_distributed(T, E_global, K, H, F, shared_F, world_s
 
 
 @DistributedFixture
+@_requires_multi_gpu
 def test_fused_moe_vs_vllm_distributed(T, E_global, K, H, F, world_size):
     """Multi-GPU EP test: TileOPs (expert_map) vs vLLM (single-GPU baseline).
 
@@ -324,12 +306,12 @@ def test_fused_moe_vs_vllm_distributed(T, E_global, K, H, F, world_size):
         pytest.skip(f"This test requires {world_size} GPUs, got {actual_world_size}")
 
     dtype = torch.bfloat16
-    dev = f"cuda:{rank}"
+    dev = torch.device(torch.cuda.__name__.removeprefix("torch."), rank)
 
     # All ranks use same seed
     torch.manual_seed(42)
     hidden = torch.randn(T, H, dtype=dtype, device=dev)
-    gating = torch.randn(T, E_global, dtype=dtype, device=dev)
+    gating = torch.randn(T, E_global, dtype=torch.float32, device=dev)
     correction_bias = torch.randn(E_global, dtype=torch.float32, device=dev) * 0.1
 
     # Each rank owns E_local experts
@@ -351,25 +333,15 @@ def test_fused_moe_vs_vllm_distributed(T, E_global, K, H, F, world_size):
     expert_map[start_expert:end_expert] = torch.arange(E_local, dtype=torch.int32, device=dev)
 
     # Compute routing (same for both)
-    from tileops.ops.moe import FusedTopKOp
+    from tileops._ops.moe import FusedTopKFwdOp
 
-    fk = FusedTopKOp(top_k=K, scoring_func="sigmoid", renormalize=True)
+    fk = FusedTopKFwdOp(top_k=K, scoring_func="sigmoid", renormalize=True)
     topk_weights, topk_ids = fk(gating, correction_bias)
 
     # ========== TileOPs: expert_map local filtering ==========
-    op_tileops = FusedMoeFwdOp(
-        num_tokens=T,
-        num_experts=E_global,
-        top_k=K,
-        hidden_size=H,
-        ffn_size=F,
-        scoring_func="sigmoid",
-        renormalize=True,
-        routed_scaling_factor=2.827,
-        prepare_finalize=_LocalExpertPrepare(expert_map),
-        experts=FusedMoEExpertsFwdOp(T, E_local, K, H, F, routed_scaling_factor=2.827),
+    out_tileops = _local_moe(
+        hidden, gating, w_gate_up_local, w_down_local, correction_bias, expert_map, K
     )
-    out_tileops = op_tileops(hidden, gating, w_gate_up_local, w_down_local, correction_bias)
     dist.all_reduce(out_tileops, op=dist.ReduceOp.SUM)
 
     # ========== vLLM: use fused_moe with full weights on rank-0 only ==========
@@ -394,6 +366,7 @@ def test_fused_moe_vs_vllm_distributed(T, E_global, K, H, F, world_size):
 
 
 @DistributedFixture
+@_requires_multi_gpu
 def test_fused_moe_vs_vllm_ep_layer(T, E_global, K, H, F, world_size):
     """Multi-GPU EP test: TileOPs vs vLLM with expert_map simulation.
 
@@ -411,12 +384,12 @@ def test_fused_moe_vs_vllm_ep_layer(T, E_global, K, H, F, world_size):
         pytest.skip(f"This test requires {world_size} GPUs, got {actual_world_size}")
 
     dtype = torch.bfloat16
-    dev = f"cuda:{rank}"
+    dev = torch.device(torch.cuda.__name__.removeprefix("torch."), rank)
 
     # All ranks use same seed
     torch.manual_seed(42)
     hidden = torch.randn(T, H, dtype=dtype, device=dev)
-    gating = torch.randn(T, E_global, dtype=dtype, device=dev)
+    gating = torch.randn(T, E_global, dtype=torch.float32, device=dev)
     correction_bias = torch.randn(E_global, dtype=torch.float32, device=dev) * 0.1
 
     # Each rank owns E_local experts
@@ -438,25 +411,15 @@ def test_fused_moe_vs_vllm_ep_layer(T, E_global, K, H, F, world_size):
     expert_map[start_expert:end_expert] = torch.arange(E_local, dtype=torch.int32, device=dev)
 
     # Compute routing
-    from tileops.ops.moe import FusedTopKOp
+    from tileops._ops.moe import FusedTopKFwdOp
 
-    fk = FusedTopKOp(top_k=K, scoring_func="sigmoid", renormalize=True)
+    fk = FusedTopKFwdOp(top_k=K, scoring_func="sigmoid", renormalize=True)
     topk_weights, topk_ids = fk(gating, correction_bias)
 
     # ========== TileOPs: expert_map local filtering ==========
-    op_tileops = FusedMoeFwdOp(
-        num_tokens=T,
-        num_experts=E_global,
-        top_k=K,
-        hidden_size=H,
-        ffn_size=F,
-        scoring_func="sigmoid",
-        renormalize=True,
-        routed_scaling_factor=2.827,
-        prepare_finalize=_LocalExpertPrepare(expert_map),
-        experts=FusedMoEExpertsFwdOp(T, E_local, K, H, F, routed_scaling_factor=2.827),
+    out_tileops = _local_moe(
+        hidden, gating, w_gate_up_local, w_down_local, correction_bias, expert_map, K
     )
-    out_tileops = op_tileops(hidden, gating, w_gate_up_local, w_down_local, correction_bias)
 
     # ========== vLLM: fused_experts with expert_map ==========
     out_vllm = (
@@ -483,3 +446,29 @@ def test_fused_moe_vs_vllm_ep_layer(T, E_global, K, H, F, world_size):
 
     dist.barrier()
     dist.destroy_process_group()
+
+
+@pytest.mark.smoke
+def test_local_expert_prepare_excludes_nonlocal_routes():
+    """EPDispatch gives the local op valid ids and zero weight for foreign routes."""
+    hidden = torch.arange(6, dtype=torch.bfloat16).view(2, 3)
+    weights = torch.tensor([[0.25, 0.75], [0.6, 0.4]], dtype=torch.float32)
+    ids = torch.tensor([[0, 1], [3, 2]], dtype=torch.int32)
+    expert_map = torch.tensor([-1, 0, -1, 1], dtype=torch.int32)
+    prepared = _LocalExpertPrepare(expert_map).prepare(hidden, weights, ids, 2)
+    assert prepared.hidden_q is hidden and prepared.scale is None
+    assert torch.equal(prepared.topk_ids, torch.tensor([[0, 0], [1, 0]], dtype=torch.int32))
+    assert torch.equal(prepared.topk_weights, torch.tensor([[0.0, 0.75], [0.6, 0.0]]))
+
+
+@pytest.mark.smoke
+def test_fused_moe_refuses_global_gating_with_local_weights():
+    """A composite's E binds gating and weights; EP routes before the local experts."""
+    op = FusedMoEFwdOp(top_k=2, scoring_func="sigmoid", renormalize=True)
+    with pytest.raises(ValueError, match="w_gate_up|shape"):
+        op(
+            torch.empty(2, 128, dtype=torch.bfloat16, device="meta"),
+            torch.empty(2, 8, dtype=torch.float32, device="meta"),
+            torch.empty(4, 128, 128, dtype=torch.bfloat16, device="meta"),
+            torch.empty(4, 128, 64, dtype=torch.bfloat16, device="meta"),
+        )

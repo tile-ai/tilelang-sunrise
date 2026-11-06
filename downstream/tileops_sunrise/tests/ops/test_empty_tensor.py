@@ -1,90 +1,146 @@
-"""TileOPs refuses a call whose declared outputs would all be empty.
+"""A call that writes no element runs nothing and returns what torch returns.
 
-One case per distinct shape of the answer, not one per op: the refusal is decided in
-``Op.get_or_build_kernel`` for every family, so a second op of the same shape re-tests
-the same branch.
+The rule is decided in ``Op`` for every family, so the cases cover the shapes of the
+answer rather than the ops: one output or several, a new output or a written tensor, an op
+with or without a compile boundary, and an empty input whose output is not empty.
 """
-
-import re
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from tests.compile_contract import compile_fullgraph
-from tileops.ops.elementwise import AddFwdOp, ReluFwdOp
-from tileops.ops.norm import BatchNormFwdOp, RMSNormFwdOp
-from tileops.ops.reduction import SumFwdOp, VarMeanFwdOp
+from tileops._ops.elementwise import AddFwdOp, ReLUFwdOp
+from tileops._ops.moe import ContiguousLayoutSpec, MoEExpertMLPFwdOp, MoEPostPermuteFwdOp
+from tileops._ops.reduction import SumFwdOp
+from tileops.norm import FusedAddRMSNormFwdOp, InstanceNormFwdOp
+from tileops.quantization import FP8QuantPerTokenGroupFwdOp
+from workloads.device import run_device, run_device_available
+from workloads.numerics import reference_for
 
 pytestmark = [
     pytest.mark.smoke,
-    pytest.mark.skipif(not torch.ptpu.is_available(), reason="PTPU required"),
+    pytest.mark.skipif(not run_device_available(), reason="the run device is not available"),
 ]
 
 DTYPE = torch.float16
 
 
-def _message(op_class_name: str, input_name: str, shape: tuple) -> str:
-    return (
-        f"{op_class_name} does not support an empty tensor: input '{input_name}' "
-        f"has shape {shape}, which holds no elements."
+def _tensor(*shape: int, dtype: torch.dtype = DTYPE) -> torch.Tensor:
+    return torch.randn(*shape, device=run_device()).to(dtype)
+
+
+def _assert_same(actual: object, expected: object) -> None:
+    """Equal structure, shape, dtype and device, and equal values where there are any."""
+    if isinstance(expected, tuple):
+        assert isinstance(actual, tuple) and len(actual) == len(expected)
+        for a, e in zip(actual, expected, strict=True):
+            _assert_same(a, e)
+        return
+    assert (actual.shape, actual.dtype, actual.device) == (
+        expected.shape,
+        expected.dtype,
+        expected.device,
     )
+    if expected.numel():
+        torch.testing.assert_close(actual, expected)
 
 
-@pytest.fixture
-def empty() -> torch.Tensor:
-    return torch.randn(0, 8, device="ptpu", dtype=DTYPE)
+def _post_permute(out: "torch.Tensor | None" = None) -> torch.Tensor:
+    """A routed MoE reduction over no tokens."""
+    op = MoEPostPermuteFwdOp(ContiguousLayoutSpec.tight_physical_psum())
+    weights = torch.empty(0, 2, device=run_device())
+    inverse = torch.empty(0, dtype=torch.int32, device=run_device())
+    return op(_tensor(0, 64), weights, inverse, out=out)
 
 
 @pytest.mark.parametrize(
-    "call, op_class_name, input_name",
+    "call, reference",
     [
-        pytest.param(lambda x: ReluFwdOp()(x), "ReluFwdOp", "input", id="unary"),
-        pytest.param(lambda x: AddFwdOp()(x, x), "AddFwdOp", "input", id="binary"),
-        pytest.param(lambda x: SumFwdOp(dim=1)(x), "SumFwdOp", "x", id="reduce_to_empty"),
         pytest.param(
-            lambda x: RMSNormFwdOp((8,))(x, torch.ones(8, device=x.device, dtype=x.dtype)),
-            "RMSNormFwdOp",
-            "x",
-            id="norm",
+            lambda x: ReLUFwdOp()(x),
+            lambda x: reference_for(torch.relu, x).to(x.device),
+            id="one-output",
         ),
-        pytest.param(lambda x: VarMeanFwdOp(dim=1)(x), "VarMeanFwdOp", "x", id="two_outputs"),
+        pytest.param(
+            lambda x: FusedAddRMSNormFwdOp()(x, x, _tensor(8)),
+            lambda x: (F.rms_norm(x + x, [8]), x + x),
+            id="two-outputs",
+        ),
+        pytest.param(
+            lambda x: FP8QuantPerTokenGroupFwdOp()(x.reshape(0, 4, 1, 2)),
+            lambda x: (
+                torch.empty(0, 4, 1, 2, device=x.device, dtype=torch.float8_e4m3fn),
+                torch.empty(0, 4, 1, device=x.device),
+            ),
+            id="output-dtype",
+        ),
+        pytest.param(
+            lambda x: SumFwdOp(dim=0)(x),
+            lambda x: reference_for(torch.sum, x, dim=0).to(x.device),
+            id="non-empty-output",
+        ),
     ],
 )
-def test_empty_input_is_refused(empty, call, op_class_name, input_name):
-    """The message names the op, the input and its shape."""
-    with pytest.raises(ValueError, match=re.escape(_message(op_class_name, input_name, (0, 8)))):
-        call(empty)
+def test_an_empty_call_returns_what_torch_returns(call, reference):
+    x = _tensor(0, 8)
+    _assert_same(call(x), reference(x))
 
 
-def test_batch_norm_training_is_refused():
-    """An op reading a private multi-output from its kernel is refused like any other."""
-    x = torch.empty(0, 4, 2, 2, device="ptpu", dtype=DTYPE)
-    stat = lambda: torch.zeros(4, device="ptpu")  # noqa: E731
-    with pytest.raises(ValueError, match=re.escape(_message("BatchNormFwdOp", "x", (0, 4, 2, 2)))):
-        BatchNormFwdOp(training=True)(x, stat(), stat(), stat(), stat())
+@pytest.mark.parametrize(
+    "call",
+    [
+        pytest.param(lambda t: ReLUFwdOp(inplace=True)(t), id="written-input"),
+        pytest.param(_post_permute, id="out"),
+    ],
+)
+def test_a_written_empty_tensor_is_returned_as_passed(call):
+    written = _tensor(0, 64)
+    assert call(written) is written
 
 
-def test_compiled_call_is_refused_the_same_way(empty):
-    """The traced path reaches kernel selection too, so it gets the same message."""
-    compiled = compile_fullgraph(ReluFwdOp())
-    assert compiled(torch.randn(4, 8, device="ptpu", dtype=DTYPE)).shape == (4, 8)
-    with pytest.raises(ValueError, match=re.escape(_message("ReluFwdOp", "input", (0, 8)))):
-        compiled(empty)
+def test_an_empty_composite_call_runs_no_sub_op():
+    """An op without a compile boundary decides in its own call, before its sub-ops."""
+    op = MoEExpertMLPFwdOp(ContiguousLayoutSpec.tight_physical_psum())
+    experts, ffn, hidden = 4, 64, 64
+    result = op(
+        _tensor(0, hidden),
+        _tensor(experts, 2 * ffn, hidden),
+        _tensor(experts, hidden, ffn),
+        torch.zeros(experts, dtype=torch.int32, device=run_device()),
+    )
+    _assert_same(result, _tensor(0, hidden))
+    assert not any(op.last_call.stages.values())
 
 
-def test_the_op_s_own_validation_precedes_the_refusal():
-    """``_eager_forward``'s prelude runs before kernel selection, so it reports first."""
-    with pytest.raises(ValueError, match="needs every input on one device"):
-        AddFwdOp()(torch.empty(0, 2), torch.empty(0, 2, device="ptpu"))
+def test_a_written_input_with_elements_still_runs():
+    """A batch of no instances writes the running statistics, as torch writes them."""
+    x = _tensor(0, 4, 8, dtype=torch.float32)
+    ours = torch.zeros(4, device=run_device()), torch.ones(4, device=run_device())
+    theirs = torch.zeros(4, device=run_device()), torch.ones(4, device=run_device())
+    InstanceNormFwdOp()(x, *ours)
+    F.instance_norm(x, *theirs, use_input_stats=True)
+    for a, b in zip(ours, theirs, strict=True):
+        assert reference_for(
+            lambda a, b: (
+                torch.equal(a.isnan(), b.isnan()) and torch.equal(a.nan_to_num(), b.nan_to_num())
+            ),
+            a,
+            b,
+        )
 
 
-def test_the_refusal_precedes_what_the_kernel_states():
-    """The kernel's device statement is made at launch, which this call never reaches."""
-    with pytest.raises(ValueError, match=re.escape(_message("ReluFwdOp", "input", (0, 8)))):
-        ReluFwdOp()(torch.empty(0, 8))
+def test_a_compiled_empty_call_returns_what_torch_returns():
+    compiled = compile_fullgraph(ReLUFwdOp(), fullgraph=True)
+    assert compiled(_tensor(4, 8)).shape == (4, 8)
+    _assert_same(compiled(_tensor(0, 8)), reference_for(torch.relu, _tensor(0, 8)).to(run_device()))
 
 
-def test_an_empty_input_with_a_non_empty_output_is_not_refused(empty):
-    """An input's zero-length axis is legitimate where the op still produces something."""
-    with pytest.raises(ZeroDivisionError):
-        SumFwdOp(dim=0)(empty)
+@pytest.mark.skipif(
+    torch.device(run_device()).type == "cpu",
+    reason="mixes a run-device tensor with a cpu one, so the run device is not cpu",
+)
+def test_an_empty_call_is_still_checked():
+    """The signature's checks run before the call is found to write nothing."""
+    with pytest.raises(ValueError, match="needs every tensor on one device"):
+        AddFwdOp()(torch.empty(0, 2), torch.empty(0, 2, device=run_device()))

@@ -1,100 +1,50 @@
-import torch
-import torch.nn.functional as F
 from typing import Optional
 
-from tile_kernels.moe.scoring import ScoringFunc
+import torch
+import torch.nn.functional as F
+
+from tile_kernels.config import is_ascend
+
+
+def sqrt_softplus_ref(x: torch.Tensor) -> torch.Tensor:
+    """Correctly-rounded fp32 sqrt(softplus(x)) via fp64 on Ascend, fp32 elsewhere."""
+    if x.device.type == 'ptpu':
+        # PTPU has no softplus kernel.
+        return F.softplus(x.cpu()).sqrt().to(x.device)
+    if not is_ascend():
+        return F.softplus(x).sqrt()
+    x_f64 = x.detach().cpu().double()
+    y_f64 = (torch.clamp(x_f64, min=0.0) + torch.log1p(torch.exp(-torch.abs(x_f64)))).sqrt()
+    return y_f64.to(device=x.device, dtype=x.dtype)
 
 
 def stable_topk(scores: torch.Tensor, num_topk: int) -> torch.Tensor:
     _, sorted_indices = torch.sort(scores, dim=1, descending=True, stable=True)
-    return sorted_indices[:, :num_topk].contiguous()
+    topk_idx = sorted_indices[:, :num_topk].contiguous()
+    return topk_idx.as_strided(topk_idx.shape, (num_topk, 1))
 
 
-def topk_sum_and_topk_group_idx(
-    scores: torch.Tensor,
-    num_group_sum_topk: int,
-    num_topk_groups: int,
-) -> torch.Tensor:
-    group_scores_ref = scores.topk(num_group_sum_topk, dim=-1, sorted=False).values.sum(-1)
-    return stable_topk(group_scores_ref, num_topk_groups)
-
-
-def top2_sum_gate(
+def moe_topk_gate_forward(
     logits: torch.Tensor,
-    bias: torch.Tensor,
     num_topk: int,
-    num_topk_groups: int,
-    num_groups: int,
     use_shared_as_routed: bool,
     num_shared_experts: int,
     routed_scaling_factor: float,
     ep_rank: int,
-    num_ep_ranks: int,
-    tp_rank: int,
-    num_tp_ranks: int,
     scoring_func: str,
     mask: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    image_bias: Optional[torch.Tensor] = None,
+    image_token_mask: Optional[torch.Tensor] = None,
     fix_routing_mask: Optional[torch.Tensor] = None,
     to_physical_map: Optional[torch.Tensor] = None,
     logical_count: Optional[torch.Tensor] = None,
     unmapped_topk_idx: Optional[torch.Tensor] = None,
+    out: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """PyTorch reference for top-k expert routing with top-2 sum grouping.
-
-    Args:
-        logits: Raw token-expert logits, shape ``(num_tokens, num_routed_experts)``,
-            ``float32``.
-        bias: Per-expert bias added to scores before ranking, shape
-            ``(num_routed_experts,)``, ``float32``.
-        num_topk: Number of routed experts to select per token.
-        num_topk_groups: Number of expert groups to keep (0 means no grouping).
-        num_groups: Total number of expert groups (0 means no grouping).
-        use_shared_as_routed: Whether shared experts are appended as extra routed
-            slots in the output.
-        num_shared_experts: Number of shared experts.
-        routed_scaling_factor: Multiplicative scaling applied to normalised weights.
-        ep_rank: Expert-parallelism rank of this process.
-        num_ep_ranks: Total number of expert-parallelism ranks.
-        tp_rank: Tensor-parallelism rank of this process.
-        num_tp_ranks: Total number of tensor-parallelism ranks.
-        scoring_func: One of ``'sigmoid'``, ``'sqrtsoftplus'``, ``'softmax'``.
-        mask: Boolean mask, shape ``(num_tokens,)``.  ``True`` → route the token,
-            ``False`` → fill outputs with ``-1`` / ``0``.
-        fix_routing_mask: Boolean mask, shape ``(num_tokens,)``.  When ``True`` for
-            a token, use the indices already stored in *unmapped_topk_idx* instead of
-            running the selection algorithm.
-        to_physical_map: Logical-to-physical expert map, shape
-            ``(num_logical_experts, num_duplicate_experts + 1)``, ``int32``.
-        logical_count: Number of active duplicates per logical expert, shape
-            ``(num_logical_experts,)``, ``int32``.
-        unmapped_topk_idx: Output tensor (updated in-place) for unmasked expert
-            indices, shape ``(num_tokens, num_topk)``, ``int64``.
-
-    Returns:
-        topk_idx: Selected (post-EP/TP masking) expert indices, shape
-            ``(num_tokens, num_topk + num_shared_experts)``, ``int64``.
-        topk_weights: Normalised expert weights, same shape, ``float32``.
-    """
-    logits = logits.cpu()
-    bias = bias.cpu()
-
-    if mask is not None:
-        mask = mask.cpu()
-
-    if fix_routing_mask is not None:
-        fix_routing_mask = fix_routing_mask.cpu()
-
-    if to_physical_map is not None:
-        to_physical_map = to_physical_map.cpu()
-
-    if logical_count is not None:
-        logical_count = logical_count.cpu()
-
-    if unmapped_topk_idx is not None:
-        unmapped_topk_idx = unmapped_topk_idx.cpu()
-
+    """PyTorch reference for top-k expert routing."""
+    assert scoring_func == 'sqrtsoftplus', f'moe_topk_gate_forward only supports sqrtsoftplus scoring, got {scoring_func!r}'
     num_tokens_full, num_routed_experts = logits.shape
-    scoring = ScoringFunc.from_str(scoring_func)
 
     if not use_shared_as_routed:
         num_shared_experts = 0
@@ -103,8 +53,13 @@ def top2_sum_gate(
     num_logical_experts = num_routed_experts + num_shared_experts
     device = logits.device
 
-    topk_idx_out = torch.full((num_tokens_full, num_physical_topk), -1, dtype=torch.int64, device=device)
-    topk_weights_out = torch.zeros((num_tokens_full, num_physical_topk), dtype=torch.float32, device=device)
+    if out is None:
+        topk_idx_out = torch.full((num_tokens_full, num_physical_topk), -1, dtype=torch.int64, device=device)
+        topk_weights_out = torch.zeros((num_tokens_full, num_physical_topk), dtype=torch.float32, device=device)
+    else:
+        topk_idx_out, topk_weights_out = out
+        topk_idx_out.fill_(-1)
+        topk_weights_out.zero_()
 
     if num_tokens_full == 0:
         return topk_idx_out, topk_weights_out
@@ -119,18 +74,21 @@ def top2_sum_gate(
         return topk_idx_out, topk_weights_out
 
     logits_a = logits[active_indices]
-    bias_b = bias.unsqueeze(0)
+    if bias is None:
+        bias = torch.zeros(num_routed_experts, dtype=torch.float32, device=device)
 
     # 1. Apply scoring function
-    if scoring == ScoringFunc.SIGMOID:
-        scores_wo_bias = torch.sigmoid(logits_a)
-    elif scoring == ScoringFunc.SQRTSOFTPLUS:
-        scores_wo_bias = F.softplus(logits_a).sqrt()
-    else:  # SOFTMAX
-        scores_wo_bias = torch.softmax(logits_a, dim=-1)
+    scores_wo_bias = sqrt_softplus_ref(logits_a)
 
-    # 2. Biased scores for ranking (softmax uses raw logits + bias)
-    scores_biased = (logits_a + bias_b) if scoring == ScoringFunc.SOFTMAX else (scores_wo_bias + bias_b)
+    # 2. Biased scores for ranking
+    # Use image_bias for image tokens, regular bias otherwise
+    if image_token_mask is not None:
+        image_token_mask_a = image_token_mask[active_indices]
+        bias_for_ranking = torch.where(image_token_mask_a.unsqueeze(-1), image_bias.unsqueeze(0), bias.unsqueeze(0))
+    else:
+        bias_for_ranking = bias.unsqueeze(0)
+
+    scores_biased = scores_wo_bias + bias_for_ranking
 
     # 3. Split tokens into normal routing and fix_routing
     fix_mask = torch.zeros(num_tokens, dtype=torch.bool, device=device)
@@ -145,16 +103,6 @@ def top2_sum_gate(
     if normal_mask.any():
         normal_indices = normal_mask.nonzero(as_tuple=False).squeeze(1)
         sb = scores_biased[normal_indices]
-
-        if num_groups != num_topk_groups:
-            num_per_group = num_routed_experts // num_groups
-            top_group_idx = topk_sum_and_topk_group_idx(sb.view(-1, num_groups, num_per_group), 2, num_topk_groups)
-            group_mask = torch.ones((normal_indices.numel(), num_groups), dtype=torch.bool, device=device)
-            group_mask.scatter_(1, top_group_idx, False)
-            sb = sb.masked_fill(
-                group_mask.unsqueeze(-1).expand(-1, num_groups, num_per_group).reshape(-1, num_routed_experts),
-                float('-inf'),
-            )
 
         selected = stable_topk(sb, num_topk)
         topk_idx_local[normal_indices] = selected
@@ -174,7 +122,8 @@ def top2_sum_gate(
             unmapped_topk_idx[~active] = -1
 
     # 7. Normalise weights (top-sum normalisation)
-    topk_sum = topk_score_local.sum(dim=-1, keepdim=True).clamp(min=1e-20)
+    # NOTE: Align with moe_topk_gate_forward kernel implementation, which adds 1e-20 instead of clamping.
+    topk_sum = topk_score_local.sum(dim=-1, keepdim=True) + 1e-20
     topk_weights_routed = topk_score_local / topk_sum * routed_scaling_factor
 
     # 8. Append shared-expert slots
@@ -201,24 +150,47 @@ def top2_sum_gate(
                 dup_idx = (ep_rank + global_idx * 23333) % logical_count[logical[valid]].to(torch.int64)
                 topk_idx_all[valid, lane] = to_physical_map[logical[valid], dup_idx].to(torch.int64)
 
-    # 10. EP / TP masking
-    num_extra = to_physical_map.shape[1] - 1 if to_physical_map is not None else 0
-    experts_per_rank = (num_routed_experts + num_extra) // num_ep_ranks
-    experts_per_dp = experts_per_rank * num_tp_ranks
-
-    idx = topk_idx_all
-    valid = idx >= 0
-    ep_of = torch.where(valid, idx // experts_per_rank, torch.zeros_like(idx))
-    idx = torch.where(valid & (ep_of % num_tp_ranks != tp_rank), -1, idx)
-
-    valid = idx >= 0
-    local = idx - tp_rank * experts_per_rank
-    dp_of = torch.where(valid, local // experts_per_dp, torch.zeros_like(local))
-    remapped = local - dp_of * (experts_per_dp - experts_per_rank)
-    idx = torch.where(valid & (remapped >= 0), remapped, torch.where(valid, -1, idx))
-
-    # 11. Write outputs
-    topk_idx_out[active_indices] = idx
+    # 10. Write outputs
+    topk_idx_out[active_indices] = topk_idx_all
     topk_weights_out[active_indices] = topk_weights_all
 
-    return topk_idx_out, topk_weights_out, unmapped_topk_idx
+    return topk_idx_out, topk_weights_out
+
+
+def moe_topk_gate_backward(
+    scores: torch.Tensor,
+    topk_idx: torch.Tensor,
+    topk_weights: torch.Tensor,
+    grad_topk_weights: torch.Tensor,
+    routed_scaling_factor: float,
+    scoring_func: str,
+    mask: Optional[torch.Tensor] = None,
+    grad_scores_sum: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """FP64 PyTorch reference for top-k expert routing backward."""
+    assert scoring_func == 'sqrtsoftplus', f'moe_topk_gate_backward only supports sqrtsoftplus scoring, got {scoring_func!r}'
+    u = scores.double()
+    num_tokens = u.shape[0]
+    valid = topk_idx >= 0
+    idx = topk_idx.clamp(min=0)
+    u_j = u.gather(1, idx) * valid
+    g = grad_topk_weights.double() * valid
+    w = topk_weights.double()
+
+    # 1. Route term: w_j = s * u_j / D  =>  dL/du_j = (s * g_j - <g, w>) / D, scattered back (duplicates accumulate)
+    topk_sum = u_j.sum(dim=-1, keepdim=True) + 1e-20
+    route_grad = (routed_scaling_factor * g - (g * w).sum(dim=-1, keepdim=True)) / topk_sum * valid
+    grad_u = torch.zeros_like(u).scatter_add_(1, idx, route_grad)
+
+    # 2. Aux term: d/du of u / sum(u), summed over the sequence
+    if grad_scores_sum is not None:
+        num_seqs = grad_scores_sum.shape[0]
+        h = grad_scores_sum.double().repeat_interleave(num_tokens // num_seqs, dim=0)
+        u_sum = u.sum(dim=-1, keepdim=True)
+        mask = mask.unsqueeze(-1)
+        inv = mask / torch.where(mask, u_sum, torch.ones_like(u_sum))
+        grad_u = grad_u + (h - (h * u).sum(dim=-1, keepdim=True) * inv) * inv
+
+    # 3. Scoring derivative from u: dy/dx = sigmoid(x) / (2y) = (1 - exp(-y^2)) / (2y), 0 at y = 0
+    dydx = torch.where(u > 0, -torch.expm1(-u * u) / (2 * u), 0.0)
+    return (dydx * grad_u).to(scores.dtype)

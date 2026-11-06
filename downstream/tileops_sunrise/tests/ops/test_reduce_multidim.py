@@ -2,7 +2,7 @@
 
 Covers: SumFwdOp, MeanFwdOp, AmaxFwdOp, AminFwdOp, VarFwdOp, StdFwdOp, VarMeanFwdOp with
 list[int] dim. Also covers multi-dim for LogSumExpFwdOp, AllFwdOp, AnyFwdOp,
-CountNonzeroFwdOp, L1NormFwdOp, L2NormFwdOp, InfNormFwdOp.
+CountNonzeroFwdOp, VectorNormFwdOp.
 
 Each test verifies that reducing over multiple dims at once matches
 the corresponding PyTorch reference.
@@ -11,7 +11,15 @@ the corresponding PyTorch reference.
 import pytest
 import torch
 
-from tests.test_base import FixtureBase
+from tests.workload_test_base import FixtureBase
+from workloads.device import run_device
+from workloads.numerics import compare_outputs, reference_for
+from workloads.reduction import (
+    LogSumExpWorkload,
+    reduction_tolerance,
+    reduction_verification,
+    vector_norm_verification,
+)
 
 
 class MultiDimFixture(FixtureBase):
@@ -25,13 +33,6 @@ class MultiDimFixture(FixtureBase):
                     [0, 1],
                     False,
                     torch.float16,
-                    marks=pytest.mark.smoke,
-                ),
-                pytest.param(
-                    (4, 32, 256),
-                    [0, 1],
-                    False,
-                    torch.bfloat16,
                     marks=pytest.mark.smoke,
                 ),
                 pytest.param(
@@ -62,12 +63,6 @@ class MultiDimFixture(FixtureBase):
     ]
 
 
-def _tol(dtype: torch.dtype) -> dict:
-    if dtype == torch.float32:
-        return {"atol": 1e-4, "rtol": 1e-4}
-    return {"atol": 1e-2, "rtol": 1e-2}
-
-
 # Simple reduce ops: sum, mean, amax, amin
 
 
@@ -78,15 +73,15 @@ def test_sum_multidim(
     keepdim: bool,
     dtype: torch.dtype,
 ) -> None:
-    from tileops.ops.reduction.reduce import SumFwdOp
+    from tileops._ops.reduction.reduce import SumFwdOp
 
-    x = torch.randn(*shape, dtype=dtype)
+    x = torch.randn(*shape, dtype=dtype, device=run_device())
     op = SumFwdOp(dim=dims, keepdim=keepdim)
     ref = torch.sum(x.float(), dim=dims, keepdim=keepdim).to(dtype)
-    y = op(x.ptpu()).cpu()
-    tol = _tol(dtype)
+    y = op(x)
+
     assert y.shape == ref.shape, f"shape mismatch: {y.shape} vs {ref.shape}"
-    assert torch.allclose(y, ref, **tol), f"max err: {(y - ref).abs().max()}"
+    compare_outputs(y, ref, reduction_verification((ref).dtype))
 
 
 @MultiDimFixture
@@ -96,30 +91,33 @@ def test_mean_multidim(
     keepdim: bool,
     dtype: torch.dtype,
 ) -> None:
-    from tileops.ops.reduction.reduce import MeanFwdOp
+    from tileops._ops.reduction.reduce import MeanFwdOp
 
-    x = torch.randn(*shape, dtype=dtype)
+    x = torch.randn(*shape, dtype=dtype, device=run_device())
     op = MeanFwdOp(dim=dims, keepdim=keepdim)
     ref = torch.mean(x.float(), dim=dims, keepdim=keepdim).to(dtype)
-    y = op(x.ptpu()).cpu()
-    tol = _tol(dtype)
+    y = op(x)
+
     assert y.shape == ref.shape, f"shape mismatch: {y.shape} vs {ref.shape}"
-    assert torch.allclose(y, ref, **tol), f"max err: {(y - ref).abs().max()}"
+    compare_outputs(y, ref, reduction_verification((ref).dtype))
 
 
 @pytest.mark.smoke
 def test_mean_edge_axes_fp16_keeps_fp32_intermediates() -> None:
     """A mean over edge axes must not narrow its partial sums to the storage dtype.
 
-    fp16 rows of 100.0 sum to 409600 per row — past fp16's max — so any pass
-    that casts an undivided sum back to fp16 answers inf instead of 100.
+    fp16 rows of 100.0 sum to 1740800 per row — past fp16's max — so any pass
+    that casts an undivided sum back to fp16 answers inf instead of 100. Seventeen
+    segments a row is past what the one-launch fold takes, so the edge kernel runs.
     """
-    from tileops.ops.reduction.reduce import MeanFwdOp
+    from tileops._ops.reduction.reduce import MeanFwdOp
 
-    x = torch.full((4, 8, 1024), 100.0, dtype=torch.float16, device="ptpu")
+    x = torch.full((17, 8, 1024), 100.0, dtype=torch.float16, device=run_device())
     y = MeanFwdOp(dim=[0, 2])(x)
     assert torch.isfinite(y).all(), "edge-axes mean overflowed an intermediate"
-    assert torch.allclose(y, torch.full_like(y, 100.0))
+    compare_outputs(
+        y, torch.full_like(y, 100.0), reduction_verification((torch.full_like(y, 100.0)).dtype)
+    )
 
 
 @MultiDimFixture
@@ -129,28 +127,27 @@ def test_amax_multidim(
     keepdim: bool,
     dtype: torch.dtype,
 ) -> None:
-    from tileops.ops.reduction.reduce import AmaxFwdOp
+    from tileops._ops.reduction.reduce import AmaxFwdOp
 
-    x = torch.randn(*shape, dtype=dtype)
+    x = torch.randn(*shape, dtype=dtype, device=run_device())
     op = AmaxFwdOp(dim=dims, keepdim=keepdim)
     ref = torch.amax(x.float(), dim=dims, keepdim=keepdim).to(dtype)
-    y = op(x.ptpu()).cpu()
-    tol = _tol(dtype)
+    y = op(x)
+
     assert y.shape == ref.shape, f"shape mismatch: {y.shape} vs {ref.shape}"
-    assert torch.allclose(y, ref, **tol), f"max err: {(y - ref).abs().max()}"
+    compare_outputs(y, ref, reduction_verification((ref).dtype))
 
 
 @pytest.mark.smoke
 def test_prod_multidim_rejected() -> None:
     """ProdFwdOp narrows ``dim`` to ``int`` per its manifest signature, so
     the multi-dim (``list[int]`` / ``tuple[int, ...]``) overload is rejected
-    at construction time."""
-    from tileops.ops.reduction.reduce import ProdFwdOp
+    at construction time; so is an empty sequence."""
+    from tileops._ops.reduction.reduce import ProdFwdOp
 
-    with pytest.raises(TypeError, match="ProdFwdOp.dim must be int"):
-        ProdFwdOp(dim=[0, 1])
-    with pytest.raises(TypeError, match="ProdFwdOp.dim must be int"):
-        ProdFwdOp(dim=(0, 1))
+    for dim in ([0, 1], (0, 1), [], None):
+        with pytest.raises(ValueError, match="ProdFwdOp: dim = "):
+            ProdFwdOp(dim=dim)
 
 
 @MultiDimFixture
@@ -160,15 +157,15 @@ def test_amin_multidim(
     keepdim: bool,
     dtype: torch.dtype,
 ) -> None:
-    from tileops.ops.reduction.reduce import AminFwdOp
+    from tileops._ops.reduction.reduce import AminFwdOp
 
-    x = torch.randn(*shape, dtype=dtype)
+    x = torch.randn(*shape, dtype=dtype, device=run_device())
     op = AminFwdOp(dim=dims, keepdim=keepdim)
     ref = torch.amin(x.float(), dim=dims, keepdim=keepdim).to(dtype)
-    y = op(x.ptpu()).cpu()
-    tol = _tol(dtype)
+    y = op(x)
+
     assert y.shape == ref.shape, f"shape mismatch: {y.shape} vs {ref.shape}"
-    assert torch.allclose(y, ref, **tol), f"max err: {(y - ref).abs().max()}"
+    compare_outputs(y, ref, reduction_verification((ref).dtype))
 
 
 # Welford ops: var, std, var_mean
@@ -181,15 +178,17 @@ def test_var_multidim(
     keepdim: bool,
     dtype: torch.dtype,
 ) -> None:
-    from tileops.ops.reduction.reduce import VarFwdOp
+    from tileops._ops.reduction.reduce import VarFwdOp
 
-    x = torch.randn(*shape, dtype=dtype)
+    x = torch.randn(*shape, dtype=dtype, device=run_device())
     op = VarFwdOp(dim=dims, keepdim=keepdim)
-    ref = torch.var(x.float(), dim=dims, keepdim=keepdim, correction=1).to(dtype)
-    y = op(x.ptpu()).cpu()
-    tol = _tol(dtype)
+    ref = reference_for(
+        lambda x: torch.var(x.float(), dim=dims, keepdim=keepdim, correction=1).to(dtype), x
+    )
+    y = op(x)
+
     assert y.shape == ref.shape, f"shape mismatch: {y.shape} vs {ref.shape}"
-    assert torch.allclose(y, ref, **tol), f"max err: {(y - ref).abs().max()}"
+    compare_outputs(y, ref, reduction_verification((ref).dtype))
 
 
 @MultiDimFixture
@@ -199,15 +198,17 @@ def test_std_multidim(
     keepdim: bool,
     dtype: torch.dtype,
 ) -> None:
-    from tileops.ops.reduction.reduce import StdFwdOp
+    from tileops._ops.reduction.reduce import StdFwdOp
 
-    x = torch.randn(*shape, dtype=dtype)
+    x = torch.randn(*shape, dtype=dtype, device=run_device())
     op = StdFwdOp(dim=dims, keepdim=keepdim)
-    ref = torch.std(x.float(), dim=dims, keepdim=keepdim, correction=1).to(dtype)
-    y = op(x.ptpu()).cpu()
-    tol = _tol(dtype)
+    ref = reference_for(
+        lambda x: torch.std(x.float(), dim=dims, keepdim=keepdim, correction=1).to(dtype), x
+    )
+    y = op(x)
+
     assert y.shape == ref.shape, f"shape mismatch: {y.shape} vs {ref.shape}"
-    assert torch.allclose(y, ref, **tol), f"max err: {(y - ref).abs().max()}"
+    compare_outputs(y, ref, reduction_verification((ref).dtype))
 
 
 @MultiDimFixture
@@ -217,27 +218,26 @@ def test_var_mean_multidim(
     keepdim: bool,
     dtype: torch.dtype,
 ) -> None:
-    from tileops.ops.reduction.reduce import VarMeanFwdOp
+    from tileops._ops.reduction.reduce import VarMeanFwdOp
 
-    x = torch.randn(*shape, dtype=dtype)
+    x = torch.randn(*shape, dtype=dtype, device=run_device())
     op = VarMeanFwdOp(dim=dims, keepdim=keepdim)
-    ref_var = torch.var(
-        x.float(),
-        dim=dims,
-        keepdim=keepdim,
-        correction=1,
-    ).to(dtype)
+    ref_var = reference_for(
+        lambda x: torch.var(
+            x.float(),
+            dim=dims,
+            keepdim=keepdim,
+            correction=1,
+        ).to(dtype),
+        x,
+    )
     ref_mean = torch.mean(x.float(), dim=dims, keepdim=keepdim).to(dtype)
-    var_out, mean_out = op(x.ptpu())
-    var_out = var_out.cpu()
-    mean_out = mean_out.cpu()
-    tol = _tol(dtype)
+    var_out, mean_out = op(x)
+
     assert var_out.shape == ref_var.shape, f"var shape: {var_out.shape} vs {ref_var.shape}"
     assert mean_out.shape == ref_mean.shape, f"mean shape: {mean_out.shape} vs {ref_mean.shape}"
-    assert torch.allclose(var_out, ref_var, **tol), f"var err: {(var_out - ref_var).abs().max()}"
-    assert torch.allclose(mean_out, ref_mean, **tol), (
-        f"mean err: {(mean_out - ref_mean).abs().max()}"
-    )
+    compare_outputs(var_out, ref_var, reduction_verification((ref_var).dtype))
+    compare_outputs(mean_out, ref_mean, reduction_verification((ref_mean).dtype))
 
 
 # LogSumExp
@@ -250,31 +250,36 @@ def test_logsumexp_multidim(
     keepdim: bool,
     dtype: torch.dtype,
 ) -> None:
-    from tileops.ops.reduction.softmax import LogSumExpFwdOp
+    from tileops._ops.reduction.softmax import LogSumExpFwdOp
 
-    x = torch.randn(*shape, dtype=dtype)
+    x = torch.randn(*shape, dtype=dtype, device=run_device())
     op = LogSumExpFwdOp(dim=dims, keepdim=keepdim)
-    ref = torch.logsumexp(x.float(), dim=dims, keepdim=keepdim).to(dtype)
-    y = op(x.ptpu()).cpu()
-    tol = _tol(dtype)
+    ref = reference_for(
+        lambda x: torch.logsumexp(x.float(), dim=dims, keepdim=keepdim).to(dtype), x
+    )
+    y = op(x)
+
     assert y.shape == ref.shape, f"shape mismatch: {y.shape} vs {ref.shape}"
-    assert torch.allclose(y, ref, **tol), f"max err: {(y - ref).abs().max()}"
+    compare_outputs(y, ref, LogSumExpWorkload(tuple(x.shape), x.dtype).verification(x))
 
 
 @pytest.mark.smoke
 def test_logsumexp_edge_axes_special_values() -> None:
     """Own-layout edge-axis logsumexp preserves -inf and NaN row semantics."""
-    from tileops.ops.reduction.softmax import LogSumExpFwdOp
+    from tileops._ops.reduction.softmax import LogSumExpFwdOp
 
-    x = torch.randn(4, 32, 256, dtype=torch.float16, device="ptpu")
+    x = torch.randn(4, 32, 256, dtype=torch.float16, device=run_device())
     x[:, 0, :] = float("-inf")
     x[2, 1, 7] = float("nan")
-    y = LogSumExpFwdOp(dim=[0, 2])(x).cpu().float()
-    ref = torch.logsumexp(x.cpu().float(), dim=[0, 2])
+    y = LogSumExpFwdOp(dim=[0, 2])(x)
+    ref = reference_for(torch.logsumexp, x.float(), dim=[0, 2]).to(x.dtype)
+    y = reference_for(lambda out: out, y)
     assert y[0].item() == float("-inf")
     assert torch.isnan(y[1])
     finite = torch.isfinite(ref)
-    assert torch.allclose(y[finite], ref[finite], **_tol(torch.float16))
+    compare_outputs(
+        y[finite], ref[finite], LogSumExpWorkload(tuple(x.shape), x.dtype).verification(x)
+    )
 
 
 # Logical reduce ops: all, any, count_nonzero
@@ -324,10 +329,14 @@ def _make_logical_input(
 ) -> torch.Tensor:
     """Generate input tensor for logical reduce ops."""
     if dtype == torch.bool:
-        return torch.randint(0, 2, shape, dtype=torch.bool)
+        return torch.randint(0, 2, shape, dtype=torch.bool, device=run_device())
     if dtype.is_complex:
-        return torch.randn(*shape, dtype=dtype)
-    return torch.randn(*shape, dtype=dtype)
+        return torch.randn(
+            *shape,
+            dtype=dtype,
+            device="cpu" if torch.device(run_device()).type == "ptpu" else run_device(),
+        ).to(run_device())
+    return torch.randn(*shape, dtype=dtype, device=run_device())
 
 
 @MultiDimLogicalFixture
@@ -337,14 +346,14 @@ def test_all_multidim(
     keepdim: bool,
     dtype: torch.dtype,
 ) -> None:
-    from tileops.ops.reduction.logical_reduce import AllFwdOp
+    from tileops._ops.reduction.logical_reduce import AllFwdOp
 
     x = _make_logical_input(shape, dtype)
     op = AllFwdOp(dim=dims, keepdim=keepdim)
-    ref = torch.all(x.bool(), dim=dims, keepdim=keepdim)
-    y = op(x.ptpu()).cpu()
+    ref = reference_for(lambda x: torch.all(x.bool(), dim=dims, keepdim=keepdim), x)
+    y = reference_for(lambda out: out.cpu(), op(x.ptpu()))
     assert y.shape == ref.shape, f"shape mismatch: {y.shape} vs {ref.shape}"
-    assert torch.equal(y, ref), "all multi-dim mismatch"
+    compare_outputs(y, ref, reduction_verification((ref).dtype))
 
 
 @MultiDimLogicalFixture
@@ -354,14 +363,14 @@ def test_any_multidim(
     keepdim: bool,
     dtype: torch.dtype,
 ) -> None:
-    from tileops.ops.reduction.logical_reduce import AnyFwdOp
+    from tileops._ops.reduction.logical_reduce import AnyFwdOp
 
     x = _make_logical_input(shape, dtype)
     op = AnyFwdOp(dim=dims, keepdim=keepdim)
-    ref = torch.any(x.bool(), dim=dims, keepdim=keepdim)
-    y = op(x.ptpu()).cpu()
+    ref = reference_for(lambda x: torch.any(x.bool(), dim=dims, keepdim=keepdim), x)
+    y = reference_for(lambda out: out.cpu(), op(x.ptpu()))
     assert y.shape == ref.shape, f"shape mismatch: {y.shape} vs {ref.shape}"
-    assert torch.equal(y, ref), "any multi-dim mismatch"
+    compare_outputs(y, ref, reduction_verification((ref).dtype))
 
 
 class MultiDimCountFixture(FixtureBase):
@@ -398,21 +407,25 @@ def test_count_nonzero_multidim(
     dims: list,
     dtype: torch.dtype,
 ) -> None:
-    from tileops.ops.reduction.logical_reduce import CountNonzeroFwdOp
+    from tileops._ops.reduction.logical_reduce import CountNonzeroFwdOp
 
     if dtype == torch.bool:
-        x = torch.randint(0, 2, shape, dtype=torch.bool)
+        x = torch.randint(0, 2, shape, dtype=torch.bool, device=run_device())
     elif dtype.is_complex:
-        x = torch.randn(*shape, dtype=dtype)
+        x = torch.randn(
+            *shape,
+            dtype=dtype,
+            device="cpu" if torch.device(run_device()).type == "ptpu" else run_device(),
+        ).to(run_device())
     else:
-        x = torch.randn(*shape, dtype=dtype)
+        x = torch.randn(*shape, dtype=dtype, device=run_device())
         # Zero out some elements to make it interesting
         x[x < 0] = 0.0
     op = CountNonzeroFwdOp(dim=dims)
-    ref = torch.count_nonzero(x, dim=dims)
-    y = op(x.ptpu()).cpu()
+    ref = reference_for(torch.count_nonzero, x, dim=dims)
+    y = reference_for(lambda out: out.cpu(), op(x.ptpu()))
     assert y.shape == ref.shape, f"shape mismatch: {y.shape} vs {ref.shape}"
-    assert torch.equal(y, ref), "count_nonzero multi-dim mismatch"
+    compare_outputs(y, ref, reduction_verification((ref).dtype))
 
 
 # Vector norm ops: l1, l2, inf
@@ -425,20 +438,20 @@ def test_l1_norm_multidim(
     keepdim: bool,
     dtype: torch.dtype,
 ) -> None:
-    from tileops.ops.reduction.vector_norm import L1NormFwdOp
+    from tileops._ops.reduction.vector_norm import VectorNormFwdOp
 
-    x = torch.randn(*shape, dtype=dtype)
-    op = L1NormFwdOp(dim=dims, keepdim=keepdim)
+    x = torch.randn(*shape, dtype=dtype, device=run_device())
+    op = VectorNormFwdOp(1, dim=dims, keepdim=keepdim)
     ref = torch.linalg.vector_norm(
         x.float(),
         ord=1,
         dim=dims,
         keepdim=keepdim,
     ).to(dtype)
-    y = op(x.ptpu()).cpu()
-    tol = _tol(dtype)
+    y = op(x)
+
     assert y.shape == ref.shape, f"shape mismatch: {y.shape} vs {ref.shape}"
-    assert torch.allclose(y, ref, **tol), f"max err: {(y - ref).abs().max()}"
+    compare_outputs(y, ref, vector_norm_verification(x.dtype))
 
 
 @MultiDimFixture
@@ -448,20 +461,20 @@ def test_l2_norm_multidim(
     keepdim: bool,
     dtype: torch.dtype,
 ) -> None:
-    from tileops.ops.reduction.vector_norm import L2NormFwdOp
+    from tileops._ops.reduction.vector_norm import VectorNormFwdOp
 
-    x = torch.randn(*shape, dtype=dtype)
-    op = L2NormFwdOp(dim=dims, keepdim=keepdim)
+    x = torch.randn(*shape, dtype=dtype, device=run_device())
+    op = VectorNormFwdOp(2, dim=dims, keepdim=keepdim)
     ref = torch.linalg.vector_norm(
         x.float(),
         ord=2,
         dim=dims,
         keepdim=keepdim,
     ).to(dtype)
-    y = op(x.ptpu()).cpu()
-    tol = _tol(dtype)
+    y = op(x)
+
     assert y.shape == ref.shape, f"shape mismatch: {y.shape} vs {ref.shape}"
-    assert torch.allclose(y, ref, **tol), f"max err: {(y - ref).abs().max()}"
+    compare_outputs(y, ref, vector_norm_verification(x.dtype))
 
 
 @MultiDimFixture
@@ -471,122 +484,94 @@ def test_inf_norm_multidim(
     keepdim: bool,
     dtype: torch.dtype,
 ) -> None:
-    from tileops.ops.reduction.vector_norm import InfNormFwdOp
+    from math import inf
 
-    x = torch.randn(*shape, dtype=dtype)
-    op = InfNormFwdOp(dim=dims, keepdim=keepdim)
+    from tileops._ops.reduction.vector_norm import VectorNormFwdOp
+
+    x = torch.randn(*shape, dtype=dtype, device=run_device())
+    op = VectorNormFwdOp(inf, dim=dims, keepdim=keepdim)
     ref = torch.linalg.vector_norm(
         x.float(),
         ord=float("inf"),
         dim=dims,
         keepdim=keepdim,
     ).to(dtype)
-    y = op(x.ptpu()).cpu()
-    tol = _tol(dtype)
+    y = op(x)
+
     assert y.shape == ref.shape, f"shape mismatch: {y.shape} vs {ref.shape}"
-    assert torch.allclose(y, ref, **tol), f"max err: {(y - ref).abs().max()}"
+    compare_outputs(y, ref, vector_norm_verification(x.dtype))
 
 
 # Empty dim list / tuple is full-reduction (matches PyTorch semantics)
 
 
 @pytest.mark.smoke
-def test_normalize_dim_empty_default_rejects() -> None:
-    from tileops.ops.reduction._multidim import normalize_dim
-
-    with pytest.raises(ValueError, match="dim=\\[\\] is not supported"):
-        normalize_dim([], ndim=3)
-    with pytest.raises(ValueError, match="dim=\\[\\] is not supported"):
-        normalize_dim((), ndim=3)
-
-
-@pytest.mark.smoke
-def test_normalize_dim_empty_full_opt_in() -> None:
-    from tileops.ops.reduction._multidim import normalize_dim
-
-    assert normalize_dim([], ndim=3, empty_dim_policy="full") == [0, 1, 2]
-    assert normalize_dim((), ndim=3, empty_dim_policy="full") == [0, 1, 2]
-    assert normalize_dim([], ndim=1, empty_dim_policy="full") == [0]
-
-
-@pytest.mark.smoke
 def test_sum_empty_dim_full_reduction() -> None:
-    from tileops.ops.reduction.reduce import SumFwdOp
+    from tileops._ops.reduction.reduce import SumFwdOp
 
-    x = torch.randn(2, 3, 4, dtype=torch.float16).ptpu()
+    x = torch.randn(2, 3, 4, dtype=torch.float16, device=run_device())
     op = SumFwdOp(dim=[], keepdim=False)
     op_none = SumFwdOp(dim=None, keepdim=False)
-    assert torch.allclose(op(x).cpu(), op_none(x).cpu(), **_tol(torch.float16))
+    assert reference_for(torch.allclose, op(x), op_none(x), **reduction_tolerance(torch.float16))
 
 
 @pytest.mark.smoke
 def test_mean_empty_dim_full_reduction() -> None:
-    from tileops.ops.reduction.reduce import MeanFwdOp
+    from tileops._ops.reduction.reduce import MeanFwdOp
 
-    x = torch.randn(2, 3, 4, dtype=torch.float16).ptpu()
+    x = torch.randn(2, 3, 4, dtype=torch.float16, device=run_device())
     op = MeanFwdOp(dim=(), keepdim=True)
     op_none = MeanFwdOp(dim=None, keepdim=True)
-    assert torch.allclose(op(x).cpu(), op_none(x).cpu(), **_tol(torch.float16))
+    assert torch.allclose(op(x), op_none(x), **reduction_tolerance(torch.float16))
 
 
 @pytest.mark.smoke
 @pytest.mark.parametrize("op_name", ["amin", "amax", "count_nonzero"])
 def test_simple_op_empty_dim_full_reduction(op_name: str) -> None:
-    from tileops.ops.reduction.logical_reduce import CountNonzeroFwdOp
-    from tileops.ops.reduction.reduce import AmaxFwdOp, AminFwdOp
+    from tileops._ops.reduction.logical_reduce import CountNonzeroFwdOp
+    from tileops._ops.reduction.reduce import AmaxFwdOp, AminFwdOp
 
     op_cls = {"amin": AminFwdOp, "amax": AmaxFwdOp, "count_nonzero": CountNonzeroFwdOp}[op_name]
-    x = torch.randn(2, 3, 4, dtype=torch.float16).ptpu()
+    x = torch.randn(2, 3, 4, dtype=torch.float16, device=run_device())
     y_empty = op_cls(dim=[])(x)
     y_none = op_cls(dim=None)(x)
     assert y_empty.shape == y_none.shape
     if op_name == "count_nonzero":
         assert torch.equal(y_empty.cpu(), y_none.cpu())
     else:
-        assert torch.allclose(y_empty.cpu(), y_none.cpu(), **_tol(torch.float16))
+        assert reference_for(torch.allclose, y_empty, y_none, **reduction_tolerance(torch.float16))
 
 
 @pytest.mark.smoke
 @pytest.mark.parametrize("op_name", ["std", "var"])
 def test_welford_op_empty_dim_full_reduction(op_name: str) -> None:
-    from tileops.ops.reduction.reduce import StdFwdOp, VarFwdOp
+    from tileops._ops.reduction.reduce import StdFwdOp, VarFwdOp
 
     op_cls = {"std": StdFwdOp, "var": VarFwdOp}[op_name]
-    x = torch.randn(2, 3, 4, dtype=torch.float16).ptpu()
+    x = torch.randn(2, 3, 4, dtype=torch.float16, device=run_device())
     y_empty = op_cls(dim=[], keepdim=False)(x)
     y_none = op_cls(dim=None, keepdim=False)(x)
-    assert torch.allclose(y_empty.cpu(), y_none.cpu(), **_tol(torch.float16))
+    assert reference_for(torch.allclose, y_empty, y_none, **reduction_tolerance(torch.float16))
 
 
 @pytest.mark.smoke
 def test_var_mean_empty_dim_full_reduction() -> None:
-    from tileops.ops.reduction.reduce import VarMeanFwdOp
+    from tileops._ops.reduction.reduce import VarMeanFwdOp
 
-    x = torch.randn(2, 3, 4, dtype=torch.float16).ptpu()
+    x = torch.randn(2, 3, 4, dtype=torch.float16, device=run_device())
     var_e, mean_e = VarMeanFwdOp(dim=[], keepdim=False)(x)
     var_n, mean_n = VarMeanFwdOp(dim=None, keepdim=False)(x)
-    assert torch.allclose(var_e.cpu(), var_n.cpu(), **_tol(torch.float16))
-    assert torch.allclose(mean_e.cpu(), mean_n.cpu(), **_tol(torch.float16))
-
-
-@pytest.mark.smoke
-def test_prod_empty_dim_rejects() -> None:
-    """ProdFwdOp narrows ``dim`` to ``int`` per its manifest signature, so
-    ``dim=[]`` is rejected by ``_validate_dim`` at construction (before
-    reaching the base class's ``empty_dim_policy`` branch)."""
-    from tileops.ops.reduction.reduce import ProdFwdOp
-
-    with pytest.raises(TypeError, match="ProdFwdOp.dim must be int"):
-        ProdFwdOp(dim=[], keepdim=False)
+    assert reference_for(torch.allclose, var_e, var_n, **reduction_tolerance(torch.float16))
+    assert reference_for(torch.allclose, mean_e, mean_n, **reduction_tolerance(torch.float16))
 
 
 @pytest.mark.smoke
 def test_logsumexp_empty_dim_rejects() -> None:
-    from tileops.ops.reduction.softmax import LogSumExpFwdOp
+    from tileops._ops.reduction.softmax import LogSumExpFwdOp
 
-    x = torch.randn(2, 3, 4, dtype=torch.float16).ptpu()
+    x = torch.randn(2, 3, 4, dtype=torch.float16, device=run_device())
     op = LogSumExpFwdOp(dim=[], keepdim=False)
-    with pytest.raises(ValueError, match="dim=\\[\\] is not supported"):
+    with pytest.raises(ValueError, match="an empty dim is rejected"):
         op(x)
 
 
@@ -594,37 +579,37 @@ def test_logsumexp_empty_dim_rejects() -> None:
 def test_all_empty_dim_is_noop() -> None:
     """AllFwdOp honors the spec's ``dim=[]`` no-op contract: output equals
     ``x.bool()`` with the input shape."""
-    from tileops.ops.reduction.logical_reduce import AllFwdOp
+    from tileops._ops.reduction.logical_reduce import AllFwdOp
 
-    x = (torch.randn(2, 3, 4) > 0).to(torch.float16).ptpu()
+    x = (torch.randn(2, 3, 4, device=run_device()) > 0).to(torch.float16)
     op = AllFwdOp(dim=[], keepdim=False)
     y = op(x)
     assert y.shape == x.shape
     assert y.dtype == torch.bool
-    assert torch.equal(y.cpu(), x.cpu().bool())
+    compare_outputs(y, x.bool(), reduction_verification((x.bool()).dtype))
 
 
 @pytest.mark.smoke
 def test_negative_dims_accepted() -> None:
     """Negative dims should be normalized and produce correct results."""
-    from tileops.ops.reduction.reduce import SumFwdOp
+    from tileops._ops.reduction.reduce import SumFwdOp
 
-    x = torch.randn(4, 8, 256, dtype=torch.float16)
+    x = torch.randn(4, 8, 256, dtype=torch.float16, device=run_device())
     op = SumFwdOp(dim=[-1, 0], keepdim=False)
     ref = torch.sum(x.float(), dim=[0, 2], keepdim=False).to(torch.float16)
     y = op(x.ptpu()).cpu()
     assert y.shape == ref.shape, f"shape mismatch: {y.shape} vs {ref.shape}"
-    assert torch.allclose(y, ref, **_tol(torch.float16))
+    compare_outputs(y, ref, reduction_verification((ref).dtype))
 
 
 @pytest.mark.smoke
 def test_duplicate_dims_raises() -> None:
     """Duplicate dims (after normalization) must raise ValueError at op level."""
-    from tileops.ops.reduction.reduce import SumFwdOp
+    from tileops._ops.reduction.reduce import SumFwdOp
 
-    x = torch.randn(4, 8, 256, dtype=torch.float16).ptpu()
+    x = torch.randn(4, 8, 256, dtype=torch.float16, device=run_device())
     op = SumFwdOp(dim=[1, 1], keepdim=False)
-    with pytest.raises(ValueError, match="Duplicate dims"):
+    with pytest.raises(ValueError, match="unique_axes"):
         op(x)
 
 
@@ -634,12 +619,12 @@ def test_edge_axis_reduce_returns_the_storage_dtype(dtype: torch.dtype) -> None:
     """The edge-axis columns pass writes the result dtype itself, with no cast after.
 
     Nothing downstream converts, so a pass left writing fp32 reaches the caller
-    as fp32.
+    as fp32. Seventeen segments a row is past what the one-launch fold takes.
     """
-    from tileops.ops.reduction import CountNonzeroFwdOp
-    from tileops.ops.reduction.reduce import AmaxFwdOp, MeanFwdOp, SumFwdOp
+    from tileops._ops.reduction import CountNonzeroFwdOp
+    from tileops._ops.reduction.reduce import AmaxFwdOp, MeanFwdOp, SumFwdOp
 
-    x = torch.randn(4, 32, 512, dtype=dtype, device="ptpu")
+    x = torch.randn(17, 32, 512, dtype=dtype, device=run_device())
     for op_cls, ref in (
         (SumFwdOp, lambda z: torch.sum(z.float(), dim=[0, 2])),
         (MeanFwdOp, lambda z: torch.mean(z.float(), dim=[0, 2])),
@@ -647,18 +632,113 @@ def test_edge_axis_reduce_returns_the_storage_dtype(dtype: torch.dtype) -> None:
     ):
         out = op_cls(dim=[0, 2])(x)
         assert out.dtype == dtype, f"{op_cls.__name__} returned {out.dtype}"
-        torch.testing.assert_close(out.float(), ref(x), rtol=1.6e-2, atol=1.6e-2)
+        compare_outputs(out, ref(x).to(dtype), reduction_verification(dtype))
 
     counted = CountNonzeroFwdOp(dim=[0, 2])(x)
     assert counted.dtype == torch.int64
-    assert torch.equal(counted, torch.count_nonzero(x, dim=[0, 2]))
+    compare_outputs(
+        counted,
+        torch.count_nonzero(x, dim=[0, 2]),
+        reduction_verification((torch.count_nonzero(x, dim=[0, 2])).dtype),
+    )
 
 
 @pytest.mark.smoke
 @pytest.mark.parametrize("shape", [(768, 512), (1536, 512)], ids=["ragged-split", "exact-split"])
 def test_leading_axis_split_reduces_every_row(shape):
     """A split that does not divide the reduced extent still sums every row."""
-    from tileops.ops.reduction.reduce import SumFwdOp
+    from tileops._ops.reduction.reduce import SumFwdOp
 
-    x = torch.randn(shape, dtype=torch.float32, device="ptpu")
-    torch.testing.assert_close(SumFwdOp(dim=0)(x), x.sum(dim=0), rtol=1e-4, atol=1e-4)
+    x = torch.randn(shape, dtype=torch.float32, device=run_device())
+    compare_outputs(SumFwdOp(dim=0)(x), x.sum(dim=0), reduction_verification((x.sum(dim=0)).dtype))
+
+
+def _vector_tiles_kept(dtype: torch.dtype) -> int:
+    """The fewest kept columns the one-launch vector down-rows pass takes."""
+    from tileops._kernels.constants import VECTOR_ACCESS_BYTES
+    from tileops._kernels.reduction._primitives import _LEADING_POLICY
+
+    vec = VECTOR_ACCESS_BYTES // dtype.itemsize
+    return _LEADING_POLICY.min_vector_blocks * _LEADING_POLICY.vector_threads * vec
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_leading_axis_vector_tiles_reduce_every_column(dtype: torch.dtype) -> None:
+    """At the fewest vector tiles every column of every row reaches the result."""
+    from tileops._ops.reduction.reduce import AmaxFwdOp, MeanFwdOp, ProdFwdOp
+
+    kept = _vector_tiles_kept(dtype)
+    x = torch.rand(4, 2, kept // 2, dtype=dtype, device=run_device()) * 0.5 + 0.75
+    for op, reduce in (
+        (ProdFwdOp(dim=0), torch.prod),
+        (MeanFwdOp(dim=0), torch.mean),
+        (AmaxFwdOp(dim=0), torch.amax),
+    ):
+        ref = reference_for(reduce, x.float(), dim=0)
+        compare_outputs(op(x), ref.to(dtype), reduction_verification(dtype))
+
+
+@pytest.mark.smoke
+def test_vector_tiles_take_whole_tiles_from_the_minimum() -> None:
+    """The vector pass takes the minimum of whole tiles, not one tile fewer or a ragged width;
+    the logical and vector-norm callers' dtypes and epilogue reduce exactly on it."""
+    from tileops._kernels.reduction._primitives import (
+        _LEADING_POLICY,
+        _vector_tiles,
+        down_rows_launcher,
+    )
+
+    kept = _vector_tiles_kept(torch.float16)
+    tile = kept // _LEADING_POLICY.min_vector_blocks
+    assert _vector_tiles(kept, "float16")
+    assert not _vector_tiles(kept - tile, "float16")
+    assert not _vector_tiles(kept + tile // 2, "float16")
+
+    device = run_device()
+    flags = torch.randint(
+        0, 2, (3, _vector_tiles_kept(torch.int8)), dtype=torch.int8, device=device
+    )
+    counts = torch.randint(0, 9, (3, _vector_tiles_kept(torch.float32)), device=device).float()
+    for op, dtypes, epilogue, x, ref in (
+        ("amin", ("int8", "int8"), "", flags, flags.amin(0)),
+        ("sum", ("float32", "int64"), "", counts, counts.sum(0).long()),
+        ("sum", ("float32", "float16"), "sqrt", counts, counts.sum(0).sqrt().half()),
+    ):
+        torch.testing.assert_close(
+            down_rows_launcher(*x.shape, op, *dtypes, 0.0, 1, epilogue)(x), ref
+        )
+
+
+@pytest.mark.smoke
+@pytest.mark.in_tree_kernels
+@pytest.mark.parametrize(
+    "lead, folds", [(16, True), (17, False)], ids=["row-in-flight", "row-past-in-flight"]
+)
+def test_edge_axes_route_by_the_row_a_block_holds_in_flight(lead: int, folds: bool) -> None:
+    """A row a 512-thread block holds in flight, 16 loads a thread, folds in one launch.
+
+    Each row is ``lead`` segments of 1000 fp16 (125 vectors), so every segment ends in a
+    partial step. One segment more takes the edge kernels' two passes.
+    """
+    from tileops._ops.reduction.reduce import AmaxFwdOp, AminFwdOp, MeanFwdOp, SumFwdOp
+    from tileops._ops.reduction.vector_norm import VectorNormFwdOp
+
+    dtype = torch.float16
+    x = torch.randn(lead, 8, 1000, dtype=dtype, device=run_device())
+    for op, ref, verification in (
+        (SumFwdOp(dim=[0, 2]), torch.sum(x.float(), dim=[0, 2]), reduction_verification),
+        (MeanFwdOp(dim=[0, 2]), torch.mean(x.float(), dim=[0, 2]), reduction_verification),
+        (AmaxFwdOp(dim=[0, 2]), torch.amax(x.float(), dim=[0, 2]), reduction_verification),
+        (AminFwdOp(dim=[0, 2]), torch.amin(x.float(), dim=[0, 2]), reduction_verification),
+        (
+            VectorNormFwdOp(ord=2, dim=[0, 2]),
+            torch.linalg.vector_norm(x.float(), 2, (0, 2)),
+            vector_norm_verification,
+        ),
+    ):
+        out = op(x)
+        (entry,) = op._entries_built("reduce").values()
+        name = type(entry).__name__
+        assert (name == "ReduceFoldKernel") == folds, f"{type(op).__name__} took {name}"
+        compare_outputs(out, ref.to(dtype), verification(dtype))

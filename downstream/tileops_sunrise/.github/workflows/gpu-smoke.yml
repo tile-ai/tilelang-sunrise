@@ -168,7 +168,7 @@ jobs:
       reason: ${{ steps.policy.outputs.reason }}
     steps:
       - name: Checkout test files
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -263,11 +263,26 @@ jobs:
             # config, etc.) that must still trigger GPU smoke even without
             # Python changes to avoid security bypass.
             has_python="false"
+            has_contract="false"
+            has_native="false"
             has_high_risk="false"
             for path in "${changed_files[@]}"; do
               if [[ "$path" == *.py ]]; then
                 has_python="true"
               fi
+              # The op contract is YAML. A roofline formula, a shape rule or a workload
+              # row changes what the contract tests assert while changing no Python, and
+              # the skip below would take the recount check -- the only layer that judges
+              # a `bytes` total against the tensors a call binds -- out of the run.
+              case "$path" in
+                src/tileops/manifest/spec/*.yaml)
+                  has_contract="true"
+                  ;;
+                # Kernels compile these in at build time.
+                src/tileops/csrc/*)
+                  has_native="true"
+                  ;;
+              esac
               if [[ "$is_fork" == "true" ]]; then
                 case "$path" in
                   .github/workflows/*|pyproject.toml|requirements*.txt|requirements*.in|setup.py|setup.cfg|Dockerfile*|scripts/bootstrap*|scripts/install*)
@@ -276,9 +291,10 @@ jobs:
                 esac
               fi
             done
-            if [[ "$has_python" == "false" && "$has_high_risk" == "false" ]]; then
+            if [[ "$has_python" == "false" && "$has_contract" == "false" \
+                  && "$has_native" == "false" && "$has_high_risk" == "false" ]]; then
               skip_gpu_smoke="true"
-              reason="No Python files changed; GPU smoke skipped."
+              reason="No Python, manifest or native source files changed; GPU smoke skipped."
               {
                 echo "skip_gpu_smoke=$skip_gpu_smoke"
                 echo "is_fork=$is_fork"
@@ -317,7 +333,7 @@ jobs:
             for path in "${changed_files[@]}"; do
               if [[ "$is_fork" == "true" ]]; then
                 case "$path" in
-                  .github/ISSUE_TEMPLATE/*|.github/pull_request_template.md|src/tileops/ops/*.py|tests/ops/test_*.py|tests/ops/*/test_*.py|*.md)
+                  .github/ISSUE_TEMPLATE/*|.github/pull_request_template.md|src/tileops/_ops/*.py|tests/ops/test_*.py|tests/ops/*/test_*.py|*.md)
                     ;;
                   .github/workflows/*|pyproject.toml|requirements*.txt|requirements*.in|setup.py|setup.cfg|Dockerfile*|scripts/bootstrap*|scripts/install*)
                     allow_fast_path="false"
@@ -332,6 +348,11 @@ jobs:
 
               case "$path" in
                 .github/ISSUE_TEMPLATE/*|.github/pull_request_template.md|.github/workflows/auto-label.yml|.github/workflows/stale-issues.yml|*.md)
+                  ;;
+                src/tileops/manifest/spec/*.yaml)
+                  scope="full-smoke"
+                  reason="Manifest contract changed in $path; the recount and parity tests judge it."
+                  break
                   ;;
                 tests/ops/test_*.py|tests/ops/*/test_*.py)
                   add_target "$path"
@@ -402,7 +423,7 @@ jobs:
     steps:
       - name: Checkout code for fork PR
         if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: ${{ github.event.pull_request.head.repo.full_name }}
           ref: ${{ github.event.pull_request.head.sha }}
@@ -411,7 +432,7 @@ jobs:
 
       - name: Checkout code for trusted branch
         if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: ${{ github.repository }}
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -432,7 +453,7 @@ jobs:
       #   - trusted (same-repo PR, write+ member-fork PR, or push)
       #       → head sha (author already has write access to the base repo)
       - name: Checkout trusted actions (base repo)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: ${{ github.repository }}
           ref: ${{ needs.security-policy.outputs.is_fork == 'true' && github.event.pull_request.base.sha || github.event.pull_request.head.sha || github.sha }}
@@ -521,7 +542,10 @@ jobs:
           # call) fails as a timeout with a thread dump instead of wedging the job. --no-deps
           # tileops install doesn't bring this; pin via constraints.txt so the install is
           # deterministic (the runner image should bake it and drop this install — follow-up).
-          python3 -m pip install -q -c constraints.txt pytest-timeout
+          python3 -m pip install -q -c constraints.txt pytest-timeout pytest-xdist
+          # Eight workers share the job's one GPU. `loadfile` keeps a file on one worker: some
+          # files assert over what their other cases recorded in the process.
+          XDIST=(-n 8 --dist loadfile)
           current_dir="$(pwd)"
           export PYTHONPATH="${current_dir}${PYTHONPATH:+:$PYTHONPATH}"
           echo "PYTHONPATH=$PYTHONPATH"
@@ -559,7 +583,7 @@ jobs:
             else
               echo "Running diff-scoped pytest -m \"smoke or full\" on ${#FULL_TARGETS[@]} changed test file(s)"
               diff_status=0
-              python3 -m pytest -q "${FULL_TARGETS[@]}" -m "smoke or full" \
+              python3 -m pytest -q "${FULL_TARGETS[@]}" -m "smoke or full" "${XDIST[@]}" \
                 --timeout=600 --timeout-method=thread \
                 --junit-xml=gpu_smoke_full_results.xml | tee gpu_smoke_full.log \
                 || diff_status=$?
@@ -579,7 +603,7 @@ jobs:
           echo "EXECUTED_MARK_EXPR=${TEST_MARK_EXPR}" >> "$GITHUB_ENV"
 
           echo "Running pytest -m \"${TEST_MARK_EXPR}\" on ${#TARGETS[@]} target(s)"
-          python3 -m pytest -q "${TARGETS[@]}" -m "${TEST_MARK_EXPR}" \
+          python3 -m pytest -q "${TARGETS[@]}" -m "${TEST_MARK_EXPR}" "${XDIST[@]}" \
             --timeout=600 --timeout-method=thread \
             --junit-xml=gpu_smoke_results.xml | tee gpu_smoke.log
 
@@ -657,7 +681,7 @@ jobs:
           done
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: gpu_smoke.log

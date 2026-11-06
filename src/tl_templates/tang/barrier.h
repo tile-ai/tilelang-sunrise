@@ -22,17 +22,23 @@
 //     the parity passed in, which is the same convention TileLang and CUDA use
 //     (a barrier starts at phase 0, so the first completion is awaited with
 //     parity 0, the second with parity 1, ...).
-//   * There is no fused arrive.expect_tx and no cluster/cta_id arrive. Those
-//     TileLang builtins are rejected in the TANG code generator rather than
-//     emulated here: splitting a fused arrive.expect_tx into two calls would
-//     quietly drop its atomicity.
+//   * arrive(cta_id, pred) is local-only. The lowering keeps cta_id == 0 and
+//     drops it, so this file only sees a block-scoped arrive. A remote rank
+//     would be __set_block_rank + __mbarrier_arrive on a DSHM pointer, which
+//     is not wired.
+//   * arrive.expect_tx has no fused hardware opcode.
+//   T.mbarrier_arrive_expect_tx
+//     calls __mbarrier_arrive_expect_tx, whose shared-memory body is
+//     expect_tx followed by arrive. The two updates are visible separately,
+//     so this is not the PTX single-RMW. The shared-register overload is a
+//     different object and is not used here.
 //
 // expect_tx is wired up because the instruction exists, but pairing it with an
 // async bulk copy is NOT supported on current silicon -- the transaction
-// counter that complete_tx bumps is documented as unreliable, and the bulk-copy
-// overloads taking an __mbarrier_t* are deprecated upstream. Publish producer
-// completion with a fence group bound to the barrier, or with a sync barrier,
-// instead. See docs/tang_mbarrier.md.
+// counter that complete_tx bumps is unreliable, and the bulk-copy overloads
+// taking an __mbarrier_t* are deprecated upstream. The same limit applies to
+// arrive_expect_tx. Publish producer completion with a fence group bound to
+// the barrier, or with a sync barrier, instead.
 //
 // Everything here is gated on stcuv2 by construction: the underlying builtins
 // are compiled only for __Tang_ARCH__ >= 200, and the code generator emits this
@@ -88,6 +94,16 @@ TL_DEVICE void mbarrier_expect_tx(::tang::ptx::__mbarrier_t &smem_barrier,
   (void)::tang::ptx::mbarrier_expect_tx(&smem_barrier, transaction_bytes);
 }
 
+// Shared-memory __mbarrier_arrive_expect_tx. The device library implements it
+// as expect_tx then arrive; there is no fused opcode, and the tx counter is
+// the same unreliable one as mbarrier_expect_tx. count stays at the API
+// default of 1, matching T.mbarrier_arrive_expect_tx(mbar, tx).
+TL_DEVICE void
+mbarrier_arrive_expect_tx(::tang::ptx::__mbarrier_t &smem_barrier,
+                          uint32_t transaction_bytes) {
+  (void)::__mbarrier_arrive_expect_tx(&smem_barrier, transaction_bytes);
+}
+
 // Bind the calling warp's tensor-core fence group to a barrier: once the work
 // outstanding in that group retires, hardware posts one arrive on the barrier.
 // This is the producer half of an async MMA -- the counterpart of Blackwell's
@@ -114,6 +130,60 @@ fence_tc_arrive_mbarrier(::tang::ptx::__mbarrier_t &smem_barrier) {
                 "TANG tensor-core fence group id must be 0 or 1");
   ::tang::ptx::fence_tc_arrive_mbarrier(
       &smem_barrier, static_cast<::tang::ptx::FenceGroup>(FenceGroup));
+}
+
+// Bind the calling warp's g2s (memory) fence group to a barrier: once the bulk
+// copies that warp issued into that group retire, hardware posts one arrive on
+// the barrier. Per-warp and non-blocking, exactly like the tensor-core
+// counterpart above and for the same reason -- a fence group is private to the
+// warp that issued into it, so N copy warps produce N arrivals and the
+// barrier's arrive count has to be the copy's warp count, not the thread count.
+//
+// Never call ::tang::ptx::mbarrier_arrive from a whole warp to emulate this:
+// that form counts per call (32 lanes -> 32 arrivals), which desynchronises the
+// phase of a barrier sized for warps and hangs every waiter.
+//
+// This is the mbarrier form of ``fence_g2s_arrive(bar_id)``, which posts into a
+// named sync barrier. A named barrier sizes *both* sides of an edge, so it can
+// only order a pipeline whose arriving warps also wait. When a warp-specialised
+// region splits those sets -- two copy warps publishing, one MMA warp waiting
+// -- the wait side is not in the count at all, and only an mbarrier can express
+// the edge. For the unguarded shape (every warp on both sides) the two are
+// interchangeable, which is why the sync barrier stays the default there.
+//
+// The group is the one the async copy helpers issue into by default, so the
+// copies this arrival must cover are the ones it fences.
+TL_DEVICE void
+fence_g2s_arrive_mbarrier(::tang::ptx::__mbarrier_t &smem_barrier) {
+  // Keep the shared address in a register for the fence instruction.
+  unsigned addr = __stvm_get_smem_pointer(&smem_barrier);
+  asm volatile("" : "+r"(addr));
+  __stvm_fence_arrive_mbar_mem(addr,
+                               static_cast<int>(::tang::ptx::fg_g2s_default));
+}
+
+// T.cp_async_barrier_noinc. TANG has no cp.async.mbarrier.arrive opcode
+// (cp_async_mbarrier_arrive.h is commented out of <tang/ptx>). The .noinc
+// form is fence.arrive_mbar.mem on fg_g2s_default: when this warp's g2s
+// fence group retires, hardware posts one arrive. Copies this covers are
+// the ones issued into that group, and the barrier's arrive count is the
+// number of warps that call it, not the thread count.
+TL_DEVICE void cp_async_arrive_noinc(::tang::ptx::__mbarrier_t &smem_barrier) {
+  fence_g2s_arrive_mbarrier(smem_barrier);
+}
+
+// The same arrive for the shared->tensor-memory copy engine (cps2t), whose
+// completion is drained on the s2t fence group: a staging warp that writes
+// tensor memory the MMA (a different warp, or a different warp-specialised
+// region) reads publishes with this instead of a block-wide barrier. That is
+// what makes the publish expressible when the two sides are in separate
+// regions: an arrive is legal inside a region guard, while a
+// `__syncthreads()` is not.
+TL_DEVICE void
+fence_s2t_arrive_mbarrier(::tang::ptx::__mbarrier_t &smem_barrier) {
+  ::tang::ptx::fence_mem_arrive_mbarrier(
+      &smem_barrier,
+      static_cast<::tang::ptx::FenceGroup>(::tang::ptx::fg_s2t_default));
 }
 
 // Order the shared.mbarrier init stores before any thread can use the barrier.
@@ -181,10 +251,34 @@ public:
     tl::mbarrier_expect_tx(storage(), transaction_bytes);
   }
 
+  // Not a fused atomic arrive+expect_tx. See tl::mbarrier_arrive_expect_tx.
+  TL_DEVICE void arrive_expect_tx(uint32_t transaction_bytes) const {
+    tl::mbarrier_arrive_expect_tx(storage(), transaction_bytes);
+  }
+
   // Publish the calling warp's tensor-core completion into this barrier; see
   // tl::fence_tc_arrive_mbarrier for the per-warp arrive count.
   template <int FenceGroup = 0> TL_DEVICE void arrive_on_tc_fence() const {
     tl::fence_tc_arrive_mbarrier<FenceGroup>(storage());
+  }
+
+  // Same for the g2s (bulk copy) group: the mem-domain counterpart, used by the
+  // async-copy pipeline when the warps waiting for a tile are not the warps
+  // that issued its copy.
+  TL_DEVICE void arrive_on_g2s_fence() const {
+    tl::fence_g2s_arrive_mbarrier(storage());
+  }
+
+  // See tl::cp_async_arrive_noinc. Same instruction as arrive_on_g2s_fence.
+  TL_DEVICE void cp_async_arrive_noinc() const {
+    tl::cp_async_arrive_noinc(storage());
+  }
+
+  // Same for the s2t (shared -> tensor memory) group: the copy engine's
+  // completion, published by the staging warps for whoever reads the staged
+  // tensor memory next.
+  TL_DEVICE void arrive_on_s2t_fence() const {
+    tl::fence_s2t_arrive_mbarrier(storage());
   }
 };
 

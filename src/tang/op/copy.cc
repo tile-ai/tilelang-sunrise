@@ -13,13 +13,17 @@
 #include "op/utils.h"
 #include "tang/op/builtin.h"
 #include "tang/target_utils.h"
+#include "tang/transform/s3_async_pipeline_sync_schema.h"
 #include "transform/common/loop_fusion_utils.h"
 #include "transform/loop_partition.h"
 #include "transform/loop_vectorize.h"
 
+#include <tvm/tirx/builtin.h>
 #include <tvm/tirx/stmt_functor.h>
 
+#include <cstdlib>
 #include <optional>
+#include <sstream>
 #include <tvm/ir/transform.h>
 #include <vector>
 
@@ -414,8 +418,326 @@ int TangTcgen5SwizzleAtomBytes(const Layout &layout, int stride, int continuous,
   return *structural;
 }
 
+// Whether `layout` describes a permutation of the shared tile itself -- the
+// only thing a bulk copy can fill -- rather than a reshape of it.
+//
+// A bulk copy lands one element per position: it applies the copy engine's
+// swizzle to the tile and reads the declared layout only for the tiling
+// geometry that swizzle is parameterised by, so the declared map has to be a
+// permutation of the same tile. Every layout the tang lowering assigns is one
+// (``_make_tcgen5_segment_layout`` and ``_make_tang_ab_layout`` in Python both
+// keep the region's shape). A CUDA ``make_swizzled_layout`` is not: it declares
+// the buffer as a stack of swizzle units -- (32, 128) bf16 becomes
+// (2, 4, 512) -- because its consumer is a tensor-map descriptor that reads
+// that reshaped view. Filling such a buffer with a bulk copy leaves the
+// engine's swizzle and the declared map disagreeing, and nothing reports it:
+// the loaded elements come back permuted.
+//
+// Stated on the shapes rather than on the index expressions: the families that
+// are legal here keep the region's geometry, and comparing shapes cannot
+// misfire on an expression form the copy path has not seen.
+bool TangLayoutKeepsTileShape(const Layout &layout) {
+  Array<PrimExpr> in_shape = layout->InputShape();
+  Array<PrimExpr> out_shape = layout->OutputShape();
+  if (in_shape.size() != out_shape.size() || in_shape.empty()) {
+    return false;
+  }
+  for (size_t i = 0; i < in_shape.size(); ++i) {
+    if (!StructuralEqual()(in_shape[i], out_shape[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Bytes of one operand row a single MMA reads (gemm_tcgen05_descriptors.py
+// MMA_OPERAND_ROW_BYTES). A K-major operand row wider than this is stored as
+// this many-byte segments (see below).
+constexpr int64_t kMmaOperandRowBytes = 128;
+
+// Whether the GEMM declared this shared operand segment-major, and in how many
+// 128-byte segments.
+//
+// A K-major operand whose row exceeds one MMA read is stored as a stack of
+// standalone 128-byte-row operands (gemm_tmma.py
+// _make_tang_ab_layout_segmented), and the bulk copy that fills it has to land
+// the same shape: one swizzled copy per segment. A single copy of the wide row
+// would place a swizzled pattern that no descriptor can address -- the row's
+// swizzle unit spans both halves of the row, which is exactly what makes the
+// wide row unreadable in the first place.
+//
+// The count is read off the *declared layout* rather than off the tile
+// geometry, because the geometry alone cannot tell a K-major wide row (which
+// must be split) from an MN-major axis of the same width (which must not be:
+// there the wide extent is M or N, so cutting it would split the operand along
+// the wrong axis and every value would land in the wrong place). Only the
+// segmented declaration has the shape signature this looks for -- output
+// columns are one segment, output rows are the input rows times the segment
+// count.
+//
+// Returns 1 for everything else, including MN-major operands and plain layouts.
+int64_t TangSegmentedOperandSegments(const Layout &layout, int bits) {
+  if (bits <= 0)
+    return 1;
+  auto in_shape = layout->InputShape();
+  auto out_shape = layout->OutputShape();
+  if (in_shape.size() != 2 || out_shape.size() != 2)
+    return 1;
+  const int64_t *in_rows = as_const_int(in_shape[0]);
+  const int64_t *in_cols = as_const_int(in_shape[1]);
+  const int64_t *out_rows = as_const_int(out_shape[0]);
+  const int64_t *out_cols = as_const_int(out_shape[1]);
+  if (!in_rows || !in_cols || !out_rows || !out_cols || *out_cols <= 0)
+    return 1;
+  if (*in_cols % *out_cols != 0)
+    return 1;
+  const int64_t segments = *in_cols / *out_cols;
+  if (segments <= 1)
+    return 1;
+  if (*out_rows != *in_rows * segments)
+    return 1;
+  if (*out_cols * bits != kMmaOperandRowBytes * 8)
+    return 1;
+  return segments;
+}
+
+// ---------------------------------------------------------------------------
+// IR-emitted 1D bulk copies
+// ---------------------------------------------------------------------------
+// Emit the warp gate, row split, drain and synchronization as IR so later
+// synchronization passes can inspect them. Geometry must be compile-time
+// constant because the runtime branch form is not supported by stcuv2.
+
+// The statement a copy emitter returns: its pieces, which are sometimes just
+// one (a store that states nothing but the transfer), and a length-1 SeqStmt is
+// rejected outright.
+Stmt AsBody(const Array<Stmt> &body) {
+  ICHECK(!body.empty());
+  return body.size() == 1 ? body[0] : SeqStmt(body);
+}
+
+// How many versions a pipelined shared buffer has, i.e. how many stages the
+// software pipeline gave it. The version dim is a leading dim the copy slices
+// to a single index, and one whole tile is its stride -- the same tile size the
+// stage division uses. A buffer without such a dim is not rotated (1).
+//
+// The handshake pass needs this number and cannot read it off the stage: the
+// pipeline may reindex a rotated buffer affinely, leaving no version count in
+// the stage expression.
+int64_t PipelinedVersions(const Buffer &buffer, const Array<Range> &ranges,
+                          const std::vector<PrimExpr> &strides,
+                          const PrimExpr &tile_elements) {
+  const auto *tile = as_const_int(tile_elements);
+  if (tile == nullptr) {
+    return 1;
+  }
+  for (size_t d = 0; d < ranges.size() && d < buffer->shape.size(); ++d) {
+    const auto *extent = as_const_int(ranges[d]->extent);
+    if (extent == nullptr || *extent != 1) {
+      break; // leading single-index slices only; past them are the tile dims
+    }
+    const auto *stride = as_const_int(strides[d]);
+    if (stride == nullptr || *stride != *tile) {
+      continue; // a sliced batch dim, not the version dim
+    }
+    const auto *dim = as_const_int(buffer->shape[d]);
+    if (dim != nullptr && *dim > 1) {
+      return *dim;
+    }
+  }
+  return 1;
+}
+
+// How the handshake pass names the buffer a copy fills: the *data variable* of
+// the copy's shared side, spelled the same way inject_s3_async_copy.cc spells
+// it. Deliberately a string and not the access_ptr itself -- a call carrying a
+// shared pointer argument looks like a shared access to the sync analysis.
+String KeyOfSharedSide(const PrimExpr &access_ptr) {
+  const auto *call = access_ptr.as<CallNode>();
+  if (call == nullptr || call->args.size() < 2) {
+    return String("");
+  }
+  std::ostringstream os;
+  os << call->args[1];
+  return String(os.str());
+}
+
+Array<PrimExpr> MakeCopyRecord(const PrimExpr &shared_addr,
+                               const PrimExpr &stage, int64_t versions,
+                               int64_t arrive, int64_t num_warps,
+                               int64_t direction,
+                               const transform::PipelinePlan &plan,
+                               bool pipeline_ready) {
+  transform::PipelinePlan record_plan = plan;
+  if (pipeline_ready) {
+    record_plan.ready_owner =
+        transform::PipelineReadyOwner::kInjectSoftwarePipeline;
+  }
+  return {
+      IntImm(DataType::Int(32), transform::kPipelinePlanSchemaVersion),
+      StringImm(KeyOfSharedSide(shared_addr)),
+      stage,
+      IntImm(DataType::Int(32), versions),
+      IntImm(DataType::Int(32), arrive),
+      IntImm(DataType::Int(32), num_warps),
+      IntImm(DataType::Int(32), direction),
+      IntImm(DataType::Int(64), record_plan.loop_uid),
+      IntImm(DataType::Int(64), record_plan.buffer_uid),
+      IntImm(DataType::Int(32), record_plan.distance),
+      IntImm(DataType::Int(32), record_plan.producer_stage),
+      IntImm(DataType::Int(32), record_plan.consumer_stage),
+      IntImm(DataType::Int(32), static_cast<int64_t>(record_plan.ready_owner))};
+}
+
+// The pipeline-version expression of a whole-version access_ptr: the pipeline
+// writes a rotated buffer as ``offset == stage * extent``, so the stage is that
+// offset over the extent (a constant 0 for a copy that is not rotated). Keep
+// the stripe offset out of this pointer so the division stays exact.
+PrimExpr WholeVersionStage(const PrimExpr &access_ptr,
+                           arith::Analyzer *analyzer) {
+  const auto *call = access_ptr.as<CallNode>();
+  if (call == nullptr || call->args.size() < 4) {
+    return IntImm(DataType::Int(32), 0);
+  }
+  const size_t n = call->args.size();
+  const PrimExpr &offset = call->args[n - 3];
+  const auto *extent = call->args[n - 2].as<IntImmNode>();
+  if (extent == nullptr || extent->value <= 0) {
+    return IntImm(DataType::Int(32), 0);
+  }
+  return analyzer->Simplify(
+      floordiv(offset, IntImm(offset.dtype(), extent->value)));
+}
+
+// One ``fcpg2s`` / ``fcps2g`` and nothing else, guarded by the warp gate.
+//
+// dst_addr / src_addr are the whole-tile (or whole-segment) base pointers, i.e.
+// exactly what the helper is handed today, and the stripe offsets are applied
+// on top of them here. Keeping the pipeline-version offset in the base pointer
+// and the stripe offset out of it is deliberate: the lowering records the
+// whole-version stage next to the copy while ThreadSync reads the extent.
+// Geometry that does not fold is *refused*, not emitted.
+//
+// A runtime pitch branch does not compile on stcuv2 because ptcc requires the
+// set_mem preamble and its bulk-copy consumer to remain adjacent. Refuse it
+// here so the diagnostic names the copy that caused it.
+void RefuseUnfoldableBulkCopy(const std::string &buffer, const PrimExpr &rows,
+                              const PrimExpr &smem_row_bytes,
+                              const PrimExpr &gmem_row_bytes) {
+  LOG(FATAL) << "TANG STCUV2: bulk copy of buffer '" << buffer
+             << "' has geometry that does not fold -- rows = " << rows
+             << ", shared row pitch = " << smem_row_bytes
+             << " B, global row pitch = " << gmem_row_bytes << " B.\n"
+             << "  The runtime-geometry form of this copy does not compile on "
+                "stcuv2 (ptcc: \"set_mem.* lost adjacency to its "
+                "cp_async_bulk consumer\"), so lowering refuses it rather "
+                "than emitting it.\n"
+             << "  Make the geometry constant: static tile shapes, and a "
+                "global buffer whose row pitch is a constant (a runtime "
+                "extent in the global tensor makes it symbolic).";
+}
+
+Stmt EmitStcuv21DCopy(const std::string &buffer, int direction,
+                      const PrimExpr &dst_addr, const PrimExpr &src_addr,
+                      const PrimExpr &thread_index, const PrimExpr &total_rows,
+                      const PrimExpr &row_bytes, const PrimExpr &gmem_bytes,
+                      int num_threads, int warp_base, int64_t versions,
+                      const std::optional<transform::PipelinePlan> &plan,
+                      const PrimExpr &pipeline_barrier,
+                      arith::Analyzer *analyzer) {
+  LOG(FATAL) << "STCUV2 bulk copy is not supported";
+  return Stmt();
+}
+
+// ---------------------------------------------------------------------------
+// IR-emitted swizzled 3D bulk copies
+// ---------------------------------------------------------------------------
+// The swizzled 3D pair used to hide the same kind of structure the 1D helpers
+// did: stripe geometry, a region-relative warp gate, a fence-group drain --
+// and, for the store, a block-wide __syncthreads() on *each* side of the copy.
+// None of that is visible to the sync passes, which is why the
+// redundant-barrier work had to match kernels by shape. This emitter states the
+// structure as IR instead, so the gate, the addresses, the drain and the
+// barriers are all readable.
+//
+// The split itself is the ISA's own geometry: 512 bytes per stripe divided by
+// the swizzle atom. The row count folds (a runtime one is refused), so every
+// quantity in the balanced split (`active`, `base`, `rem`) is a constant and
+// what is left at run time is the region warp id and two predicates.
+//
+// The pointers handed in here are the whole-tile (or whole-segment) base
+// addresses and the stripe offsets are applied on top, exactly as in
+// EmitStcuv21DCopy: keep the version offset in the base address so the lowering
+// can record the whole-version stage.
+
+// One fcpg2s/fcps2g and nothing else, guarded by the warp gate. `row_off` is
+// the stripe origin in *rows*; both sides advance by their own pitch from it.
+Stmt EmitStcuv23DCopy(const std::string &buffer, int direction,
+                      const PrimExpr &dst_addr, const PrimExpr &src_addr,
+                      const PrimExpr &thread_index, const PrimExpr &total_rows,
+                      const PrimExpr &smem_row_bytes,
+                      const PrimExpr &gmem_row_bytes, int num_threads,
+                      int warp_base, int swizzle_mode, int pack_mode,
+                      int64_t atom_bytes, int64_t versions,
+                      const std::optional<transform::PipelinePlan> &plan,
+                      const PrimExpr &pipeline_barrier,
+                      arith::Analyzer *analyzer) {
+  LOG(FATAL) << "STCUV2 bulk copy is not supported";
+  return Stmt();
+}
+
 Stmt LowerSTCUV2BulkCopy(const CopyNode &op, const LowerArgs &lower_args,
                          arith::Analyzer *analyzer) {
+  std::optional<transform::PipelinePlan> pipeline_plan;
+  {
+    Array<Integer> encoded{Integer(transform::kPipelinePlanSchemaVersion)};
+    bool complete = true;
+    for (const char *key :
+         {transform::kPipelineLoopUidAttr, transform::kPipelineBufferUidAttr,
+          transform::kPipelineVersionsAttr, transform::kPipelineDistanceAttr,
+          transform::kPipelineProducerStageAttr,
+          transform::kPipelineConsumerStageAttr,
+          transform::kPipelineReadyOwnerAttr}) {
+      auto value = op.annotations.Get(key);
+      const auto *imm =
+          value.has_value() ? value.value().as<IntImmNode>() : nullptr;
+      if (imm == nullptr) {
+        complete = false;
+        break;
+      }
+      encoded.push_back(Integer(imm->value));
+    }
+    transform::PipelinePlan plan;
+    if (complete && transform::ParsePipelinePlan(encoded, &plan)) {
+      pipeline_plan = plan;
+    }
+  }
+  // The pipeline's barrier, when the generic expansion owns this copy's edge:
+  // the copy then posts its own arrival on it (see EmitStcuv21DCopy /
+  // EmitStcuv23DCopy) and the handshake pass no longer has to. Absent for every
+  // copy the handshake pass still wires.
+  PrimExpr pipeline_barrier;
+  int64_t pipeline_arrive_count = 0;
+  if (auto barrier = op.annotations.Get("barrier");
+      barrier.has_value() && pipeline_plan.has_value()) {
+    pipeline_plan->ready_owner =
+        transform::PipelineReadyOwner::kInjectSoftwarePipeline;
+    pipeline_barrier = Downcast<PrimExpr>(barrier.value());
+    auto declared = op.annotations.Get("tang_pipeline_arrive_count");
+    ICHECK(declared.has_value())
+        << "a stcuv2 pipeline-owned copy is missing ISP's "
+           "tang_pipeline_arrive_count declaration";
+    const auto *imm = declared.value().as<IntImmNode>();
+    ICHECK(imm != nullptr && imm->value > 0)
+        << "tang_pipeline_arrive_count must be a positive IntImm";
+    pipeline_arrive_count = imm->value;
+  }
+  if (pipeline_plan.has_value() &&
+      pipeline_plan->ready_owner ==
+          transform::PipelineReadyOwner::kInjectSoftwarePipeline &&
+      !pipeline_barrier.defined()) {
+    pipeline_plan.reset();
+  }
   bool is_load = op.src.scope() == "global" &&
                  (op.dst.scope() == "shared" || op.dst.scope() == "shared.dyn");
   bool is_store =
@@ -459,6 +781,13 @@ Stmt LowerSTCUV2BulkCopy(const CopyNode &op, const LowerArgs &lower_args,
   auto [global_offset, global_strides] =
       compute_offset_and_strides(global_tensor, global_range);
   PrimExpr elements = analyzer->Simplify(total_elements);
+  const int64_t versions =
+      PipelinedVersions(shared_tensor, shared_range, shared_strides, elements);
+  if (pipeline_plan.has_value() && pipeline_plan->versions != versions) {
+    pipeline_plan.reset();
+    pipeline_barrier = PrimExpr();
+    pipeline_arrive_count = 0;
+  }
   PrimExpr shared_addr = shared_tensor.access_ptr(
       is_load ? 2 : 1, DataType::Handle(), 1, shared_offset, elements);
   PrimExpr global_addr = global_tensor.access_ptr(
@@ -503,6 +832,31 @@ Stmt LowerSTCUV2BulkCopy(const CopyNode &op, const LowerArgs &lower_args,
   PrimExpr gmem_row_stride = global_strides.empty()
                                  ? PrimExpr(1)
                                  : global_strides[row_dim(global_range)];
+
+  // A one-dimensional shared tile carries no row structure of its own: the tile
+  // is exactly the run of elements the global side hands over. Deriving rows
+  // from that flat extent splits a contiguous fill (`X[i, h, 0:n] -> S[0:n]`)
+  // into n rows of a single element and then rejects it as an unaligned row
+  // copy, although the transfer is one contiguous 2n-byte chunk. Take the tile
+  // from the global side whenever the shared side is flat and the global side
+  // is a single contiguous run (every leading extent unit); a strided gather
+  // into a flat tile keeps the row decomposition, which is what makes its
+  // unaligned geometry get reported.
+  if (shared_range.size() == 1) {
+    bool contiguous_run = !global_range.empty();
+    for (size_t d = 0; d + 1 < global_range.size(); ++d) {
+      contiguous_run &= is_unit(global_range[d]->extent);
+    }
+    contiguous_run &= !global_range.empty() &&
+                      analyzer->CanProveEqual(global_range.back()->extent,
+                                              shared_range[0]->extent);
+    if (contiguous_run) {
+      rows = PrimExpr(1);
+      cols = shared_range[0]->extent;
+      col_bytes =
+          analyzer->Simplify(FloorDiv(cols * shared_tensor->dtype.bits(), 8));
+    }
+  }
   PrimExpr gmem_row_bytes = analyzer->Simplify(
       FloorDiv(gmem_row_stride * global_tensor->dtype.bits(), 8));
 
@@ -511,9 +865,8 @@ Stmt LowerSTCUV2BulkCopy(const CopyNode &op, const LowerArgs &lower_args,
   // fcps2g.3d under the same SwizzleMode comes out permuted at atom
   // granularity, and that is an ISA-level asymmetry rather than a
   // parameterisation mistake on our side -- driving the vendor's own public
-  // wrappers with the round-trip recipe documented verbatim in cp_async_bulk.h
-  // reproduces it exactly (gver/data_copy/fcpg2s_fcps2g_path;
-  // docs/tang_bulk_copy_gs_layout.md §15.2). So the swizzled form is only
+  // wrappers with the round-trip recipe documented in cp_async_bulk.h
+  // reproduces it exactly. So the swizzled form is only
   // usable where the two ends are known to agree:
   //
   //   * `tang_swizzle_atom_bytes` present  -> the caller states the layout, so
@@ -543,7 +896,7 @@ Stmt LowerSTCUV2BulkCopy(const CopyNode &op, const LowerArgs &lower_args,
         << "', which the GEMM assigned a shared operand layout.\n"
         << "  An MMA operand is laid out swizzled for the MMA descriptor, and "
            "the swizzled shared->global store does not invert the swizzled "
-           "load (docs/tang_bulk_copy_gs_layout.md §15.2), so streaming it "
+           "load, so streaming it "
            "back to global would silently scramble it.\n"
         << "  The only validated swizzled store is the cpt2s drain (tensor "
            "memory -> shared -> global); annotate both copies with "
@@ -553,6 +906,16 @@ Stmt LowerSTCUV2BulkCopy(const CopyNode &op, const LowerArgs &lower_args,
            "unswizzled 1D path.";
   }
 
+  // Segment-major MMA operand (K-major row over one 128-byte MMA read): the
+  // layout says how many segments the row is stored in, and the copy has to
+  // fill exactly that shape -- one swizzled copy per segment (see
+  // TangSegmentedOperandSegments).
+  const int64_t segments = is_mma_operand
+                               ? TangSegmentedOperandSegments(
+                                     lower_args.layout_map.at(shared_tensor),
+                                     shared_tensor->dtype.bits())
+                               : 1;
+
   // Swizzle atom (32 or 64 bytes). An explicit annotation wins; otherwise
   // recover it from the GEMM-assigned shared-operand layout so the copy's
   // hardware swizzle matches the MMA descriptor (MN-major tf32/int8 -> atom64).
@@ -561,7 +924,17 @@ Stmt LowerSTCUV2BulkCopy(const CopyNode &op, const LowerArgs &lower_args,
     const auto *imm = value->as<IntImmNode>();
     ICHECK(imm) << "tang_swizzle_atom_bytes must be an IntImm";
     atom_bytes = static_cast<int>(imm->value);
-  } else if (is_mma_operand) {
+    ICHECK(segments == 1 || atom_bytes == 32)
+        << "TANG STCUV2: segmented MMA operand '" << shared_tensor->name
+        << "' is annotated with a " << atom_bytes
+        << "-byte swizzle atom, but a segment-major K-major operand is always "
+           "sw128a32 (32-byte atom). Drop the annotation.";
+  } else if (is_mma_operand && segments == 1) {
+    // A segmented operand is skipped here on purpose: its declared layout is a
+    // stack of operands, not one operand tiling, so the atom recovery below
+    // would have to guess. It is fixed at 32 bytes (sw128a32) instead -- the
+    // only swizzle a K-major operand uses, and the one the MMA reads the
+    // segment with.
     int ndim = static_cast<int>(shared_tensor->shape.size());
     if (ndim >= 2) {
       const auto *p_stride = as_const_int(shared_tensor->shape[ndim - 2]);
@@ -573,6 +946,35 @@ Stmt LowerSTCUV2BulkCopy(const CopyNode &op, const LowerArgs &lower_args,
             shared_tensor->dtype.bits());
       }
     }
+  }
+
+  // A swizzle *derived from the declared layout* is only reproducible if that
+  // layout is something the copy engine can land. Refuse the rest, because the
+  // alternative is silent corruption: the copy writes the hardware swizzle,
+  // every other access follows the declared map, and nothing reports the
+  // difference. Reached only when the layout is what chose the swizzle -- an
+  // explicit `tang_swizzle_atom_bytes` states the atom itself, and a
+  // segment-major operand declares a stack of segments whose geometry the copy
+  // lands one segment at a time.
+  if (is_mma_operand && !has_atom_annotation && !is_store && segments == 1) {
+    const Layout &declared = lower_args.layout_map.at(shared_tensor);
+    ICHECK(TangLayoutKeepsTileShape(declared))
+        << "TANG STCUV2: shared buffer '" << shared_tensor->name
+        << "', which a bulk copy fills, declares a layout the copy cannot "
+           "land: it reshapes the tile instead of permuting it.\n"
+        << "  A bulk copy writes one element per position and applies the copy "
+           "engine's own swizzle, reading the declared layout only for the "
+           "tiling that swizzle is parameterised by. A layout that reshapes "
+           "the buffer (a different output scope, e.g. a stack of swizzle "
+           "units) describes how a descriptor reads it, which the copy cannot "
+           "reproduce: the fill and the buffer's declared mapping then "
+           "disagree and the data comes back permuted with no error.\n"
+        << "  On stcuv2 that is what a CUDA "
+           "`T.annotate_layout(make_swizzled_layout(...))` produces. Drop the "
+           "annotation: the buffer is plain staging, and bulk copies of it "
+           "then stay unswizzled on both legs. To state a swizzle on purpose, "
+           "annotate the copy with `tang_swizzle_atom_bytes` instead.\n"
+        << "  Layout: " << declared->DebugOutput();
   }
 
   // fp4 lives in global packed 2 e2m1 codes per byte, but an mxf8f6f4 operand
@@ -619,6 +1021,16 @@ Stmt LowerSTCUV2BulkCopy(const CopyNode &op, const LowerArgs &lower_args,
                     "it gets a swizzled layout, or annotate "
                     "`tang_swizzle_atom_bytes: 32`.";
     }
+    if (segments > 1) {
+      LOG(FATAL) << "TANG STCUV2: unpacked fp4 operand '" << shared_tensor->name
+                 << "' is a segment-major operand (its " << col_bytes
+                 << "-byte shared row is " << segments
+                 << " MMA rows), and b4p4x16 has only been validated for a "
+                    "single 128-byte row.\n"
+                 << kWhy
+                 << "  Tile K at 128 so the operand is one segment, or "
+                    "pre-unpack in global and use a matching unpacked dtype.";
+    }
     ICHECK_EQ(atom_bytes, 32)
         << "TANG STCUV2: unpacked fp4 operand '" << shared_tensor->name
         << "' has a " << atom_bytes
@@ -657,26 +1069,121 @@ Stmt LowerSTCUV2BulkCopy(const CopyNode &op, const LowerArgs &lower_args,
       << "TANG bulk copy requires a constant thread count (thread_bounds), got "
       << lower_args.thread_bounds;
   int num_threads = *as_const_int(lower_args.thread_bounds->extent);
-
-  if (pack_mode != 0) {
-    // Swizzle mode 6 = sw128a32, the only atom the guards above let through.
-    return Evaluate(Call(
-        DataType::Handle(), tang_cp_async_bulk_sw(),
-        {IntImm(DataType::Int(32), direction), dst_addr, src_addr, rows,
-         col_bytes, gmem_row_bytes, IntImm(DataType::Int(32), num_threads),
-         IntImm(DataType::Int(32), 6), IntImm(DataType::Int(32), pack_mode)}));
+  if (pipeline_barrier.defined()) {
+    ICHECK_EQ(pipeline_arrive_count, num_threads / 32)
+        << "InjectSoftwarePipeline declared " << pipeline_arrive_count
+        << " stcuv2 arrivals for one engine copy, but its lowering region has "
+        << num_threads / 32
+        << " warps. Conditional/role-split copies must not be engine copies.";
   }
+  // Warp base of the *region* this copy runs in. Inside a T.ws region
+  // (`with T.ws(w, warp_group_size=32)`) the copy is executed by a subset of
+  // the block's warps, and thread_bounds is that subset -- so the helper's "one
+  // warp does the tile" gate and its stripe split have to be indexed from the
+  // region. Handing it the block-relative warp id is what made a copy outside
+  // warp 0 move no bytes at all and post no barrier arrival, which deadlocked
+  // every consumer waiting on its barrier.
+  ICHECK(is_const_int(lower_args.thread_bounds->min))
+      << "TANG bulk copy requires a constant thread lower bound "
+         "(thread_bounds), got "
+      << lower_args.thread_bounds;
+  const int warp_base =
+      static_cast<int>(*as_const_int(lower_args.thread_bounds->min) / 32);
+
+  // Per-segment addresses for a segmented MMA operand. Segment s occupies its
+  // own tile in shared memory (the operand's rows of one 128-byte MMA row, with
+  // the segments stacked) and its own column range in the global tile, so both
+  // ends of the copy are the whole-tile addresses plus one segment's step. With
+  // one segment these are exactly the addresses this copy used before, and the
+  // per-segment bodies below collapse back to a single statement.
+  PrimExpr col_bytes_one = col_bytes;
+  PrimExpr seg_shared_step = rows;
+  if (segments > 1) {
+    const int64_t *c_col_bytes = as_const_int(col_bytes);
+    ICHECK(c_col_bytes && *c_col_bytes % segments == 0)
+        << "TANG STCUV2: segmented MMA operand '" << shared_tensor->name
+        << "' has a " << col_bytes << "-byte shared row, which is not "
+        << segments << " whole " << kMmaOperandRowBytes << "-byte MMA rows.";
+    // One segment row: its bytes, and the elements it holds (which is also the
+    // step between two segments in the global tile, since the segments are
+    // consecutive column ranges of one row).
+    const int64_t one_bytes = *c_col_bytes / segments;
+    const int64_t one_elems = one_bytes * 8 / shared_tensor->dtype.bits();
+    col_bytes_one = IntImm(col_bytes.dtype(), one_bytes);
+    seg_shared_step = IntImm(shared_offset.dtype(), one_elems);
+  }
+  auto segment_offset = [&](const PrimExpr &base, const PrimExpr &step,
+                            int64_t s) {
+    return analyzer->Simplify(base + IntImm(step.dtype(), s) * step);
+  };
+  auto shared_part = [&](int64_t s) -> PrimExpr {
+    if (segments == 1)
+      return shared_addr;
+    // The offset is a *logical* element offset: the declared layout maps it
+    // into the physical segment (which is why a segment origin is a column
+    // offset in row 0 -- `s` segments along K -- rather than the segment's
+    // physical tile stride). The extent is one segment's element count.
+    PrimExpr off = segment_offset(shared_offset, seg_shared_step, s);
+    return shared_tensor.access_ptr(is_load ? 2 : 1, DataType::Handle(), 1, off,
+                                    analyzer->Simplify(seg_shared_step * rows));
+  };
+  auto global_part = [&](int64_t s) -> PrimExpr {
+    if (segments == 1)
+      return global_addr;
+    PrimExpr off = segment_offset(global_offset, seg_shared_step, s);
+    return global_tensor.access_ptr(is_load ? 1 : 2, DataType::Handle(), 1, off,
+                                    analyzer->Simplify(seg_shared_step * rows));
+  };
+  auto dst_part = [&](int64_t s) -> PrimExpr {
+    return is_load ? shared_part(s) : global_part(s);
+  };
+  auto src_part = [&](int64_t s) -> PrimExpr {
+    return is_load ? global_part(s) : shared_part(s);
+  };
+  auto emit_per_segment =
+      [&](const std::function<Stmt(int64_t)> &build) -> Stmt {
+    if (segments == 1)
+      return build(0);
+    std::vector<Stmt> stmts;
+    stmts.reserve(static_cast<size_t>(segments));
+    for (int64_t s = 0; s < segments; ++s)
+      stmts.push_back(build(s));
+    return SeqStmt(std::move(stmts));
+  };
+  // Fulfil ISP's ready-edge contract mechanically: one publication per
+  // logical copy, reached by every warp in this (unconditional) block region.
+  // Warps with no stripe bind an empty fence group and arrive immediately;
+  // issuing warps arrive only after their own DMA group retires. In both cases
+  // the count is exactly ``pipeline_arrive_count`` and does not depend on copy
+  // geometry or on how many MMA segments the logical copy lowers into.
+  const auto publish_pipeline = [&](Stmt issued) -> Stmt {
+    if (!pipeline_barrier.defined()) {
+      return issued;
+    }
+    return SeqStmt({issued, Evaluate(Call(DataType::Handle(),
+                                          tang_fence_g2s_arrive_mbarrier(),
+                                          {pipeline_barrier}))});
+  };
+
+  // A pack-mode copy needs no separate path: the swizzled 3D emitter below
+  // passes the pack mode straight to the fcpg2s template argument, and the
+  // stripe geometry is the same one the wrapper used. The guards above are what
+  // make the mode usable at all (they reject every shape the hardware
+  // mis-reads), so pack_mode is simply carried into EmitStcuv23DCopy.
 
   if (!has_atom_annotation && !is_mma_operand) {
     // Pure staging buffer: unswizzled 1D. The 1D overloads round `size` UP to
     // the 128-byte transfer chunk, which would write past the destination, so
     // reject shapes that would rely on that instead of silently overrunning.
-    // Which size matters depends on how the helper transfers the tile: one flat
-    // call when the pitches match, one call per row otherwise.
+    // Which size matters depends on how the tile is transferred: one flat call
+    // when the pitches match, one call per row otherwise. The geometry folds by
+    // the time the emitter runs (it would refuse otherwise), so these are
+    // constants here and the check below is unconditional.
     const auto *c_rows = as_const_int(rows);
     const auto *c_col_bytes = as_const_int(col_bytes);
     const auto *c_gmem_row_bytes = as_const_int(gmem_row_bytes);
-    if (c_rows && c_col_bytes && c_gmem_row_bytes) {
+    if (c_rows != nullptr && c_col_bytes != nullptr &&
+        c_gmem_row_bytes != nullptr) {
       const bool contiguous = *c_col_bytes == *c_gmem_row_bytes;
       const int64_t unit =
           contiguous ? (*c_rows) * (*c_col_bytes) : *c_col_bytes;
@@ -690,38 +1197,61 @@ Stmt LowerSTCUV2BulkCopy(const CopyNode &op, const LowerArgs &lower_args,
                "chunk.\n"
             << "  Tile is " << *c_rows << " rows x " << *c_col_bytes
             << " B, global row pitch " << *c_gmem_row_bytes << " B.\n"
-            << "  A staging buffer cannot use the swizzled path (it does not "
-               "round-trip, docs/tang_bulk_copy_gs_layout.md §15.2), and the "
+            << "  A staging buffer cannot use the swizzled path because it "
+               "does not round-trip, and the "
                "1D path would round the size up and overrun the destination.\n"
             << "  Pad the shared tile so "
             << (contiguous ? "rows * row_bytes" : "row_bytes")
             << " is a multiple of 128.";
       }
     }
-    return Evaluate(Call(DataType::Handle(), tang_cp_async_bulk_1d(),
-                         {IntImm(DataType::Int(32), direction), dst_addr,
-                          src_addr, rows, col_bytes, gmem_row_bytes,
-                          IntImm(DataType::Int(32), num_threads)}));
+    // Emit the copy structure as IR (see EmitStcuv21DCopy). There is no
+    // monolithic call or runtime fallback:
+    // geometry that does not fold is refused by the emitter itself. A planned
+    // shape also carries a `tl.tang_bulk_async_commit` record so the sync
+    // passes can materialize its declared ordering.
+    //
+    // A 1D staging copy consumed by a register copy has no tensor-core
+    // retirement event, so it keeps the blocking path.
+    return publish_pipeline(emit_per_segment([&](int64_t s) {
+      return EmitStcuv21DCopy(shared_tensor->name, direction, dst_part(s),
+                              src_part(s), lower_args.thread_index, rows,
+                              col_bytes_one, gmem_row_bytes, num_threads,
+                              warp_base, versions, pipeline_plan,
+                              pipeline_barrier, analyzer);
+    }));
   }
 
-  if (atom_bytes == 64 || atom_bytes == 8) {
-    // Swizzle mode codes consumed by codegen: 4 = sw128a8, 7 = sw128a64.
-    // sw128a8 is the mode a cpt2s-staged tile is written with, so a tile
-    // coming out of tensor memory has to be read back with it too.
-    int swizzle_mode = atom_bytes == 64 ? 7 : 4;
-    return Evaluate(
-        Call(DataType::Handle(), tang_cp_async_bulk_sw(),
-             {IntImm(DataType::Int(32), direction), dst_addr, src_addr, rows,
-              col_bytes, gmem_row_bytes, IntImm(DataType::Int(32), num_threads),
-              IntImm(DataType::Int(32), swizzle_mode),
-              IntImm(DataType::Int(32), 0)}));
-  }
-  ICHECK_EQ(atom_bytes, 32)
+  // ---- swizzled 3D forms ----
+  // Reached only by copies that are neither a pure staging buffer (the 1D
+  // block above) nor a pack-mode copy (the branch above, which is load-only).
+  //
+  // Swizzle mode codes consumed by codegen: 4 = sw128a8, 6 = sw128a32 (the
+  // hard-coded default), 7 = sw128a64. The mode is also what sizes the 3D
+  // stripe split (512 / atom_bytes), so it is derived once here.
+  const int swizzle_mode = atom_bytes == 64 ? 7 : (atom_bytes == 8 ? 4 : 6);
+
+  // Emit the copy's structure as IR. The emitter rejects row counts that are
+  // not compile-time constants. Loads also publish a record consumed by
+  // InjectS3AsyncCopy; stores do not participate in that handshake.
+  //
+  // This sits after the 1D block on purpose: a staging buffer's store is a 1D
+  // copy and must stay one. Placing it earlier made the staging shapes emit a
+  // *swizzled* store instead -- same byte count, different instruction, and for
+  // a sub-tile (shared row != global row) the wrong bytes.
+  //
+  // The version count is stated to the pass rather than recovered from the
+  // addresses: a pipeline may reindex a rotated buffer affinely, and then the
+  // offset may carry no `k % versions` term from which to recover it.
+  ICHECK(atom_bytes == 8 || atom_bytes == 32 || atom_bytes == 64)
       << "TANG STCUV2 bulk copy supports swizzle atom sizes 8, 32 or 64 bytes";
-  return Evaluate(Call(DataType::Handle(), tang_cp_async_bulk(),
-                       {IntImm(DataType::Int(32), direction), dst_addr,
-                        src_addr, rows, col_bytes, gmem_row_bytes,
-                        IntImm(DataType::Int(32), num_threads)}));
+  return publish_pipeline(emit_per_segment([&](int64_t s) {
+    return EmitStcuv23DCopy(
+        shared_tensor->name, direction, dst_part(s), src_part(s),
+        lower_args.thread_index, rows, col_bytes_one, gmem_row_bytes,
+        num_threads, warp_base, swizzle_mode, pack_mode, atom_bytes, versions,
+        pipeline_plan, pipeline_barrier, analyzer);
+  }));
 }
 
 // Emit the TANG stcuv2 register <-> TMEM movement as a single-warp `.16x256b`
@@ -845,8 +1375,18 @@ Stmt LowerTangTmemFragmentCopy(const CopyNode &op, const LowerArgs &lower_args,
 //
 // The engine writes 8-byte atoms holding one tensor memory row each (the
 // sw128a8 configuration), so the staged tile is row-major only when the shared
-// row is exactly one 128-byte swizzle unit wide. A single call drains 64 rows;
-// the device helper loops for taller tiles.
+// row is exactly one 128-byte swizzle unit wide. A single call drains 64 rows
+// (``kCpt2s``), so a taller tile is a counted loop around the leaf op -- the
+// loop, strides and fence are IR so the synchronization passes can see them.
+constexpr int64_t kCpt2sRowsPerCall = 64;
+constexpr int64_t kCpt2sBytesPerCall =
+    512 * (128 / 8); // sw128a8: 512 * (swizzle bytes / atom bytes)
+constexpr int64_t kFenceGroupT2s = 2; // fg_t2s_default
+constexpr int64_t kFenceGroupS2t = 3; // fg_s2t_default
+// Rows one cps2t call stages (one 32x32b group; the engine walks the 32 rows
+// itself from its per-lane addressing mode).
+constexpr int64_t kCps2tRowsPerCall = 32;
+
 Stmt LowerTangTmemToSharedCopy(const CopyNode &op, const LowerArgs &lower_args,
                                arith::Analyzer *analyzer) {
   const Buffer &tmem_buf = op.src;
@@ -917,13 +1457,69 @@ Stmt LowerTangTmemToSharedCopy(const CopyNode &op, const LowerArgs &lower_args,
   PrimExpr smem_addr = smem_buf.access_ptr(
       2, DataType::Handle(), 1, analyzer->Simplify(smem_offset), elements);
 
-  // Unguarded on purpose: the helper elects warp 0 internally and ends with a
-  // __syncthreads(), so every thread of the block has to reach it.
-  return Evaluate(Call(DataType::Handle(), tang_cp_tmem_to_shared(),
-                       {smem_addr,
-                        BufferLoad(tmem_buf, {analyzer->Simplify(row_min),
-                                              analyzer->Simplify(col_min)}),
-                        IntImm(DataType::Int(32), rows)}));
+  const auto c = [](int64_t v) { return IntImm(DataType::Int(32), v); };
+  // Region-relative warp id: the *region's* first warp, not the block's. Inside
+  // a T.ws region the block's warp 0 need not be one of the warps that execute
+  // this copy at all, which would make a block-relative election copy nothing.
+  ICHECK(is_const_int(lower_args.thread_bounds->min) &&
+         is_const_int(lower_args.thread_bounds->extent))
+      << "TANG tmem->shared copy requires constant thread bounds, got "
+      << lower_args.thread_bounds;
+  const int64_t warp_base =
+      static_cast<int64_t>(*as_const_int(lower_args.thread_bounds->min) / 32);
+  const int64_t region_warps = static_cast<int64_t>(
+      *as_const_int(lower_args.thread_bounds->extent) / 32);
+  PrimExpr warp_id = analyzer->Simplify(
+      floordiv(lower_args.thread_index, c(32)) - c(warp_base));
+
+  // Kept as the BufferLoad (the tmem buffer still carries its logical element
+  // type here) with the starting row passed separately: the engine reads the
+  // row out of the address high half, so codegen shifts it in (`(row << 16)`).
+  PrimExpr taddr = BufferLoad(
+      tmem_buf, {analyzer->Simplify(row_min), analyzer->Simplify(col_min)});
+
+  // Split the row blocks across the region's warps, one contiguous run each --
+  // the rotation ExpandS3TmemDrain uses for the multi-warp writeback
+  // (`r = warp*16; r += nwarps*16`). Two reasons it beats the single-warp form
+  // the helper had: the participating warps then match whoever consumes the
+  // staged tile (a bulk s2g store is issued by the leading warps), and when the
+  // tile is tall enough for every warp to get a run the guard folds away
+  // entirely -- the common case, and one the single-warp form could not reach.
+  const int64_t chunks = rows / kCpt2sRowsPerCall;
+  int64_t active = std::min<int64_t>(region_warps, chunks);
+  if (active < 1 || chunks % active != 0) {
+    active = 1; // keep every warp's run whole instead of splitting unevenly
+  }
+  const int64_t per_warp = chunks / active;
+  auto copy_at = [&](const PrimExpr &blk) {
+    return Evaluate(
+        Call(DataType::Handle(), tang_cpt2s_16x64b_2d(),
+             {smem_addr, analyzer->Simplify(blk * c(kCpt2sBytesPerCall)), taddr,
+              analyzer->Simplify(blk * c(kCpt2sRowsPerCall)), c(0),
+              c(kFenceGroupT2s)}));
+  };
+  const PrimExpr first = analyzer->Simplify(warp_id * c(per_warp));
+  Stmt copy;
+  if (per_warp == 1) {
+    copy = copy_at(first); // one block per warp: no loop to emit at all
+  } else {
+    // Counted loop with the index recomputed in the body: a For's `step` does
+    // not survive to codegen (it degenerates to ++i).
+    Var step("step", DataType::Int(32));
+    copy = tirx::For(step, c(0), c(per_warp), tirx::ForKind::kSerial,
+                     copy_at(analyzer->Simplify(first + step)));
+  }
+  // Per-warp drain, not a barrier: it retires the issuing warp's cpt2s before
+  // anything reads the staged tile, and fence_mem only covers its own group.
+  Stmt drain =
+      Evaluate(Call(DataType::Handle(), tang_fence_mem(), {c(kFenceGroupT2s)}));
+
+  // No `__syncthreads()` is emitted. Whoever consumes the staged tile reads
+  // *shared* memory -- a bulk s2g store, or an epilogue -- so the publish is a
+  // shared hazard the sync passes derive from the accesses themselves. The
+  // barrier the device helper hid at its end was invisible to every sync pass,
+  // which is why it could not be reasoned about; it was never load-bearing.
+  return IfThenElse(warp_id < c(active), SeqStmt({copy, drain}), Stmt());
 }
 
 // Stage a shared-memory tile into tensor memory with the cps2t copy engine,
@@ -1055,16 +1651,8 @@ Stmt LowerTangSharedToTmemCopy(const CopyNode &op, const LowerArgs &lower_args,
   PrimExpr smem_addr = smem_buf.access_ptr(
       1, DataType::Handle(), 1, IntImm(DataType::Int(32), 0), elements);
 
-  // Unguarded on purpose: the helper elects warp 0 internally and ends with a
-  // __syncthreads(), so every thread of the block has to reach it.
-  return Evaluate(Call(
-      DataType::Handle(), tang_cp_shared_to_tmem(),
-      {smem_addr,
-       BufferLoad(tmem_buf,
-                  {analyzer->Simplify(row_min), analyzer->Simplify(col_min)}),
-       IntImm(DataType::Int(32), rows), IntImm(DataType::Int(32), col_words),
-       IntImm(DataType::Int(32), row_words),
-       IntImm(DataType::Int(32), source_is_swizzled ? 1 : 0)}));
+  LOG(FATAL) << "STCUV2 GEMM operand staging is not supported";
+  return Stmt();
 }
 
 // Element-wise SM-to-SM cluster copy. T.copy_cluster(dst_block=...) writes the
@@ -1134,8 +1722,26 @@ Stmt LowerClusterCopyElementWise(const CopyNode &op,
   if (lower_args.buffer_remap.count(op.dst)) {
     target_dst = lower_args.buffer_remap[op.dst];
   }
-  return ClusterCopyReplacer(op.dst, op.dst_block.value(),
-                             target_dst)(vectorized_thread_loop);
+  Stmt simt_copy = ClusterCopyReplacer(op.dst, op.dst_block.value(),
+                                       target_dst)(vectorized_thread_loop);
+
+  // Remote mbarrier arrive: signal the destination CTA that the element-wise
+  // stores are visible. A local shared sync first ensures every thread finished
+  // its store, then a single thread arrives on the peer's barrier. The arrive
+  // lowers to tl::cluster_arrive_barrier, which maps the barrier into the peer
+  // CTA's address space and arrives once (requires the LLVM dev_dshm branch).
+  if (auto barrier_opt = op.annotations.Get("barrier")) {
+    auto barrier = Downcast<PrimExpr>(barrier_opt.value());
+    Stmt sync = Evaluate(Call(DataType::Int(32), builtin::tvm_storage_sync(),
+                              {StringImm("shared")}));
+    Stmt arrive =
+        Evaluate(Call(DataType::Handle(), ptx_arrive_cluster_barrier(),
+                      {barrier, op.dst_block.value()}));
+    Stmt guarded_arrive = IfThenElse(
+        EQ(lower_args.thread_index, lower_args.thread_bounds->min), arrive);
+    return SeqStmt({simt_copy, sync, guarded_arrive});
+  }
+  return simt_copy;
 }
 
 Stmt Lower(const CopyNode &op, const LowerArgs &lower_args,

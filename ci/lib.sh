@@ -36,51 +36,27 @@ CMAKE_PATH="${CMAKE_PATH:-/usr/local/tangrt/cmake}"
 CMAKE_ROOT="${CMAKE_ROOT:-/usr/local/bin/cmake}"
 TANG_CMAKE_PACKAGE_DIR="${TANG_CMAKE_PACKAGE_DIR:-${TANGRT_PATH}/targets/linux-x86_64/lib/cmake/TANG}"
 TANGRT_CMAKE_PACKAGE_DIR="${TANGRT_CMAKE_PACKAGE_DIR:-${TANGRT_PATH}/targets/linux-x86_64/lib/cmake/TANGRT}"
-# S3 (stcuv2) ISS simulator toolchain paths. Shared by both CI jobs on purpose:
-# the S2 job runs the tilelang list, which also carries stcuv2/simulator cases
-# ("... + simulator" helpers in four upstream test files), and the S3 job runs
-# the s3 list. What a run *targets* is not decided here -- see
-# ci_apply_test_mode below.
-TANG_S3_PTCC_PATH="${TANG_S3_PTCC_PATH:-}"
-TANG_S3_ISS_PATH="${TANG_S3_ISS_PATH:-}"
-TANG_S3_LOADER_PATH="${TANG_S3_LOADER_PATH:-}"
-
-# -------------------- Test mode (S2 / S3) --------------------
-# One switch decides what "the default target" means for a whole test run, so the
-# same test files can be pointed at either TANG arch without editing them:
+# -------------------- Test mode --------------------
+# One switch decides what "the default target" means for a whole test run:
 #
-#   s2 -> tang/stcu on real hardware (tvm_ffi backend), the historical behaviour
-#   s3 -> tang/stcuv2 through the ISS simulator; TANG_SIMULATOR=1 makes the
-#         simulator the auto-selected execution backend for stcuv2
-#         (tilelang/tang/execution_backend.py) and never matches stcu, so the S2
-#         mode is unaffected by it
+#   s2 -> tang/stcu on real hardware (tvm_ffi backend)
 #
 # Tests express "I only make sense on arch X" with tilelang.testing.requires_stcu
 # / requires_stcuv2, which read this same default target. ci/run.sh --arch <mode>
-# applies it locally; the CI entry scripts call it with their own mode
-# (ci/test.sh -> s2, ci/s3/test_s3.sh -> s3).
+# applies it locally; ci/test.sh calls it with s2.
 ci_apply_test_mode () {
     local mode="${1:-s2}"
-    # NOTE: a JSON target cannot be inlined into ${VAR:-...}: its closing brace
-    # would terminate the parameter expansion, so stage it in a local first.
-    local s3_target='{"kind": "tang", "arch": "stcuv2"}'
     case "$mode" in
     s2)
         export TILELANG_DEFAULT_TARGET="${TILELANG_DEFAULT_TARGET:-tang}"
         export TANG_ARCH="${TANG_ARCH:-stcu}"
-        unset TANG_SIMULATOR
-        ;;
-    s3)
-        export TILELANG_DEFAULT_TARGET="${TILELANG_DEFAULT_TARGET:-$s3_target}"
-        export TANG_ARCH="${TANG_ARCH:-stcuv2}"
-        export TANG_SIMULATOR=1
         ;;
     *)
-        echo "ERROR: ci_apply_test_mode expects s2 or s3 (got '$mode')" >&2
+        echo "ERROR: ci_apply_test_mode expects s2 (got '$mode')" >&2
         return 1
         ;;
     esac
-    echo "TANG test mode: $mode (target=$TILELANG_DEFAULT_TARGET, TANG_ARCH=$TANG_ARCH, TANG_SIMULATOR=${TANG_SIMULATOR:-0})"
+    echo "TANG test mode: $mode (target=$TILELANG_DEFAULT_TARGET, TANG_ARCH=$TANG_ARCH)"
 }
 
 # -------------------- Helpers --------------------
@@ -348,7 +324,7 @@ ci_failure_report_dir () {
 #       [attempt max_attempts will_retry]
 ci_record_case_result () {
     local suite="$1" case_id="$2" command="$3" status="$4" exit_code="$5" elapsed="$6" reason="$7" logfile="$8"
-    local timeout_seconds="${9:-}"
+    local timeout_seconds="${9:-}" skip_origin="${10:-}"
     local report_dir; report_dir="$(ci_failure_report_dir)"
     if ! mkdir -p "$report_dir"; then
         echo "ERROR: failed to create case-report directory: $report_dir" >&2
@@ -361,10 +337,10 @@ ci_record_case_result () {
         return 1
     fi
     python3 - "$report_dir/${suite}.jsonl" "$suite" "$case_id" "$command" "$status" \
-              "$exit_code" "$elapsed" "$reason" "$tail" "$timeout_seconds" <<'PY'
+              "$exit_code" "$elapsed" "$reason" "$tail" "$timeout_seconds" "$skip_origin" <<'PY'
 import json, os, sys
 out, suite, case_id, command, status, exit_code, elapsed, reason, tail = sys.argv[1:10]
-timeout_seconds = sys.argv[10]
+timeout_seconds, skip_origin = sys.argv[10:12]
 rec = {
     "schema_version": 2, "record_kind": "case_result",
     "suite": suite, "job": os.getenv("CI_JOB_NAME", ""), "case": case_id,
@@ -375,6 +351,11 @@ rec = {
     "job_name": os.getenv("CI_JOB_NAME", ""), "commit_sha": os.getenv("CI_COMMIT_SHA", ""),
     "project_id": os.getenv("CI_PROJECT_ID", ""), "mr_iid": os.getenv("CI_MERGE_REQUEST_IID", ""),
 }
+rec["counting_policy"] = "unified-skipped-v1"
+if skip_origin:
+    rec["skip_origin"] = skip_origin
+if skip_origin == "list_comment":
+    rec["executed"] = False
 if timeout_seconds:
     rec["timeout_seconds"] = int(timeout_seconds)
 with open(out, "a", encoding="utf-8") as fh:
@@ -865,7 +846,6 @@ ci_export_tang_env () {
     fi
     export LLVM_VERSION_MAJOR LLVM_VERSION_MINOR
     export TANGRT_PATH STPU_TANGRT_PATH VENDOR_INCLUDE_DIRS PTCC_PATH CMAKE_PATH CMAKE_ROOT
-    export TANG_S3_PTCC_PATH TANG_S3_ISS_PATH TANG_S3_LOADER_PATH
     # Prefer the physical target prefix over /usr/local/tangrt-* symlinks.  The
     # vendor package computes imported library paths relative to its config
     # file, so resolving the symlink first would incorrectly produce /usr/targets.
@@ -1076,6 +1056,61 @@ _ci_warn_unparsable () {
     CI_DROPPED_LINES+=("$line")
 }
 
+# Decode only complete commented selectors, never prose mentioning a Python file.
+# Marker-filtered runs cannot select disabled entries without collecting them.
+ci_decode_list_line () {
+    CI_LIST_LINE="$1"
+    CI_LIST_LINE="${CI_LIST_LINE#"${CI_LIST_LINE%%[![:space:]]*}"}"
+    CI_LIST_LINE="${CI_LIST_LINE%"${CI_LIST_LINE##*[![:space:]]}"}"
+    CI_LIST_COMMENT=0
+    [[ -n "$CI_LIST_LINE" ]] || return 1
+    if [[ "$CI_LIST_LINE" == \#* ]]; then
+        [[ -z "${TEST_MARKER:-}" ]] || return 1
+        CI_LIST_LINE="${CI_LIST_LINE#\#}"
+        CI_LIST_LINE="${CI_LIST_LINE#"${CI_LIST_LINE%%[![:space:]]*}"}"
+        local path_re='[[:alnum:]_./+-]+\.py'
+        local selector_re="${path_re}(::[^[:space:]]+)?([[:space:]]+-m[[:space:]]+[A-Za-z_][A-Za-z0-9_]*)?"
+        case "${2:-pytest}" in
+            pytest) [[ "$CI_LIST_LINE" =~ ^($selector_re|python[[:space:]]+$path_re)$ ]] || return 1 ;;
+            command) [[ "$CI_LIST_LINE" =~ ^(python[[:space:]]+$path_re|pytest[[:space:]]+$selector_re)$ ]] || return 1 ;;
+            puzzle) [[ "$CI_LIST_LINE" =~ ^$path_re$ ]] || return 1 ;;
+            *) return 1 ;;
+        esac
+        CI_LIST_COMMENT=1
+    fi
+    return 0
+}
+
+# Stable selector dedup: an enabled entry wins over a commented copy, even when
+# it occurs later. Marker/node selections remain distinct tasks.
+ci_dedup_plan () {
+    local root="$1" i key slot
+    local -A seen=()
+    local -a cmds=() labels=() modes=()
+    for i in "${!CI_CMDS[@]}"; do
+        key=$(ci_timeout_key "${CI_LABELS[$i]}" "$root") || return 1
+        key+="${CI_LABELS[$i]#"${CI_LABELS[$i]%%[[:space:]]*}"}"
+        if [[ -n "${seen[$key]:-}" ]]; then
+            slot=$((${seen[$key]}-1))
+            if [[ "${modes[$slot]}" != list_comment && "${CI_CASE_MODES[$i]}" != list_comment &&
+                  ( "${modes[$slot]}" != "${CI_CASE_MODES[$i]}" ||
+                    "${cmds[$slot]%% *}" != "${CI_CMDS[$i]%% *}" ) ]]; then
+                echo "ERROR: conflicting execution modes for ${CI_LABELS[$i]}" >&2
+                return 1
+            fi
+            if [[ "${modes[$slot]}" == list_comment && "${CI_CASE_MODES[$i]}" != list_comment ]]; then
+                cmds[$slot]="${CI_CMDS[$i]}"
+                labels[$slot]="${CI_LABELS[$i]}"
+                modes[$slot]="${CI_CASE_MODES[$i]}"
+            fi
+            continue
+        fi
+        seen[$key]=$((${#cmds[@]}+1))
+        cmds+=("${CI_CMDS[$i]}"); labels+=("${CI_LABELS[$i]}"); modes+=("${CI_CASE_MODES[$i]}")
+    done
+    CI_CMDS=("${cmds[@]}"); CI_LABELS=("${labels[@]}"); CI_CASE_MODES=("${modes[@]}")
+}
+
 # Parse a test-case list file into the caller-visible arrays CI_CMDS / CI_LABELS
 # / CI_CASE_MODES (APPENDS; caller resets first). $1=list file, $2=mode
 # (command|pytest|puzzle), optional $3=list_root used to resolve relative paths
@@ -1092,13 +1127,15 @@ ci_parse_list_into () {
     fi
     [[ -z "$list_root" ]] && list_root="$(cd "$(dirname "$list_file")" && pwd)"
     local line
-    while IFS= read -r line; do
-        [[ $line =~ ^#.*$ ]] && continue
-        [[ -z $line ]] && continue
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ci_decode_list_line "$line" "$mode" || continue
+        line="$CI_LIST_LINE"
         case "$mode" in
             command)
                 [[ $line =~ ^(python|pytest)[[:space:]]+ ]] || { _ci_warn_unparsable "$line" "$list_file"; continue; }
-                CI_CMDS+=("$line"); CI_LABELS+=("$(echo "$line" | awk '{print $2}')")
+                local command_selector="${line#*[[:space:]]}"
+                command_selector="${command_selector#"${command_selector%%[![:space:]]*}"}"
+                CI_CMDS+=("$line"); CI_LABELS+=("$command_selector")
                 CI_CASE_MODES+=("command") ;;
             pytest)
                 if [[ $line =~ ^python[[:space:]]+.+\.py$ ]]; then
@@ -1133,6 +1170,7 @@ ci_parse_list_into () {
                     local file_part="${selector%%::*}" node_suffix=""
                     [[ "$selector" == *::* ]] && node_suffix="::${selector#*::}"
                     [[ "$file_part" != /* ]] && file_part="$list_root/$file_part"
+                    file_part=$(realpath -m -- "$file_part") || return 1
                     local case_path="${file_part}${node_suffix}"
                     if [ -n "${TEST_MARKER:-}" ]; then
                         CI_CMDS+=("python -m pytest -v -ra --instafail --import-mode=importlib ${PYTEST_AUDIT_PLUGIN_ARGS:-} -m ${TEST_MARKER} $case_path")
@@ -1141,7 +1179,7 @@ ci_parse_list_into () {
                     else
                         CI_CMDS+=("python -m pytest -v -ra --instafail --import-mode=importlib ${PYTEST_AUDIT_PLUGIN_ARGS:-}${extra} $case_path")
                     fi
-                    CI_LABELS+=("$line")
+                    CI_LABELS+=("${selector}${extra}")
                     CI_CASE_MODES+=("pytest")
                 fi
                 ;;
@@ -1149,7 +1187,11 @@ ci_parse_list_into () {
                 [[ $line =~ \.py$ ]] || { _ci_warn_unparsable "$line" "$list_file"; continue; }
                 CI_CMDS+=("python $line"); CI_LABELS+=("$line"); CI_CASE_MODES+=("puzzle") ;;
         esac
+        if [[ "$CI_LIST_COMMENT" -eq 1 ]]; then
+            CI_CASE_MODES[$((${#CI_CASE_MODES[@]}-1))]=list_comment
+        fi
     done < "$list_file"
+    ci_dedup_plan "$list_root"
 }
 
 # Canonical selector identity shared by list overrides and run.sh's merged plan.
@@ -1178,6 +1220,8 @@ ci_load_test_timeouts () {
     local list_root
     list_root=$(cd "$(dirname "$list_file")" && pwd) || return 1
     local -a CI_CMDS=() CI_LABELS=() CI_CASE_MODES=()
+    # Validate mappings against the whole list, even in a marker-filtered run.
+    local TEST_MARKER=""
     ci_parse_list_into "$list_file" "$mode" "$list_root" || return 1
     local -A available=() seen=()
     local label key line value
@@ -1260,6 +1304,7 @@ ci_run_prepared_cases () {
     fi
 
     local num=${#cmds[@]}
+    echo "Counting policy: unified-skipped-v1 (includes disabled list entries)"
     echo "Total test cases: $num   (marker: ${TEST_MARKER:-all}, repeat: ${case_repeat})"
     if [[ $num -eq 0 ]]; then
         echo "Error: no valid test cases found"; return 1
@@ -1291,9 +1336,20 @@ ci_run_prepared_cases () {
 
     local -a results=()
     local success=0 fail=0 skipped=0 i ret start end elapsed line_result
-    local attempt case_status reason rec_log current_mode launch_cwd logfile attempt_log current_timeout key
+    local attempt case_status reason rec_log skip_origin current_mode launch_cwd logfile attempt_log current_timeout key
     local recording_failed=0 record_ret device_unusable=0
     for ((i=0; i<num; i++)); do
+        [[ ${CI_SHUTTING_DOWN:-0} -eq 1 ]] && exit 143
+        if [[ "${case_modes[$i]}" == list_comment ]]; then
+            reason="disabled by test list comment"
+            line_result="SKIPPED: ${labels[$i]} ($reason)"
+            echo "  -> $line_result"
+            ci_record_case_result "$suite" "${labels[$i]}" "${cmds[$i]}" SKIPPED 0 0 \
+                "$reason" "" "" list_comment || recording_failed=1
+            results+=("$line_result")
+            skipped=$((skipped+1))
+            continue
+        fi
         echo ">>>>>>> running case $((i+1))/$num: ${labels[$i]} <<<<<<<<"
         key=$(ci_timeout_key "${labels[$i]}" "$list_root") || return 1
         current_timeout="${CI_CASE_TIMEOUTS[$key]:-$case_timeout}"
@@ -1391,7 +1447,9 @@ ci_run_prepared_cases () {
                 line_result="FAILURE: ${labels[$i]} (exit $ret, ${elapsed}s)"; fail=$((fail+1)) ;;
         esac
         # Record every case (PASS/SKIPPED carry no log_tail to bound artifact size).
-        ci_record_case_result "$suite" "${labels[$i]}" "${cmds[$i]}" "$case_status" "$ret" "$elapsed" "$reason" "$rec_log" "$current_timeout" || {
+        skip_origin=""
+        [[ "$case_status" == SKIPPED ]] && skip_origin=pytest
+        ci_record_case_result "$suite" "${labels[$i]}" "${cmds[$i]}" "$case_status" "$ret" "$elapsed" "$reason" "$rec_log" "$current_timeout" "$skip_origin" || {
             record_ret=$?
             echo "ERROR: failed to record final result for ${labels[$i]} (exit $record_ret)" >&2
             recording_failed=1

@@ -1,21 +1,16 @@
 import torch
 import torch.nn.functional as F
-from typing import Optional, Union
+from typing import Optional, Sequence, Union
 
 from tile_kernels.utils import align, ceil_div
-from tile_kernels.quant.common import unpack_from_e2m1fn_x2
+from tile_kernels.config import get_amax_clamp_for_quant, is_ascend
+from tile_kernels.quant.common import (
+    BaseCastConfig,
+    get_packed_ue8m0_pack_factor,
+    get_packed_ue8m0_torch_dtype,
+    unpack_from_e2m1fn_x2,
+)
 from tile_kernels.quant.types import QuantTensor
-
-
-def right_shift_unsigned(x, shift):
-    # CUDA torch does not support bit ops on uint32, so we need to mask to get unsigned right shift
-    return (x >> shift) & ((1 << (32 - shift)) - 1)
-
-
-def get_min_clamp_val(dtype: torch.dtype):
-    min_clamp_by_dtype = {torch.int8: 6.0 * 2 ** (-126), torch.float8_e4m3fn: 0.0001}
-    assert dtype in min_clamp_by_dtype
-    return min_clamp_by_dtype[dtype]
 
 
 def get_max_quant_val(dtype: torch.dtype):
@@ -24,16 +19,22 @@ def get_max_quant_val(dtype: torch.dtype):
     return max_quant_by_dtype[dtype]
 
 
-def transform_sf(sf: torch.Tensor) -> torch.Tensor:
+def transform_sf(sf: torch.Tensor, input_config: Optional[BaseCastConfig] = None) -> torch.Tensor:
     if sf.dtype == torch.float32:
         return sf
-    assert sf.dtype == torch.int32
+    elif sf.dtype == torch.float8_e4m3fn:
+        return sf.float()
+    assert sf.dtype == get_packed_ue8m0_torch_dtype()
+    num_rows, num_cols = sf.shape
     sf = sf.contiguous()
     if sf.stride(-1) != 1:
         sf = sf.as_strided(size=sf.shape, stride=(sf.shape[-1], 1))
     sf = sf.view(torch.uint8)
     sf = sf.to(torch.int32)
     sf = (sf << 23).view(torch.float32)
+    if input_config is not None and input_config.sf_col_pack:
+        pack_factor = get_packed_ue8m0_pack_factor()
+        sf = sf.view(num_rows, num_cols, pack_factor).permute(0, 2, 1).reshape(num_rows * pack_factor, num_cols)
     return sf
 
 
@@ -51,12 +52,66 @@ def cast_back(x: QuantTensor, fmt: str, block_size: tuple[int, int] = (32, 32)) 
     input_tensor, input_sf = x
     assert input_tensor.dtype in (torch.float8_e4m3fn, torch.int8)
     # Expand x_sf and do elementwise multiply with x
-    input_sf = transform_sf(input_sf)
+    input_config = BaseCastConfig(input_tensor.dtype, block_size, use_packed_ue8m0=input_sf.dtype == get_packed_ue8m0_torch_dtype())
+    input_sf = transform_sf(input_sf, input_config)
     input_sf = input_sf.repeat_interleave(block_size[0], dim=0).repeat_interleave(block_size[1], dim=1)
     input_tensor = unpack_from_e2m1fn_x2(input_tensor) if input_tensor.dtype == torch.int8 else input_tensor.to(torch.float32)
     input_sf = input_sf[: input_tensor.shape[0], : input_tensor.shape[1]]
     x = input_tensor * input_sf
     return x.to(dtype=torch.float32 if fmt == 'fp32' else torch.bfloat16)
+
+
+def transpose_weight_sf(
+    sf: torch.Tensor,
+    block_size: int,
+    transpose_sf1: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert sf.dtype == torch.float32
+    is_dense = sf.dim() == 2
+    if is_dense:
+        sf = sf.unsqueeze(0)
+
+    num_groups, num_sf_n, num_sf_k = sf.shape
+    n, k = num_sf_n * block_size, num_sf_k * block_size
+
+    pack_factor = get_packed_ue8m0_pack_factor()
+    packed_dtype = get_packed_ue8m0_torch_dtype()
+    num_packed_sf0 = ceil_div(num_sf_k, pack_factor)
+    num_packed_sf1 = ceil_div(num_sf_n, pack_factor)
+
+    exp = (sf.view(torch.int32) >> 23) & 0xFF
+
+    exp_padded_c = torch.zeros(num_groups, num_sf_n, pack_factor * num_packed_sf0, dtype=torch.int32, device=sf.device)
+    exp_padded_c[:, :, :num_sf_k] = exp
+    packed_rc = sum(exp_padded_c[:, :, j::pack_factor] << (8 * j) for j in range(pack_factor))
+    row_block_ids = torch.arange(n, device=sf.device) // block_size
+    sf0_storage = torch.empty(num_groups, num_packed_sf0, n, dtype=packed_dtype, device=sf.device)
+    sf0_storage.copy_(packed_rc[:, row_block_ids, :].transpose(1, 2))
+
+    exp_padded_r = torch.zeros(num_groups, pack_factor * num_packed_sf1, num_sf_k, dtype=torch.int32, device=sf.device)
+    exp_padded_r[:, :num_sf_n, :] = exp
+    packed_rk = sum(exp_padded_r[:, j::pack_factor, :] << (8 * j) for j in range(pack_factor))
+    col_block_ids = torch.arange(k, device=sf.device) // block_size
+    sf1_storage = torch.empty(num_groups, num_packed_sf1, k, dtype=packed_dtype, device=sf.device)
+    sf1_storage.copy_(packed_rk[:, :, col_block_ids])
+
+    sf0_out = sf0_storage.transpose(-1, -2)
+    sf1_out = sf1_storage.transpose(-1, -2)
+    if transpose_sf1:
+        sf1_out = sf1_out.transpose(-1, -2)
+    if is_dense:
+        sf0_out = sf0_out[0]
+        sf1_out = sf1_out[0]
+    return sf0_out, sf1_out
+
+
+def batched_transpose_weight_sf(
+    sf: Sequence[torch.Tensor],
+    block_size: int,
+    transpose_sf1s: Sequence[bool],
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    assert len(sf) == len(transpose_sf1s)
+    return [transpose_weight_sf(sf, block_size, transpose_sf1) for sf, transpose_sf1 in zip(sf, transpose_sf1s)]
 
 
 def cast(
@@ -68,6 +123,7 @@ def cast(
     round_sf: bool = False,
     use_tma_aligned_col_major_sf: bool = False,
     use_packed_ue8m0: bool = False,
+    use_e4m3_sf: bool = False,
 ) -> Union[torch.Tensor, QuantTensor]:
     """Cast a 2D tensor to MX format with 2D block-shared sf.
 
@@ -76,10 +132,11 @@ def cast(
         fmt: Target quantization format, e.g. "e4m3".
         block_size: Block shape (block_h, block_w), e.g. (32, 32).
         sf: Optional precomputed dequant sf.
-        x_block_size: Input block shape when `x_packed` carries sf.
+        x_block_size: Input block shape when `x` is a QuantTensor.
         round_sf: Whether to round sf.
         use_tma_aligned_col_major_sf: Whether to use TMA-aligned column-major sf.
         use_packed_ue8m0: Whether to store sf in packed UE8M0.
+        use_e4m3_sf: Whether to store sf factors in E4M3 format.
 
     Returns:
         Quantized tensor (packed on the last dim for mxfp4) and optional sf.
@@ -90,7 +147,8 @@ def cast(
         assert input_tensor.dtype in (torch.float8_e4m3fn, torch.int8)
         assert input_sf is not None and x_block_size is not None
         # Expand x_sf and do elementwise multiply with x
-        input_sf = transform_sf(input_sf)
+        input_config = BaseCastConfig(input_tensor.dtype, x_block_size, use_packed_ue8m0=input_sf.dtype == get_packed_ue8m0_torch_dtype())
+        input_sf = transform_sf(input_sf, input_config)
         input_sf = input_sf.repeat_interleave(x_block_size[0], dim=0).repeat_interleave(x_block_size[1], dim=1)
         input_tensor = unpack_from_e2m1fn_x2(input_tensor) if input_tensor.dtype == torch.int8 else input_tensor.to(torch.float32)
         input_sf = input_sf[: input_tensor.shape[0], : input_tensor.shape[1]]
@@ -98,9 +156,13 @@ def cast(
     else:
         assert x.dtype in (torch.bfloat16, torch.float32)
 
+    assert not use_packed_ue8m0 or round_sf
+    assert not (round_sf and use_e4m3_sf)
+
     assert x.ndim == 2, 'Only 2D tensors are supported for 2D blocking.'
     h, w = x.shape
     bh, bw = block_size
+    pack_sf_along_m = use_packed_ue8m0 and bw == 1
 
     out_dtype = {'e2m1': torch.int8, 'e4m3': torch.float8_e4m3fn}[fmt]
     max_quant_val = get_max_quant_val(out_dtype)
@@ -113,13 +175,20 @@ def cast(
         if sf is not None:
             return out_weight
         sf_h = 0
+        dq_sf_dtype = torch.float32
         sf_w = (w + bw - 1) // bw
         if use_packed_ue8m0:
-            dq_sf = torch.empty((ceil_div(sf_w, 4), sf_h), dtype=torch.int32, device=device).T
-        elif use_tma_aligned_col_major_sf:
-            dq_sf = torch.empty((sf_w, sf_h), dtype=torch.float32, device=device).T
+            dq_sf_dtype = get_packed_ue8m0_torch_dtype()
+            if pack_sf_along_m:
+                sf_h = ceil_div(sf_h, get_packed_ue8m0_pack_factor())
+            else:
+                sf_w = ceil_div(sf_w, get_packed_ue8m0_pack_factor())
+        elif use_e4m3_sf:
+            dq_sf_dtype = torch.float8_e4m3fn
+        if use_tma_aligned_col_major_sf:
+            dq_sf = torch.empty((sf_w, sf_h), dtype=dq_sf_dtype, device=device).T
         else:
-            dq_sf = torch.empty((sf_h, sf_w), dtype=torch.float32, device=device)
+            dq_sf = torch.empty((sf_h, sf_w), dtype=dq_sf_dtype, device=device)
         return out_weight, dq_sf
 
     if is_fp4:
@@ -144,7 +213,8 @@ def cast(
         # Exclude padded positions from max.
         abs_f = torch.where(reshaped_mask, abs_f, torch.tensor(-1.0, device=device, dtype=abs_f.dtype))
         max_val, _ = abs_f.max(dim=-1, keepdim=True)  # shape: (ph/bh, pw/bw, 1)
-        max_val = torch.clamp(max_val, min=get_min_clamp_val(out_dtype))
+        max_clamp_min = get_amax_clamp_for_quant(fmt, use_e4m3_sf)
+        max_val = torch.clamp(max_val, min=max_clamp_min)
 
         # 3) Compute sf.
         assert max_val.dtype == torch.float32
@@ -161,19 +231,29 @@ def cast(
             quant_sf = torch.where(dequant_sf_rounded == 0, torch.tensor(0.0, device=device), 1.0 / dequant_sf_rounded)
         else:
             ds_int_rounded = ds_int
-            quant_sf = torch.where(ds_int_rounded == 0, torch.tensor(0.0, device=device), max_quant_val_expanded / max_val)
+            if use_e4m3_sf:
+                # Quantize data by the reciprocal of the dequant sf rounded to E4M3, mirroring the kernel
+                # (sf_inv = 1 / RNE_e4m3(amax / max_quant_val) instead of RNE_e4m3(max_quant_val / amax)).
+                dequant_sf_e4m3 = dequant_sf.to(torch.float8_e4m3fn).to(torch.float32)
+                quant_sf = torch.where(ds_int_rounded == 0, torch.tensor(0.0, device=device), 1.0 / dequant_sf_e4m3)
+            else:
+                quant_sf = torch.where(ds_int_rounded == 0, torch.tensor(0.0, device=device), max_quant_val_expanded / max_val)
     else:
         assert not use_packed_ue8m0 and not use_tma_aligned_col_major_sf
         expected_sf_shape = (ph // bh, pw // bw)
         assert sf.ndim == 2, f'sf must be 2D, got {sf.ndim}D'
         assert tuple(sf.shape) == expected_sf_shape, f'sf shape mismatch: expected {expected_sf_shape}, got {tuple(sf.shape)}'
-        quant_sf = sf.reciprocal().unsqueeze(-1)
+        quant_sf = sf.float().reciprocal().unsqueeze(-1)
 
     # 4) Quantize data.
     if has_input_sf:
         quant_sf_extended = quant_sf.repeat_interleave(block_size[0], dim=0).repeat_interleave(block_size[1], dim=1).squeeze(-1)
         quant_sf_extended = quant_sf_extended[:h, :w]
-        quant_tensor = x * quant_sf_extended
+        # Note: Bitwise with implementation multiplication order
+        if is_ascend() or block_size[1] == 1:
+            quant_tensor = x * quant_sf_extended
+        else:
+            quant_tensor = input_tensor.to(torch.float32) * (input_sf * quant_sf_extended)
     else:
         # Map to block layout: (Hb, bh, Wb, bw) * (Hb, 1, Wb, 1)
         padded_src_view = padded_src.view(ph // bh, bh, pw // bw, bw)
@@ -189,10 +269,10 @@ def cast(
         quant_tensor = torch.clamp(quant_tensor, -max_quant_val, max_quant_val)
         out_weight = quant_tensor.to(out_dtype)
     else:
-        e2m1_value = convert_to_e2m1_bits(quant_tensor, max_quant_val, device)
+        e2m1_value = convert_to_e2m1_bits(quant_tensor)
         # Pack (H, W) -> (H, W/2)
         e2m1_value = e2m1_value.view(h, w // 2, 2)
-        out_weight = e2m1_value[..., 0] | (e2m1_value[..., 1] << 4)
+        out_weight = e2m1_value[..., 0] | (e2m1_value[..., 1] * 16)
         out_weight = out_weight.view(torch.int8)
 
     if sf is not None:
@@ -200,53 +280,46 @@ def cast(
 
     # 6) Format sf output.
     ds_int_rounded = ds_int_rounded.squeeze(-1)
-    if use_tma_aligned_col_major_sf:
-        # TMA alignment requirements of 16 bytes.
-        # Either packed UE8M0 or float32, all 4 bytes per element.
-        # Therefore, align to 16 / 4 = 4 elements.
-        tma_alignment = 4
-        packing_alignment = 4 if use_packed_ue8m0 else 1
-        pad_h = align(ds_int_rounded.shape[0], tma_alignment) - ds_int_rounded.shape[0]
-        pad_w = align(ds_int_rounded.shape[1], packing_alignment) - ds_int_rounded.shape[1]
-        ds_int_rounded_padded = F.pad(ds_int_rounded, (0, pad_w, 0, pad_h))
-        if use_packed_ue8m0:
-            dq_sf = (ds_int_rounded_padded >> 23).to(torch.int8).view(torch.int32)  # (H/bh, W/bw)
+    # CUDA TMA col-major loads require 16-byte alignment; Ascend only needs the layout transform.
+    sf_dtype_bytes = 1 if use_e4m3_sf else 4
+    tma_alignment = (16 // sf_dtype_bytes) if use_tma_aligned_col_major_sf and not is_ascend() else 1
+    pack_factor = get_packed_ue8m0_pack_factor()
+    pad_h = align(ds_int_rounded.shape[0], pack_factor if pack_sf_along_m else tma_alignment) - ds_int_rounded.shape[0]
+    pad_w = align(ds_int_rounded.shape[1], pack_factor if use_packed_ue8m0 and not pack_sf_along_m else 1) - ds_int_rounded.shape[1]
+    ds_int_rounded_padded = F.pad(ds_int_rounded, (0, pad_w, 0, pad_h))
+    if use_packed_ue8m0:
+        if pack_sf_along_m:
+            assert not use_tma_aligned_col_major_sf
+            ue8 = (ds_int_rounded_padded >> 23).to(torch.uint8)
+            dq_sf = (
+                ue8.view(ue8.shape[0] // pack_factor, pack_factor, ue8.shape[1])
+                .permute(0, 2, 1)
+                .contiguous()
+                .view(get_packed_ue8m0_torch_dtype())
+                .view(ue8.shape[0] // pack_factor, ue8.shape[1])
+            )
         else:
-            dq_sf = ds_int_rounded_padded.view(torch.float32)
-        dq_sf = dq_sf.T.contiguous().T[: ds_int_rounded.shape[0], :]
-
+            dq_sf = (ds_int_rounded_padded >> 23).to(torch.int8).view(get_packed_ue8m0_torch_dtype())  # (H/bh, W/bw)
+    elif use_e4m3_sf:
+        dq_sf = ds_int_rounded_padded.view(torch.float32).to(torch.float8_e4m3fn)
     else:
-        dq_sf = ds_int_rounded.view(torch.float32)
+        dq_sf = ds_int_rounded_padded.view(torch.float32)
+    if use_tma_aligned_col_major_sf:
+        dq_sf = dq_sf.T.contiguous()
+        # [1,512].T is already contiguous, so .contiguous() won't set stride[1] to 1; force it
+        dq_sf = dq_sf.as_strided(dq_sf.shape, (dq_sf.shape[1], 1))
+        dq_sf = dq_sf.T[: ds_int_rounded.shape[0], :]
 
     return out_weight, dq_sf
 
 
-def convert_to_e2m1_bits(quant_tensor, max_quant_val, device):
-    """FP4 cast"""
-    q_int = quant_tensor.contiguous().view(torch.int32)
-    signs = q_int & 0x80000000
-    exponents = (q_int >> 23) & 0xFF
-    mantissas_orig = q_int & 0x7FFFFF
-
-    E8_BIAS, E2_BIAS = 127, 1
-    # Adjust mantissas for subnormals.
-    is_subnormal = exponents < E8_BIAS
-    shift = E8_BIAS - exponents - 1
-    mantissas_pre = 0x400000 | right_shift_unsigned(mantissas_orig, 1)
-    bit0_dropped = (mantissas_orig & 0x1) != 0
-    mask = (1 << shift.clamp(max=31)) - 1
-    dropped_post = (mantissas_pre & mask) != 0
-    sticky = is_subnormal & (bit0_dropped | dropped_post)
-    mantissas = torch.where(is_subnormal, mantissas_pre >> shift, mantissas_orig)
-    exponents = torch.maximum(exponents, torch.tensor(E8_BIAS - E2_BIAS, device=device)) - (E8_BIAS - E2_BIAS)
-    # Round to nearest, ties to even (RTNE)
-    m2bits = right_shift_unsigned(mantissas, 21) & 0x3
-    lsb_keep = right_shift_unsigned(m2bits, 1) & 0x1
-    guard = m2bits & 0x1
-    sticky |= (mantissas & ((1 << 21) - 1)) != 0
-    round_inc = guard & (sticky.to(torch.int32) | lsb_keep)
-    e2m1_tmp = right_shift_unsigned(((exponents << 2) | m2bits) + round_inc, 1)
-    e2m1_tmp = torch.minimum(e2m1_tmp, torch.tensor(0x7, device=device))
-    e2m1_value = (right_shift_unsigned(signs, 28) | e2m1_tmp).to(torch.uint8)  # shape: (..., even_axis_shape)
-
-    return e2m1_value
+def convert_to_e2m1_bits(quant_tensor):
+    """FP4 round-to-nearest-even, with spacing 0.5, 1 and 2 in its three ranges."""
+    # Avoid large integer intermediates and slow AICPU shifts on Ascend.
+    magnitude = torch.nan_to_num(quant_tensor.abs(), nan=6.0, posinf=6.0).clamp(max=6.0)
+    code = torch.where(
+        magnitude < 2,
+        (magnitude * 2).round(),
+        torch.where(magnitude < 4, magnitude.round() + 2, (magnitude * 0.5).round() + 4),
+    ).to(torch.uint8)
+    return code | (torch.signbit(quant_tensor).to(torch.uint8) * 8)

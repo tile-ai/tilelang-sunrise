@@ -1,79 +1,59 @@
 """Benchmarks for argreduce ops (argmax, argmin).
 
-Measures latency, TFLOPS, and DRAM bandwidth against PyTorch baselines.
-Workload shapes, dtypes, and op-call parameters (e.g. ``dim``) are loaded
-from the ops manifest (``src/tileops/manifest/``) — the benchmark must not
-hard-code op parameters that are declared on manifest workload entries.
+Measures latency, TFLOPS, and DRAM bandwidth against PyTorch baselines. Each case is one
+manifest call (``src/tileops/manifest/``), parameters included.
 
 Each row is timed against flag_gems' Triton argreduce and against torch eager and
 inductor.
 """
 
 import pytest
-import torch
 
+from benchmarks import api as bench
 from benchmarks.baselines import (
     FLAGGEMS_TAG,
     TORCH_COMPILE_TAG,
-    assert_matches_reference,
     compiled_reference,
     flaggems_op,
 )
-from benchmarks.benchmark_base import ManifestBenchmark, workloads_to_params
-from tileops.ops.reduction.argreduce import ArgmaxFwdOp, ArgminFwdOp
-from workloads.reduction import ArgmaxWorkload, ArgminWorkload
+from tileops._ops.reduction.argreduce import ArgmaxFwdOp, ArgminFwdOp
 
 
-def _functors(op, baseline_fn, flaggems_name: str, dim: int, inputs) -> dict:
-    """The op, flag_gems' argreduce, and torch eager and compiled.
+def _implementations(baseline_fn, flaggems_name: str, dim: int, keepdim: bool, inputs) -> dict:
+    """flag_gems' argreduce, and torch eager and compiled."""
+    implementations = {}
+    # flag_gems' argmin launch fails with an invalid argument on a non-last axis.
+    if flaggems_name == "argmax" or dim in (-1, inputs[0].ndim - 1):
+        fn = flaggems_op(flaggems_name)
 
-    Indices are exact or wrong, so the check takes no tolerance.
-    """
-    fn = flaggems_op(flaggems_name)
+        def flaggems_fn(x):
+            return fn(x, dim, keepdim)
 
-    def flaggems_fn(x):
-        return fn(x, dim)
-
-    assert_matches_reference(flaggems_fn, baseline_fn, *inputs)
-    return {
-        "tileops": op,
-        FLAGGEMS_TAG: flaggems_fn,
-        "torch": baseline_fn,
-        TORCH_COMPILE_TAG: compiled_reference(baseline_fn),
-    }
+        implementations[FLAGGEMS_TAG] = flaggems_fn
+    implementations["torch"] = baseline_fn
+    implementations[TORCH_COMPILE_TAG] = compiled_reference(baseline_fn)
+    return implementations
 
 
-@pytest.mark.parametrize(
-    "shape, dtype, extra", workloads_to_params(ArgmaxFwdOp, include_extra=True)
-)
-def test_argmax_bench(shape: tuple, dtype: torch.dtype, extra: dict) -> None:
-    workload = ArgmaxWorkload(shape, dtype)
-    inputs = workload.gen_inputs()
+@pytest.mark.parametrize("case", bench.cases(ArgmaxFwdOp), ids=lambda case: case.id)
+def test_argmax_bench(case) -> None:
+    op = ArgmaxFwdOp(**case.arguments)
+    dim, keepdim = case.params["dim"], case.params["keepdim"]
 
-    op = ArgmaxFwdOp(**extra)
-    bm = ManifestBenchmark(op, workload)
+    baseline_fn = case.reference
 
-    dim = extra["dim"]
+    implementations = _implementations(baseline_fn, "argmax", dim, keepdim, case.inputs)
 
-    def baseline_fn(x):
-        return x.argmax(dim=dim)
-
-    bm.compare(_functors(op, baseline_fn, "argmax", dim, inputs), *inputs)
+    bench.Runner(op, case).compare(implementations)
 
 
-@pytest.mark.parametrize(
-    "shape, dtype, extra", workloads_to_params(ArgminFwdOp, include_extra=True)
-)
-def test_argmin_bench(shape: tuple, dtype: torch.dtype, extra: dict) -> None:
-    workload = ArgminWorkload(shape, dtype)
-    inputs = workload.gen_inputs()
+@pytest.mark.parametrize("case", bench.cases(ArgminFwdOp), ids=lambda case: case.id)
+def test_argmin_bench(case) -> None:
+    op = ArgminFwdOp(**case.arguments)
+    dim, keepdim = case.params["dim"], case.params["keepdim"]
 
-    op = ArgminFwdOp(**extra)
-    bm = ManifestBenchmark(op, workload)
+    baseline_fn = case.reference
 
-    dim = extra["dim"]
+    implementations = _implementations(baseline_fn, "argmin", dim, keepdim, case.inputs)
 
-    def baseline_fn(x):
-        return x.argmin(dim=dim)
-
-    bm.compare(_functors(op, baseline_fn, "argmin", dim, inputs), *inputs)
+    bench.Runner(op, case).compare(implementations)

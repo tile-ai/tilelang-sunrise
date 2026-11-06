@@ -37,8 +37,8 @@ default to S3. The PTCC executable's real path and SHA256 participate in TANG
 kernel cache keys. Restart Python after changing the compiler path or replacing
 the toolchain. Do not replace files in the maintainer-managed directory. The
 fingerprint does not cover headers or device libraries: clear the kernel cache
-if those change without replacing PTCC. S3 ISS retains its separate
-`TANG_S3_PTCC_PATH` interface.
+if those change without replacing PTCC. S3 (`stcuv2`) compilation retains its
+separate `TANG_S3_PTCC_PATH` interface.
 
 For GitLab, ensure the managed compiler path is available on each runner and set
 `PTCC_PATH` and `PTCC_JIT_PROFILE=llvm22` only for explicit LLVM22 validation
