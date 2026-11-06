@@ -1,6 +1,6 @@
 import torch
 
-from tile_kernels.engram import fused_weight, engram_gate_fwd, engram_gate_bwd, grad_w_reduce
+from tile_kernels.engram import engram_gate_bwd, engram_gate_fwd, fused_weight, grad_w_reduce
 
 
 class EngramGateFn(torch.autograd.Function):
@@ -16,12 +16,12 @@ class EngramGateFn(torch.autograd.Function):
 
     Args:
         hidden_states: [*, hc_mult, hidden_size], bf16.
-        k:             [*, hc_mult, hidden_size], bf16.
-        v:             [*, hidden_size], bf16.
+        kv:            [*, (hc_mult + 1) * hidden_size], bf16.
         weight_hidden: [hc_mult, hidden_size], bf16. RMSNorm weight for hidden_states.
         weight_embed:  [hc_mult, hidden_size], bf16. RMSNorm weight for k.
         clamp_value:   float. Clamp range.
         eps:           float. RMSNorm epsilon.
+        image_token_mask: bool tensor over tokens.
 
     Returns:
         output: same shape and dtype as hidden_states.
@@ -33,41 +33,47 @@ class EngramGateFn(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, hidden_states, k, v, weight_hidden, weight_embed, clamp_value, eps):
+    def forward(ctx, hidden_states, kv, weight_hidden, weight_embed, clamp_value, eps, image_token_mask):
         origin_shape = hidden_states.shape
         *_, hc_mult, hidden_size = origin_shape
 
         x = hidden_states.view(-1, hc_mult, hidden_size)
-        k = k.view(-1, hc_mult, hidden_size)
-        v = v.view(-1, hidden_size)
+        kv = kv.view(-1, hc_mult + 1, hidden_size)
+        if image_token_mask is not None:
+            image_token_mask = image_token_mask.view(-1)
 
         weight_fused = fused_weight(weight_hidden, weight_embed)
         output, dot, gate_score, rstd_x, rstd_k = engram_gate_fwd(
-            x, k, v, weight_fused, eps, clamp_value,
+            x,
+            kv,
+            weight_fused,
+            eps,
+            clamp_value,
+            image_token_mask=image_token_mask,
         )
 
         ctx.save_for_backward(
-            x, k, v, weight_hidden, weight_embed, weight_fused,
-            dot, gate_score, rstd_x, rstd_k,
-        )
+            x, kv, weight_hidden, weight_embed, weight_fused,
+            dot, gate_score, rstd_x, rstd_k, image_token_mask,
+        )  # fmt: off
         ctx.clamp_value = clamp_value
         ctx.origin_shape = origin_shape
         return output.view(origin_shape)
 
     @staticmethod
     def backward(ctx, grad_output):
-        (x, k, v, weight_hidden, weight_embed, weight_fused,
-         dot, gate_score, rstd_x, rstd_k) = ctx.saved_tensors
+        (x, kv, weight_hidden, weight_embed, weight_fused, dot, gate_score, rstd_x, rstd_k, image_token_mask) = ctx.saved_tensors
         origin_shape = ctx.origin_shape
         clamp_value = ctx.clamp_value
         *_, hc_mult, hidden_size = origin_shape
 
         grad_out = grad_output.view(-1, hc_mult, hidden_size)
 
-        grad_x, grad_k, grad_v, grad_w_partial = engram_gate_bwd(
-            grad_out, x, k, v, weight_fused,
+        grad_x, grad_kv, grad_w_partial = engram_gate_bwd(
+            grad_out, x, kv, weight_fused,
             dot, gate_score, rstd_x, rstd_k, clamp_value,
-        )
+            image_token_mask=image_token_mask,
+        )  # fmt: off
 
         # Use main_grad (fp32 gradient buffer) if available, otherwise allocate fp32 grad tensors.
         # grad_w_reduce accumulates into grad_wh / grad_we in-place.
@@ -76,19 +82,23 @@ class EngramGateFn(torch.autograd.Function):
         grad_wh = main_grad_wh if main_grad_wh is not None else torch.zeros_like(weight_hidden, dtype=torch.float32)
         grad_we = main_grad_we if main_grad_we is not None else torch.zeros_like(weight_embed, dtype=torch.float32)
         grad_w_reduce(
-            grad_w_partial, weight_hidden, weight_embed,
-            grad_wh, grad_we,
+            grad_w_partial,
+            weight_hidden,
+            weight_embed,
+            grad_wh,
+            grad_we,
         )
 
-        v_origin_shape = origin_shape[:-2] + (hidden_size,)
+        kv_origin_shape = origin_shape[:-2] + ((hc_mult + 1) * hidden_size,)
         # Return None for weight grads when main_grad is used (already accumulated in-place).
         return (
             grad_x.view(origin_shape),
-            grad_k.view(origin_shape),
-            grad_v.view(v_origin_shape),
+            grad_kv.view(kv_origin_shape),
             None if main_grad_wh is not None else grad_wh,
             None if main_grad_we is not None else grad_we,
-            None, None,
+            None,
+            None,
+            None,
         )
 
 

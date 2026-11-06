@@ -1,12 +1,16 @@
 import os
 import torch
 import pytest
+import itertools
 
 import tile_kernels
-from tile_kernels.testing.generator import generate_num_tokens
+from tile_kernels.rand import randn
+from tile_kernels.testing.generator import generate_num_tokens, get_test_level
 from tile_kernels.testing.numeric import assert_equal, count_bytes
 from tile_kernels.testing.bench import make_param_id
 from tile_kernels.torch import stable_topk as torch_stable_topk
+from tile_kernels.config import get_device
+
 # Disable TileLang prints
 os.environ['TILELANG_PRINT_ON_COMPILATION'] = '0'
 
@@ -22,46 +26,49 @@ _EXPERT_CONFIGS = [
     (128, 6),
     (144, 6),
     (256, 8),
-]
+]  # fmt: off
 
 
 def generate_test_data(params):
     num_tokens = params['num_tokens']
     num_experts = params['num_experts']
-    scores = torch.randn((num_tokens, num_experts), dtype=torch.float).ptpu()
+    scores = randn((num_tokens, num_experts), dtype=torch.float, device=get_device())
     return scores
 
 
-def generate_test_params(is_benchmark: bool) -> list[dict]:
+def generate_test_params(level: int) -> list[dict]:
     return [
         {
             'num_tokens': num_tokens,
             'num_experts': num_experts,
             'num_topk': num_topk,
         }
-        for num_tokens in generate_num_tokens(is_benchmark=is_benchmark)
-        for num_experts, num_topk in _EXPERT_CONFIGS
+        for num_tokens in generate_num_tokens(level)
+        for num_experts, num_topk in itertools.product([1, 35, 1025], [1, 9, 32])
+        if num_experts >= num_topk
     ]
 
 
-@pytest.mark.parametrize('params', generate_test_params(is_benchmark=False), ids=make_param_id)
+@pytest.mark.parametrize('params', generate_test_params(get_test_level()), ids=make_param_id)
 def test_topk_gate(params):
     scores = generate_test_data(params)
     num_topk = params['num_topk']
 
     topk_idx_ref = torch_stable_topk(scores, num_topk)
-    torch.ptpu.synchronize()
-
     topk_idx = tile_kernels.moe.topk_gate(scores, num_topk)
-
-    torch.ptpu.synchronize()
-    topk_idx_ref = topk_idx_ref.cpu()
-    topk_idx = topk_idx.cpu()
     assert_equal(topk_idx, topk_idx_ref)
 
 
 @pytest.mark.benchmark
-@pytest.mark.parametrize('params', generate_test_params(is_benchmark=True), ids=make_param_id)
+@pytest.mark.parametrize(
+    'params',
+    [
+        {'num_tokens': num_tokens, 'num_experts': num_experts, 'num_topk': num_topk}
+        for num_tokens in generate_num_tokens(0)
+        for num_experts, num_topk in _EXPERT_CONFIGS
+    ],
+    ids=make_param_id,
+)
 def test_topk_gate_benchmark(benchmark_timer, benchmark_record, params):
     scores = generate_test_data(params)
     num_topk = params['num_topk']

@@ -4,8 +4,9 @@ import torch
 import pytest
 
 import tile_kernels
-from tile_kernels.testing.generator import generate_topk_idx, generate_moe_params
-from tile_kernels.testing.numeric import assert_equal, count_bytes
+from tile_kernels.testing.generator import generate_topk_idx, generate_moe_params, get_test_level
+from tile_kernels.config import get_device
+from tile_kernels.testing.numeric import count_bytes
 from tile_kernels.torch import normalize_weight as torch_normalize_weight
 from tile_kernels.testing.bench import make_param_id
 
@@ -18,32 +19,26 @@ def generate_test_data(params):
 
     topk_idx = generate_topk_idx(params)
     num_tokens = topk_idx.shape[0]
-    topk_weights = torch.rand((num_tokens, num_topk), dtype=torch.float32).ptpu()
+    topk_weights = torch.rand((num_tokens, num_topk), dtype=torch.float32, device=get_device())
 
     return (topk_weights, num_tokens)
 
 
-@pytest.mark.parametrize('params', list(generate_moe_params(is_benchmark=False)), ids=make_param_id)
+@pytest.mark.parametrize('params', list(generate_moe_params(get_test_level())), ids=make_param_id)
 def test_normalize_weight(params):
-    (topk_weights, _) = generate_test_data(params)
+    topk_weights, _ = generate_test_data(params)
 
     denominator, normalized_weights = tile_kernels.moe.normalize_weight(topk_weights)
 
-    # Test correctness: torch reference
     denom_ref, norm_ref = torch_normalize_weight(topk_weights)
-    denominator = denominator.cpu()
-    normalized_weights = normalized_weights.cpu()
-    denom_ref = denom_ref.cpu()
-    norm_ref = norm_ref.cpu()
-    assert_equal(denominator, denom_ref)
-    assert_equal(normalized_weights, norm_ref)
+    torch.testing.assert_close(denominator, denom_ref, atol=2e-6, rtol=0)
+    torch.testing.assert_close(normalized_weights, norm_ref, atol=2e-6, rtol=0)
 
 
 @pytest.mark.benchmark
-@pytest.mark.parametrize('params', list(generate_moe_params(is_benchmark=True)), ids=make_param_id)
+@pytest.mark.parametrize('params', list(generate_moe_params(0)), ids=make_param_id)
 def test_normalize_weight_benchmark(benchmark_timer, benchmark_record, params):
     topk_weights, num_tokens = generate_test_data(params)
-    num_topk = params['num_topk']
 
     denominator, normalized_weights = tile_kernels.moe.normalize_weight(topk_weights)
 
@@ -55,7 +50,7 @@ def test_normalize_weight_benchmark(benchmark_timer, benchmark_record, params):
     benchmark_record(
         kernel='normalize_weight',
         operation='fwd',
-        params={'num_tokens': num_tokens, **params, 'num_topk': num_topk},
+        params={'num_tokens': num_tokens, **params},
         time_us=t_us,
         bandwidth_gbs=bandwidth_gbs,
     )

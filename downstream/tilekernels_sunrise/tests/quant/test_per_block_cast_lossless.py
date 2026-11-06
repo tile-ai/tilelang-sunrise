@@ -4,8 +4,9 @@ import torch
 
 
 import tile_kernels
+from tile_kernels.config import is_ascend
 from tile_kernels.testing.numeric import assert_equal, count_bytes
-from tile_kernels.testing.generator import generate_hidden_sizes, generate_num_tokens, generate_rand_float
+from tile_kernels.testing.generator import generate_cast_config, generate_hidden_sizes, generate_num_tokens, generate_rand_float, get_test_level
 from tile_kernels.testing.bench import make_param_id
 
 # Disable TileLang prints
@@ -37,13 +38,16 @@ def generate_test_data(params):
     x = generate_rand_float((num_tokens, hidden))
     x = clamp_abs_ratio(x)
     x_fp4 = tile_kernels.torch.cast(
-        x, 'e2m1', (in_sf_block_m, in_sf_block_k),
+        x,
+        'e2m1',
+        (in_sf_block_m, in_sf_block_k),
         use_tma_aligned_col_major_sf=in_use_tma_aligned_col_major_sf,
         round_sf=in_round_sf,
         use_packed_ue8m0=in_use_packed_ue8m0,
     )
     cast_func = lambda: tile_kernels.quant.per_block_cast_lossless(
-        x_fp4, 'e4m3',
+        x_fp4,
+        'e4m3',
         x_block_size=(in_sf_block_m, in_sf_block_k),
         out_block_size=(out_sf_block_m, out_sf_block_k),
         use_tma_aligned_col_major_sf=out_use_tma_aligned_col_major_sf,
@@ -54,7 +58,11 @@ def generate_test_data(params):
     return (x, x_fp4, cast_func)
 
 
-def generate_test_params(is_benchmark: bool) -> list[dict]:
+def generate_test_params(level: int) -> list[dict]:
+    # Ascend only supports out block (32, 32) and hidden % 256 == 0 (all sf layouts supported).
+    ascend = is_ascend()
+    out_sf_blocks = ((32, 32),) if ascend else ((1, 128), (32, 32), (128, 128))
+    hidden_sizes = (*generate_hidden_sizes(256), 2304) if ascend else generate_hidden_sizes(128)
     params = [
         {
             'num_tokens': num_tokens,
@@ -68,18 +76,23 @@ def generate_test_params(is_benchmark: bool) -> list[dict]:
             'out_sf_block': (out_sf_block_m, out_sf_block_k),
             'in_sf_block': (in_sf_block_m, in_sf_block_k),
         }
-        for num_tokens in generate_num_tokens(is_benchmark=is_benchmark)
-        for hidden_size in generate_hidden_sizes()
-        for in_use_tma_aligned_col_major_sf, in_round_sf, in_use_packed_ue8m0 in [(False, True, False), (True, True, True)]
-        for out_use_tma_aligned_col_major_sf, out_round_sf, out_use_packed_ue8m0 in [(False, True, False), (True, True, True)]
-        for out_sf_block_m, out_sf_block_k in ((1, 128), (32, 32), (128, 128))
+        for num_tokens in generate_num_tokens(level, 128)
+        for hidden_size in hidden_sizes
+        for in_use_tma_aligned_col_major_sf, in_round_sf, in_use_packed_ue8m0 in (
+            [(False, True, False)] if level == 0 else generate_cast_config(level, 'e4m3')
+        )
+        if in_round_sf == True
+        for out_use_tma_aligned_col_major_sf, out_round_sf, out_use_packed_ue8m0 in (
+            [(False, True, False)] if level == 0 else generate_cast_config(level, 'e4m3')
+        )
+        if out_round_sf == True
+        for out_sf_block_m, out_sf_block_k in out_sf_blocks
         for in_sf_block_m, in_sf_block_k in ((1, 32),)
-        if out_sf_block_m % in_sf_block_m == 0 and out_sf_block_k % in_sf_block_k == 0
     ]
     return params
 
 
-@pytest.mark.parametrize('params', generate_test_params(is_benchmark=False), ids=make_param_id)
+@pytest.mark.parametrize('params', generate_test_params(get_test_level()), ids=make_param_id)
 def test_per_block_cast_lossless(params):
     out_sf_block = params['out_sf_block']
     in_sf_block = params['in_sf_block']
@@ -97,7 +110,7 @@ def test_per_block_cast_lossless(params):
 
 
 @pytest.mark.benchmark
-@pytest.mark.parametrize('params', generate_test_params(is_benchmark=True), ids=make_param_id)
+@pytest.mark.parametrize('params', generate_test_params(0), ids=make_param_id)
 def test_per_block_cast_lossless_benchmark(benchmark_timer, benchmark_record, params):
     _, x_fp4, cast_func = generate_test_data(params)
 
