@@ -1,50 +1,35 @@
 """Benchmark for the FP8 quantization op.
 
 Workload shapes and dtypes come from the ops manifest; roofline FLOP and
-byte counts come from the op's ``eval_roofline()`` via
-:class:`ManifestBenchmark`.
+byte counts come from the op's ``eval_roofline()``.
 """
 
 import pytest
-import torch
 
-from benchmarks.baselines import TORCH_COMPILE_TAG, compiled_reference
-from benchmarks.benchmark_base import (
-    ManifestBenchmark,
-    fields,
-    workload_params,
-)
-from tileops.manifest import load_workloads
-from tileops.ops import FP8QuantFwdOp
-from workloads.fp8_quant import FP8QuantWorkload
-
-# Autotuning is a bench-run policy, not a workload property; manifest
-# workloads do not carry it.
-_TUNE = True
+from benchmarks import api as bench
+from benchmarks.baselines import TORCH_COMPILE_TAG, VLLM_TAG, compiled_reference, vllm_op
+from tileops.quantization import FP8QuantPerTokenGroupFwdOp
 
 
-_FP8_QUANT_PARAMS = workload_params(
-    load_workloads(FP8QuantFwdOp),
-    fields("batch", "seq_len_kv", "kv_group", "index_dim", "in_dtype"),
-    smoke_first=True,
-)
+@pytest.mark.parametrize("case", bench.cases(FP8QuantPerTokenGroupFwdOp), ids=lambda case: case.id)
+def test_fp8_quant_bench(case) -> None:
+    op = FP8QuantPerTokenGroupFwdOp(**case.arguments)
+    op.request_tune()
 
+    quantize = vllm_op(
+        "per_token_group_quant_fp8", "model_executor.layers.quantization.utils.fp8_utils"
+    )
 
-@pytest.mark.parametrize("batch, seq_len_kv, kv_group, index_dim, in_dtype", _FP8_QUANT_PARAMS)
-def test_fp8_quant_bench(
-    batch: int, seq_len_kv: int, kv_group: int, index_dim: int, in_dtype: torch.dtype
-) -> None:
-    test = FP8QuantWorkload(batch, seq_len_kv, kv_group, index_dim, in_dtype)
-    inputs = test.gen_inputs()
+    def vllm_fn(x):
+        values, scales = quantize(
+            x.reshape(-1, x.shape[-1]), x.shape[-1], eps=1e-4, use_ue8m0=False
+        )
+        return values.reshape_as(x), scales.reshape(x.shape[:-1])
 
-    op = FP8QuantFwdOp(tune=_TUNE)
-    bm = ManifestBenchmark(op, test)
-
-    bm.compare(
+    bench.Runner(op, case).compare(
         {
-            "tileops": op,
-            "torch-ref": test.ref_program,
-            TORCH_COMPILE_TAG: compiled_reference(test.ref_program),
-        },
-        *inputs,
+            VLLM_TAG: vllm_fn,
+            "torch-ref": case.reference,
+            TORCH_COMPILE_TAG: compiled_reference(case.reference),
+        }
     )

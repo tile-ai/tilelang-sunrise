@@ -195,17 +195,17 @@ class PassConfigKey(str, Enum):
     TL_ENABLE_TANG_INJECT_TCGEN05_FENCE = "tl.enable_tang_inject_tcgen05_fence"
     """Enable automatic TCGEN05/TMEM fence injection on stcuv2 (S3).
 
-    When enabled, tilelang.tang.transform.InjectTcgen05Fence wraps shared-memory
-    syncs and the linear barrier wait/arrive handoffs that bracket a
-    TCGEN05/TMEM operation with the fence of the neighbour's domain
-    (``fence_tc<0>`` for TC work, ``fence_tmem<3>`` for LDT, ``fence_tmem<2>``
-    for STT), so an S3 kernel that just uses TMEM does not have to place the
-    fences by hand.
+    When enabled, the fence-injection phase of
+    tilelang.tang.transform.FinalizeS3ThreadSyncs wraps shared-memory syncs and
+    the linear barrier wait/arrive handoffs that bracket a TCGEN05/TMEM
+    operation with the fence of the neighbour's domain (``fence_tc<0>`` for TC
+    work, ``fence_tmem<3>`` for LDT, ``fence_tmem<2>`` for STT), so an S3
+    kernel that just uses TMEM does not have to place the fences by hand.
 
     On by default, mirroring the CUDA pipeline which runs its
-    InjectTcgen05Fence unconditionally. The pass is a no-op on non-stcuv2
-    targets and on functions without TC/TMEM operations; set this to False for
-    a bit-exact A/B against an uninstrumented pipeline.
+    InjectTcgen05Fence unconditionally. FinalizeS3ThreadSyncs is a no-op on
+    non-stcuv2 targets; this option controls only fence insertion, independently
+    of its certificate-aware ThreadSync finalization.
 
     Default: True
     """

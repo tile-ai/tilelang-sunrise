@@ -2,11 +2,10 @@
 
 import pytest
 import torch
-import torch.nn.functional as F
 
-from tests.test_base import FixtureBase, TestBase
-from tileops.ops import MHCPostFwdOp, MHCPreFwdOp
-from workloads.mhc import MHCPostWorkload, MHCPreWorkload
+from tests.workload_test_base import FixtureBase, TestBase
+from tileops.sequence_modeling import MHCPostFwdOp, MHCPreFwdOp
+from workloads.sequence_modeling.mhc import MHCPostWorkload, MHCPreWorkload
 
 
 class MHCPreTest(MHCPreWorkload, TestBase):
@@ -18,41 +17,35 @@ class MHCPreFixture(FixtureBase):
         (
             "batch, n_expand, c_x, dtype, tune",
             [
-                pytest.param(1, 4, 1280, torch.bfloat16, False, marks=pytest.mark.smoke),
+                pytest.param(
+                    1,
+                    4,
+                    1280,
+                    torch.bfloat16,
+                    False,
+                    marks=[pytest.mark.smoke, pytest.mark.packaging(family="sequence_modeling")],
+                ),
                 pytest.param(2, 4, 1920, torch.bfloat16, False, marks=pytest.mark.full),
                 pytest.param(4, 4, 2560, torch.bfloat16, False, marks=pytest.mark.full),
+                pytest.param(6, 4, 1000, torch.bfloat16, False, marks=pytest.mark.full),
             ],
         ),
     ]
 
 
-def _cosine_compare(output: torch.Tensor, output_ref: torch.Tensor) -> None:
-    """Compare using cosine similarity (MHC ops use bf16 and need looser checks)."""
-    output = output.cpu().float()
-    output_ref = output_ref.cpu().float()
-    cos_sim = F.cosine_similarity(output_ref, output, dim=-1, eps=1e-8)
-
-    # Cosine similarity is undefined for a zero reference row. Larger MHC
-    # shapes legitimately produce such rows, so compare those by magnitude.
-    ref_nonzero = output_ref.norm(dim=-1) > 1e-6
-    if ref_nonzero.any():
-        assert cos_sim[ref_nonzero].min() > 0.99, (
-            f"cosine similarity too low: {cos_sim[ref_nonzero].min().item()}"
-        )
-    if (~ref_nonzero).any():
-        torch.testing.assert_close(
-            output[~ref_nonzero],
-            output_ref[~ref_nonzero],
-            rtol=1e-2,
-            atol=1e-2,
-        )
-
-
 @MHCPreFixture
 def test_mhc_pre_op(batch: int, n_expand: int, c_x: int, dtype: torch.dtype, tune: bool) -> None:
     test = MHCPreTest(batch, n_expand, c_x, dtype)
-    op = MHCPreFwdOp(tune=tune)
-    test.check(op, *test.gen_inputs(), compare=_cosine_compare)
+    op = MHCPreFwdOp(
+        test.alpha_pre,
+        test.alpha_post,
+        test.alpha_res,
+        test.sinkhorn_repeat,
+        test.sinkhorn_eps,
+    )
+    if tune:
+        op.request_tune()
+    test.check(op, *test.gen_inputs())
 
 
 class MHCPostTest(MHCPostWorkload, TestBase):
@@ -67,6 +60,10 @@ class MHCPostFixture(FixtureBase):
                 pytest.param(1, 4, 1280, torch.bfloat16, False, marks=pytest.mark.smoke),
                 pytest.param(2, 4, 1920, torch.bfloat16, False, marks=pytest.mark.full),
                 pytest.param(4, 4, 2560, torch.bfloat16, False, marks=pytest.mark.full),
+                # A c_x that no column tile divides: the last tile runs past it.
+                pytest.param(6, 4, 1000, torch.bfloat16, False, marks=pytest.mark.full),
+                pytest.param(1, 40, 128, torch.bfloat16, False, marks=pytest.mark.full),
+                pytest.param(1, 4, 999, torch.bfloat16, False, marks=pytest.mark.full),
             ],
         ),
     ]
@@ -75,5 +72,19 @@ class MHCPostFixture(FixtureBase):
 @MHCPostFixture
 def test_mhc_post_op(batch: int, n_expand: int, c_x: int, dtype: torch.dtype, tune: bool) -> None:
     test = MHCPostTest(batch, n_expand, c_x, dtype)
-    op = MHCPostFwdOp(tune=tune)
-    test.check(op, *test.gen_inputs(), compare=_cosine_compare)
+    op = MHCPostFwdOp()
+    if tune:
+        op.request_tune()
+    test.check(op, *test.gen_inputs())
+
+
+@pytest.mark.smoke
+def test_mhc_post_op_misaligned_storage() -> None:
+    """Contiguous views with an unaligned storage offset, at a c_x read in pairs."""
+    test = MHCPostTest(2, 4, 998, torch.bfloat16)
+    x_layer_out, h_post, x_res = test.gen_inputs()
+    x_layer_out, x_res = (
+        torch.empty(t.numel() + 1, dtype=t.dtype, device=t.device)[1:].view_as(t).copy_(t)
+        for t in (x_layer_out, x_res)
+    )
+    test.check(MHCPostFwdOp(), x_layer_out, h_post, x_res)

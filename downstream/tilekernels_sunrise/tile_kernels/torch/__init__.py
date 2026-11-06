@@ -1,10 +1,25 @@
-from .cast import cast, cast_back
-from .cast_e5m6 import cast_to_e5m6, cast_back_from_e5m6
-from .expand_to_fused import expand_to_fused, expand_to_fused_with_sf
-from .mhc import (expand_to_mhc_ref, mhc_head_compute_mix_ref, mhc_post_ref, mhc_pre_apply_mix_ref, mhc_pre_norm_fn_ref,
-                   mhc_pre_split_mixes_ref, sinkhorn_normalize_ref)
+from .cast import batched_transpose_weight_sf, cast, cast_back
+from .engram import (
+    make_offsets,
+    engram_hash_ref,
+    engram_gate_ref,
+    engram_sinkhorn_momentum_update_ref,
+    engram_sinkhorn_step_ref,
+    engram_sinkhorn_finalize_ref,
+)
+from .mhc import (
+    expand_to_mhc_ref,
+    mhc_head_compute_mix_ref,
+    mhc_post_ref,
+    mhc_pre_apply_mix_ref,
+    mhc_pre_norm_fn_partials_ref,
+    mhc_pre_norm_fn_ref,
+    mhc_pre_split_mixes_ref,
+    sinkhorn_normalize_ref,
+)
 from .reduce_fused import reduce_fused
-from .swiglu import swiglu_forward, swiglu_backward
-from .topk import stable_topk, topk_sum_and_topk_group_idx, top2_sum_gate
-from .moe import inplace_unique_group_indices, aux_fi, group_count, mask_indices_by_tp, normalize_weight
-from .per_channel_cast_fused import per_channel_cast_fused
+from .rope import rotary_embedding_ref
+from .swiglu import get_mapping_from_psum, swiglu_forward, swiglu_backward
+from .topk import stable_topk, moe_topk_gate_forward, moe_topk_gate_backward
+from .moe import mask_indices_by_tp, normalize_weight
+from .norm import norm_backward_ref, norm_forward_ref

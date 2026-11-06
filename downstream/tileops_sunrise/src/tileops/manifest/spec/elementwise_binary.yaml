@@ -1,0 +1,622 @@
+# elementwise_binary.yaml -- manifest entries for elementwise binary ops.
+#
+# Two-input single-output elementwise ops (arithmetic, comparison, logical,
+# bitwise). Source of truth for op interfaces in this family. Loaded and
+# merged with other family files by tileops.manifest at runtime. See
+# docs/design/manifest.md for the full schema.
+
+PReLUFwdOp:
+  ref_api: "torch.nn.functional.prelu"
+  family: elementwise
+  status: implemented
+
+  signature:
+    # PyTorch prelu: weight is either scalar or per-channel along dim 1
+    # for inputs with ndim >= 2; 1-D inputs accept scalar weight only.
+    forall: {S: Shape, W: Shape, T: "DType[float16 | bfloat16 | float32]"}
+    inputs:
+      input: {dtype: T, shape: "[*S]"}
+      weight: {dtype: T, shape: "[*W]"}
+    outputs:
+      output: {dtype: T, shape: "[*S]"}
+    shape_rules:
+    - "len(W) == 0 or (len(W) == 1 and (W[0] == 1 or (len(S) >= 2 and W[0] == S[1])))"
+
+  workloads:
+  # PReLU CNN feature map (per-channel weight)
+  - {S: [16, 256, 56, 56], W: [256], dtype_cases: [{T: float16}, {T: bfloat16}], label: "cnn-feat"}
+  - {S: [16, 512, 28, 28], W: [512], dtype_cases: [{T: float16}, {T: bfloat16}], label: "cnn-feat-deep"}
+
+  roofline:
+    # FLOPs: prelu(x) = x if x>0 else weight*x. Per roofline.md §1.3,
+    # compare-and-select(1) + mul(1) = 2 per elem.
+    flops: "2 * prod(S)"
+
+MaskedFillTensorFwdOp:
+  # Primary entry: PyTorch's torch.Tensor.masked_fill(mask, value: Tensor)
+  # where ``value`` is a 0-dim Tensor. The out-of-place
+  # ``Tensor.masked_fill`` returns a new tensor whose shape is the
+  # bidirectional broadcast of ``input`` and ``mask`` — either operand
+  # may be expanded (verified directly: ``torch.zeros((2,1)).masked_fill(
+  # mask=torch.zeros((2,3), dtype=torch.bool), value=1.0)`` returns shape
+  # ``(2, 3)``). The in-place ``masked_fill_`` is unidirectional, but
+  # the manifest models only the out-of-place form. The scalar (Number)
+  # value form is its own entry, MaskedFillScalarFwdOp below: a Number is
+  # not a tensor, so it cannot be one entry's optional tensor input.
+  ref_api: "torch.Tensor.masked_fill"
+  family: elementwise
+  status: implemented
+
+  signature:
+    # Out-of-place masked_fill returns the bidirectional broadcast of
+    # input and mask; value is 0-dim.
+    forall: {A: Shape, M: Shape, T: "DType[bool | uint8 | int8 | int16 | int32 | int64 | float16 | bfloat16 | float32]"}
+    inputs:
+      input: {dtype: T, shape: "[*A]"}
+      mask: {dtype: bool, shape: "[*M]"}
+      value: {dtype: T, shape: "[]"}
+    outputs:
+      output: {dtype: T, shape: "[*broadcast(A, M)]"}
+
+  workloads:
+  - {A: [4096, 4096], M: [4096, 4096], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "16M"}
+  - {A: [16384, 16384], M: [16384, 16384], dtype_cases: [{T: float16}, {T: bfloat16}], label: "256M"}
+
+  roofline:
+    flops: "prod(broadcast(A, M))"
+
+MaskedFillScalarFwdOp:
+  # PyTorch's torch.Tensor.masked_fill(mask, value: Number). `value` is a scalar
+  # param here and a 0-dim tensor input in MaskedFillTensorFwdOp above: two signatures,
+  # so two entries.
+  ref_api: "torch.Tensor.masked_fill"
+  family: elementwise
+  status: implemented
+
+  signature:
+    # Out-of-place masked_fill returns the bidirectional broadcast of
+    # input and mask; out shape follows that broadcast (verified against
+    # ``torch.Tensor.masked_fill`` — input may also be expanded up).
+    forall: {A: Shape, M: Shape, T: "DType[bool | uint8 | int8 | int16 | int32 | int64 | float16 | bfloat16 | float32]"}
+    params:
+      value: {type: Number, default: 0.0, kw_only: true}
+    inputs:
+      input: {dtype: T, shape: "[*A]"}
+      mask: {dtype: bool, shape: "[*M]"}
+    outputs:
+      output: {dtype: T, shape: "[*broadcast(A, M)]"}
+    shape_rules:
+    - "representable(value, T)"
+
+  workloads:
+  - {A: [4096, 4096], M: [4096, 4096], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "16M"}
+  - {A: [16384, 16384], M: [16384, 16384], dtype_cases: [{T: float16}, {T: bfloat16}], label: "256M"}
+
+  roofline:
+    flops: "prod(broadcast(A, M))"
+
+AddFwdOp:
+  ref_api: "torch.add"
+  family: elementwise
+  status: implemented
+
+  signature:
+    forall: {A: Shape, B: Shape, T: "DType[bool | uint8 | int8 | int16 | int32 | int64 | float16 | bfloat16 | float32]"}
+    params:
+      alpha: {type: "int | float", default: 1, kw_only: true}
+    inputs:
+      input: {dtype: T, shape: "[*A]"}
+      other: {dtype: T, shape: "[*B]"}
+    outputs:
+      output: {dtype: T, shape: "[*broadcast(A, B)]"}
+    shape_rules:
+    # torch.add: an integral or bool input takes no float alpha, only a bool input takes a bool
+    # one, and alpha must convert to the input dtype.
+    - "category(alpha) == 'int' or category(alpha) == category(T)"
+    - "representable(alpha, T)"
+
+  workloads:
+  - {A: [2048, 4096], B: [2048, 4096], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "hidden-state-prefill"}
+  - {A: [16, 256, 56, 56], B: [256, 1, 1], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "cnn-feat-broadcast"}
+  - {A: [1024, 11008], B: [1024, 11008], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "llama-7b-ffn"}
+  - {A: [1024, 4096], B: [1, 4096], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "linear-bias"}
+
+  roofline:
+    flops: "(1 if alpha == 1 else 2) * prod(broadcast(A, B))"
+
+SubFwdOp:
+  ref_api: "torch.sub"
+  family: elementwise
+  status: implemented
+
+  signature:
+    forall: {A: Shape, B: Shape, T: "DType[uint8 | int8 | int16 | int32 | int64 | float16 | bfloat16 | float32]"}
+    params:
+      alpha: {type: "int | float", default: 1, kw_only: true}
+    inputs:
+      input: {dtype: T, shape: "[*A]"}
+      other: {dtype: T, shape: "[*B]"}
+    outputs:
+      output: {dtype: T, shape: "[*broadcast(A, B)]"}
+    shape_rules:
+    # torch.add: an integral or bool input takes no float alpha, only a bool input takes a bool
+    # one, and alpha must convert to the input dtype.
+    - "category(alpha) == 'int' or category(alpha) == category(T)"
+    - "representable(alpha, T)"
+
+  workloads:
+  - {A: [2048, 4096], B: [2048, 4096], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "hidden-state-prefill"}
+  - {A: [16, 256, 56, 56], B: [256, 1, 1], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "cnn-feat-broadcast"}
+  - {A: [1024, 11008], B: [1024, 11008], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "llama-7b-ffn"}
+  - {A: [1024, 4096], B: [1, 4096], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "linear-bias"}
+  - {A: [1024, 4096], B: [1024, 4096], dtype_cases: [{T: float16}], label: "llama-7b-hidden"}
+  - {A: [1024, 10240], B: [1024, 10240], dtype_cases: [{T: float16}], label: "phi-2-ffn"}
+  - {A: [1024, 10240], B: [1, 10240], dtype_cases: [{T: float16}], label: "phi-2-ffn-bias"}
+  - {A: [1024, 11008], B: [1, 11008], dtype_cases: [{T: float16}], label: "llama-7b-ffn-bias"}
+
+  roofline:
+    flops: "(1 if alpha == 1 else 2) * prod(broadcast(A, B))"
+
+MulFwdOp:
+  ref_api: "torch.mul"
+  family: elementwise
+  status: implemented
+
+  signature:
+    forall: {A: Shape, B: Shape, T: "DType[bool | uint8 | int8 | int16 | int32 | int64 | float16 | bfloat16 | float32]"}
+    inputs:
+      input: {dtype: T, shape: "[*A]"}
+      other: {dtype: T, shape: "[*B]"}
+    outputs:
+      output: {dtype: T, shape: "[*broadcast(A, B)]"}
+
+  workloads:
+  - {A: [2048, 4096], B: [2048, 4096], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "hidden-state-prefill"}
+  - {A: [16, 256, 56, 56], B: [256, 1, 1], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "cnn-feat-broadcast"}
+  - {A: [1024, 11008], B: [1024, 11008], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "llama-7b-ffn"}
+  - {A: [1024, 4096], B: [1, 4096], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "linear-bias"}
+  - {A: [1024, 4096], B: [1024, 4096], dtype_cases: [{T: float16}], label: "llama-7b-hidden"}
+  - {A: [1024, 10240], B: [1024, 10240], dtype_cases: [{T: float16}], label: "phi-2-ffn"}
+  - {A: [1024, 10240], B: [1, 10240], dtype_cases: [{T: float16}], label: "phi-2-ffn-bias"}
+  - {A: [1024, 11008], B: [1, 11008], dtype_cases: [{T: float16}], label: "llama-7b-ffn-bias"}
+
+  roofline:
+    flops: "prod(broadcast(A, B))"
+
+DivFwdOp:
+  ref_api: "torch.div"
+  family: elementwise
+  status: implemented
+
+  signature:
+    forall: {A: Shape, B: Shape, T: "DType[float16 | bfloat16 | float32]"}
+    params:
+      rounding_mode: {type: "'trunc' | 'floor' | None", default: null, kw_only: true}
+    inputs:
+      input: {dtype: T, shape: "[*A]"}
+      other: {dtype: T, shape: "[*B]"}
+    outputs:
+      output: {dtype: T, shape: "[*broadcast(A, B)]"}
+
+  workloads:
+  - {A: [2048, 4096], B: [2048, 4096], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "hidden-state-prefill"}
+  - {A: [16, 256, 56, 56], B: [256, 1, 1], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "cnn-feat-broadcast"}
+  - {A: [1024, 11008], B: [1024, 11008], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "llama-7b-ffn"}
+  - {A: [1024, 4096], B: [1, 4096], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "linear-bias"}
+  - {A: [1024, 4096], B: [1024, 4096], dtype_cases: [{T: float16}], label: "llama-7b-hidden"}
+  - {A: [1024, 10240], B: [1024, 10240], dtype_cases: [{T: float16}], label: "phi-2-ffn"}
+  - {A: [1024, 10240], B: [1, 10240], dtype_cases: [{T: float16}], label: "phi-2-ffn-bias"}
+  - {A: [1024, 11008], B: [1, 11008], dtype_cases: [{T: float16}], label: "llama-7b-ffn-bias"}
+
+  roofline:
+    # A rounding mode adds the trunc or floor.
+    flops: "(2 if present(rounding_mode) else 1) * prod(broadcast(A, B))"
+
+RemainderFwdOp:
+  ref_api: "torch.remainder"
+  family: elementwise
+  status: implemented
+
+  signature:
+    forall: {A: Shape, B: Shape, T: "DType[float16 | bfloat16 | float32]"}
+    inputs:
+      input: {dtype: T, shape: "[*A]"}
+      other: {dtype: T, shape: "[*B]"}
+    outputs:
+      output: {dtype: T, shape: "[*broadcast(A, B)]"}
+
+  workloads:
+  - {A: [2048, 4096], B: [2048, 4096], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "hidden-state-prefill"}
+  - {A: [16, 256, 56, 56], B: [256, 1, 1], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "cnn-feat-broadcast"}
+  - {A: [1024, 11008], B: [1024, 11008], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "llama-7b-ffn"}
+  - {A: [1024, 4096], B: [1, 4096], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "linear-bias"}
+  - {A: [1024, 4096], B: [1024, 4096], dtype_cases: [{T: float16}], label: "llama-7b-hidden"}
+  - {A: [1024, 10240], B: [1024, 10240], dtype_cases: [{T: float16}], label: "phi-2-ffn"}
+
+  roofline:
+    flops: "4 * prod(broadcast(A, B))"
+
+PowFwdOp:
+  ref_api: "torch.pow"
+  family: elementwise
+  status: implemented
+
+  signature:
+    forall: {A: Shape, B: Shape, T: "DType[float16 | bfloat16 | float32]"}
+    inputs:
+      input: {dtype: T, shape: "[*A]"}
+      exponent: {dtype: T, shape: "[*B]"}
+    outputs:
+      output: {dtype: T, shape: "[*broadcast(A, B)]"}
+
+  workloads:
+  - {A: [2048, 4096], B: [2048, 4096], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "hidden-state-prefill"}
+  - {A: [16, 256, 56, 56], B: [256, 1, 1], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "cnn-feat-broadcast"}
+  - {A: [1024, 11008], B: [1024, 11008], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "llama-7b-ffn"}
+  - {A: [1024, 4096], B: [1, 4096], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "linear-bias"}
+  - {A: [1024, 4096], B: [1024, 4096], dtype_cases: [{T: float16}], label: "llama-7b-hidden"}
+  - {A: [1024, 10240], B: [1024, 10240], dtype_cases: [{T: float16}], label: "phi-2-ffn"}
+
+  roofline:
+    # One transcendental call per element.
+    flops: "prod(broadcast(A, B))"
+
+FloorDivideFwdOp:
+  ref_api: "torch.floor_divide"
+  family: elementwise
+  status: implemented
+
+  signature:
+    forall: {A: Shape, B: Shape, T: "DType[float16 | bfloat16 | float32]"}
+    inputs:
+      input: {dtype: T, shape: "[*A]"}
+      other: {dtype: T, shape: "[*B]"}
+    outputs:
+      output: {dtype: T, shape: "[*broadcast(A, B)]"}
+
+  workloads:
+  - {A: [2048, 4096], B: [2048, 4096], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "hidden-state-prefill"}
+  - {A: [16, 256, 56, 56], B: [256, 1, 1], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "cnn-feat-broadcast"}
+  - {A: [1024, 11008], B: [1024, 11008], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "llama-7b-ffn"}
+  - {A: [1024, 4096], B: [1, 4096], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "linear-bias"}
+  - {A: [1024, 4096], B: [1024, 4096], dtype_cases: [{T: float16}], label: "llama-7b-hidden"}
+  - {A: [1024, 10240], B: [1024, 10240], dtype_cases: [{T: float16}], label: "phi-2-ffn"}
+
+  roofline:
+    flops: "2 * prod(broadcast(A, B))"
+
+LerpScalarFwdOp:
+  # Scalar-weight variant: PyTorch's torch.lerp also accepts a Tensor
+  # weight (see LerpTensorFwdOp); this entry tracks the scalar (Number)
+  # slice that the existing kernel implements.
+  ref_api: "torch.lerp"
+  family: elementwise
+  status: implemented
+
+  signature:
+    forall: {A: Shape, B: Shape, T: "DType[float16 | bfloat16 | float32]"}
+    params:
+      weight: {type: float, default: 0.5, kw_only: true}
+    inputs:
+      input: {dtype: T, shape: "[*A]"}
+      end: {dtype: T, shape: "[*B]"}
+    outputs:
+      output: {dtype: T, shape: "[*broadcast(A, B)]"}
+
+  workloads:
+  - {A: [2048, 4096], B: [2048, 4096], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "hidden-state-prefill"}
+  - {A: [16, 256, 56, 56], B: [256, 1, 1], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "cnn-feat-broadcast"}
+  - {A: [1024, 11008], B: [1024, 11008], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "llama-7b-ffn"}
+  - {A: [1024, 4096], B: [1, 4096], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "linear-bias"}
+  - {A: [1024, 4096], B: [1024, 4096], dtype_cases: [{T: float16}], label: "llama-7b-hidden"}
+  - {A: [1024, 10240], B: [1024, 10240], dtype_cases: [{T: float16}], label: "phi-2-ffn"}
+
+  roofline:
+    flops: "3 * prod(broadcast(A, B))"
+
+MaximumFwdOp:
+  ref_api: "torch.maximum"
+  family: elementwise
+  status: implemented
+
+  signature:
+    forall: {A: Shape, B: Shape, T: "DType[bool | uint8 | int8 | int16 | int32 | int64 | float16 | bfloat16 | float32]"}
+    inputs:
+      input: {dtype: T, shape: "[*A]"}
+      other: {dtype: T, shape: "[*B]"}
+    outputs:
+      output: {dtype: T, shape: "[*broadcast(A, B)]"}
+
+  workloads:
+  - {A: [2048, 4096], B: [2048, 4096], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "hidden-state-prefill"}
+  - {A: [16, 256, 56, 56], B: [256, 1, 1], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "cnn-feat-broadcast"}
+  - {A: [1024, 11008], B: [1024, 11008], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "llama-7b-ffn"}
+  - {A: [1024, 4096], B: [1, 4096], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "linear-bias"}
+  - {A: [1024, 4096], B: [1024, 4096], dtype_cases: [{T: float16}], label: "llama-7b-hidden"}
+  - {A: [1024, 10240], B: [1024, 10240], dtype_cases: [{T: float16}], label: "phi-2-ffn"}
+
+  roofline:
+    flops: "prod(broadcast(A, B))"
+
+MinimumFwdOp:
+  ref_api: "torch.minimum"
+  family: elementwise
+  status: implemented
+
+  signature:
+    forall: {A: Shape, B: Shape, T: "DType[bool | uint8 | int8 | int16 | int32 | int64 | float16 | bfloat16 | float32]"}
+    inputs:
+      input: {dtype: T, shape: "[*A]"}
+      other: {dtype: T, shape: "[*B]"}
+    outputs:
+      output: {dtype: T, shape: "[*broadcast(A, B)]"}
+
+  workloads:
+  - {A: [2048, 4096], B: [2048, 4096], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "hidden-state-prefill"}
+  - {A: [16, 256, 56, 56], B: [256, 1, 1], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "cnn-feat-broadcast"}
+  - {A: [1024, 11008], B: [1024, 11008], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "llama-7b-ffn"}
+  - {A: [1024, 4096], B: [1, 4096], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "linear-bias"}
+  - {A: [1024, 4096], B: [1024, 4096], dtype_cases: [{T: float16}], label: "llama-7b-hidden"}
+  - {A: [1024, 10240], B: [1024, 10240], dtype_cases: [{T: float16}], label: "phi-2-ffn"}
+
+  roofline:
+    flops: "prod(broadcast(A, B))"
+
+EqFwdOp:
+  ref_api: "torch.eq"
+  family: elementwise
+  status: implemented
+
+  signature:
+    forall: {A: Shape, B: Shape, T: "DType[bool | uint8 | int8 | int16 | int32 | int64 | float16 | bfloat16 | float32]"}
+    inputs:
+      input: {dtype: T, shape: "[*A]"}
+      other: {dtype: T, shape: "[*B]"}
+    outputs:
+      output: {dtype: bool, shape: "[*broadcast(A, B)]"}
+
+  workloads:
+  - {A: [2048, 4096], B: [2048, 4096], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "hidden-state-prefill"}
+  - {A: [16, 256, 56, 56], B: [256, 1, 1], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "cnn-feat-broadcast"}
+  - {A: [1024, 11008], B: [1024, 11008], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "llama-7b-ffn"}
+  - {A: [1024, 4096], B: [1, 4096], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "linear-bias"}
+  - {A: [1024, 4096], B: [1024, 4096], dtype_cases: [{T: float16}], label: "llama-7b-hidden"}
+  - {A: [1024, 10240], B: [1024, 10240], dtype_cases: [{T: float16}], label: "phi-2-ffn"}
+
+  roofline:
+    flops: "prod(broadcast(A, B))"
+
+NeFwdOp:
+  ref_api: "torch.ne"
+  family: elementwise
+  status: implemented
+
+  signature:
+    forall: {A: Shape, B: Shape, T: "DType[bool | uint8 | int8 | int16 | int32 | int64 | float16 | bfloat16 | float32]"}
+    inputs:
+      input: {dtype: T, shape: "[*A]"}
+      other: {dtype: T, shape: "[*B]"}
+    outputs:
+      output: {dtype: bool, shape: "[*broadcast(A, B)]"}
+
+  workloads:
+  - {A: [2048, 4096], B: [2048, 4096], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "hidden-state-prefill"}
+  - {A: [16, 256, 56, 56], B: [256, 1, 1], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "cnn-feat-broadcast"}
+  - {A: [1024, 11008], B: [1024, 11008], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "llama-7b-ffn"}
+  - {A: [1024, 4096], B: [1, 4096], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "linear-bias"}
+  - {A: [1024, 4096], B: [1024, 4096], dtype_cases: [{T: float16}], label: "llama-7b-hidden"}
+
+  roofline:
+    flops: "prod(broadcast(A, B))"
+
+GtFwdOp:
+  ref_api: "torch.gt"
+  family: elementwise
+  status: implemented
+
+  signature:
+    forall: {A: Shape, B: Shape, T: "DType[bool | uint8 | int8 | int16 | int32 | int64 | float16 | bfloat16 | float32]"}
+    inputs:
+      input: {dtype: T, shape: "[*A]"}
+      other: {dtype: T, shape: "[*B]"}
+    outputs:
+      output: {dtype: bool, shape: "[*broadcast(A, B)]"}
+
+  workloads:
+  - {A: [2048, 4096], B: [2048, 4096], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "hidden-state-prefill"}
+  - {A: [16, 256, 56, 56], B: [256, 1, 1], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "cnn-feat-broadcast"}
+  - {A: [1024, 11008], B: [1024, 11008], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "llama-7b-ffn"}
+  - {A: [1024, 4096], B: [1, 4096], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "linear-bias"}
+  - {A: [1024, 4096], B: [1024, 4096], dtype_cases: [{T: float16}], label: "llama-7b-hidden"}
+
+  roofline:
+    flops: "prod(broadcast(A, B))"
+
+LtFwdOp:
+  ref_api: "torch.lt"
+  family: elementwise
+  status: implemented
+
+  signature:
+    forall: {A: Shape, B: Shape, T: "DType[bool | uint8 | int8 | int16 | int32 | int64 | float16 | bfloat16 | float32]"}
+    inputs:
+      input: {dtype: T, shape: "[*A]"}
+      other: {dtype: T, shape: "[*B]"}
+    outputs:
+      output: {dtype: bool, shape: "[*broadcast(A, B)]"}
+
+  workloads:
+  - {A: [2048, 4096], B: [2048, 4096], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "hidden-state-prefill"}
+  - {A: [16, 256, 56, 56], B: [256, 1, 1], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "cnn-feat-broadcast"}
+  - {A: [1024, 11008], B: [1024, 11008], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "llama-7b-ffn"}
+  - {A: [1024, 4096], B: [1, 4096], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "linear-bias"}
+  - {A: [1024, 4096], B: [1024, 4096], dtype_cases: [{T: float16}], label: "llama-7b-hidden"}
+
+  roofline:
+    flops: "prod(broadcast(A, B))"
+
+GeFwdOp:
+  ref_api: "torch.ge"
+  family: elementwise
+  status: implemented
+
+  signature:
+    forall: {A: Shape, B: Shape, T: "DType[bool | uint8 | int8 | int16 | int32 | int64 | float16 | bfloat16 | float32]"}
+    inputs:
+      input: {dtype: T, shape: "[*A]"}
+      other: {dtype: T, shape: "[*B]"}
+    outputs:
+      output: {dtype: bool, shape: "[*broadcast(A, B)]"}
+
+  workloads:
+  - {A: [2048, 4096], B: [2048, 4096], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "hidden-state-prefill"}
+  - {A: [16, 256, 56, 56], B: [256, 1, 1], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "cnn-feat-broadcast"}
+  - {A: [1024, 11008], B: [1024, 11008], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "llama-7b-ffn"}
+  - {A: [1024, 4096], B: [1, 4096], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "linear-bias"}
+  - {A: [1024, 4096], B: [1024, 4096], dtype_cases: [{T: float16}], label: "llama-7b-hidden"}
+
+  roofline:
+    flops: "prod(broadcast(A, B))"
+
+LeFwdOp:
+  ref_api: "torch.le"
+  family: elementwise
+  status: implemented
+
+  signature:
+    forall: {A: Shape, B: Shape, T: "DType[bool | uint8 | int8 | int16 | int32 | int64 | float16 | bfloat16 | float32]"}
+    inputs:
+      input: {dtype: T, shape: "[*A]"}
+      other: {dtype: T, shape: "[*B]"}
+    outputs:
+      output: {dtype: bool, shape: "[*broadcast(A, B)]"}
+
+  workloads:
+  - {A: [2048, 4096], B: [2048, 4096], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "hidden-state-prefill"}
+  - {A: [16, 256, 56, 56], B: [256, 1, 1], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "cnn-feat-broadcast"}
+  - {A: [1024, 11008], B: [1024, 11008], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "llama-7b-ffn"}
+  - {A: [1024, 4096], B: [1, 4096], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "linear-bias"}
+  - {A: [1024, 4096], B: [1024, 4096], dtype_cases: [{T: float16}], label: "llama-7b-hidden"}
+
+  roofline:
+    flops: "prod(broadcast(A, B))"
+
+LogicalAndFwdOp:
+  ref_api: "torch.logical_and"
+  family: elementwise
+  status: implemented
+
+  signature:
+    forall: {A: Shape, B: Shape, T: "DType[bool | uint8 | int8 | int16 | int32 | int64 | float16 | bfloat16 | float32]"}
+    inputs:
+      input: {dtype: T, shape: "[*A]"}
+      other: {dtype: T, shape: "[*B]"}
+    outputs:
+      output: {dtype: bool, shape: "[*broadcast(A, B)]"}
+
+  workloads:
+  - {A: [2048, 4096], B: [2048, 4096], dtype_cases: [{T: bool}, {T: float16}, {T: bfloat16}, {T: float32}], label: "hidden-state-prefill"}
+  - {A: [16, 256, 56, 56], B: [256, 1, 1], dtype_cases: [{T: bool}, {T: float16}, {T: bfloat16}, {T: float32}], label: "cnn-feat-broadcast"}
+  - {A: [1024, 11008], B: [1024, 11008], dtype_cases: [{T: bool}, {T: float16}, {T: bfloat16}, {T: float32}], label: "llama-7b-ffn"}
+  - {A: [1024, 4096], B: [1, 4096], dtype_cases: [{T: bool}, {T: float16}, {T: bfloat16}, {T: float32}], label: "linear-bias"}
+  - {A: [1024, 4096], B: [1024, 4096], dtype_cases: [{T: float16}], label: "llama-7b-hidden"}
+  - {A: [1024, 10240], B: [1024, 10240], dtype_cases: [{T: float16}], label: "phi-2-ffn"}
+
+  roofline:
+    # Two truth tests and the combine; bool operands are already truth values.
+    flops: "(1 if T == 'bool' else 3) * prod(broadcast(A, B))"
+
+LogicalOrFwdOp:
+  ref_api: "torch.logical_or"
+  family: elementwise
+  status: implemented
+
+  signature:
+    forall: {A: Shape, B: Shape, T: "DType[bool | uint8 | int8 | int16 | int32 | int64 | float16 | bfloat16 | float32]"}
+    inputs:
+      input: {dtype: T, shape: "[*A]"}
+      other: {dtype: T, shape: "[*B]"}
+    outputs:
+      output: {dtype: bool, shape: "[*broadcast(A, B)]"}
+
+  workloads:
+  - {A: [2048, 4096], B: [2048, 4096], dtype_cases: [{T: bool}, {T: float16}, {T: bfloat16}, {T: float32}], label: "hidden-state-prefill"}
+  - {A: [16, 256, 56, 56], B: [256, 1, 1], dtype_cases: [{T: bool}, {T: float16}, {T: bfloat16}, {T: float32}], label: "cnn-feat-broadcast"}
+  - {A: [1024, 11008], B: [1024, 11008], dtype_cases: [{T: bool}, {T: float16}, {T: bfloat16}, {T: float32}], label: "llama-7b-ffn"}
+  - {A: [1024, 4096], B: [1, 4096], dtype_cases: [{T: bool}, {T: float16}, {T: bfloat16}, {T: float32}], label: "linear-bias"}
+  - {A: [1024, 4096], B: [1024, 4096], dtype_cases: [{T: float16}], label: "llama-7b-hidden"}
+  - {A: [1024, 10240], B: [1024, 10240], dtype_cases: [{T: float16}], label: "phi-2-ffn"}
+
+  roofline:
+    # Two truth tests and the combine; bool operands are already truth values.
+    flops: "(1 if T == 'bool' else 3) * prod(broadcast(A, B))"
+
+BitwiseAndFwdOp:
+  ref_api: "torch.bitwise_and"
+  family: elementwise
+  status: implemented
+
+  signature:
+    forall: {A: Shape, B: Shape, T: "DType[bool | uint8 | int8 | int16 | int32 | int64]"}
+    inputs:
+      input: {dtype: T, shape: "[*A]"}
+      other: {dtype: T, shape: "[*B]"}
+    outputs:
+      output: {dtype: T, shape: "[*broadcast(A, B)]"}
+
+  workloads:
+  - {A: [2048, 4096], B: [2048, 4096], dtype_cases: [{T: bool}, {T: int32}, {T: int64}], label: "hidden-state-prefill"}
+  - {A: [16, 256, 56, 56], B: [256, 1, 1], dtype_cases: [{T: bool}, {T: int32}, {T: int64}], label: "cnn-feat-broadcast"}
+  - {A: [1024, 11008], B: [1024, 11008], dtype_cases: [{T: bool}, {T: int32}, {T: int64}], label: "llama-7b-ffn"}
+  - {A: [1024, 4096], B: [1, 4096], dtype_cases: [{T: bool}, {T: int32}, {T: int64}], label: "linear-bias"}
+  - {A: [1024, 4096], B: [1024, 4096], dtype_cases: [{T: int32}], label: "llama-7b-hidden"}
+  - {A: [1024, 10240], B: [1024, 10240], dtype_cases: [{T: int32}], label: "phi-2-ffn"}
+
+  roofline:
+    flops: "prod(broadcast(A, B))"
+
+BitwiseOrFwdOp:
+  ref_api: "torch.bitwise_or"
+  family: elementwise
+  status: implemented
+
+  signature:
+    forall: {A: Shape, B: Shape, T: "DType[bool | uint8 | int8 | int16 | int32 | int64]"}
+    inputs:
+      input: {dtype: T, shape: "[*A]"}
+      other: {dtype: T, shape: "[*B]"}
+    outputs:
+      output: {dtype: T, shape: "[*broadcast(A, B)]"}
+
+  workloads:
+  - {A: [2048, 4096], B: [2048, 4096], dtype_cases: [{T: bool}, {T: int32}, {T: int64}], label: "hidden-state-prefill"}
+  - {A: [16, 256, 56, 56], B: [256, 1, 1], dtype_cases: [{T: bool}, {T: int32}, {T: int64}], label: "cnn-feat-broadcast"}
+  - {A: [1024, 11008], B: [1024, 11008], dtype_cases: [{T: bool}, {T: int32}, {T: int64}], label: "llama-7b-ffn"}
+  - {A: [1024, 4096], B: [1, 4096], dtype_cases: [{T: bool}, {T: int32}, {T: int64}], label: "linear-bias"}
+  - {A: [1024, 4096], B: [1024, 4096], dtype_cases: [{T: int32}], label: "llama-7b-hidden"}
+
+  roofline:
+    flops: "prod(broadcast(A, B))"
+
+BitwiseXorFwdOp:
+  ref_api: "torch.bitwise_xor"
+  family: elementwise
+  status: implemented
+
+  signature:
+    forall: {A: Shape, B: Shape, T: "DType[bool | uint8 | int8 | int16 | int32 | int64]"}
+    inputs:
+      input: {dtype: T, shape: "[*A]"}
+      other: {dtype: T, shape: "[*B]"}
+    outputs:
+      output: {dtype: T, shape: "[*broadcast(A, B)]"}
+
+  workloads:
+  - {A: [2048, 4096], B: [2048, 4096], dtype_cases: [{T: bool}, {T: int32}, {T: int64}], label: "hidden-state-prefill"}
+  - {A: [16, 256, 56, 56], B: [256, 1, 1], dtype_cases: [{T: bool}, {T: int32}, {T: int64}], label: "cnn-feat-broadcast"}
+  - {A: [1024, 11008], B: [1024, 11008], dtype_cases: [{T: bool}, {T: int32}, {T: int64}], label: "llama-7b-ffn"}
+  - {A: [1024, 4096], B: [1, 4096], dtype_cases: [{T: bool}, {T: int32}, {T: int64}], label: "linear-bias"}
+  - {A: [1024, 4096], B: [1024, 4096], dtype_cases: [{T: int32}], label: "llama-7b-hidden"}
+
+  roofline:
+    flops: "prod(broadcast(A, B))"

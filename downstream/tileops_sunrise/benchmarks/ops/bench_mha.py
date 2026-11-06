@@ -1,0 +1,113 @@
+"""Benchmarks for multi-head attention paged decode, one case per manifest call, against FA3 and FlashInfer."""
+
+import pytest
+import torch
+
+from benchmarks import api as bench
+from benchmarks.baselines import FLASHINFER_TAG, optional_baseline
+from tileops.attention import MHAPagedFwdOp
+
+
+def _fa3_mha_decode_paged(workload, k, v):
+    """Set up FA3 paged decode. Returns callable or None.
+
+    FA3 requires page_block_size to be a multiple of 256.
+    """
+    if workload.page_size % 256 != 0:
+        return None
+    flash_attn_with_kvcache = optional_baseline(
+        "flash_attn_interface", "fa3", "flash_attn_with_kvcache"
+    )
+    if flash_attn_with_kvcache is None:
+        return None
+
+    num_pages = k.shape[0] // workload.page_size
+    k_paged = k.view(num_pages, workload.page_size, workload.heads, workload.dim)
+    v_paged = v.view(num_pages, workload.page_size, workload.heads, workload.dim)
+
+    def baseline_fn(q, k, v, block_table, cache_seqlens):
+        out = flash_attn_with_kvcache(
+            q,
+            k_paged,
+            v_paged,
+            cache_seqlens=cache_seqlens.int(),
+            page_table=block_table.int(),
+            causal=workload.is_causal,
+        )
+        return out[0] if isinstance(out, tuple) else out
+
+    return baseline_fn
+
+
+def _flashinfer_mha_decode_paged(workload, q, k, v, block_table, cache_seqlens):
+    """Set up FlashInfer paged decode wrapper. Returns callable or None.
+
+    The decode wrapper takes one query token per request.
+    """
+    if q.shape[1] != 1:
+        return None
+    BatchDecodeWithPagedKVCacheWrapper = optional_baseline(
+        "flashinfer.decode", "flashinfer", "BatchDecodeWithPagedKVCacheWrapper"
+    )
+    if BatchDecodeWithPagedKVCacheWrapper is None:
+        return None
+
+    batch = q.shape[0]
+    num_pages = k.shape[0] // workload.page_size
+    k_paged = k.view(num_pages, workload.page_size, workload.heads, workload.dim)
+    v_paged = v.view(num_pages, workload.page_size, workload.heads, workload.dim)
+    kv_data = (k_paged, v_paged)
+
+    pages_per_batch = (cache_seqlens.int() + workload.page_size - 1) // workload.page_size
+    indptr = torch.zeros(batch + 1, dtype=torch.int32, device=q.device)
+    indptr[1:] = torch.cumsum(pages_per_batch, dim=0)
+
+    indices_list = []
+    for b in range(batch):
+        n = pages_per_batch[b].item()
+        indices_list.append(block_table[b, :n])
+    indices = torch.cat(indices_list)
+
+    last_page_len = (cache_seqlens.int() - 1) % workload.page_size + 1
+
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=q.device)
+    wrapper = BatchDecodeWithPagedKVCacheWrapper(workspace, kv_layout="NHD")
+    wrapper.plan(
+        indptr=indptr,
+        indices=indices,
+        last_page_len=last_page_len,
+        num_qo_heads=workload.heads,
+        num_kv_heads=workload.heads,
+        head_dim=workload.dim,
+        page_size=workload.page_size,
+        q_data_type=workload.dtype,
+    )
+
+    def run_fn(q, k, v, block_table, cache_seqlens):
+        return wrapper.run(q.squeeze(1), kv_data).unsqueeze(1)
+
+    return run_fn
+
+
+@pytest.mark.parametrize("case", bench.cases(MHAPagedFwdOp), ids=lambda case: case.id)
+def test_mha_decode_paged_bench(case) -> None:
+    workload = case.workload
+    inputs = case.inputs
+    q, k, v, block_table, cache_seqlens = inputs
+
+    op = MHAPagedFwdOp(**case.arguments)
+    op.request_tune()
+    implementations = {}
+
+    fa3_fn = _fa3_mha_decode_paged(workload, k, v)
+    if fa3_fn is not None:
+        implementations["fa3"] = fa3_fn
+
+    fi_fn = _flashinfer_mha_decode_paged(workload, *inputs)
+    if fi_fn is not None:
+        implementations[FLASHINFER_TAG] = fi_fn
+
+    if fa3_fn is None and fi_fn is None:
+        implementations["torch-ref"] = case.reference
+
+    bench.Runner(op, case).compare(implementations)

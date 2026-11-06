@@ -114,6 +114,20 @@ TIR_REGISTER_TL_TILE_OP(GemmBlockScaled, gemm_blockscaled)
     .set_attr<tirx::TCallEffectKind>("TCallEffectKind",
                                      Integer(tirx::CallEffectKind::kOpaque));
 
+TVM_REGISTER_OP("tl.tileop.tcgen05_gemm_blockscaled")
+    .set_attr<tirx::TScriptPrinterName>("TScriptPrinterName",
+                                        "tcgen05_gemm_blockscaled")
+    .set_attr<OpBuilderFunc>(
+        "TLOpBuilder",
+        [](ffi::Array<PrimExpr> args,
+           ffi::Map<ffi::String, ffi::ObjectRef> annotations) {
+          annotations.Set("is_tcgen05", IntImm(DataType::Int(32), 1));
+          return GemmBlockScaled(std::move(args), std::move(annotations));
+        })
+    .set_num_inputs(-1)
+    .set_attr<tirx::TCallEffectKind>("TCallEffectKind",
+                                     Integer(tirx::CallEffectKind::kOpaque));
+
 TVM_FFI_STATIC_INIT_BLOCK() { GemmBlockScaledNode::RegisterReflection(); }
 
 } // namespace tl

@@ -1,21 +1,27 @@
 """The Mamba ops, at the public path ``tileops.mamba``."""
 
-from .ops.mamba import (
-    CBProducerFwdOp,
-    DaCumsumFwdOp,
+from tileops._ops.mamba import (
+    CausalConv1dFwdOp,
+    CausalConv1dUpdateFwdOp,
     Mamba2FwdOp,
+    SelectiveScanFwdOp,
+    SSDChunkCouplingFwdOp,
+    SSDChunkCumsumFwdOp,
     SSDChunkScanFwdOp,
     SSDChunkStateFwdOp,
-    SSDDecodeFwdOp,
+    SSDRecurrentFwdOp,
     SSDStatePassingFwdOp,
 )
 
 __all__ = [
+    "CausalConv1dFwdOp",
+    "CausalConv1dUpdateFwdOp",
     "Mamba2FwdOp",
-    "DaCumsumFwdOp",
-    "SSDChunkStateFwdOp",
-    "SSDStatePassingFwdOp",
+    "SSDChunkCouplingFwdOp",
+    "SSDChunkCumsumFwdOp",
     "SSDChunkScanFwdOp",
-    "SSDDecodeFwdOp",
-    "CBProducerFwdOp",
+    "SSDChunkStateFwdOp",
+    "SSDRecurrentFwdOp",
+    "SSDStatePassingFwdOp",
+    "SelectiveScanFwdOp",
 ]

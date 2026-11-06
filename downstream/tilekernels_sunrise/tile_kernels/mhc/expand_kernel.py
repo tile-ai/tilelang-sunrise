@@ -1,148 +1,79 @@
-import tilelang
-import torch
-from tilelang import language as T
-
-# Module-level hardware constants (overridable, no runtime device query).
-_S2_SMEM_BUDGET_BYTES = 64 * 1024  # single-buffer staging within the resource budget
-_BLK_H_CANDIDATES = (256, 128, 64, 32, 16, 8)  # 256=512B rows saturate the 128B transaction
-_BLK_N_CANDIDATES = (128, 64, 32, 16, 8, 4, 2, 1)  # includes 1 so the fast path always hits
-_MIN_BLK_N = 8  # narrower token tiles only lose vectorization, never help this copy
-# When hidden spans only a few blk_h tiles (grid_j <= _WIDE_HIDDEN_GRID_J) blk_n
-# stays minimal: a few wide rows already keep the SMs busy and the token grid is
-# short. For hidden that spans many blk_h tiles (grid_j large), the grid can grow
-# huge along j, so blk_n grows with n to cap the token-dimension block count at
-# _MAX_TOKEN_BLOCKS, avoiding the scheduling overhead of an enormous grid.
-_WIDE_HIDDEN_GRID_J = 16
-_MAX_TOKEN_BLOCKS = 64
+from tile_kernels.config import get_is_tang, get_num_vec_cores, get_pdl, is_ascend
+from tile_kernels.mhc.expand_cuda import expand_to_mhc_bwd_cuda, expand_to_mhc_fwd_cuda
 
 
-def choose_expand_blocks(hidden: int, mhc_mult: int,
-                         n_tokens: int) -> tuple[int, int]:
-    """Analytically pick (blk_n, blk_h) for expand_to_mhc, compile-time only.
+def _asc_fwd_h_blk(hidden: int, mhc_mult: int) -> int:
+    num_stages = 7
+    ub_budget_bytes = 245 * 1024
+    max_h_blk = ub_budget_bytes // ((mhc_mult + 1) * 2 * num_stages)
+    h_blk = min(hidden, max_h_blk // 128 * 128)
+    while h_blk > 128 and hidden % h_blk != 0:
+        h_blk -= 128
+    return h_blk
 
-    ``blk_h`` is the widest divisor of ``hidden`` (for vectorized T.copy). ``blk_n``
-    is kept at ``_MIN_BLK_N`` unless ``hidden`` spans many blk_h tiles (grid_j
-    large), in which case it grows with ``n_tokens`` to hold the token-block count
-    near ``_MAX_TOKEN_BLOCKS``. This keeps the distinct JIT key count tiny (blk_n
-    only depends on a coarse grid_j split, not on every n) while keeping SMs
-    saturated. The result always divides ``n_tokens`` so the aligned fast path is
-    hit, and the staging buffer fits: ``blk_n * blk_h * 2 <= _S2_SMEM_BUDGET_BYTES``.
 
-    For this memory-bound copy, keep the smallest sensible ``blk_n`` except when
-    large hidden dimensions and many tokens require a wider tile to control the
-    grid. ``mhc_mult`` does not steer the choice and is accepted only for symmetry
-    with the kernel factory.
-    """
-    # blk_h: widest candidate dividing hidden (engram _choose_blk_d style);
-    # a non-dividing hidden (odd/prime) falls back via the caller's alignment gate.
-    blk_h = next((b for b in _BLK_H_CANDIDATES if hidden % b == 0),
-                 min(hidden, _BLK_H_CANDIDATES[0]))
-    grid_j = -(-hidden // blk_h)  # ceildiv
+def _asc_h_blk(hidden: int) -> int:
+    # Keep h_blk small enough that mhc * h_blk fits in UB with multi-stage.
+    # For large hidden, split so that h_blk <= 4096.
+    h_blk = hidden if hidden <= 4096 else (hidden + 1) // 2
+    h_blk = (h_blk + 63) // 64 * 64
+    # Cap at 4096 to fit UB budget for mhc * h_blk * num_stages
+    while h_blk > 4096 and hidden % (h_blk // 2) == 0:
+        h_blk //= 2
+    return h_blk
 
-    if n_tokens <= 0:
-        return 1, blk_h
 
-    if grid_j <= _WIDE_HIDDEN_GRID_J:
-        # Few blk_h tiles -> keep blk_n minimal; token grid is already short.
-        target = _MIN_BLK_N
+def expand_to_mhc_fwd(x, o):
+    if get_is_tang():
+        from tile_kernels.mhc.expand_tang import (
+            _expand_to_mhc_fwd_fallback,
+            choose_expand_blocks,
+            expand_to_mhc_fwd_tl,
+        )
+
+        hidden = x.shape[-1]
+        mhc_mult = o.shape[-2]
+        num_tokens = x.numel() // hidden
+        if num_tokens == 0:
+            return
+        blk_n, blk_h = choose_expand_blocks(hidden, mhc_mult, num_tokens)
+        if num_tokens % blk_n == 0 and hidden % blk_h == 0:
+            expand_to_mhc_fwd_tl(hidden, mhc_mult, blk_n, blk_h)(
+                x.view(num_tokens, hidden), o.view(num_tokens, mhc_mult * hidden),
+            )
+        else:
+            _expand_to_mhc_fwd_fallback(hidden, mhc_mult)(
+                x.view(num_tokens, hidden), o.view(num_tokens, mhc_mult, hidden),
+            )
+    elif is_ascend():
+        from tile_kernels.mhc.expand_asc import expand_to_mhc_fwd_asc
+
+        hidden = x.shape[-1]
+        assert hidden % 128 == 0, f'Ascend expand fwd requires hidden divisible by 128, got {hidden}'
+        h_blk = _asc_fwd_h_blk(hidden, o.shape[-2])
+        assert hidden % h_blk == 0, f'Ascend expand fwd requires hidden divisible by h_blk, got {hidden=}, {h_blk=}'
+        expand_to_mhc_fwd_asc(x, o, h_blk=h_blk, num_stages=7, num_vec_cores=get_num_vec_cores())
     else:
-        # Many blk_h tiles -> grow blk_n so the token-block count stays bounded.
-        target = max(_MIN_BLK_N, n_tokens // _MAX_TOKEN_BLOCKS)
-
-    blk_n_cap = min(_S2_SMEM_BUDGET_BYTES // (blk_h * 2), _BLK_N_CANDIDATES[0])
-    target = min(target, blk_n_cap)
-
-    # Largest candidate that is <= target and divides n_tokens (fast path);
-    # 1 always divides, so this never fails.
-    blk_n = next((b for b in _BLK_N_CANDIDATES if b <= target and n_tokens % b == 0),
-                 1)
-    return blk_n, blk_h
+        expand_to_mhc_fwd_cuda(x, o, use_pdl=get_pdl())
 
 
-@tilelang.jit
-def _expand_to_mhc_fwd_fallback(hidden: int, mhc_mult: int) -> tilelang.JITKernel:
-    """Original element-wise fwd, used when n/h are not blk-aligned."""
-    n = T.dynamic('num_tokens')
-    h = hidden
-    mhc = mhc_mult
+def expand_to_mhc_bwd(o_grad, x_grad):
+    if get_is_tang():
+        from tile_kernels.mhc.expand_tang import expand_to_mhc_bwd_tl
 
-    blk_n = 32
-    blk_h = 128
+        hidden, mhc_mult = o_grad.shape[-1], o_grad.shape[-2]
+        num_tokens = x_grad.numel() // hidden
+        if num_tokens:
+            expand_to_mhc_bwd_tl(hidden, mhc_mult)(
+                o_grad.view(num_tokens, mhc_mult, hidden), x_grad.view(num_tokens, hidden),
+            )
+    elif is_ascend():
+        from tile_kernels.mhc.expand_asc import expand_to_mhc_bwd_asc
 
-    @T.prim_func
-    def _kernel(
-        x: T.Tensor[(n, h), T.bfloat16],
-        o: T.Tensor[(n, mhc, h), T.bfloat16],
-    ) -> None:
-        with T.Kernel(T.ceildiv(n, blk_n), T.ceildiv(h, blk_h)) as (pid_i, pid_j):
-            if n > 0:
-                xl = T.alloc_fragment((blk_n, blk_h), T.bfloat16)
-                T.copy(x[pid_i * blk_n, pid_j * blk_h], xl)
-                for m in T.serial(mhc):
-                    for ti, tj in T.Parallel(blk_n, blk_h):
-                        i = pid_i * blk_n + ti
-                        j = pid_j * blk_h + tj
-                        if i < n and j < h:
-                            o[i, m, j] = xl[ti, tj]
-
-    return _kernel
-
-
-@tilelang.jit
-def expand_to_mhc_fwd_tl(hidden: int, mhc_mult: int,
-                         blk_n: int, blk_h: int) -> tilelang.JITKernel:
-    """Vectorized fwd kernel using shared-memory T.copy.
-
-    Requires num_tokens and hidden to be multiples of blk_n/blk_h; the caller
-    dispatches to ``_expand_to_mhc_fwd_fallback`` otherwise. ``blk_n``/``blk_h``
-    come from ``choose_expand_blocks``.
-    """
-    n = T.dynamic('num_tokens')
-    h = hidden
-    mhc = mhc_mult
-
-    @T.prim_func
-    def expand_to_mhc_fwd_kernel(
-        x: T.Tensor[(n, h), T.bfloat16],
-        o: T.Tensor[(n, mhc * h), T.bfloat16],
-    ) -> None:
-        with T.Kernel(T.ceildiv(n, blk_n), T.ceildiv(h, blk_h)) as (pid_i, pid_j):
-            if n > 0:
-                xs = T.alloc_shared((blk_n, blk_h), T.bfloat16)
-                T.copy(x[pid_i * blk_n, pid_j * blk_h], xs)
-                T.assume(n % blk_n == 0)
-                T.assume(h % blk_h == 0)
-                for m_idx in T.unroll(mhc):
-                    T.copy(xs, o[pid_i * blk_n, m_idx * h + pid_j * blk_h],
-                           disable_tma=True)
-
-    return expand_to_mhc_fwd_kernel
-
-
-@tilelang.jit
-def expand_to_mhc_bwd_tl(hidden: int, mhc_mult: int) -> tilelang.JITKernel:
-    n = T.dynamic('num_tokens')
-    h = hidden
-    mhc = mhc_mult
-
-    blk_n = 32
-    blk_h = 128
-
-    @T.prim_func
-    def expand_to_mhc_bwd_kernel(
-        o_grad: T.Tensor[(n, mhc, h), T.bfloat16],
-        x_grad: T.Tensor[(n, h), T.bfloat16],
-    ) -> None:
-        with T.Kernel(T.ceildiv(n, blk_n), T.ceildiv(h, blk_h)) as (pid_i, pid_j):
-            if n > 0:
-                xgl = T.alloc_fragment((blk_n, blk_h), T.float32)
-                T.fill(xgl, 0)
-                for m in T.serial(mhc):
-                    for ti, tj in T.Parallel(blk_n, blk_h):
-                        i = pid_i * blk_n + ti
-                        j = pid_j * blk_h + tj
-                        if i < n and j < h:
-                            xgl[ti, tj] += o_grad[i, m, j]
-                T.copy(xgl, x_grad[pid_i * blk_n, pid_j * blk_h])
-
-    return expand_to_mhc_bwd_kernel
+        hidden = x_grad.shape[-1]
+        assert hidden % 64 == 0, f'Ascend expand bwd requires hidden divisible by 64, got {hidden}'
+        h_blk = _asc_h_blk(hidden)
+        assert hidden % h_blk == 0, f'Ascend expand bwd requires hidden divisible by h_blk, got {hidden=}, {h_blk=}'
+        expand_to_mhc_bwd_asc(o_grad, x_grad, h_blk=h_blk, num_stages=3, num_vec_cores=get_num_vec_cores())
+    else:
+        expand_to_mhc_bwd_cuda(o_grad, x_grad, use_pdl=get_pdl())

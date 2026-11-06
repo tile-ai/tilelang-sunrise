@@ -1,88 +1,15 @@
-"""Workload definitions for the MHA attention ops."""
+"""Workload definitions for the MHA paged decode op."""
 
 import math
 
 import torch
-import torch.nn.functional as F
-from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from workloads.attention.gqa import _compute_gqa_square_lse
-from workloads.workload_base import WorkloadBase
-
-
-class MhaBwdWorkload(WorkloadBase):
-    def __init__(
-        self, batch: int, heads: int, seq_len: int, dim: int, is_causal: bool, dtype: torch.dtype
-    ):
-        self.batch = batch
-        self.heads = heads
-        self.seq_len = seq_len
-        self.dim = dim
-        self.is_causal = is_causal
-        self.dtype = dtype
-
-    def gen_inputs(
-        self,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        q = torch.randn(
-            self.batch, self.seq_len, self.heads, self.dim, dtype=self.dtype, requires_grad=True
-        ).ptpu()
-        k = torch.randn(
-            self.batch, self.seq_len, self.heads, self.dim, dtype=self.dtype, requires_grad=True
-        ).ptpu()
-        v = torch.randn(
-            self.batch, self.seq_len, self.heads, self.dim, dtype=self.dtype, requires_grad=True
-        ).ptpu()
-        grad_output = torch.randn(
-            self.batch, self.seq_len, self.heads, self.dim, dtype=self.dtype
-        ).ptpu()
-
-        with torch.no_grad(), sdpa_kernel(backends=[SDPBackend.MATH]):
-            o = (
-                F.scaled_dot_product_attention(
-                    q.cpu().transpose(1, 2),
-                    k.cpu().transpose(1, 2),
-                    v.cpu().transpose(1, 2),
-                    is_causal=self.is_causal,
-                )
-                .transpose(1, 2)
-                .contiguous()
-                .to(q.device)
-            )
-            lse = _compute_gqa_square_lse(
-                q,
-                k,
-                heads=self.heads,
-                heads_kv=self.heads,
-                dim=self.dim,
-                is_causal=self.is_causal,
-            )
-
-        return q, k, v, o, grad_output, lse
-
-    def ref_program(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        o: torch.Tensor,
-        grad_output: torch.Tensor,
-        lse: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        q_bhsd = q.transpose(1, 2)  # [B, H, S, D]
-        k_bhsd = k.transpose(1, 2)
-        v_bhsd = v.transpose(1, 2)
-        with sdpa_kernel(backends=[SDPBackend.MATH]):
-            output_bhsd = F.scaled_dot_product_attention(
-                q_bhsd, k_bhsd, v_bhsd, is_causal=self.is_causal
-            )
-        output = output_bhsd.transpose(1, 2).contiguous()
-
-        output.backward(grad_output)
-        return q.grad, k.grad, v.grad
+from workloads.attention.paged_kv_cache import make_fragmented_block_table
+from workloads.device import run_device
+from workloads.workload_base import CallWorkload, WorkloadBase
 
 
-class MhaDecodePagedWorkload(WorkloadBase):
+class MHADecodePagedWorkload(WorkloadBase):
     def __init__(
         self,
         batch: int,
@@ -107,93 +34,101 @@ class MhaDecodePagedWorkload(WorkloadBase):
         self,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         num_pages = self.seqlen_kv // self.page_size
-        real_seqlen_kv = (
-            torch.ones((self.batch,), dtype=torch.int32, device="ptpu") * self.seqlen_kv
+        cache_seqlens = (
+            torch.ones((self.batch,), dtype=torch.int32, device=run_device()) * self.seqlen_kv
         )
         q = torch.randn(
-            self.batch, self.seqlen_q, self.heads, self.dim, device="ptpu", dtype=self.dtype
+            self.batch, self.seqlen_q, self.heads, self.dim, device=run_device(), dtype=self.dtype
         )
-        k = torch.randn(self.seqlen_kv, self.heads, self.dim, device="ptpu", dtype=self.dtype)
-        v = torch.randn(self.seqlen_kv, self.heads, self.dim, device="ptpu", dtype=self.dtype)
-        # Identity block_table: logical page i -> physical page i (contiguous layout)
-        block_table = (
-            torch.arange(num_pages, dtype=torch.int32, device="ptpu")
-            .unsqueeze(0)
-            .expand(self.batch, -1)
+        k_cache = torch.randn(
+            self.seqlen_kv, self.heads, self.dim, device=run_device(), dtype=self.dtype
         )
+        v_cache = torch.randn(
+            self.seqlen_kv, self.heads, self.dim, device=run_device(), dtype=self.dtype
+        )
+        block_table = make_fragmented_block_table(self.batch, num_pages, num_pages)
 
         q = q.contiguous()
-        k = k.contiguous()
-        v = v.contiguous()
-        block_table = block_table.contiguous()
-        real_seqlen_kv = real_seqlen_kv.contiguous()
+        k_cache = k_cache.contiguous()
+        v_cache = v_cache.contiguous()
+        cache_seqlens = cache_seqlens.contiguous()
 
-        return q, k, v, real_seqlen_kv, block_table
+        return q, k_cache, v_cache, block_table, cache_seqlens
 
     def ref_program(
         self,
         q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        real_seqlen_kv: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
         block_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
     ) -> torch.Tensor:
-        """Reassemble paged K/V to logical layout per batch, then SDPA."""
+        """Reassemble paged K/V to logical layout per batch, then attend.
+
+        A causal query ``i`` sees the keys up to position ``i + kv_len - seqlen_q``; a query
+        that sees no key outputs zeros.
+        """
         batch, seqlen_q, heads, dim = q.shape
-        seqlen_kv = k.shape[0]
+        seqlen_kv = k_cache.shape[0]
         out_list = []
         for i_b in range(batch):
-            q_b = q[i_b : i_b + 1, :, :, :]
+            kv_len = cache_seqlens[i_b].item()
             k_logical = torch.zeros(seqlen_kv, heads, dim, dtype=q.dtype, device=q.device)
             v_logical = torch.zeros(seqlen_kv, heads, dim, dtype=q.dtype, device=q.device)
-            num_pages = math.ceil(real_seqlen_kv[i_b].item() / self.page_size)
+            num_pages = math.ceil(kv_len / self.page_size)
             for i_paged in range(num_pages):
                 start_pos = block_table[i_b, i_paged].item() * self.page_size
                 end_pos = min(start_pos + self.page_size, seqlen_kv)
                 page_len = end_pos - start_pos
-                k_logical[i_paged * self.page_size : i_paged * self.page_size + page_len, :, :] = k[
-                    start_pos:end_pos, :, :
-                ]
-                v_logical[i_paged * self.page_size : i_paged * self.page_size + page_len, :, :] = v[
-                    start_pos:end_pos, :, :
-                ]
-            k_logical = k_logical[: real_seqlen_kv[i_b].item(), :, :]
-            v_logical = v_logical[: real_seqlen_kv[i_b].item(), :, :]
-            k_b = k_logical.unsqueeze(0)
-            v_b = v_logical.unsqueeze(0)
-            q_bhsd = q_b.transpose(1, 2)
-            k_bhsd = k_b.transpose(1, 2)
-            v_bhsd = v_b.transpose(1, 2)
-            out_b = F.scaled_dot_product_attention(q_bhsd, k_bhsd, v_bhsd)
-            out_b = out_b.transpose(1, 2).contiguous()
-            out_list.append(out_b)
+                k_logical[i_paged * self.page_size : i_paged * self.page_size + page_len, :, :] = (
+                    k_cache[start_pos:end_pos, :, :]
+                )
+                v_logical[i_paged * self.page_size : i_paged * self.page_size + page_len, :, :] = (
+                    v_cache[start_pos:end_pos, :, :]
+                )
+            q_b = q[i_b].float().transpose(0, 1)  # [H, S_q, D]
+            k_b = k_logical[:kv_len].float().transpose(0, 1)  # [H, kv_len, D]
+            v_b = v_logical[:kv_len].float().transpose(0, 1)
+            scores = q_b @ k_b.transpose(1, 2) * dim**-0.5
+            if self.is_causal:
+                last_key = torch.arange(seqlen_q, device=q.device)[:, None] + kv_len - seqlen_q
+                visible = torch.arange(kv_len, device=q.device) <= last_key
+                scores = scores.masked_fill(~visible, float("-inf"))
+            probs = scores.softmax(-1).nan_to_num(0.0)
+            out_list.append((probs @ v_b).transpose(0, 1).unsqueeze(0).to(q.dtype))
         return torch.cat(out_list, dim=0)
 
+    def verification(self, *inputs):
+        from workloads.numerics import Custom
 
-class MhaDenseDecodeWorkload(WorkloadBase):
-    def __init__(self, batch, heads, seq_len_q, seq_len_kv, dim, dtype):
-        self.batch, self.heads = batch, heads
-        self.seq_len_q, self.seq_len_kv = seq_len_q, seq_len_kv
-        self.dim, self.dtype = dim, dtype
+        atol = {torch.float16: 1e-3, torch.bfloat16: 5e-3}[inputs[0].dtype]
 
-    def gen_inputs(self):
-        q = torch.randn(
-            self.batch, self.seq_len_q, self.heads, self.dim, device="ptpu", dtype=self.dtype
-        )
-        k = torch.randn(
-            self.batch, self.seq_len_kv, self.heads, self.dim, device="ptpu", dtype=self.dtype
-        )
-        return q, k, torch.randn_like(k)
-
-    def ref_program(self, q, k, v):
-        return (
-            F.scaled_dot_product_attention(
-                q.transpose(1, 2).float(),
-                k.transpose(1, 2).float(),
-                v.transpose(1, 2).float(),
-                is_causal=False,
+        def validate(got, expected):
+            torch.testing.assert_close(got, expected, atol=atol, rtol=atol)
+            cosine = torch.nn.functional.cosine_similarity(
+                got.reshape(self.batch, -1), expected.reshape(self.batch, -1), dim=-1
             )
-            .transpose(1, 2)
-            .to(q.dtype)
-            .contiguous()
+            assert cosine.min() > 0.99
+
+        return Custom(validate, "attention values and cosine agreement")
+
+
+class MHADecodePagedCall(CallWorkload, MHADecodePagedWorkload):
+    """A manifest call of MHAPagedFwdOp."""
+
+    def __init__(self, call) -> None:
+        CallWorkload.__init__(self, call)
+        indices, params = call.indices, call.params
+        MHADecodePagedWorkload.__init__(
+            self,
+            indices["B"],
+            indices["H"],
+            indices["S_q"],
+            indices["N_kv"],
+            indices["D"],
+            params["page_size"],
+            params["is_causal"],
+            getattr(torch, indices["T"]),
         )
+
+    gen_inputs = CallWorkload.gen_inputs

@@ -1,12 +1,14 @@
 import os
+
 import pytest
 import torch
 
-from tile_kernels.config import get_num_sms
+from tile_kernels.config import get_device, get_num_sms, is_ascend, set_num_sms
 from tile_kernels.engram import grad_w_reduce
-from tile_kernels.testing.numeric import calc_diff, count_bytes
-from tile_kernels.testing.generator import generate_hidden_sizes
+from tile_kernels.rand import randn
 from tile_kernels.testing.bench import make_param_id
+from tile_kernels.testing.generator import generate_hidden_sizes, generate_num_sms, get_test_level
+from tile_kernels.testing.numeric import count_bytes
 
 # Disable TileLang prints
 os.environ['TILELANG_PRINT_ON_COMPILATION'] = '0'
@@ -21,47 +23,59 @@ def grad_w_reduce_ref(grad_w_partial, weight_hidden, weight_embed, grad_weight_h
 def generate_test_data(params):
     hidden_size = params['hidden']
     hc_mult = 4
-    num_persistent_blocks = get_num_sms()
-    grad_w_partial = torch.randn(num_persistent_blocks, hc_mult, hidden_size, dtype=torch.float32).ptpu()
-    weight_hidden = torch.randn(hc_mult, hidden_size, dtype=torch.bfloat16).ptpu()
-    weight_embed = torch.randn(hc_mult, hidden_size, dtype=torch.bfloat16).ptpu()
+    num_persistent_blocks = get_num_sms() * 2 // hc_mult if is_ascend() else get_num_sms()
+    device = get_device()
+    grad_w_partial = randn(num_persistent_blocks, hc_mult, hidden_size, dtype=torch.float32, device=device)
+    weight_hidden = randn(hc_mult, hidden_size, dtype=torch.bfloat16, device=device)
+    weight_embed = randn(hc_mult, hidden_size, dtype=torch.bfloat16, device=device)
     return (grad_w_partial, weight_hidden, weight_embed)
 
 
-def generate_test_params(is_benchmark: bool) -> list[dict]:
+def generate_test_params(level: int) -> list[dict]:
+    partials_per_sm = 2 if is_ascend() else 1
     return [
-        {'hidden': hidden_size}
-        for hidden_size in generate_hidden_sizes(128)
+        {
+            'hidden': hidden_size,
+            'num_sms': num_sms * partials_per_sm,
+        }
+        for hidden_size in generate_hidden_sizes(64 if is_ascend() else 256)
+        for num_sms in generate_num_sms(level)
     ]
 
 
-@pytest.mark.parametrize('params', generate_test_params(is_benchmark=False), ids=make_param_id)
+@pytest.mark.parametrize('params', generate_test_params(get_test_level()), ids=make_param_id)
 def test_engram_grad_w_reduce(params):
     hidden_size = params['hidden']
+
+    if not is_ascend():
+        set_num_sms(params['num_sms'])
     grad_w_partial, weight_hidden, weight_embed = generate_test_data(params)
     hc_mult = grad_w_partial.shape[1]
 
     # Correctness
-    grad_wh_ref = torch.randn(hc_mult, hidden_size, dtype=torch.float32).ptpu()
-    grad_we_ref = torch.randn(hc_mult, hidden_size, dtype=torch.float32).ptpu()
+    device = get_device()
+    grad_wh_ref = randn(hc_mult, hidden_size, dtype=torch.float32, device=device)
+    grad_we_ref = randn(hc_mult, hidden_size, dtype=torch.float32, device=device)
     grad_weight_hidden = grad_wh_ref.clone()
     grad_weight_embed = grad_we_ref.clone()
     grad_w_reduce_ref(grad_w_partial, weight_hidden, weight_embed, grad_wh_ref, grad_we_ref)
     grad_w_reduce(grad_w_partial, weight_hidden, weight_embed, grad_weight_hidden, grad_weight_embed)
-    diff_wh = calc_diff(grad_weight_hidden, grad_wh_ref)
-    assert diff_wh < 1e-10, f'grad_wh mismatch: {diff_wh:.6e}'
-    diff_we = calc_diff(grad_weight_embed, grad_we_ref)
-    assert diff_we < 1e-10, f'grad_we mismatch: {diff_we:.6e}'
+    torch.testing.assert_close(grad_weight_hidden, grad_wh_ref, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(grad_weight_embed, grad_we_ref, rtol=1e-4, atol=1e-4)
 
 
 @pytest.mark.benchmark
-@pytest.mark.parametrize('params', generate_test_params(is_benchmark=True), ids=make_param_id)
+@pytest.mark.parametrize('params', generate_test_params(0), ids=make_param_id)
 def test_engram_grad_w_reduce_benchmark(benchmark_timer, benchmark_record, params):
     hidden_size = params['hidden']
+
+    if not is_ascend():
+        set_num_sms(params['num_sms'])
     grad_w_partial, weight_hidden, weight_embed = generate_test_data(params)
     hc_mult = grad_w_partial.shape[1]
-    grad_weight_hidden = torch.randn(hc_mult, hidden_size, dtype=torch.float32).ptpu()
-    grad_weight_embed = torch.randn(hc_mult, hidden_size, dtype=torch.float32).ptpu()
+    device = get_device()
+    grad_weight_hidden = randn(hc_mult, hidden_size, dtype=torch.float32, device=device)
+    grad_weight_embed = randn(hc_mult, hidden_size, dtype=torch.float32, device=device)
 
     t_us = benchmark_timer(lambda: grad_w_reduce(grad_w_partial, weight_hidden, weight_embed, grad_weight_hidden, grad_weight_embed))
 

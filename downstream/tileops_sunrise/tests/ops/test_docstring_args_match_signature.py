@@ -11,7 +11,7 @@ import re
 
 import pytest
 
-import tileops.ops.elementwise as ew
+import tileops._ops.elementwise as ew
 
 _SECTION = re.compile(
     r"^\s*(Args|Returns|Raises|Example|Examples|Attributes|Note|Notes|Yields):\s*$"
@@ -50,7 +50,7 @@ def _inheriting_op_classes() -> dict:
             continue
         if "__init__" in vars(cls) or not cls.__dict__.get("__doc__"):
             continue
-        if getattr(cls, "_op_name", None) is None:
+        if "kernel_types" not in vars(cls):
             continue
         found[name] = cls
     return found

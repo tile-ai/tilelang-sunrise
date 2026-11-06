@@ -1,163 +1,121 @@
-import tilelang
 import torch
-from tilelang import language as T
+from tile_kernels.config import get_is_tang, get_num_sms, get_num_vec_cores, get_pdl, is_ascend
+from tile_kernels.mhc.pre_split_mixes_cuda import (
+    mhc_pre_split_mixes_bwd_cuda,
+)
+from tile_kernels.mhc.pre_split_mixes_cuda import (
+    mhc_pre_split_mixes_bwd_reduce_cuda,
+)
+from tile_kernels.mhc.pre_split_mixes_cuda import (
+    mhc_pre_split_mixes_fwd_cuda,
+)
 
-_PASS_CONFIGS = {
-    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-}
 
-
-@tilelang.jit(pass_configs=_PASS_CONFIGS)
-def _mhc_pre_split_mixes_fwd(
-    mhc_mult: int,
+def mhc_pre_split_mixes_fwd(
+    input_mixes,
+    mhc_scale,
+    mhc_base,
+    pre_layer_mix,
+    post_layer_mix,
+    comb_res_mix,
     mhc_post_mult_value: float,
     mhc_pre_eps: float,
-    token_block_size: int,
-    dtype: T.dtype = T.float32,
-) -> tilelang.JITKernel:
-    num_tokens = T.dynamic('num_tokens')
+):
+    if get_is_tang() and input_mixes.shape[0] == 0:
+        return
+    if is_ascend():
+        from tile_kernels.mhc.pre_split_mixes_asc import mhc_pre_split_mixes_fwd_simd_mhc4_asc
 
-    mhc_mult2 = mhc_mult * mhc_mult
-    mhc_mult3 = mhc_mult * 2 + mhc_mult2
-
-    @T.prim_func
-    def mhc_pre_split_mixes_fwd_kernel(
-        # Input
-        input_mixes: T.Tensor[(num_tokens, mhc_mult3), dtype],
-        mhc_scale: T.Tensor[(3,), dtype],
-        mhc_base: T.Tensor[mhc_mult3, dtype],
-        # Output
-        pre_layer_mix: T.Tensor[(num_tokens, mhc_mult), dtype],
-        post_layer_mix: T.Tensor[(num_tokens, mhc_mult), dtype],
-        comb_res_mix: T.Tensor[(num_tokens, mhc_mult2), dtype],
-    ) -> None:
-        with T.Kernel(T.ceildiv(num_tokens, token_block_size)) as pid:
-            input_mixes_frag = T.alloc_fragment((token_block_size, mhc_mult3), dtype)
-            pre_layer_mix_frag = T.alloc_fragment((token_block_size, mhc_mult), dtype)
-            post_layer_mix_frag = T.alloc_fragment((token_block_size, mhc_mult), dtype)
-            comb_res_mix_frag = T.alloc_fragment((token_block_size, mhc_mult2), dtype)
-
-            T.annotate_layout(
-                {
-                    input_mixes_frag: T.Fragment(
-                        (token_block_size, mhc_mult3),
-                        lambda i, j: (i % 32, i // 32 * mhc_mult3 + j),
-                    ),
-                },
-            )
-
-            T.copy(input_mixes[pid * token_block_size, 0], input_mixes_frag)
-
-            for i, j in T.Parallel(token_block_size, mhc_mult):
-                pre_layer_mix_frag[i, j] = (
-                    T.sigmoid(
-                        input_mixes_frag[i, j] * mhc_scale[0] + mhc_base[j],
-                    )
-                    + mhc_pre_eps
-                )
-            for i, j in T.Parallel(token_block_size, mhc_mult):
-                post_layer_mix_frag[i, j] = T.sigmoid(input_mixes_frag[i, j + mhc_mult] * mhc_scale[1] + mhc_base[j + mhc_mult]) * mhc_post_mult_value
-            for i, j in T.Parallel(token_block_size, mhc_mult2):
-                comb_res_mix_frag[i, j] = input_mixes_frag[i, j + mhc_mult * 2] * mhc_scale[2] + mhc_base[j + mhc_mult * 2]
-
-            T.copy(pre_layer_mix_frag, pre_layer_mix[pid * token_block_size, 0])
-            T.copy(post_layer_mix_frag, post_layer_mix[pid * token_block_size, 0])
-            T.copy(comb_res_mix_frag, comb_res_mix[pid * token_block_size, 0])
-
-    return mhc_pre_split_mixes_fwd_kernel
+        mhc_pre_split_mixes_fwd_simd_mhc4_asc(
+            input_mixes,
+            mhc_scale,
+            mhc_base,
+            pre_layer_mix,
+            post_layer_mix,
+            comb_res_mix,
+            mhc_post_mult_value,
+            mhc_pre_eps,
+            token_block_size=64,
+            num_stages=2,
+            num_vec_cores=get_num_vec_cores(),
+        )
+    else:
+        mhc_pre_split_mixes_fwd_cuda(
+            input_mixes,
+            mhc_scale,
+            mhc_base,
+            pre_layer_mix,
+            post_layer_mix,
+            comb_res_mix,
+            mhc_post_mult_value,
+            mhc_pre_eps,
+            token_block_size=32,
+            use_pdl=get_pdl() and not get_is_tang(),
+        )
 
 
-@tilelang.jit(pass_configs=_PASS_CONFIGS)
-def _mhc_pre_split_mixes_bwd(
-    mhc_mult: int,
+def mhc_pre_split_mixes_bwd(
+    pre_layer_mix_grad,
+    post_layer_mix_grad,
+    comb_res_mix_grad,
+    input_mixes,
+    post_layer_mix,
+    mhc_scale,
+    mhc_base,
+    input_mixes_grad,
+    mhc_scale_grad,
+    mhc_base_grad,
     mhc_post_mult_value: float,
-    token_block_size: int,
-    num_sms: int = 148,
-    dtype: T.dtype = T.float32,
-) -> tilelang.JITKernel:
-    num_tokens = T.dynamic('num_tokens')
+):
+    if get_is_tang() and input_mixes.shape[0] == 0:
+        mhc_scale_grad.zero_()
+        mhc_base_grad.zero_()
+        return
+    num_sms = get_num_vec_cores() if is_ascend() else get_num_sms()
+    mhc_scale_grad_partial = torch.empty(num_sms, *mhc_scale.shape, dtype=mhc_scale.dtype, device=mhc_scale.device)
+    mhc_base_grad_partial = torch.empty(num_sms, *mhc_base.shape, dtype=mhc_base.dtype, device=mhc_base.device)
 
-    mhc_mult2 = mhc_mult * mhc_mult
-    mhc_mult3 = mhc_mult * 2 + mhc_mult2
+    if is_ascend():
+        from tile_kernels.mhc.pre_split_mixes_asc import mhc_pre_split_mixes_bwd_mhc4_asc
 
-    @T.prim_func
-    def mhc_pre_split_mixes_bwd_kernel(
-        # Gradient of output
-        pre_layer_mix_grad: T.Tensor[(num_tokens, mhc_mult), dtype],
-        post_layer_mix_grad: T.Tensor[(num_tokens, mhc_mult), dtype],
-        comb_res_mix_grad: T.Tensor[(num_tokens, mhc_mult2), dtype],
-        # Cached activation
-        input_mixes: T.Tensor[(num_tokens, mhc_mult3), dtype],
-        post_layer_mix: T.Tensor[(num_tokens, mhc_mult), dtype],
-        mhc_scale: T.Tensor[(3,), dtype],
-        mhc_base: T.Tensor[mhc_mult3, dtype],
-        # Gradient of input
-        input_mixes_grad: T.Tensor[(num_tokens, mhc_mult3), dtype],
-        mhc_scale_grad_partial: T.Tensor[(num_sms, 3), dtype],
-        mhc_base_grad_partial: T.Tensor[(num_sms, mhc_mult3), dtype],
-    ) -> None:
-        with T.Kernel(num_sms) as pid:
-            pre_layer_mix_grad_frag = T.alloc_fragment((token_block_size, mhc_mult), dtype)
-            post_layer_mix_grad_frag = T.alloc_fragment((token_block_size, mhc_mult), dtype)
-            comb_res_mix_grad_frag = T.alloc_fragment((token_block_size, mhc_mult2), dtype)
-
-            pre_layer_mix_frag = T.alloc_fragment((token_block_size, mhc_mult), dtype)
-            post_layer_mix_frag = T.alloc_fragment((token_block_size, mhc_mult), dtype)
-
-            input_mixes_frag = T.alloc_fragment((token_block_size, mhc_mult3), dtype)
-            input_mixes_grad_frag = T.alloc_fragment((token_block_size, mhc_mult3), dtype)
-
-            T.annotate_layout(
-                {
-                    input_mixes_grad_frag: T.Fragment(
-                        (token_block_size, mhc_mult3),
-                        lambda i, j: (i % 32, i // 32 * mhc_mult3 + j),
-                    ),
-                },
-            )
-
-            mhc_scale_grad_frag = T.alloc_reducer(3, dtype, replication='all')
-            T.clear(mhc_scale_grad_frag)
-
-            mhc_base_grad_frag = T.alloc_fragment(mhc_mult3, dtype)
-            T.clear(mhc_base_grad_frag)
-
-            for t in T.Persistent(
-                [T.ceildiv(num_tokens, token_block_size)],
-                num_sms,
-                pid,
-                group_size=1,
-            ):
-                T.copy(pre_layer_mix_grad[t * token_block_size, 0], pre_layer_mix_grad_frag)
-                T.copy(post_layer_mix_grad[t * token_block_size, 0], post_layer_mix_grad_frag)
-                T.copy(comb_res_mix_grad[t * token_block_size, 0], comb_res_mix_grad_frag)
-
-                T.copy(post_layer_mix[t * token_block_size, 0], post_layer_mix_frag)
-                T.copy(input_mixes[t * token_block_size, 0], input_mixes_frag)
-
-                for i, j in T.Parallel(token_block_size, mhc_mult):
-                    pre_layer_mix_frag[i, j] = T.sigmoid(
-                        input_mixes_frag[i, j] * mhc_scale[0] + mhc_base[j],
-                    )
-                    input_mixes_grad_frag[i, j] = pre_layer_mix_grad_frag[i, j] * pre_layer_mix_frag[i, j] * (1 - pre_layer_mix_frag[i, j])
-                for i, j in T.Parallel(token_block_size, mhc_mult):
-                    input_mixes_grad_frag[i, j + mhc_mult] = (
-                        post_layer_mix_grad_frag[i, j] * post_layer_mix_frag[i, j] * (1 - post_layer_mix_frag[i, j] / mhc_post_mult_value)
-                    )
-                for i, j in T.Parallel(token_block_size, mhc_mult2):
-                    input_mixes_grad_frag[i, j + mhc_mult * 2] = comb_res_mix_grad_frag[i, j]
-
-                T.reduce_sum(input_mixes_grad_frag, mhc_base_grad_frag, dim=0, clear=False)
-
-                for i, j in T.Parallel(token_block_size, mhc_mult3):
-                    mhc_scale_grad_frag[T.min(2, j // mhc_mult)] += input_mixes_grad_frag[i, j] * input_mixes_frag[i, j]
-                    input_mixes_grad_frag[i, j] *= mhc_scale[T.min(2, j // mhc_mult)]
-
-                T.copy(input_mixes_grad_frag, input_mixes_grad[t * token_block_size, 0])
-
-            T.copy(mhc_base_grad_frag, mhc_base_grad_partial[pid, :])
-
-            T.finalize_reducer(mhc_scale_grad_frag)
-            T.copy(mhc_scale_grad_frag, mhc_scale_grad_partial[pid, :])
-
-    return mhc_pre_split_mixes_bwd_kernel
+        mhc_pre_split_mixes_bwd_mhc4_asc(
+            pre_layer_mix_grad,
+            post_layer_mix_grad,
+            comb_res_mix_grad,
+            input_mixes,
+            post_layer_mix,
+            mhc_scale,
+            mhc_base,
+            input_mixes_grad,
+            mhc_scale_grad_partial,
+            mhc_base_grad_partial,
+            mhc_post_mult_value,
+            token_block_size=64,
+            num_stages=2,
+            num_vec_cores=num_sms,
+        )
+        mhc_scale_grad.copy_(mhc_scale_grad_partial.sum(0))
+        mhc_base_grad.copy_(mhc_base_grad_partial.sum(0))
+    else:
+        mhc_pre_split_mixes_bwd_cuda(
+            pre_layer_mix_grad,
+            post_layer_mix_grad,
+            comb_res_mix_grad,
+            input_mixes,
+            post_layer_mix,
+            mhc_scale,
+            mhc_base,
+            input_mixes_grad,
+            mhc_scale_grad_partial,
+            mhc_base_grad_partial,
+            mhc_post_mult_value,
+            token_block_size=32,
+            use_pdl=get_pdl() and not get_is_tang(),
+        )
+        mhc_pre_split_mixes_bwd_reduce_cuda(
+            mhc_scale_grad_partial,
+            mhc_base_grad_partial,
+            mhc_scale_grad,
+            mhc_base_grad,
+            num_sms=num_sms,
+        )

@@ -1,87 +1,43 @@
-"""Tests for FusedMoEExpertsFwdOp and supporting ABCs."""
+"""Tests for FusedMoEExpertsFwdOp, IndexedExpertMLPFwdOp and supporting ABCs."""
 
 import pytest
 import torch
-import torch.nn.functional as F
 
-from tileops.ops.moe.abc import (
-    WeightedReduce,
-    WeightedReduceNoOp,
-)
-from tileops.ops.moe.fused_moe import FusedMoeFwdOp
-from tileops.ops.moe.prepare_finalize.no_dp_ep import MoEPrepareAndFinalizeNoDPEP
-from tileops.ops.moe.routed_expert.fused_routed_expert import (
-    FusedMoEExpertsFwdOp,
-)
-
-
-def _torch_ref_moe(hidden, w1, w2, topk_weights, topk_ids):
-    """Per-expert PyTorch reference: ground-truth MoE FFN."""
-    hidden = hidden.cpu()
-    w1 = w1.cpu()
-    w2 = w2.cpu()
-    topk_weights = topk_weights.cpu()
-    topk_ids = topk_ids.cpu()
-    T, H = hidden.shape
-    E, twoF, _ = w1.shape
-    F_dim = twoF // 2
-    output = torch.zeros(T, H, dtype=torch.float32, device=hidden.device)
-    ids_i64 = topk_ids.to(torch.int64)
-    for e in range(E):
-        mask = ids_i64 == e
-        if not mask.any():
-            continue
-        t_idx, k_idx = mask.nonzero(as_tuple=True)
-        h = hidden[t_idx].float()
-        gate_up = h @ w1[e].float().t()
-        act = F.silu(gate_up[:, :F_dim]) * gate_up[:, F_dim:]
-        down = act @ w2[e].float().t()
-        output.index_add_(0, t_idx, down * topk_weights[t_idx, k_idx].float().unsqueeze(-1))
-    return output.to(hidden.dtype)
+from tileops._ops.moe.abc import WeightedReduce, WeightedReduceNoOp
+from tileops._ops.moe.fused_moe import FusedMoEFwdOp
+from tileops._ops.moe.fused_moe_shared_expert import FusedMoESharedExpertFwdOp
+from tileops._ops.moe.prepare_finalize.no_dp_ep import MoEPrepareAndFinalizeNoDPEP
+from tileops._ops.moe.routed_expert import FusedMoEExpertsFwdOp, IndexedExpertMLPFwdOp
+from workloads.device import run_device
+from workloads.moe import MoEExpertsWorkload, moe_verification, ref_routed_experts
+from workloads.numerics import compare_outputs, reference_for
+from workloads.workload_base import manifest_call
 
 
-def _torch_ref_moe_activation(hidden, w1, w2, topk_weights, topk_ids, activation="silu_and_mul"):
-    """Per-expert PyTorch reference supporting silu_and_mul and gelu_and_mul."""
-    hidden = hidden.cpu()
-    w1 = w1.cpu()
-    w2 = w2.cpu()
-    topk_weights = topk_weights.cpu()
-    topk_ids = topk_ids.cpu()
-    T, H = hidden.shape
-    E, twoF, _ = w1.shape
-    F_dim = twoF // 2
-    # gelu_and_mul: PyTorch's F.gelu(x, approximate="none") is exact erf GELU,
-    # which matches GeluAndMulFwdKernel's `x * 0.5 * (1 + erf(x/sqrt(2)))`.
-    # approximate="none" is passed explicitly: PyTorch's default happens to be
-    # "none", but a changed default would silently switch the reference to the
-    # tanh approximation (GeluTanhAndMulFwdKernel, a separate registry entry).
-    # Resolve once outside the per-expert loop so an unsupported activation
-    # raises immediately rather than silently falling back to a wrong
-    # reference value when this helper is extended.
-    _ACT_FNS = {
-        "silu_and_mul": lambda gate, up: F.silu(gate) * up,
-        "gelu_and_mul": lambda gate, up: F.gelu(gate, approximate="none") * up,
-    }
-    if activation not in _ACT_FNS:
-        raise ValueError(
-            f"_torch_ref_moe_activation has no reference for activation={activation!r}; "
-            "extend this helper before adding the activation to the registry."
-        )
-    gated = _ACT_FNS[activation]
-    output = torch.zeros(T, H, dtype=torch.float32, device=hidden.device)
-    ids_i64 = topk_ids.to(torch.int64)
-    for e in range(E):
-        mask = ids_i64 == e
-        if not mask.any():
-            continue
-        t_idx, k_idx = mask.nonzero(as_tuple=True)
-        h = hidden[t_idx].float()
-        gate_up = h @ w1[e].float().t()
-        gate, up = gate_up[:, :F_dim], gate_up[:, F_dim:]
-        act = gated(gate, up)
-        down = act @ w2[e].float().t()
-        output.index_add_(0, t_idx, down * topk_weights[t_idx, k_idx].float().unsqueeze(-1))
-    return output.to(hidden.dtype)
+def _experts_case(dtype=torch.bfloat16, activation="silu_and_mul", some=(), **dims):
+    """A manifest call of the expert MLP at *dims* passing the optional inputs *some*, its
+    inputs and the op built from it."""
+    call = manifest_call(
+        "FusedMoEExpertsFwdOp",
+        {"D": str(dtype).removeprefix("torch.")},
+        activation=activation,
+        **({"some": list(some)} if some else {}),
+        **dims,
+    )
+    workload = MoEExpertsWorkload(call)
+    return FusedMoEExpertsFwdOp(**call.arguments({})), workload, workload.gen_inputs()
+
+
+def _small_route_case(ids, dtype=torch.bfloat16):
+    """An indexed-path call routed by *ids*: few routes per expert, H = 128, F = 256."""
+    T, K = len(ids), len(ids[0])
+    E = max(8, max(max(row) for row in ids) + 1)
+    hidden = torch.randn(T, 128, dtype=dtype, device=run_device()) * 0.1
+    w1 = torch.randn(E, 512, 128, dtype=dtype, device=run_device()) * 0.02
+    w2 = torch.randn(E, 128, 256, dtype=dtype, device=run_device()) * 0.02
+    weights = torch.softmax(torch.randn(T, K, dtype=torch.float32, device=run_device()), -1)
+    topk_ids = torch.tensor(ids, dtype=torch.int32, device=run_device())
+    return FusedMoEExpertsFwdOp(), (hidden, w1, w2, weights, topk_ids)
 
 
 @pytest.mark.smoke
@@ -150,395 +106,183 @@ class TestMoEPrepareAndFinalizeNoDPEP:
 # FusedMoEExpertsFwdOp
 
 
-@pytest.fixture
-def moe_meta():
-    T, H, F_dim, E, K = 128, 256, 128, 4, 2
-    return dict(T=T, H=H, F=F_dim, E=E, K=K, dtype=torch.bfloat16)
-
-
-@pytest.fixture(params=[torch.bfloat16, torch.float16], ids=["bfloat16", "float16"])
-def moe_tensors(request):
-    T, H, F_dim, E, K = 128, 256, 128, 4, 2
-    dtype = request.param
-    hidden = torch.randn(T, H, dtype=dtype, device="ptpu") * 0.1
-    w1 = torch.randn(E, 2 * F_dim, H, dtype=dtype, device="ptpu") * 0.02
-    w2 = torch.randn(E, H, F_dim, dtype=dtype, device="ptpu") * 0.02
-    weights = torch.softmax(torch.randn(T, K, dtype=torch.float32, device="ptpu"), dim=-1)
-    ids = torch.randint(0, E, (T, K), dtype=torch.int32, device="ptpu")
-    return dict(
-        T=T,
-        H=H,
-        F=F_dim,
-        E=E,
-        K=K,
-        dtype=dtype,
-        hidden=hidden,
-        w1=w1,
-        w2=w2,
-        weights=weights,
-        ids=ids,
-    )
-
-
 class TestFusedMoEExpertsFwdOp:
     @pytest.mark.smoke
-    def test_the_decode_shaped_pipeline_matches_the_reference(self):
-        """Cover the complete decode-shaped expert pipeline."""
-        T_count, E, top_k, H, F_dim = 1024, 128, 2, 256, 1152
-        experts = FusedMoEExpertsFwdOp(
-            num_tokens=T_count,
-            num_experts=E,
-            top_k=top_k,
-            hidden_size=H,
-            ffn_size=F_dim,
-        )
-
-        torch.manual_seed(0)
-        dtype = torch.bfloat16
-        hidden = torch.randn(T_count, H, dtype=dtype, device="ptpu") * 0.1
-        w1 = torch.randn(E, 2 * F_dim, H, dtype=dtype, device="ptpu") * 0.02
-        w2 = torch.randn(E, H, F_dim, dtype=dtype, device="ptpu") * 0.02
-        weights = torch.softmax(
-            torch.randn(T_count, top_k, dtype=torch.float32, device="ptpu"), dim=-1
-        )
-        ids = torch.randint(0, E, (T_count, top_k), dtype=torch.int32, device="ptpu")
-        out = torch.empty(T_count, H, dtype=dtype, device="ptpu")
-        ws = torch.empty(0, dtype=dtype, device="ptpu")
-
-        experts.forward(out, hidden, w1, w2, weights, ids, ws, ws)
-
-        expected = _torch_ref_moe(hidden, w1, w2, weights, ids)
-        torch.testing.assert_close(
-            (out.float()).cpu(), (expected.float()).cpu(), rtol=3e-2, atol=3e-2
-        )
-
-    @pytest.mark.smoke
-    @pytest.mark.smoke
-    def test_workspace_shapes(self, moe_meta):
-        d = moe_meta
-        experts = FusedMoEExpertsFwdOp(
-            num_tokens=d["T"],
-            num_experts=d["E"],
-            top_k=d["K"],
-            hidden_size=d["H"],
-            ffn_size=d["F"],
-        )
-        ws1, ws2 = experts.workspace_shapes(d["T"], d["F"], d["H"], d["K"], d["E"])
-        assert ws1 == (0,) and ws2 == (0,)
-
-    @pytest.mark.smoke
-    def test_output_shape(self, moe_meta):
-        d = moe_meta
-        experts = FusedMoEExpertsFwdOp(
-            num_tokens=d["T"],
-            num_experts=d["E"],
-            top_k=d["K"],
-            hidden_size=d["H"],
-            ffn_size=d["F"],
-        )
-        assert experts.output_shape(d["T"], d["H"]) == (d["T"], d["H"])
-
-    @pytest.mark.smoke
-    def test_make_weighted_reduce_is_noop(self, moe_meta):
-        d = moe_meta
-        experts = FusedMoEExpertsFwdOp(
-            num_tokens=d["T"],
-            num_experts=d["E"],
-            top_k=d["K"],
-            hidden_size=d["H"],
-            ffn_size=d["F"],
-        )
-        assert isinstance(experts.make_weighted_reduce(), WeightedReduceNoOp)
-
-    @pytest.mark.smoke
-    def test_forward_matches_torch_ref(self, moe_tensors):
-        """forward() output must match a per-expert PyTorch reference."""
-        d = moe_tensors
-        experts = FusedMoEExpertsFwdOp(
-            num_tokens=d["T"],
-            num_experts=d["E"],
-            top_k=d["K"],
-            hidden_size=d["H"],
-            ffn_size=d["F"],
-        )
-
-        ref_out = _torch_ref_moe(d["hidden"], d["w1"], d["w2"], d["weights"], d["ids"])
-
-        output = torch.empty(d["T"], d["H"], dtype=d["dtype"], device="ptpu")
-        ws1 = torch.empty(0, dtype=d["dtype"], device="ptpu")
-        ws2 = torch.empty(0, dtype=d["dtype"], device="ptpu")
-        experts.forward(
-            output,
-            d["hidden"],
-            d["w1"],
-            d["w2"],
-            d["weights"],
-            d["ids"],
-            workspace1=ws1,
-            workspace2=ws2,
-        )
-
-        assert torch.allclose(output.float().cpu(), ref_out.float(), atol=1e-2, rtol=1e-2)
-
-    @pytest.mark.smoke
-    def test_forward_dims_off_the_tile_grid(self):
-        """Cover non-tile-aligned gate-up and down dimensions."""
-        T, H, F_dim, E, K = 64, 128, 96, 4, 2
-        dtype = torch.bfloat16
-        hidden = torch.randn(T, H, dtype=dtype, device="ptpu") * 0.1
-        w1 = torch.randn(E, 2 * F_dim, H, dtype=dtype, device="ptpu") * 0.02
-        w2 = torch.randn(E, H, F_dim, dtype=dtype, device="ptpu") * 0.02
-        weights = torch.softmax(torch.randn(T, K, dtype=torch.float32, device="ptpu"), dim=-1)
-        ids = torch.randint(0, E, (T, K), dtype=torch.int32, device="ptpu")
-
-        experts = FusedMoEExpertsFwdOp(
-            num_tokens=T,
-            num_experts=E,
-            top_k=K,
-            hidden_size=H,
-            ffn_size=F_dim,
-        )
-
-        ref_out = _torch_ref_moe(hidden, w1, w2, weights, ids)
-        output = torch.empty(T, H, dtype=dtype, device="ptpu")
-        ws1 = torch.empty(0, dtype=dtype, device="ptpu")
-        ws2 = torch.empty(0, dtype=dtype, device="ptpu")
-        experts.forward(
-            output,
-            hidden,
-            w1,
-            w2,
-            weights,
-            ids,
-            workspace1=ws1,
-            workspace2=ws2,
-        )
-        assert torch.allclose(output.float().cpu(), ref_out.float(), atol=1e-2, rtol=1e-2)
-
-    @pytest.mark.smoke
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
     @pytest.mark.parametrize("activation", ["silu_and_mul", "gelu_and_mul"])
-    def test_forward_matches_torch_ref_activation(self, moe_tensors, activation):
-        """forward() output matches PyTorch reference for each activation."""
-        d = moe_tensors
-        experts = FusedMoEExpertsFwdOp(
-            num_tokens=d["T"],
-            num_experts=d["E"],
-            top_k=d["K"],
-            hidden_size=d["H"],
-            ffn_size=d["F"],
-            activation=activation,
-        )
-        assert experts.activation == activation
-        ref_out = _torch_ref_moe_activation(
-            d["hidden"],
-            d["w1"],
-            d["w2"],
-            d["weights"],
-            d["ids"],
-            activation=activation,
-        )
-        output = torch.empty(d["T"], d["H"], dtype=d["dtype"], device="ptpu")
-        ws1 = torch.empty(0, dtype=d["dtype"], device="ptpu")
-        ws2 = torch.empty(0, dtype=d["dtype"], device="ptpu")
-        experts.forward(
-            output,
-            d["hidden"],
-            d["w1"],
-            d["w2"],
-            d["weights"],
-            d["ids"],
-            workspace1=ws1,
-            workspace2=ws2,
-        )
-        assert torch.allclose(output.float().cpu(), ref_out.float(), atol=1e-2, rtol=1e-2)
-
-
-class TestFusedMoeActivationInjection:
-    def _make_experts(self, activation="silu_and_mul"):
-        return FusedMoEExpertsFwdOp(
-            num_tokens=128,
-            num_experts=4,
-            top_k=2,
-            hidden_size=256,
-            ffn_size=128,
-            activation=activation,
+    def test_the_staged_pipeline_matches_the_reference(self, dtype, activation):
+        experts, workload, inputs = _experts_case(dtype, activation, T=128, E=4, K=2, H=256, F=128)
+        out = experts(*inputs)
+        compare_outputs(
+            out, reference_for(workload.ref_program, *inputs), workload.verification(*inputs)
         )
 
     @pytest.mark.smoke
-    def test_injection_with_conflicting_activation_raises(self):
-        """experts= + activation= that disagree must raise ValueError."""
+    @pytest.mark.parametrize(
+        ("activation", "dtype", "some", "dims"),
+        [
+            # F off the tile grid, both biases.
+            pytest.param(
+                "swigluoai",
+                torch.bfloat16,
+                ("b_gate_up", "b_down"),
+                dict(T=64, E=4, K=2, H=128, F=96),
+                id="swigluoai-off-grid",
+            ),
+            # Few routes per expert (T * K <= 2 * E), no bias.
+            pytest.param(
+                "swigluoai",
+                torch.bfloat16,
+                (),
+                dict(T=4, E=8, K=2, H=128, F=256),
+                id="swigluoai-few-routes",
+            ),
+            # Few routes per expert on silu_and_mul, with each bias alone.
+            pytest.param(
+                "silu_and_mul",
+                torch.bfloat16,
+                ("b_gate_up",),
+                dict(T=4, E=8, K=2, H=128, F=256),
+                id="silu-few-routes-gate-up-bias",
+            ),
+            pytest.param(
+                "silu_and_mul",
+                torch.bfloat16,
+                ("b_down",),
+                dict(T=4, E=8, K=2, H=128, F=256),
+                id="silu-few-routes-down-bias",
+            ),
+        ],
+    )
+    def test_expert_biases_match_the_reference(self, activation, dtype, some, dims):
+        """``b_gate_up`` is added before the activation, ``b_down`` before the routing weight."""
+        experts, workload, inputs = _experts_case(dtype, activation, some, **dims)
+        out = experts(*inputs)
+        compare_outputs(
+            out, reference_for(workload.ref_program, *inputs), workload.verification(*inputs)
+        )
 
-        experts = self._make_experts(activation="silu_and_mul")
-        with pytest.raises(ValueError, match="activation conflicts"):
-            FusedMoeFwdOp(
-                num_tokens=128,
-                num_experts=4,
-                top_k=2,
-                hidden_size=256,
-                ffn_size=128,
-                experts=experts,
-                activation="gelu_and_mul",
+    @pytest.mark.smoke
+    def test_dims_off_the_tile_grid(self):
+        experts, workload, inputs = _experts_case(T=64, E=4, K=2, H=128, F=96)
+        out = experts(*inputs)
+        compare_outputs(
+            out, reference_for(workload.ref_program, *inputs), workload.verification(*inputs)
+        )
+
+    @pytest.mark.in_tree_kernels
+    @pytest.mark.smoke
+    def test_one_instance_serves_two_expert_counts(self):
+        """The pre-permute stage takes the call's expert count, so each count holds its own."""
+        experts = FusedMoEExpertsFwdOp(activation="gelu_and_mul")
+        for e in (4, 6):
+            _, workload, inputs = _experts_case(
+                activation="gelu_and_mul", T=32, E=e, K=2, H=128, F=128
+            )
+            out = experts(*inputs)
+            compare_outputs(
+                out, reference_for(workload.ref_program, *inputs), workload.verification(*inputs)
             )
 
     @pytest.mark.smoke
-    def test_injection_with_matching_activation_works(self):
-        """experts= + activation= that match the injected experts is accepted."""
+    def test_a_call_prices_the_experts_its_routing_reads(self):
+        experts, args = _small_route_case([[0, 3], [3, 7], [0, 7], [3, 0]])
+        experts(*args)
+        T, K, H, F = 4, 2, 128, 256
+        elem = args[0].element_size()
+        active = 3  # experts 0, 3 and 7
+        expected = active * 3 * F * H * elem + 2 * T * H * elem + T * K * (4 + 4)
+        assert experts.eval_roofline()[1] == expected
+        assert experts.roofline_data_terms() == {"active_experts": active}
 
-        experts = self._make_experts(activation="gelu_and_mul")
-        moe = FusedMoeFwdOp(
-            num_tokens=128,
-            num_experts=4,
-            top_k=2,
-            hidden_size=256,
-            ffn_size=128,
-            experts=experts,
-            activation="gelu_and_mul",
+    @pytest.mark.in_tree_kernels
+    @pytest.mark.smoke
+    @pytest.mark.parametrize(
+        "ids",
+        [
+            [[0, 1], [2, 3], [4, 5], [6, 7]],
+            [[0, 1], [0, 1], [0, 2], [0, 2]],
+            [[0, 0], [0, 0], [0, 0], [0, 0]],
+            [[0, expert] for expert in range(1, 18)],
+        ],
+        ids=["dispersed", "reused", "duplicate-fallback", "second-route-group"],
+    )
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+    def test_small_route_branch_matches_reference(self, ids, dtype):
+        experts, args = _small_route_case(ids, dtype)
+        out = experts(*args)
+        compare_outputs(out, reference_for(ref_routed_experts, *args), moe_verification(2))
+
+    @pytest.mark.sm90
+    @pytest.mark.cuda_graph(op="FusedMoEExpertsFwdOp")
+    @pytest.mark.smoke
+    def test_small_route_dispatch_replays_in_cuda_graph(self):
+        experts, args = _small_route_case([[0, 1], [2, 3], [4, 5], [6, 7]])
+        out = torch.empty_like(args[0])
+        assert experts(*args, out=out) is out
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            experts(*args, out=out)
+
+        args[4].copy_(
+            torch.tensor([[0, 1], [0, 1], [0, 2], [0, 2]], dtype=torch.int32, device="cuda")
         )
-        assert moe.activation == "gelu_and_mul"
+        graph.replay()
+        torch.cuda.synchronize()
+        compare_outputs(out, reference_for(ref_routed_experts, *args), moe_verification(2))
 
     @pytest.mark.smoke
-    def test_injection_without_activation_works(self):
-        """experts= without activation= should succeed."""
+    def test_the_indexed_op_scales_its_output(self):
+        _, args = _small_route_case([[0, 1], [2, 3]])
+        out = IndexedExpertMLPFwdOp(routed_scaling_factor=2.5)(*args)
+        expected = reference_for(ref_routed_experts, *args, scale=2.5)
+        compare_outputs(out, expected, moe_verification(2))
 
-        experts = self._make_experts()
-        moe = FusedMoeFwdOp(
-            num_tokens=128,
-            num_experts=4,
-            top_k=2,
-            hidden_size=256,
-            ffn_size=128,
-            experts=experts,
+    @pytest.mark.smoke
+    def test_output_shape_and_weighted_reduce(self):
+        experts = FusedMoEExpertsFwdOp()
+        assert experts._output_shape(128, 256) == (128, 256)
+        assert isinstance(experts._make_weighted_reduce(), WeightedReduceNoOp)
+
+
+class TestFusedMoEActivationInjection:
+    @pytest.mark.smoke
+    def test_injection_with_conflicting_activation_raises(self):
+        with pytest.raises(ValueError, match="activation conflicts"):
+            FusedMoEFwdOp(2, experts=FusedMoEExpertsFwdOp(), activation="gelu_and_mul")
+
+    @pytest.mark.smoke
+    def test_injection_takes_the_experts_activation(self):
+        experts = FusedMoEExpertsFwdOp(activation="gelu_and_mul")
+        assert FusedMoEFwdOp(2, experts=experts, activation="gelu_and_mul").activation == (
+            "gelu_and_mul"
         )
-        assert moe.activation == "silu_and_mul"
+        assert FusedMoEFwdOp(2, experts=experts).activation == "gelu_and_mul"
 
     @pytest.mark.smoke
     def test_default_path_activation_forwarded(self):
-        """FusedMoeFwdOp(activation='gelu_and_mul') creates experts with gelu_and_mul."""
-
-        moe = FusedMoeFwdOp(
-            num_tokens=128,
-            num_experts=4,
-            top_k=2,
-            hidden_size=256,
-            ffn_size=128,
-            activation="gelu_and_mul",
-        )
-        assert moe.activation == "gelu_and_mul"
-        assert moe._experts.activation == "gelu_and_mul"
-
-    @pytest.mark.smoke
-    def test_injection_without_activation_attribute_raises(self):
-        """A third-party experts instance missing .activation must raise.
-
-        Catches the silent-fallback footgun: without .activation, the conflict
-        guard would default to comparing against 'silu_and_mul' and could
-        silently accept a non-matching activation argument.
-        """
-        from tileops.ops.moe.abc import FusedMoEExpertsModular
-
-        class ExpertsWithoutActivation(FusedMoEExpertsModular):
-            """Stand-in for a third-party experts impl that forgot .activation."""
-
-            def __init__(self):
-                pass
-
-            @property
-            def default_kernel_map(self):
-                return {}
-
-            def workspace_shapes(self, M, N, K, topk, num_experts):
-                return ((0,), (0,))
-
-            def output_shape(self, T_prime, H):
-                return (T_prime, H)
-
-            def _infer_output_shapes(self, *args, **kwargs):
-                raise NotImplementedError
-
-            def _validate_dtypes(self, *args, **kwargs):
-                raise NotImplementedError
-
-            def eval_roofline(self, *args, **kwargs):
-                raise NotImplementedError
-
-            def forward(
-                self,
-                output,
-                hidden_states,
-                w_gate_up,
-                w_down,
-                topk_weights,
-                topk_ids,
-                workspace1,
-                workspace2,
-            ):
-                pass
-
-            def make_weighted_reduce(self):
-                from tileops.ops.moe.abc import WeightedReduceNoOp
-
-                return WeightedReduceNoOp()
-
-        with pytest.raises(ValueError, match="missing the required `.activation`"):
-            FusedMoeFwdOp(
-                num_tokens=128,
-                num_experts=4,
-                top_k=2,
-                hidden_size=256,
-                ffn_size=128,
-                experts=ExpertsWithoutActivation(),
-            )
+        moe = FusedMoEFwdOp(2, activation="gelu_and_mul")
+        assert moe._experts().activation == "gelu_and_mul"
+        shared = FusedMoESharedExpertFwdOp(2, activation="gelu_and_mul")
+        assert shared._experts().activation == "gelu_and_mul"
 
 
-class TestSharedFusedMoeActivation:
-    @pytest.mark.smoke
-    def test_activation_forwarded_to_routed_experts(self):
-        """SharedFusedMoE(activation='gelu_and_mul') reaches the routed-experts path."""
-        from tileops.ops.moe.shared_fused_moe import SharedFusedMoE
-
-        moe = SharedFusedMoE(
-            num_tokens=128,
-            num_experts=4,
-            top_k=2,
-            hidden_size=256,
-            ffn_size=128,
-            activation="gelu_and_mul",
-        )
-        assert moe.activation == "gelu_and_mul"
-        assert moe._experts.activation == "gelu_and_mul"
-
-    @pytest.mark.smoke
-    def test_shared_expert_with_non_default_activation_raises(self):
-        """shared_ffn_size + non-silu activation must raise NotImplementedError.
-
-        SharedExpertMLPKernel hardcodes silu_and_mul; allowing a different
-        activation here would silently produce mixed outputs (routed=gelu,
-        shared=silu).
-        """
-        from tileops.ops.moe.shared_fused_moe import SharedFusedMoE
-
-        with pytest.raises(NotImplementedError, match="shared-expert path only supports"):
-            SharedFusedMoE(
-                num_tokens=128,
-                num_experts=4,
-                top_k=2,
-                hidden_size=256,
-                ffn_size=128,
-                shared_ffn_size=128,
-                activation="gelu_and_mul",
-            )
-
-    @pytest.mark.smoke
-    def test_shared_expert_with_default_activation_works(self):
-        """shared_ffn_size + silu_and_mul (default) is fine."""
-        from tileops.ops.moe.shared_fused_moe import SharedFusedMoE
-
-        moe = SharedFusedMoE(
-            num_tokens=128,
-            num_experts=4,
-            top_k=2,
-            hidden_size=256,
-            ffn_size=128,
-            shared_ffn_size=128,
-        )
-        assert moe.activation == "silu_and_mul"
+@pytest.mark.smoke
+def test_the_shared_expert_refuses_a_non_silu_activation():
+    """The shared-expert kernel applies silu_and_mul; with gelu routed experts the two halves
+    would disagree, so a call passing the shared weights is refused."""
+    T, E, H, F, S = 4, 4, 128, 128, 128
+    op = FusedMoESharedExpertFwdOp(2, activation="gelu_and_mul")
+    args = (
+        torch.randn(T, H, dtype=torch.bfloat16, device=run_device()),
+        torch.randn(T, E, device=run_device()),
+        torch.randn(E, 2 * F, H, dtype=torch.bfloat16, device=run_device()),
+        torch.randn(E, H, F, dtype=torch.bfloat16, device=run_device()),
+        None,
+        torch.randn(2 * S, H, dtype=torch.bfloat16, device=run_device()),
+        torch.randn(H, S, dtype=torch.bfloat16, device=run_device()),
+    )
+    with pytest.raises(ValueError, match="silu_and_mul"):
+        op(*args)

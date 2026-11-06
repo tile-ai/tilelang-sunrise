@@ -1,6 +1,6 @@
 """The sequence modeling ops, at the public path ``tileops.sequence_modeling``."""
 
-from .ops.sequence_modeling import (
+from tileops._ops.sequence_modeling import (
     EngramDecodeFwdOp,
     EngramGateConvBwdOp,
     EngramGateConvFwdOp,
@@ -9,9 +9,9 @@ from .ops.sequence_modeling import (
 )
 
 __all__ = [
-    "MHCPreFwdOp",
-    "MHCPostFwdOp",
     "EngramDecodeFwdOp",
     "EngramGateConvBwdOp",
     "EngramGateConvFwdOp",
+    "MHCPostFwdOp",
+    "MHCPreFwdOp",
 ]

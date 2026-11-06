@@ -1,0 +1,528 @@
+import torch
+
+from workloads.device import run_device
+from workloads.linear_attention.input_values import _small, _step_sizes
+from workloads.workload_base import CallWorkload, WorkloadBase
+
+__all__ = [
+    "DeltaNetChunkwiseCall",
+    "DeltaNetChunkwiseWorkload",
+    "DeltaNetDecodeCall",
+    "DeltaNetDecodeWorkload",
+    "DeltaNetFwdCall",
+    "DeltaNetFwdWorkload",
+    "compute_w_u_torch",
+    "deltanet_autograd_bwd_torch",
+    "deltanet_decode_torch",
+    "deltanet_differentiable_fwd_torch",
+    "deltanet_inference_torch",
+    "kernel2_deltanet_torch",
+    "prepare_wy_repr_deltanet_torch",
+]
+
+
+class DeltaNetChunkwiseWorkload(WorkloadBase):
+    def __init__(
+        self,
+        batch: int,
+        heads: int,
+        seq_len: int,
+        dim_k: int,
+        dim_v: int,
+        chunk_size: int,
+        dtype: torch.dtype,
+    ) -> None:
+        self.batch = batch
+        self.heads = heads
+        self.seq_len = seq_len
+        self.dim_k = dim_k
+        self.dim_v = dim_v
+        self.chunk_size = chunk_size
+        self.dtype = dtype
+
+    def gen_inputs(self) -> tuple[torch.Tensor, ...]:
+        B, H, S, DK, DV = self.batch, self.heads, self.seq_len, self.dim_k, self.dim_v
+        q = torch.randn(B, H, S, DK, device=run_device(), dtype=self.dtype) * 0.1
+        k = torch.randn(B, H, S, DK, device=run_device(), dtype=self.dtype) * 0.1
+        v = torch.randn(B, H, S, DV, device=run_device(), dtype=self.dtype) * 0.1
+        beta = torch.rand(B, H, S, device=run_device(), dtype=self.dtype) * 0.5
+        return q, k, v, beta
+
+    def ref_program(self, q, k, v, beta):
+        return deltanet_differentiable_fwd_torch(
+            q.float(), k.float(), v.float(), beta.float(), self.chunk_size
+        ).to(q.dtype)
+
+    def verification(self, *inputs):
+        return chunkwise_verification(inputs[0].dtype)
+
+
+class DeltaNetDecodeWorkload(WorkloadBase):
+    def __init__(
+        self,
+        batch: int,
+        heads: int,
+        dim_k: int,
+        dim_v: int,
+        dtype: torch.dtype,
+    ) -> None:
+        self.batch = batch
+        self.heads = heads
+        self.dim_k = dim_k
+        self.dim_v = dim_v
+        self.dtype = dtype
+
+    def gen_inputs(self) -> tuple[torch.Tensor, ...]:
+        B, H, DK, DV = self.batch, self.heads, self.dim_k, self.dim_v
+        q = torch.randn(B, H, DK, device=run_device(), dtype=self.dtype) * 0.1
+        k = torch.randn(B, H, DK, device=run_device(), dtype=self.dtype) * 0.1
+        v = torch.randn(B, H, DV, device=run_device(), dtype=self.dtype) * 0.1
+        beta = torch.rand(B, H, device=run_device(), dtype=self.dtype) * 0.5
+        state = torch.randn(B, H, DK, DV, device=run_device(), dtype=self.dtype) * 0.1
+        return q, k, v, beta, state
+
+    def ref_program(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        beta: torch.Tensor,
+        state: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        o, new_state = deltanet_decode_torch(q, k, v, beta, state)
+        return o.to(self.dtype), new_state.to(self.dtype)
+
+    def verification(self, *inputs):
+        return decode_verification(inputs[0].dtype)
+
+
+class DeltaNetFwdWorkload(WorkloadBase):
+    """BTHD ungated DeltaNet prefill or single-token decode with recurrent state.
+
+    ``sequence_lengths`` packs the rows into one ``B = 1`` token axis and makes the call
+    carry ``cu_seqlens``; ``l2norm`` hands Q and K over unnormalized.
+    """
+
+    def __init__(
+        self,
+        batch: int,
+        seq_len: int,
+        heads: int,
+        dim: int,
+        dtype: torch.dtype,
+        sequence_lengths: tuple[int, ...] | None = None,
+        l2norm: bool = False,
+    ) -> None:
+        self.batch = batch
+        self.seq_len = seq_len
+        self.heads = heads
+        self.dim = dim
+        self.dtype = dtype
+        self.sequence_lengths = sequence_lengths
+        self.l2norm = l2norm
+
+    def gen_inputs(self) -> tuple[torch.Tensor | None, ...]:
+        rows = (
+            (self.batch, self.seq_len)
+            if self.sequence_lengths is None
+            else (1, sum(self.sequence_lengths))
+        )
+        shape = (*rows, self.heads, self.dim)
+        q = torch.randn(shape, device=run_device(), dtype=self.dtype) * 0.1
+        k = torch.randn(shape, device=run_device(), dtype=self.dtype) * 0.1
+        v = torch.randn(shape, device=run_device(), dtype=self.dtype) * 0.1
+        beta = torch.rand(shape[:3], device=run_device(), dtype=self.dtype) * 0.5
+        sequences = self.batch if self.sequence_lengths is None else len(self.sequence_lengths)
+        initial_state = (
+            torch.randn(
+                sequences, self.heads, self.dim, self.dim, device=run_device(), dtype=torch.float32
+            )
+            * 0.01
+        )
+        if self.sequence_lengths is None:
+            return q, k, v, beta, initial_state
+        offsets = torch.zeros(sequences + 1, dtype=torch.int64)
+        offsets[1:] = torch.tensor(self.sequence_lengths, dtype=torch.int64).cumsum(0)
+        return q, k, v, beta, initial_state, offsets.to(run_device()), offsets
+
+    def ref_program(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        cu_seqlens_cpu: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return deltanet_inference_ref(
+            q, k, v, beta, initial_state, cu_seqlens, cu_seqlens_cpu, l2norm=self.l2norm
+        )
+
+    def verification(self, *inputs):
+        return inference_verification(
+            inputs[0].dtype, decode=inputs[0].shape[1] == 1, l2norm=self.l2norm
+        )
+
+
+def compute_w_u_torch(Aw, Au, k, v, beta, chunk_size):
+    B, H, S, DK = k.shape
+    _, _, _, DV = v.shape
+    BC = chunk_size
+    num_chunks = S // BC
+    k_beta = k.float() * beta.unsqueeze(-1)
+    v_beta = v.float() * beta.unsqueeze(-1)
+    Aw_ = Aw.reshape(B, H, num_chunks, BC, BC)
+    Au_ = Au.reshape(B, H, num_chunks, BC, BC)
+    k_beta_ = k_beta.reshape(B, H, num_chunks, BC, DK)
+    v_beta_ = v_beta.reshape(B, H, num_chunks, BC, DV)
+    w = torch.einsum("bhcij,bhcjd->bhcid", Aw_, k_beta_).reshape(B, H, S, DK)
+    u = torch.einsum("bhcij,bhcjd->bhcid", Au_, v_beta_).reshape(B, H, S, DV)
+    return w, u
+
+
+def kernel2_deltanet_torch(q, k, w, u, S_0, chunk_size):
+    """DeltaNet kernel2 reference (ungated)."""
+    B, H, S_len, DK = q.shape
+    _, _, _, DV = u.shape
+    BC = chunk_size
+    num_chunks = S_len // BC
+    q, k, w, u = q.float(), k.float(), w.float(), u.float()
+    h = S_0.float().clone()
+
+    o = torch.zeros(B, H, S_len, DV, dtype=torch.float32, device=q.device)
+    for c in range(num_chunks):
+        i0, i1 = c * BC, (c + 1) * BC
+        q_c = q[:, :, i0:i1, :]
+        k_c = k[:, :, i0:i1, :]
+        w_c = w[:, :, i0:i1, :]
+        u_c = u[:, :, i0:i1, :]
+        v_new_c = u_c - w_c @ h
+        o_part = torch.einsum("bhnk,bhkv->bhnv", q_c, h)
+        attn = torch.einsum("bhnk,bhmk->bhnm", q_c, k_c)
+        mask = torch.tril(torch.ones(BC, BC, device=q.device, dtype=torch.bool), diagonal=0)
+        attn = attn.masked_fill(~mask.unsqueeze(0).unsqueeze(0), 0.0)
+        o_c = o_part + torch.einsum("bhnm,bhmv->bhnv", attn, v_new_c)
+        o[:, :, i0:i1, :] = o_c
+        h = h + torch.einsum("bhnk,bhnv->bhkv", k_c, v_new_c)
+    return h, o
+
+
+def prepare_wy_repr_deltanet_torch(k, beta, chunk_size):
+    B, H, S, DK = k.shape
+    assert S % chunk_size == 0
+    BC = chunk_size
+    Aw = torch.empty(B, H, S, BC, dtype=torch.float32, device=k.device)
+    Au = torch.empty(B, H, S, BC, dtype=torch.float32, device=k.device)
+
+    for b in range(B):
+        for h in range(H):
+            for c in range(S // BC):
+                i0, i1 = c * BC, (c + 1) * BC
+                kc = k[b, h, i0:i1, :].float()
+                bc = beta[b, h, i0:i1].float()
+                Gram = kc @ kc.T
+                M = bc.unsqueeze(-1) * Gram
+                A = torch.eye(BC, device=k.device) + torch.tril(M, diagonal=-1)
+                A_inv = torch.linalg.inv(A)
+                Aw[b, h, i0:i1, :] = A_inv
+                Au[b, h, i0:i1, :] = A_inv
+
+    return Aw, Au
+
+
+def deltanet_differentiable_fwd_torch(q, k, v, beta, chunk_size):
+    """Fully differentiable chunked forward matching DeltaNet (ungated)."""
+    B, H, S, DK = q.shape
+    DV = v.shape[-1]
+    BC = chunk_size
+    NC = S // BC
+    h = q.new_zeros(B, H, DK, DV)
+    o_chunks = []
+    eye = torch.eye(BC, device=q.device, dtype=torch.float32)
+    mask = torch.tril(torch.ones(BC, BC, device=q.device, dtype=torch.float32))
+    for c in range(NC):
+        sl = slice(c * BC, (c + 1) * BC)
+        qc = q[:, :, sl, :].float()
+        kc = k[:, :, sl, :].float()
+        vc = v[:, :, sl, :].float()
+        bc = beta[:, :, sl].float()
+        Gram = torch.einsum("bhik,bhjk->bhij", kc, kc)
+        M = bc.unsqueeze(-1) * Gram
+        A = eye + torch.tril(M, diagonal=-1)
+        A_inv = torch.linalg.inv(A)
+        wc = A_inv @ (kc * bc.unsqueeze(-1))
+        uc = A_inv @ (vc * bc.unsqueeze(-1))
+        v_new = uc - wc @ h
+        o_part = qc @ h
+        attn = (qc @ kc.transpose(-2, -1)) * mask
+        o_c = o_part + attn @ v_new
+        o_chunks.append(o_c)
+        h = h + kc.transpose(-2, -1) @ v_new
+    return torch.cat(o_chunks, dim=2)
+
+
+def deltanet_autograd_bwd_torch(do, q, k, v, beta, chunk_size):
+    """Compute backward gradients via autograd on the differentiable forward."""
+    q_ = q.float().detach().requires_grad_(True)
+    k_ = k.float().detach().requires_grad_(True)
+    v_ = v.float().detach().requires_grad_(True)
+    beta_ = beta.float().detach().requires_grad_(True)
+
+    o = deltanet_differentiable_fwd_torch(q_, k_, v_, beta_, chunk_size)
+    loss = (o * do.float()).sum()
+    dq, dk, dv, dbeta = torch.autograd.grad(loss, [q_, k_, v_, beta_])
+    return dq, dk, dv, dbeta
+
+
+def deltanet_decode_torch(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    state: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pure-PyTorch reference for single-step delta rule (ungated)."""
+    q, k, v = q.float(), k.float(), v.float()
+    beta = beta.float()
+    state = state.float()
+
+    old_val = torch.einsum("bhkv,bhk->bhv", state, k)
+    beta_unsq = beta.unsqueeze(-1)
+    v_new = beta_unsq * (v - old_val)
+
+    o_inter = torch.einsum("bhkv,bhk->bhv", state, q)
+    qk_dot = torch.einsum("bhk,bhk->bh", q, k).unsqueeze(-1)
+    o_intra = qk_dot * v_new
+    o = o_inter + o_intra
+
+    new_state = state + k.unsqueeze(-1) * v_new.unsqueeze(-2)
+
+    return o, new_state
+
+
+class DeltaNetDecodeCall(CallWorkload):
+    """A manifest call of DeltaNetRecurrentFwdOp."""
+
+    def gen_inputs(self):
+        q, k, v, beta, state = super().gen_inputs()
+        return _small(q), _small(k), _small(v), _step_sizes(beta), _small(state)
+
+    def ref_program(self, q, k, v, beta, state):
+        o, new_state = deltanet_decode_torch(q, k, v, beta, state)
+        return o.to(q.dtype), new_state.to(q.dtype)
+
+    def verification(self, *inputs):
+        return decode_verification(inputs[0].dtype)
+
+
+class DeltaNetChunkwiseCall(CallWorkload):
+    """A manifest call of DeltaNetChunkFwdOp or DeltaNetChunkBwdOp.
+
+    The backward's saved buffers come back random; a caller that needs the forward's
+    values runs the forward on ``q, k, v, beta``.
+    """
+
+    def gen_inputs(self):
+        tensors = dict(zip(self.call.signature.inputs, super().gen_inputs(), strict=True))
+        return tuple(_step_sizes(t) if name == "beta" else _small(t) for name, t in tensors.items())
+
+    def ref_program(self, *inputs):
+        chunk = self.arguments()["chunk_size"]
+        if self.call.signature.name in {"DeltaNetChunkFwdOp", "DeltaNetAutogradOp"}:
+            q, k, v, beta = inputs
+            return deltanet_differentiable_fwd_torch(
+                q.float(), k.float(), v.float(), beta.float(), chunk
+            ).to(q.dtype)
+        do, q, k, v, beta, *_ = inputs
+        return tuple(t.to(q.dtype) for t in deltanet_autograd_bwd_torch(do, q, k, v, beta, chunk))
+
+    def verification(self, *inputs):
+        return chunkwise_verification(
+            inputs[0].dtype, backward=self.call.signature.name == "DeltaNetChunkBwdOp"
+        )
+
+
+class DeltaNetFwdCall(CallWorkload):
+    """A manifest call of DeltaNetFwdOp.
+
+    FLA's ``chunk_delta_rule`` is the reference for a prefill call and its
+    ``fused_recurrent_delta_rule`` for a single-token one, which is the kernel FLA
+    supplies for decode.
+    """
+
+    def gen_inputs(self):
+        q, k, v, beta, initial_state, cu_seqlens, cu_seqlens_cpu = super().gen_inputs()
+        return (
+            _small(q),
+            _small(k),
+            _small(v),
+            _step_sizes(beta),
+            _small(initial_state, 0.01),
+            cu_seqlens,
+            cu_seqlens_cpu,
+        )
+
+    def ref_program(self, q, k, v, beta, initial_state, cu_seqlens, cu_seqlens_cpu):
+        return deltanet_inference_ref(
+            q,
+            k,
+            v,
+            beta,
+            initial_state,
+            cu_seqlens,
+            cu_seqlens_cpu,
+            scale=self.call.indices["scale"],
+            l2norm=self.call.indices["use_qk_l2norm_in_kernel"],
+        )
+
+    def verification(self, *inputs):
+        return inference_verification(
+            inputs[0].dtype,
+            decode=inputs[0].shape[1] == 1,
+            l2norm=self.call.indices["use_qk_l2norm_in_kernel"],
+        )
+
+
+def decode_verification(dtype):
+    from workloads.numerics import Custom, Exact, assert_rounded
+
+    tol = {torch.float32: 2e-06, torch.float16: 0.0001, torch.bfloat16: 0.002}[dtype]
+    if dtype != torch.float16:
+        return Exact(atol=tol, rtol=tol)
+
+    def validate(got, expected):
+        # This op stores its state in the token dtype too, so the state takes the allowance.
+        got = got if isinstance(got, (tuple, list)) else (got,)
+        expected = expected if isinstance(expected, (tuple, list)) else (expected,)
+        for produced, reference in zip(got, expected, strict=True):
+            assert_rounded(produced, reference, atol=tol, rtol=tol)
+
+    return Custom(validate, "one rounding unit, then the decode bound")
+
+
+def inference_verification(dtype, *, decode=False, l2norm=False):
+    from workloads.numerics import Custom, assert_close, assert_normalized_error, assert_rounded
+
+    # FLA materializes normalized Q/K in the input dtype; our fused decode
+    # keeps them in FP32. That path includes input rounding, even for one token.
+    if decode and not l2norm:
+
+        def validate_decode(got, expected):
+            # A single step keeps its state in FP32: prefill's accumulation bound
+            # does not apply. The stored output may straddle a half/bfloat rounding
+            # boundary after two FP32 reduction orders; allow one adjacent value,
+            # then apply the original absolute bound to the remaining error.
+            assert_rounded(got[0], expected[0], atol=4e-8)
+            assert_close(got[1], expected[1], atol=4e-8, rtol=4e-8)
+
+        return Custom(validate_decode, "single-step FP32 state and one-rounding-unit output")
+
+    tol = {torch.float32: 4e-08, torch.float16: 1e-3, torch.bfloat16: 1.6e-2}[dtype]
+    state_tol = 0.003 if dtype == torch.float16 else tol
+
+    def validate(got, expected):
+        assert_close(got[0], expected[0], atol=tol, rtol=tol)
+        assert_close(got[1], expected[1], atol=state_tol, rtol=tol)
+        if not decode:
+            # The bfloat16 bound exceeds the small prefill outputs, so a zeroed output
+            # would pass it; the normalized-error budget rejects a cleared tensor.
+            assert_normalized_error(got, expected)
+
+    return Custom(validate, "output and accumulated FP32 state")
+
+
+def chunkwise_verification(dtype, *, backward=False):
+    from workloads.numerics import Exact, Partial
+
+    tol = (
+        {torch.float32: 1e-3, torch.float16: 5e-3, torch.bfloat16: 2e-2}
+        if backward
+        else {torch.float32: 1e-3, torch.float16: 2e-2, torch.bfloat16: 5e-2}
+    )[dtype]
+    if backward:
+        return Exact(atol=tol, rtol=tol)
+    return Partial(
+        1, "chunk intermediates are not produced by the independent oracle", atol=tol, rtol=tol
+    )
+
+
+def deltanet_inference_ref(
+    q,
+    k,
+    v,
+    beta,
+    initial_state=None,
+    cu_seqlens=None,
+    cu_seqlens_cpu=None,
+    *,
+    scale=None,
+    l2norm=False,
+):
+    """FLA inference oracle shared by dense fixtures and packed manifest rows."""
+    from fla.ops.delta_rule import chunk_delta_rule, fused_recurrent_delta_rule
+
+    # FLA caches derived sequence metadata by tensor identity. Give it a per-call
+    # snapshot so in-place changes to caller-owned offsets cannot reuse stale indices.
+    cu_seqlens = None if cu_seqlens is None else cu_seqlens.clone()
+
+    reference = fused_recurrent_delta_rule if q.shape[1] == 1 else chunk_delta_rule
+    return reference(
+        q,
+        k,
+        v,
+        beta,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        use_qk_l2norm_in_kernel=l2norm,
+    )
+
+
+def deltanet_inference_torch(
+    q,
+    k,
+    v,
+    beta,
+    initial_state=None,
+    cu_seqlens=None,
+    cu_seqlens_cpu=None,
+    *,
+    scale=None,
+    l2norm=False,
+):
+    """Independent CPU inference oracle with FP32 state and dtype-rounded Q/K norm.
+
+    Packed offsets come from ``cu_seqlens``; the CPU mirror is optional metadata.
+    FLA's normalization writes Q/K back to the input dtype before the recurrence.
+    """
+    del cu_seqlens_cpu
+    if q.device.type != "cpu":
+        raise ValueError("Use reference_for to evaluate the DeltaNet CPU oracle")
+    batch, tokens, heads, dim_k = q.shape
+    if l2norm:
+        q = (q.float() * torch.rsqrt(q.float().square().sum(-1, keepdim=True) + 1e-6)).to(q.dtype)
+        k = (k.float() * torch.rsqrt(k.float().square().sum(-1, keepdim=True) + 1e-6)).to(k.dtype)
+    scale = dim_k**-0.5 if scale is None else scale
+    offsets = (
+        list(range(0, (batch + 1) * tokens, tokens)) if cu_seqlens is None else cu_seqlens.tolist()
+    )
+    state = (
+        torch.zeros(len(offsets) - 1, heads, dim_k, v.shape[-1], dtype=torch.float32)
+        if initial_state is None
+        else initial_state.clone()
+    )
+    output = torch.empty_like(v)
+    q, k, v = (tensor.reshape(batch * tokens, heads, -1).float() for tensor in (q, k, v))
+    beta = beta.reshape(batch * tokens, heads).float()
+    flat_output = output.reshape(batch * tokens, heads, -1)
+    for sequence, (start, end) in enumerate(zip(offsets[:-1], offsets[1:], strict=True)):
+        h = state[sequence]
+        for token in range(start, end):
+            residual = v[token] - (h * k[token, :, :, None]).sum(dim=1)
+            update = beta[token, :, None] * residual
+            h = h + k[token, :, :, None] * update[:, None, :]
+            flat_output[token] = (h * (q[token] * scale)[:, :, None]).sum(dim=1).to(output.dtype)
+        state[sequence] = h
+    return output, state

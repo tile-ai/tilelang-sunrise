@@ -1,0 +1,553 @@
+# pool.yaml -- manifest entries for the 'pool' family.
+#
+# Source of truth for pooling op interfaces. Each entry's `status` field is the
+# authority on whether it is implemented.
+
+AvgPool1dFwdOp:
+  ref_api: torch.nn.functional.avg_pool1d
+  family: pool
+  status: implemented
+
+  signature:
+    forall: {N: Dim, C: Dim, L_in: Dim, T: "DType[float16 | bfloat16 | float32]"}
+    params:
+      kernel_size: {type: "int | tuple[int]"}
+      stride: {type: "int | tuple[int] | None", default: null}
+      padding: {type: "int | tuple[int]", default: 0}
+      ceil_mode: {type: bool, default: false}
+      count_include_pad: {type: bool, default: true}
+    inputs:
+      input: {dtype: T, shape: "[N, C, L_in]"}
+    outputs:
+      output: {dtype: T, shape: "[N, C, L_out]"}
+    let:
+      kW: "per_axis(kernel_size, 0, 1)"
+      sW: "per_axis(stride, 0, 1, fallback=kW)"
+      pW: "per_axis(padding, 0, 1)"
+      L_out: "pool.out(L_in, kW, sW, pW, 1, ceil_mode)"
+    shape_rules:
+    - "kW > 0 and sW > 0"
+    - "0 <= pW <= kW // 2"
+    - "L_in > 0 and L_out > 0"
+
+  workloads:
+  # Temporal/audio downsampling cases, expressed in PyTorch NCL layout.
+  - {N: 4, C: 128, L_in: 4096, kernel_size: 3, stride: 2, padding: 1, dtype_cases: [{T: float16}, {T: float32}], label: audio-downsample}
+  - {N: 2, C: 256, L_in: 32000, kernel_size: 5, stride: 4, padding: 2, dtype_cases: [{T: float16}], label: long-temporal}
+  - {N: 2, C: 128, L_in: 2048, kernel_size: 4, stride: 2, padding: 1, ceil_mode: true, count_include_pad: false, dtype_cases: [{T: bfloat16}], label: ceil}
+
+  roofline:
+    func: tileops._perf.formulas.pool_roofline
+
+AvgPool2dFwdOp:
+  ref_api: torch.nn.functional.avg_pool2d
+  family: pool
+  status: implemented
+
+  signature:
+    forall: {N: Dim, C: Dim, H_in: Dim, W_in: Dim, T: "DType[float16 | bfloat16 | float32]"}
+    params:
+      kernel_size: {type: "int | tuple[int, int]"}
+      stride: {type: "int | tuple[int, int] | None", default: null}
+      padding: {type: "int | tuple[int, int]", default: 0}
+      ceil_mode: {type: bool, default: false}
+      count_include_pad: {type: bool, default: true}
+      divisor_override: {type: "int | None", default: null}
+    inputs:
+      input: {dtype: T, shape: "[N, C, H_in, W_in]"}
+    outputs:
+      output: {dtype: T, shape: "[N, C, H_out, W_out]"}
+    let:
+      kH: "per_axis(kernel_size, 0, 2)"
+      sH: "per_axis(stride, 0, 2, fallback=kH)"
+      pH: "per_axis(padding, 0, 2)"
+      kW: "per_axis(kernel_size, 1, 2)"
+      sW: "per_axis(stride, 1, 2, fallback=kW)"
+      pW: "per_axis(padding, 1, 2)"
+      H_out: "pool.out(H_in, kH, sH, pH, 1, ceil_mode)"
+      W_out: "pool.out(W_in, kW, sW, pW, 1, ceil_mode)"
+    shape_rules:
+    - "kH > 0 and sH > 0 and kW > 0 and sW > 0"
+    - "0 <= pH <= kH // 2 and 0 <= pW <= kW // 2"
+    - "not present(divisor_override) or divisor_override.value != 0"
+    - "H_in > 0 and W_in > 0 and H_out > 0 and W_out > 0"
+
+  workloads:
+  # Real-model sources: ResNet-style and ConvNeXt-style vision backbones use
+  # 2D average-pooling/downsampling over NCHW feature maps at early and middle
+  # feature stages. The asymmetric ceil/divisor case is a stress workload for
+  # PyTorch avg_pool2d semantics, not a separate model family.
+  - {N: 2, C: 64, H_in: 112, W_in: 112, kernel_size: [3, 3], stride: [2, 2], padding: [1, 1], dtype_cases: [{T: float16}, {T: float32}], label: vision-3x3-s2}
+  - {N: 2, C: 128, H_in: 56, W_in: 56, kernel_size: [5, 5], stride: [2, 2], padding: [2, 2], dtype_cases: [{T: float16}], label: vision-5x5-s2}
+  - {N: 3, C: 96, H_in: 55, W_in: 57, kernel_size: [3, 5], stride: [2, 2], padding: [1, 2], ceil_mode: true, count_include_pad: false, divisor_override: 7, dtype_cases: [{T: bfloat16}], label: ceil-divisor}
+
+  roofline:
+    func: tileops._perf.formulas.pool_roofline
+
+AvgPool3dFwdOp:
+  ref_api: torch.nn.functional.avg_pool3d
+  family: pool
+  status: implemented
+
+  signature:
+    forall: {N: Dim, C: Dim, D_in: Dim, H_in: Dim, W_in: Dim, T: "DType[float16 | bfloat16 | float32]"}
+    params:
+      kernel_size: {type: "int | tuple[int, int, int]"}
+      stride: {type: "int | tuple[int, int, int] | None", default: null}
+      padding: {type: "int | tuple[int, int, int]", default: 0}
+      ceil_mode: {type: bool, default: false}
+      count_include_pad: {type: bool, default: true}
+      divisor_override: {type: "int | None", default: null}
+    inputs:
+      input: {dtype: T, shape: "[N, C, D_in, H_in, W_in]"}
+    outputs:
+      output: {dtype: T, shape: "[N, C, D_out, H_out, W_out]"}
+    let:
+      kD: "per_axis(kernel_size, 0, 3)"
+      sD: "per_axis(stride, 0, 3, fallback=kD)"
+      pD: "per_axis(padding, 0, 3)"
+      kH: "per_axis(kernel_size, 1, 3)"
+      sH: "per_axis(stride, 1, 3, fallback=kH)"
+      pH: "per_axis(padding, 1, 3)"
+      kW: "per_axis(kernel_size, 2, 3)"
+      sW: "per_axis(stride, 2, 3, fallback=kW)"
+      pW: "per_axis(padding, 2, 3)"
+      D_out: "pool.out(D_in, kD, sD, pD, 1, ceil_mode)"
+      H_out: "pool.out(H_in, kH, sH, pH, 1, ceil_mode)"
+      W_out: "pool.out(W_in, kW, sW, pW, 1, ceil_mode)"
+    shape_rules:
+    - "kD > 0 and sD > 0 and kH > 0 and sH > 0 and kW > 0 and sW > 0"
+    - "0 <= pD <= kD // 2 and 0 <= pH <= kH // 2 and 0 <= pW <= kW // 2"
+    - "not present(divisor_override) or divisor_override.value != 0"
+    - "D_in > 0 and H_in > 0 and W_in > 0 and D_out > 0 and H_out > 0 and W_out > 0"
+
+  workloads:
+  # Real-model sources: I3D/SlowFast-style video CNNs use 3D spatiotemporal
+  # pooling over NCDHW activations. The ceil and divisor workloads stress
+  # PyTorch avg_pool3d semantics on video-like feature volumes.
+  - {N: 1, C: 32, D_in: 16, H_in: 56, W_in: 56, kernel_size: [2, 2, 2], stride: [2, 2, 2], padding: [0, 0, 0], dtype_cases: [{T: float16}, {T: float32}], label: video-2x2x2}
+  - {N: 2, C: 64, D_in: 8, H_in: 28, W_in: 28, kernel_size: [2, 3, 3], stride: [2, 2, 2], padding: [1, 1, 1], ceil_mode: true, count_include_pad: false, dtype_cases: [{T: float16}], label: ceil-video}
+  - {N: 2, C: 24, D_in: 10, H_in: 20, W_in: 22, kernel_size: [2, 2, 3], stride: [2, 2, 2], padding: [0, 1, 1], divisor_override: 7, dtype_cases: [{T: bfloat16}], label: divisor}
+
+  roofline:
+    func: tileops._perf.formulas.pool_roofline
+
+MaxPool1dFwdOp:
+  # Equivalent to torch.nn.functional.max_pool1d (return_indices=False)
+  ref_api: torch.nn.functional.max_pool1d
+  family: pool
+  status: implemented
+
+  signature:
+    forall: {N: Dim, C: Dim, L_in: Dim, T: "DType[float16 | bfloat16 | float32]"}
+    params:
+      kernel_size: {type: "int | tuple[int]"}
+      stride: {type: "int | tuple[int] | None", default: null}
+      padding: {type: "int | tuple[int]", default: 0}
+      dilation: {type: "int | tuple[int]", default: 1}
+      ceil_mode: {type: bool, default: false}
+    inputs:
+      input: {dtype: T, shape: "[N, C, L_in]"}
+    outputs:
+      output: {dtype: T, shape: "[N, C, L_out]"}
+    let:
+      kW: "per_axis(kernel_size, 0, 1)"
+      sW: "per_axis(stride, 0, 1, fallback=kW)"
+      pW: "per_axis(padding, 0, 1)"
+      dW: "per_axis(dilation, 0, 1)"
+      L_out: "pool.out(L_in, kW, sW, pW, dW, ceil_mode)"
+    shape_rules:
+    - "kW > 0 and sW > 0"
+    - "dW > 0"
+    - "0 <= pW <= kW // 2"
+    - "L_in > 0 and L_out > 0"
+
+  workloads:
+  # Real-model sources: SincNet-style speaker CNNs use local MaxPool1d
+  # over waveform features; TextCNN-style classifiers use global temporal
+  # max pooling over token-convolution channels; ECG CNN classifiers use
+  # repeated 1D max-pooling downsampling on long signals.
+  - {N: 32, C: 80, L_in: 4096, kernel_size: 3, stride: 3, padding: 0, dtype_cases: [{T: float16}, {T: float32}], label: sincnet-local}
+  - {N: 64, C: 256, L_in: 128, kernel_size: 128, stride: 1, padding: 0, dtype_cases: [{T: float16}], label: textcnn-global}
+  - {N: 16, C: 128, L_in: 2048, kernel_size: 5, stride: 2, padding: 2, dilation: 2, ceil_mode: true, dtype_cases: [{T: bfloat16}], label: ecg-cnn-dilated}
+
+  roofline:
+    func: tileops._perf.formulas.pool_roofline
+
+MaxPool1dIndicesFwdOp:
+  # Equivalent to torch.nn.functional.max_pool1d (return_indices=True)
+  ref_api: torch.nn.functional.max_pool1d
+  family: pool
+  status: implemented
+
+  signature:
+    forall: {N: Dim, C: Dim, L_in: Dim, T: "DType[float16 | bfloat16 | float32]"}
+    params:
+      kernel_size: {type: "int | tuple[int]"}
+      stride: {type: "int | tuple[int] | None", default: null}
+      padding: {type: "int | tuple[int]", default: 0}
+      dilation: {type: "int | tuple[int]", default: 1}
+      ceil_mode: {type: bool, default: false}
+    inputs:
+      input: {dtype: T, shape: "[N, C, L_in]"}
+    outputs:
+      output: {dtype: T, shape: "[N, C, L_out]"}
+      indices: {dtype: int64, shape: "[N, C, L_out]"}
+    let:
+      kW: "per_axis(kernel_size, 0, 1)"
+      sW: "per_axis(stride, 0, 1, fallback=kW)"
+      pW: "per_axis(padding, 0, 1)"
+      dW: "per_axis(dilation, 0, 1)"
+      L_out: "pool.out(L_in, kW, sW, pW, dW, ceil_mode)"
+    shape_rules:
+    - "kW > 0 and sW > 0"
+    - "dW > 0"
+    - "0 <= pW <= kW // 2"
+    - "L_in > 0 and L_out > 0"
+
+  workloads:
+  # Same model sources as MaxPool1dFwdOp; indices output is consumed by
+  # unpooling or argmax-tracking paths rather than changing input shapes.
+  - {N: 32, C: 80, L_in: 4096, kernel_size: 3, stride: 3, padding: 0, dtype_cases: [{T: float16}, {T: float32}], label: sincnet-local}
+  - {N: 64, C: 256, L_in: 128, kernel_size: 128, stride: 1, padding: 0, dtype_cases: [{T: float16}], label: textcnn-global}
+  - {N: 16, C: 128, L_in: 2048, kernel_size: 5, stride: 2, padding: 2, dilation: 2, ceil_mode: true, dtype_cases: [{T: bfloat16}], label: ecg-cnn-dilated}
+
+  roofline:
+    func: tileops._perf.formulas.pool_roofline
+
+MaxPool2dFwdOp:
+  # Equivalent to torch.nn.functional.max_pool2d (return_indices=False)
+  ref_api: torch.nn.functional.max_pool2d
+  family: pool
+  status: implemented
+
+  signature:
+    forall: {N: Dim, C: Dim, H_in: Dim, W_in: Dim, T: "DType[float16 | bfloat16 | float32]"}
+    params:
+      kernel_size: {type: "int | tuple[int, int]"}
+      stride: {type: "int | tuple[int, int] | None", default: null}
+      padding: {type: "int | tuple[int, int]", default: 0}
+      dilation: {type: "int | tuple[int, int]", default: 1}
+      ceil_mode: {type: bool, default: false}
+    inputs:
+      input: {dtype: T, shape: "[N, C, H_in, W_in]"}
+    outputs:
+      output: {dtype: T, shape: "[N, C, H_out, W_out]"}
+    let:
+      kH: "per_axis(kernel_size, 0, 2)"
+      sH: "per_axis(stride, 0, 2, fallback=kH)"
+      pH: "per_axis(padding, 0, 2)"
+      dH: "per_axis(dilation, 0, 2)"
+      kW: "per_axis(kernel_size, 1, 2)"
+      sW: "per_axis(stride, 1, 2, fallback=kW)"
+      pW: "per_axis(padding, 1, 2)"
+      dW: "per_axis(dilation, 1, 2)"
+      H_out: "pool.out(H_in, kH, sH, pH, dH, ceil_mode)"
+      W_out: "pool.out(W_in, kW, sW, pW, dW, ceil_mode)"
+    shape_rules:
+    - "kH > 0 and sH > 0 and kW > 0 and sW > 0"
+    - "dH > 0 and dW > 0"
+    - "0 <= pH <= kH // 2 and 0 <= pW <= kW // 2"
+    - "H_in > 0 and W_in > 0 and H_out > 0 and W_out > 0"
+
+  workloads:
+  # Real-model sources: ResNet stem uses 3x3 stride-2 max pooling on
+  # 64-channel 112x112 features; VGG blocks use 2x2 stride-2 max pooling;
+  # AlexNet-style CNNs use 3x3 stride-2 pooling on early 55x55 features.
+  - {N: 32, C: 64, H_in: 112, W_in: 112, kernel_size: [3, 3], stride: [2, 2], padding: [1, 1], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: resnet-stem}
+  - {N: 16, C: 128, H_in: 56, W_in: 56, kernel_size: [2, 2], stride: [2, 2], padding: [0, 0], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: vgg-block}
+  - {N: 32, C: 64, H_in: 55, W_in: 55, kernel_size: [3, 3], stride: [2, 2], padding: [0, 0], ceil_mode: true, dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: alexnet-ceil}
+
+  roofline:
+    func: tileops._perf.formulas.pool_roofline
+
+MaxPool2dIndicesFwdOp:
+  # Equivalent to torch.nn.functional.max_pool2d (return_indices=True)
+  ref_api: torch.nn.functional.max_pool2d
+  family: pool
+  status: implemented
+
+  signature:
+    forall: {N: Dim, C: Dim, H_in: Dim, W_in: Dim, T: "DType[float16 | bfloat16 | float32]"}
+    params:
+      kernel_size: {type: "int | tuple[int, int]"}
+      stride: {type: "int | tuple[int, int] | None", default: null}
+      padding: {type: "int | tuple[int, int]", default: 0}
+      dilation: {type: "int | tuple[int, int]", default: 1}
+      ceil_mode: {type: bool, default: false}
+    inputs:
+      input: {dtype: T, shape: "[N, C, H_in, W_in]"}
+    outputs:
+      output: {dtype: T, shape: "[N, C, H_out, W_out]"}
+      indices: {dtype: int64, shape: "[N, C, H_out, W_out]"}
+    let:
+      kH: "per_axis(kernel_size, 0, 2)"
+      sH: "per_axis(stride, 0, 2, fallback=kH)"
+      pH: "per_axis(padding, 0, 2)"
+      dH: "per_axis(dilation, 0, 2)"
+      kW: "per_axis(kernel_size, 1, 2)"
+      sW: "per_axis(stride, 1, 2, fallback=kW)"
+      pW: "per_axis(padding, 1, 2)"
+      dW: "per_axis(dilation, 1, 2)"
+      H_out: "pool.out(H_in, kH, sH, pH, dH, ceil_mode)"
+      W_out: "pool.out(W_in, kW, sW, pW, dW, ceil_mode)"
+    shape_rules:
+    - "kH > 0 and sH > 0 and kW > 0 and sW > 0"
+    - "dH > 0 and dW > 0"
+    - "0 <= pH <= kH // 2 and 0 <= pW <= kW // 2"
+    - "H_in > 0 and W_in > 0 and H_out > 0 and W_out > 0"
+
+  workloads:
+  # Same model sources as MaxPool2dFwdOp; indices output is consumed by
+  # unpooling or argmax-tracking paths rather than changing input shapes.
+  - {N: 32, C: 64, H_in: 112, W_in: 112, kernel_size: [3, 3], stride: [2, 2], padding: [1, 1], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: resnet-stem}
+  - {N: 16, C: 128, H_in: 56, W_in: 56, kernel_size: [2, 2], stride: [2, 2], padding: [0, 0], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: vgg-block}
+  - {N: 32, C: 64, H_in: 55, W_in: 55, kernel_size: [3, 3], stride: [2, 2], padding: [0, 0], ceil_mode: true, dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: alexnet-ceil}
+
+  roofline:
+    func: tileops._perf.formulas.pool_roofline
+
+MaxPool3dFwdOp:
+  # Equivalent to torch.nn.functional.max_pool3d (return_indices=False)
+  ref_api: torch.nn.functional.max_pool3d
+  family: pool
+  status: implemented
+
+  signature:
+    forall: {N: Dim, C: Dim, D_in: Dim, H_in: Dim, W_in: Dim, T: "DType[float16 | bfloat16 | float32]"}
+    params:
+      kernel_size: {type: "int | tuple[int, int, int]"}
+      stride: {type: "int | tuple[int, int, int] | None", default: null}
+      padding: {type: "int | tuple[int, int, int]", default: 0}
+      dilation: {type: "int | tuple[int, int, int]", default: 1}
+      ceil_mode: {type: bool, default: false}
+    inputs:
+      input: {dtype: T, shape: "[N, C, D_in, H_in, W_in]"}
+    outputs:
+      output: {dtype: T, shape: "[N, C, D_out, H_out, W_out]"}
+    let:
+      kD: "per_axis(kernel_size, 0, 3)"
+      sD: "per_axis(stride, 0, 3, fallback=kD)"
+      pD: "per_axis(padding, 0, 3)"
+      dD: "per_axis(dilation, 0, 3)"
+      kH: "per_axis(kernel_size, 1, 3)"
+      sH: "per_axis(stride, 1, 3, fallback=kH)"
+      pH: "per_axis(padding, 1, 3)"
+      dH: "per_axis(dilation, 1, 3)"
+      kW: "per_axis(kernel_size, 2, 3)"
+      sW: "per_axis(stride, 2, 3, fallback=kW)"
+      pW: "per_axis(padding, 2, 3)"
+      dW: "per_axis(dilation, 2, 3)"
+      D_out: "pool.out(D_in, kD, sD, pD, dD, ceil_mode)"
+      H_out: "pool.out(H_in, kH, sH, pH, dH, ceil_mode)"
+      W_out: "pool.out(W_in, kW, sW, pW, dW, ceil_mode)"
+    shape_rules:
+    - "kD > 0 and sD > 0 and kH > 0 and sH > 0 and kW > 0 and sW > 0"
+    - "dD > 0 and dH > 0 and dW > 0"
+    - "0 <= pD <= kD // 2 and 0 <= pH <= kH // 2 and 0 <= pW <= kW // 2"
+    - "D_in > 0 and H_in > 0 and W_in > 0 and D_out > 0 and H_out > 0 and W_out > 0"
+
+  workloads:
+  # Real-model sources: C3D uses an initial 1x2x2 max pool over video
+  # features followed by 2x2x2 stages; 3D ResNet/MedicalNet-style
+  # volumetric backbones use 3x3x3 stride-2 max pooling after the stem.
+  - {N: 8, C: 64, D_in: 16, H_in: 112, W_in: 112, kernel_size: [1, 2, 2], stride: [1, 2, 2], padding: [0, 0, 0], dtype_cases: [{T: float16}, {T: float32}], label: c3d-pool1}
+  - {N: 4, C: 128, D_in: 16, H_in: 56, W_in: 56, kernel_size: [2, 2, 2], stride: [2, 2, 2], padding: [0, 0, 0], dtype_cases: [{T: float16}], label: c3d-pool2}
+  - {N: 2, C: 64, D_in: 32, H_in: 112, W_in: 112, kernel_size: [3, 3, 3], stride: [2, 2, 2], padding: [1, 1, 1], ceil_mode: true, dtype_cases: [{T: bfloat16}], label: medicalnet-stem}
+
+  roofline:
+    func: tileops._perf.formulas.pool_roofline
+
+MaxPool3dIndicesFwdOp:
+  # Equivalent to torch.nn.functional.max_pool3d (return_indices=True)
+  ref_api: torch.nn.functional.max_pool3d
+  family: pool
+  status: implemented
+
+  signature:
+    forall: {N: Dim, C: Dim, D_in: Dim, H_in: Dim, W_in: Dim, T: "DType[float16 | bfloat16 | float32]"}
+    params:
+      kernel_size: {type: "int | tuple[int, int, int]"}
+      stride: {type: "int | tuple[int, int, int] | None", default: null}
+      padding: {type: "int | tuple[int, int, int]", default: 0}
+      dilation: {type: "int | tuple[int, int, int]", default: 1}
+      ceil_mode: {type: bool, default: false}
+    inputs:
+      input: {dtype: T, shape: "[N, C, D_in, H_in, W_in]"}
+    outputs:
+      output: {dtype: T, shape: "[N, C, D_out, H_out, W_out]"}
+      indices: {dtype: int64, shape: "[N, C, D_out, H_out, W_out]"}
+    let:
+      kD: "per_axis(kernel_size, 0, 3)"
+      sD: "per_axis(stride, 0, 3, fallback=kD)"
+      pD: "per_axis(padding, 0, 3)"
+      dD: "per_axis(dilation, 0, 3)"
+      kH: "per_axis(kernel_size, 1, 3)"
+      sH: "per_axis(stride, 1, 3, fallback=kH)"
+      pH: "per_axis(padding, 1, 3)"
+      dH: "per_axis(dilation, 1, 3)"
+      kW: "per_axis(kernel_size, 2, 3)"
+      sW: "per_axis(stride, 2, 3, fallback=kW)"
+      pW: "per_axis(padding, 2, 3)"
+      dW: "per_axis(dilation, 2, 3)"
+      D_out: "pool.out(D_in, kD, sD, pD, dD, ceil_mode)"
+      H_out: "pool.out(H_in, kH, sH, pH, dH, ceil_mode)"
+      W_out: "pool.out(W_in, kW, sW, pW, dW, ceil_mode)"
+    shape_rules:
+    - "kD > 0 and sD > 0 and kH > 0 and sH > 0 and kW > 0 and sW > 0"
+    - "dD > 0 and dH > 0 and dW > 0"
+    - "0 <= pD <= kD // 2 and 0 <= pH <= kH // 2 and 0 <= pW <= kW // 2"
+    - "D_in > 0 and H_in > 0 and W_in > 0 and D_out > 0 and H_out > 0 and W_out > 0"
+
+  workloads:
+  # Same model sources as MaxPool3dFwdOp; indices output is consumed by
+  # unpooling or argmax-tracking paths rather than changing input shapes.
+  - {N: 8, C: 64, D_in: 16, H_in: 112, W_in: 112, kernel_size: [1, 2, 2], stride: [1, 2, 2], padding: [0, 0, 0], dtype_cases: [{T: float16}, {T: float32}], label: c3d-pool1}
+  - {N: 4, C: 128, D_in: 16, H_in: 56, W_in: 56, kernel_size: [2, 2, 2], stride: [2, 2, 2], padding: [0, 0, 0], dtype_cases: [{T: float16}], label: c3d-pool2}
+  - {N: 2, C: 64, D_in: 32, H_in: 112, W_in: 112, kernel_size: [3, 3, 3], stride: [2, 2, 2], padding: [1, 1, 1], ceil_mode: true, dtype_cases: [{T: bfloat16}], label: medicalnet-stem}
+
+  roofline:
+    func: tileops._perf.formulas.pool_roofline
+
+AdaptiveAvgPool2dFwdOp:
+  ref_api: torch.nn.functional.adaptive_avg_pool2d
+  family: pool
+  status: implemented
+
+  signature:
+    forall: {B: Shape, C: Dim, H_in: Dim, W_in: Dim, T: "DType[float16 | bfloat16]"}
+    params:
+      output_size: {type: "int | None | tuple[int | None, int | None] | list[int | None]"}
+    inputs:
+      input: {dtype: T, shape: "[*B, C, H_in, W_in]"}
+    outputs:
+      output: {dtype: T, shape: "[*B, C, H_out, W_out]"}
+    let:
+      H_out: "per_axis(output_size, 0, 2, fallback=H_in)"
+      W_out: "per_axis(output_size, 1, 2, fallback=W_in)"
+    shape_rules:
+    - "len(B) <= 1 and H_in > 0 and W_in > 0"
+    - "H_out > 0 and W_out > 0"
+
+  workloads:
+  # Real-model sources: ResNet-50 applies a global adaptive average pool to
+  # its final 7x7 feature map before the FC layer; SPP-style heads pool
+  # arbitrary feature maps to a fixed grid; the non-divisible case stresses
+  # PyTorch adaptive bin-boundary semantics.
+  - {B: [8], C: 2048, H_in: 7, W_in: 7, output_size: [1, 1], dtype_cases: [{T: float16}], label: resnet-gap}
+  - {B: [2], C: 128, H_in: 56, W_in: 56, output_size: [6, 6], dtype_cases: [{T: float16}], label: spp-6x6}
+  - {B: [2], C: 64, H_in: 55, W_in: 57, output_size: [7, 7], dtype_cases: [{T: bfloat16}], label: nondiv-7x7}
+  - {B: [], C: 2048, H_in: 7, W_in: 7, output_size: [1, 1], dtype_cases: [{T: float16}], label: resnet-gap-unbatched}
+
+  roofline:
+    func: tileops._perf.formulas.adaptive_pool2d_roofline
+
+AdaptiveMaxPool2dFwdOp:
+  # Equivalent to torch.nn.functional.adaptive_max_pool2d (return_indices=False)
+  ref_api: torch.nn.functional.adaptive_max_pool2d
+  family: pool
+  status: implemented
+
+  signature:
+    forall: {B: Shape, C: Dim, H_in: Dim, W_in: Dim, T: "DType[float16 | bfloat16]"}
+    params:
+      output_size: {type: "int | None | tuple[int | None, int | None] | list[int | None]"}
+    inputs:
+      input: {dtype: T, shape: "[*B, C, H_in, W_in]"}
+    outputs:
+      output: {dtype: T, shape: "[*B, C, H_out, W_out]"}
+    let:
+      H_out: "per_axis(output_size, 0, 2, fallback=H_in)"
+      W_out: "per_axis(output_size, 1, 2, fallback=W_in)"
+    shape_rules:
+    - "len(B) <= 1 and H_in > 0 and W_in > 0"
+    - "H_out > 0 and W_out > 0"
+
+  workloads:
+  # Same model sources as AdaptiveAvgPool2dFwdOp; adaptive max pooling shows
+  # up in SPP-style detection/segmentation heads with the same grid shapes.
+  - {B: [8], C: 2048, H_in: 7, W_in: 7, output_size: [1, 1], dtype_cases: [{T: float16}], label: global-1x1}
+  - {B: [2], C: 128, H_in: 56, W_in: 56, output_size: [6, 6], dtype_cases: [{T: float16}], label: spp-6x6}
+  - {B: [2], C: 64, H_in: 55, W_in: 57, output_size: [7, 7], dtype_cases: [{T: bfloat16}], label: nondiv-7x7}
+  - {B: [], C: 2048, H_in: 7, W_in: 7, output_size: [1, 1], dtype_cases: [{T: float16}], label: global-1x1-unbatched}
+
+  roofline:
+    func: tileops._perf.formulas.adaptive_pool2d_roofline
+
+AdaptiveMaxPool2dIndicesFwdOp:
+  # Equivalent to torch.nn.functional.adaptive_max_pool2d (return_indices=True)
+  ref_api: torch.nn.functional.adaptive_max_pool2d
+  family: pool
+  status: implemented
+
+  signature:
+    forall: {B: Shape, C: Dim, H_in: Dim, W_in: Dim, T: "DType[float16 | bfloat16]"}
+    params:
+      output_size: {type: "int | None | tuple[int | None, int | None] | list[int | None]"}
+    inputs:
+      input: {dtype: T, shape: "[*B, C, H_in, W_in]"}
+    outputs:
+      output: {dtype: T, shape: "[*B, C, H_out, W_out]"}
+      indices: {dtype: int64, shape: "[*B, C, H_out, W_out]"}
+    let:
+      H_out: "per_axis(output_size, 0, 2, fallback=H_in)"
+      W_out: "per_axis(output_size, 1, 2, fallback=W_in)"
+    shape_rules:
+    - "len(B) <= 1 and H_in > 0 and W_in > 0"
+    - "H_out > 0 and W_out > 0"
+
+  workloads:
+  # Same model sources as AdaptiveMaxPool2dFwdOp; indices output is consumed
+  # by unpooling or argmax-tracking paths rather than changing input shapes.
+  - {B: [8], C: 2048, H_in: 7, W_in: 7, output_size: [1, 1], dtype_cases: [{T: float16}], label: global-1x1}
+  - {B: [2], C: 128, H_in: 56, W_in: 56, output_size: [6, 6], dtype_cases: [{T: float16}], label: spp-6x6}
+  - {B: [2], C: 64, H_in: 55, W_in: 57, output_size: [7, 7], dtype_cases: [{T: bfloat16}], label: nondiv-7x7}
+  - {B: [], C: 2048, H_in: 7, W_in: 7, output_size: [1, 1], dtype_cases: [{T: float16}], label: global-1x1-unbatched}
+
+  roofline:
+    func: tileops._perf.formulas.adaptive_pool2d_roofline
+
+MeanPoolingFwdOp:
+  # A chunked mean over the sequence axis, along ragged boundaries when `cu_seqlens` and
+  # `chunk_indices` are passed; torch has no such API. Declared limits, not kernel limits:
+  # a block takes a power-of-two share of `H * D` and bounds-tests a share that does
+  # not divide it.
+  family: pool
+  status: implemented
+  ref_api: fla.ops.utils.pooling.mean_pooling_fwd
+
+  signature:
+    types:
+      PoolOut:
+        params: {p: Bool, B: Dim, NC: Dim, S: Dim, c: Dim, H: Dim, D: Dim}
+        match: p
+        cases:
+        - {when: true, is: "[B, NC, H, D]"}
+        - {when: false, is: "[B, ceil_div(S, c), H, D]"}
+    forall: {B: Dim, S: Dim, H: Dim, D: Dim, NS: Dim, NC: Dim, T: "DType[float16 | bfloat16 | float32]", seq_lens: "Seq[Int]"}
+    params:
+      chunk_size: {type: int}
+      accum_dtype: {type: torch.dtype}
+      validate_inputs: {type: bool, default: false, kw_only: true}
+    inputs:
+      x: {dtype: T, shape: "[B, S, H, D]"}
+      cu_seqlens: {dtype: int32, optional: true, shape: "[NS + 1]", values: "prefix_sum(seq_lens)", requires: ["prefix_offsets(S)"]}
+      chunk_indices: {dtype: int32, optional: "present(cu_seqlens)", shape: "[NC, 2]", values: "chunk_indices(seq_lens, chunk_size)"}
+    outputs:
+      output: {dtype: T, shape: "PoolOut[present(cu_seqlens), B, NC, S, chunk_size, H, D]"}
+    shape_rules:
+    - "chunk_size > 0 and chunk_size % 32 == 0"
+    - "D <= 128 or D % 128 == 0"
+    # A mean accumulated in an integer type truncates each partial sum.
+    - "category(accum_dtype) == 'float'"
+
+  workloads:
+  # Chunk 64 over an 8k sequence is the linear-attention chunking these come from.
+  - {B: 1, S: 8192, H: 64, D: 128, chunk_size: 64, accum_dtype: float32, dtype_cases: [{T: float16}, {T: bfloat16}], label: uniform-8k}
+  - {B: 2, S: 2048, H: 64, D: 128, chunk_size: 64, accum_dtype: float32, dtype_cases: [{T: float16}], label: uniform-batched}
+  - {B: 1, S: 8192, H: 64, D: 128, seq_lens: "repeat(2048, 4)", chunk_size: 64, accum_dtype: float32, some: [cu_seqlens], dtype_cases: [{T: float16}, {T: float32}], label: ragged-even}
+  - {B: 1, S: 1000, H: 64, D: 128, seq_lens: [100, 200, 300, 400], chunk_size: 32, accum_dtype: float32, some: [cu_seqlens], dtype_cases: [{T: float16}], label: ragged-tail}
+  - {B: 2, S: 2048, H: 64, D: 128, seq_lens: "repeat(1024, 2)", chunk_size: 64, accum_dtype: float32, some: [cu_seqlens], dtype_cases: [{T: float16}], label: ragged-batched}
+
+  roofline:
+    flops: "B * S * H * D + B * (NC if present(cu_seqlens) else ceil_div(S, chunk_size)) * H * D"
