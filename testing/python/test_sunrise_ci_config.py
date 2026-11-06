@@ -1,6 +1,5 @@
 import json
 import os
-import re
 import shlex
 import sys
 import subprocess
@@ -12,7 +11,6 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 CI_LIST = ROOT / "ci_test_case_list_tilelang.txt"
-S3_LIST = ROOT / "ci_test_case_list_tilelang_s3.txt"
 
 
 def test_ci_cache_directory_is_exported_to_child_processes(tmp_path):
@@ -174,7 +172,6 @@ def test_ci_shell_scripts_have_valid_syntax():
         ROOT / "ci" / "lint.sh",
         ROOT / "ci" / "run.sh",
         ROOT / "ci" / "test.sh",
-        ROOT / "ci" / "s3" / "test_s3.sh",
     ]
     subprocess.run(["bash", "-n", *map(str, scripts)], check=True)
 
@@ -186,32 +183,7 @@ def test_every_enabled_ci_command_references_an_existing_file():
         case_path = argv[1]
         if not (ROOT / case_path).is_file():
             missing.append(case_path)
-    missing += [case_path for case_path in _s3_list_paths() if not (ROOT / case_path).is_file()]
     assert not missing
-
-
-_S3_ENTRY_RE = re.compile(r"^(?P<path>[^\s:]+\.py)(?:::(?P<nodeid>\S+))?(?:\s+-m\s+(?P<marker>[A-Za-z_][A-Za-z0-9_]*))?$")
-
-
-def _s3_list_entries():
-    """(path, nodeid_or_None, marker_or_None) for every enabled S3 list entry.
-
-    Grammar: ``<path>[::<nodeid>][ -m <marker>]``. The trailing ``-m`` modifier
-    narrows the entry to the tests carrying that marker, which is how a file
-    whose arch-agnostic cases are not triaged for S3 yet is enlisted while only
-    its S3-only cases run (docs/s3_list_s3_only_selection_design.md).
-    """
-    entries = []
-    for line in _enabled_lines(S3_LIST):
-        match = _S3_ENTRY_RE.match(line)
-        assert match is not None, f"unparsable S3 list entry: {line!r}"
-        entries.append((match["path"], match["nodeid"], match["marker"]))
-    return entries
-
-
-def _s3_list_paths():
-    """Path part of the enabled S3 list entries (bare paths, like the main list)."""
-    return [path for path, _, _ in _s3_list_entries()]
 
 
 def test_conda_shell_bootstraps_from_home_without_user_startup(tmp_path):

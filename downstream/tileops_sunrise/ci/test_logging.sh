@@ -14,14 +14,14 @@ tileops_prepare_test_log () {
         >&"$TILEOPS_CONSOLE_FD" 2>&1 &
     TILEOPS_PROGRESS_PID=$!
     trap 'tileops_finish_test_log "$?"' EXIT
-    echo "Running TileOPs once per case; live case summaries below; full output: ${TILEOPS_TEST_LOG}.gz"
+    echo "Running TileOPs once per case; streaming full output; plain-text artifact: ${TILEOPS_TEST_LOG}"
 }
 
 tileops_finish_test_log () {
     local test_exit="$1" log_exit=0
     trap - EXIT
     set +e
-    # Drain progress before archiving, including when the test loop exits early.
+    # Drain console output before the summary, including when the test loop exits early.
     touch "${TILEOPS_TEST_LOG}.done" || {
         log_exit=$?
         kill -TERM "$TILEOPS_PROGRESS_PID" 2>/dev/null
@@ -32,7 +32,7 @@ tileops_finish_test_log () {
         echo "ERROR: live test progress failed (exit $log_exit)" >&"$TILEOPS_CONSOLE_FD"
     fi
     # An exit from inside the redirected runner (including cancel) must report
-    # back to the job console before compressing the log it was writing.
+    # back to the job console while retaining the log it was writing.
     python3 "$SCRIPT_DIR/test_log.py" "$(ci_failure_report_dir)" \
         >&"$TILEOPS_CONSOLE_FD" 2>&1 || log_exit=$?
     if [[ "$test_exit" -eq 0 && "$log_exit" -ne 0 ]]; then

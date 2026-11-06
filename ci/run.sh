@@ -1,12 +1,11 @@
 #!/bin/bash
 # Unified test-run entry for TileLang.
 #
-# Usage: ci/run.sh [--fresh] [--list FILE]... [--case SEL]... [--arch s2|s3] [--ci] [--dry-run]
+# Usage: ci/run.sh [--fresh] [--list FILE]... [--case SEL]... [--arch s2] [--ci] [--dry-run]
 #   --list FILE   a test-case list file (repeatable)
 #   --case SEL    a single selector (repeatable): a .py path, a "python x.py"
 #                 command, or a pytest nodeid (path.py::Class::test)
-#   --arch MODE   S2/S3 test mode (default s2): s2 = tang/stcu on real hardware,
-#                 s3 = tang/stcuv2 through the ISS simulator (see
+#   --arch MODE   test mode (default s2): s2 = tang/stcu on real hardware (see
 #                 ci_apply_test_mode in ci/lib.sh)
 #   --ci          CI flavor: bring up the isolated conda env, install the wheel,
 #                 export the audit-plugin env, and emit JUnit (self-contained)
@@ -35,7 +34,7 @@ EXIT_CASE_INVALID=4
 EXIT_EMPTY_PLAN=5
 
 usage () {
-    echo "Usage: ci/run.sh [--fresh] [--list FILE]... [--case SEL]... [--arch s2|s3] [--ci] [--dry-run]"
+    echo "Usage: ci/run.sh [--fresh] [--list FILE]... [--case SEL]... [--arch s2] [--ci] [--dry-run]"
 }
 
 FRESH=0 CI_MODE=0 DRY_RUN=0 ARCH="s2"
@@ -46,7 +45,7 @@ while [[ $# -gt 0 ]]; do
         --ci) CI_MODE=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         --arch)
-            [[ -n "${2:-}" ]] || { echo "ERROR: --arch requires s2 or s3" >&2; usage >&2; exit $EXIT_USAGE; }
+            [[ -n "${2:-}" ]] || { echo "ERROR: --arch requires s2" >&2; usage >&2; exit $EXIT_USAGE; }
             ARCH="$2"; shift 2 ;;
         --list)
             [[ -n "${2:-}" ]] || { echo "ERROR: --list requires a FILE" >&2; usage >&2; exit $EXIT_USAGE; }
@@ -64,9 +63,9 @@ if [[ ${#SRC_TYPE[@]} -eq 0 ]]; then
     SRC_TYPE+=("list"); SRC_VAL+=("$DEFAULT_LIST")
 fi
 
-# S2/S3 test mode: sets TILELANG_DEFAULT_TARGET / TANG_ARCH / TANG_SIMULATOR, which
-# both the test files (tilelang.testing.requires_stcu / requires_stcuv2) and the
-# execution-backend auto-selection read.
+# Test mode: sets TILELANG_DEFAULT_TARGET / TANG_ARCH, which both the test files
+# (tilelang.testing.requires_stcu / requires_stcuv2) and the execution-backend
+# selection read.
 ci_apply_test_mode "$ARCH" || exit $EXIT_USAGE
 
 # In CI flavor the built pytest command carries the audit plugin; set it early so
@@ -116,6 +115,7 @@ normalize_selection () {
         local script="${parts[1]:-}"
         if [[ ${#parts[@]} -eq 2 && "$script" == *.py ]]; then
             local abs="$script"; [[ "$abs" != /* ]] && abs="$base/$abs"
+            abs=$(realpath -m -- "$abs") || return 2
             if [[ "$origin" == "case" && ! -f "$abs" ]]; then
                 echo "ERROR: --case script not found: $script" >&2; return 2
             fi
@@ -129,6 +129,7 @@ normalize_selection () {
         local file_part="${selector%%::*}" node_suffix=""
         [[ "$selector" == *::* ]] && node_suffix="::${selector#*::}"
         local abs="$file_part"; [[ "$abs" != /* ]] && abs="$base/$abs"
+        abs=$(realpath -m -- "$abs") || return 2
         if [[ ! -f "$abs" && "$origin" == "case" ]]; then
             echo "ERROR: --case file not found: $file_part" >&2; return 2
         fi
@@ -145,11 +146,14 @@ declare -a MERGED=() DEDUPED=() DROPPED=()
 # Populated by ci_parse_list_into when it skips an unparsable line (build_plan).
 declare -a CI_DROPPED_LINES=()
 add_token () {
-    local tok="$1"
+    local tok="$1" commented="${2:-0}" entry="$1" slot
+    [[ "$commented" -eq 1 ]] && entry="# $tok"
     if [[ -n "${SEEN[$tok]:-}" ]]; then
+        slot=$((${SEEN[$tok]}-1))
+        [[ "$commented" -eq 0 ]] && MERGED[$slot]="$tok"
         DEDUPED+=("$tok"); return 0
     fi
-    SEEN[$tok]=1; MERGED+=("$tok")
+    SEEN[$tok]=$((${#MERGED[@]}+1)); MERGED+=("$entry")
 }
 
 # Expand every source in order into the merged, deduped plan.
@@ -161,16 +165,16 @@ for idx in "${!SRC_TYPE[@]}"; do
         fi
         lst_dir="$(cd "$(dirname "$sval")" && pwd)"
         ci_load_test_timeouts "$sval" pytest || exit $EXIT_CASE_INVALID
-        while IFS= read -r line; do
-            [[ $line =~ ^#.*$ ]] && continue
-            [[ -z $line ]] && continue
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            ci_decode_list_line "$line" pytest || continue
+            line="$CI_LIST_LINE"
             tok=$(normalize_selection "$line" "$lst_dir" "list"); rc=$?
             if [[ $rc -eq 1 ]]; then
                 echo "WARNING: run.sh: skipping unparsable line in ${sval}: ${line}" >&2
                 DROPPED+=("$line"); continue
             fi
             [[ $rc -eq 2 ]] && exit $EXIT_CASE_INVALID
-            add_token "$tok"
+            add_token "$tok" "$CI_LIST_COMMENT"
         done < "$sval"
     else
         tok=$(normalize_selection "$sval" "$INVOKE_CWD" "case"); rc=$?
@@ -207,6 +211,10 @@ if [[ $DRY_RUN -eq 1 ]]; then
     rm -f "$merged_file"
     echo "==================== Dry-run plan (${#CI_CMDS[@]} case(s)) ===================="
     for i in "${!CI_CMDS[@]}"; do
+        if [[ "${CI_CASE_MODES[$i]}" == list_comment ]]; then
+            printf '%3d  [SKIPPED]  %s (disabled by test list comment)\n' "$((i+1))" "${CI_LABELS[$i]}"
+            continue
+        fi
         timeout_key=$(ci_timeout_key "${CI_LABELS[$i]}" "$ROOT") || exit $EXIT_CASE_INVALID
         printf '%3d  [%-7s]  %s (timeout=%ss)\n         -> %s\n' \
             "$((i+1))" "${CI_CASE_MODES[$i]}" "${CI_LABELS[$i]}" \

@@ -4,8 +4,7 @@
 单 warp 循环实现,详见 docs/s3_tmem_fragment_ldt_stt_layout.md)。warp 专门化
 (指定非 0 warp)见 test_tang_tcgen05_warp_specialize.py。
 
-§1 Lowering 断言    test_ldst_lowering_*   (不跑 ISS, 对生成源码做正则)
-§2 数值 (via ISS)   test_ld_numeric / test_st_roundtrip_numeric
+§1 Lowering 断言    test_ldst_lowering_*   (对生成源码做正则)
 
 这些原语仅在 stcuv2 上支持;在 stcu 上不应产生对应指令。
 """
@@ -13,18 +12,15 @@
 import re
 
 import pytest
-import torch
 
 import tilelang
 import tilelang.testing
 import tilelang.tang.language as T
 from tilelang import tvm as tvm
-from tilelang.jit import JITKernel
 
 STCUV2_TARGET = {"kind": "tang", "arch": "stcuv2"}
 
 _TL_DTYPE = {"float16": T.float16, "bfloat16": T.bfloat16}
-_PT_DTYPE = {"float16": torch.float16, "bfloat16": torch.bfloat16}
 
 
 # ===========================================================================
@@ -85,17 +81,6 @@ def _lower_src(func, target=STCUV2_TARGET):
         return tilelang.lower(func, target=target).kernel_source
 
 
-def _sim_run(kernel, M, N, K, dtype):
-    pt = _PT_DTYPE[dtype]
-    torch.manual_seed(0)
-    A = torch.randn(M, K, dtype=pt)
-    B = torch.randn(N, K, dtype=pt)
-    ref = A.float() @ B.float().T
-    jit = JITKernel(kernel, out_idx=[-1], target=STCUV2_TARGET, execution_backend="simulator", verbose=False)
-    C = jit(A.ptpu(), B.ptpu()).cpu().float()
-    return (C - ref).abs().max().item() / (ref.abs().max().item() + 1e-6)
-
-
 # ===========================================================================
 # §1  Lowering assertions
 # ===========================================================================
@@ -128,40 +113,6 @@ def test_ld_rows_must_be_multiple_of_16():
     """A tile whose row count is not a multiple of 16 is rejected at lowering."""
     with pytest.raises(Exception, match=r"16x256b tmem fragment rows must be a multiple of 32"):
         _lower_src(_make_ld_kernel(24, 64, 64, 128, "float16"))
-
-
-# ===========================================================================
-# §2  Numeric (via ISS)
-# ===========================================================================
-
-
-@pytest.mark.parametrize(
-    "M,N,K,dtype",
-    [
-        (128, 32, 64, "float16"),
-        (128, 64, 64, "float16"),
-        (128, 128, 64, "float16"),
-        (128, 64, 64, "bfloat16"),
-        (64, 64, 64, "float16"),
-    ],
-)
-def test_ld_numeric(M, N, K, dtype):
-    """TMEM->fragment->global must reproduce the GEMM result."""
-    rel = _sim_run(_make_ld_kernel(M, N, K, 128, dtype), M, N, K, dtype)
-    assert rel < 1e-2, f"rel_err too large: {rel:.3e}"
-
-
-@pytest.mark.parametrize(
-    "M,N,K,dtype",
-    [
-        (128, 32, 64, "float16"),
-        (128, 64, 64, "float16"),
-    ],
-)
-def test_st_roundtrip_numeric(M, N, K, dtype):
-    """fragment->TMEM->fragment round-trip must be lossless."""
-    rel = _sim_run(_make_st_roundtrip_kernel(M, N, K, 128, dtype), M, N, K, dtype)
-    assert rel < 1e-2, f"rel_err too large: {rel:.3e}"
 
 
 if __name__ == "__main__":

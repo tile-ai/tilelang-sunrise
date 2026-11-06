@@ -1,4 +1,4 @@
-"""stcuv2 fence 自动注入测试 —— 对应 ``src/tang/transform/inject_tcgen05_fence.cc``。
+"""stcuv2 fence 自动注入测试 —— 对应 ``src/tang/transform/finalize_s3_thread_syncs.cc``。
 
 stcuv2 把 ordering 拆成互不覆盖的 **fence 域**：
 
@@ -7,7 +7,7 @@ stcuv2 把 ordering 拆成互不覆盖的 **fence 域**：
     fence.mem   —— 异步拷贝/DMA,组 fg0~fg7
 
 所以一条 ``fence_tc`` **不会** retired 掉 LDT/STT,反之亦然。
-``tl.tang.transform.InjectTcgen05Fence`` 在与 CUDA 版 ``InjectTcgen05Fence`` 等价的
+``tl.tang.transform.FinalizeS3ThreadSyncs`` 在与 CUDA 版 ``InjectTcgen05Fence`` 等价的
 交接点上按**邻居所属域**插入正确的指令:
 
 | 邻居                              | 注入                    |
@@ -27,20 +27,16 @@ stcuv2 把 ordering 拆成互不覆盖的 **fence 域**：
 ``fence_tmem``。非 stcuv2 目标、或不含 TC/TMEM 操作的函数原样返回。
 ``tang_tcgen05_mma_arrive`` 刻意不加 fence(mma 的 commit 已带 producer 侧 ordering)。
 
-§1 注入契约(只跑 pass,不跑 ISS)
-§2 pipeline 开关(``tl.enable_tang_inject_tcgen05_fence``,**默认开启**)+ ISS 数值验证
+§1 注入契约(只跑 pass)
+§2 pipeline 开关(``tl.enable_tang_inject_tcgen05_fence``,**默认开启**)
 """
 
 import re
-
-import pytest
-import torch
 
 import tilelang
 import tilelang.testing
 import tilelang.language as T
 from tilelang import tvm as tvm
-from tilelang.jit import JITKernel
 from tvm import tirx
 
 STCUV2_TARGET = {"kind": "tang", "arch": "stcuv2"}
@@ -147,11 +143,11 @@ def _sync_arrive(barrier_id: int = 0):
 def _apply(func, target=STCUV2_TARGET):
     mod = tvm.IRModule.from_expr(func.with_attr("global_symbol", "main"))
     mod = tirx.transform.BindTarget(tvm.target.Target(target))(mod)
-    return tilelang.tang.transform.InjectTcgen05Fence()(mod)
+    return tilelang.tang.transform.FinalizeS3ThreadSyncs()(mod)
 
 
 # ---------------------------------------------------------------------------
-# §1 注入契约
+# §1 Injection contract
 # ---------------------------------------------------------------------------
 
 
@@ -447,7 +443,9 @@ def test_copy_engine_calls_are_not_fenced():
         with T.Kernel(1):
             smem = T.decl_buffer((4,), T.float32, scope="shared")
             T.tvm_storage_sync("shared")
-            T.evaluate(_use("tl.tang_cp_tmem_to_shared", smem[0]))
+            # The pass identifies the ISA leaf by its tmem/smem operands, not
+            # by the old helper spelling.
+            T.evaluate(_use("tl.tang_cpt2s_16x64b_2d", smem[0]))
 
     mod = _apply(func)
     assert _fences(mod["main"].body) == 0
@@ -466,7 +464,7 @@ def test_non_stcuv2_targets_are_left_untouched():
 
 
 # ---------------------------------------------------------------------------
-# §2 pipeline 开关 + ISS 数值
+# §2 Pipeline switch
 # ---------------------------------------------------------------------------
 
 
@@ -520,33 +518,6 @@ def test_pipeline_flag_can_disable_injection():
     on = _lower_src({tilelang.PassConfigKey.TL_ENABLE_TANG_INJECT_TCGEN05_FENCE: True})
     assert len(_RE_FENCE.findall(off)) < len(_RE_FENCE.findall(on))
     assert not re.search(r"fence_tmem<\d+>\(\)", off), "opting out must not leave injected tmem fences behind"
-
-
-def test_injected_fence_gemm_matches_reference_on_iss():
-    """The injected fences must not change the numerical result on the ISS."""
-    import os
-
-    if not os.environ.get("TANG_S3_PTCC_PATH") or not os.environ.get("TANG_S3_ISS_PATH"):
-        pytest.skip("S3 simulator toolchain not configured (TANG_S3_PTCC_PATH/TANG_S3_ISS_PATH)")
-
-    torch.manual_seed(0)
-    M = N = 128
-    K = 64
-    a = torch.randn(M, K, dtype=torch.float16)
-    b = torch.randn(N, K, dtype=torch.float16)
-
-    with tvm.transform.PassContext(config={tilelang.PassConfigKey.TL_ENABLE_TANG_INJECT_TCGEN05_FENCE: True}):
-        kernel = JITKernel(
-            _make_tmem_gemm_kernel(M, N, K),
-            out_idx=[-1],
-            target=STCUV2_TARGET,
-            execution_backend="simulator",
-            verbose=False,
-        )
-
-    c = kernel(a.ptpu(), b.ptpu()).cpu()
-    ref = (a.float() @ b.float().t()).to(torch.float32)
-    torch.testing.assert_close(c, ref, atol=1e-2, rtol=1e-2)
 
 
 if __name__ == "__main__":

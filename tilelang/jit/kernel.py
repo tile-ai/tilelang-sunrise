@@ -17,7 +17,6 @@ from tilelang.jit.adapter import (
     CuTeDSLKernelAdapter,
     TVMFFIKernelAdapter,
     MetalKernelAdapter,
-    SimulatorKernelAdapter,
 )
 from tilelang.profiler import Profiler, TensorSupplyType
 from tilelang.contrib import nvcc as tl_nvcc
@@ -68,7 +67,7 @@ class JITKernel(Generic[_P, _T]):
         self,
         func: PrimFunc = None,
         out_idx: list[int] | int = None,
-        execution_backend: Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl", "simulator"] = "tvm_ffi",
+        execution_backend: Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] = "tvm_ffi",
         target: TargetLike = "auto",
         target_host: TargetLike | None = None,
         verbose: bool = False,
@@ -86,7 +85,7 @@ class JITKernel(Generic[_P, _T]):
             The TileLang TIR function to compile and wrap.
         out_idx : Union[List[int], int], optional
             Index(es) of the output tensors to return (default: None).
-        execution_backend : Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl", "simulator"], optional
+        execution_backend : Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"], optional
             Execution backend to use for kernel execution.
         target : str, dict, or tvm.target.Target, optional
             Compilation target (default: "auto"). Use a dict for target attributes,
@@ -160,7 +159,7 @@ class JITKernel(Generic[_P, _T]):
         target: TargetLike,
         target_host: TargetLike | None,
         out_idx: list[int] | int,
-        execution_backend: Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl", "simulator"],
+        execution_backend: Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"],
         pass_configs: dict[str, Any] | None = None,
         compile_flags: list[str] | None = None,
         backend_context: BackendContext | None = None,
@@ -363,18 +362,6 @@ class JITKernel(Generic[_P, _T]):
                 verbose=self.verbose,
                 pass_configs=pass_configs,
                 compile_flags=compile_flags,
-            )
-        elif execution_backend == "simulator":
-            adapter = create_adapter(
-                SimulatorKernelAdapter,
-                params=artifact.params,
-                result_idx=out_idx,
-                target=target,
-                func_or_mod=tilelang_func,
-                device_kernel_source=artifact.kernel_source,
-                verbose=self.verbose,
-                device_mod=artifact.device_mod,
-                pass_configs=pass_configs,
             )
         elif execution_backend == "cython":
             adapter = create_adapter(

@@ -1,46 +1,40 @@
 """stcuv2 mbarrier 原语测试。
 
 覆盖 T.alloc_barrier / T.mbarrier_arrive / T.mbarrier_wait_parity /
-T.mbarrier_expect_tx 四个原语在 TANG 上的 lowering、拒绝路径与数值语义。
+T.mbarrier_expect_tx 四个原语在 TANG 上的 lowering 与拒绝路径。
 
-背景(详见 docs/tang_mbarrier.md):S3 硬件只实现了四条 mbarrier 原子操作
+S3 硬件只实现了四条 mbarrier 原子操作
 (expect_tx / complete_tx / arrive / arrive_drop),init 与所有 wait 变体都是
 device 库用软件模拟的 —— init 是一次带位布局的存储 + fence.mem,wait 是轮询
 64 位 barrier 字高位的 phase 域。于是有两个测试上的后果:
 
 * 没有阻塞 wait 指令,`.wait(parity)` 由 tl_templates/tang/barrier.h 里的自旋
-  实现,所以数值用例才是真正的判据 —— lowering 断言看不出自旋写错。
+  实现;lowering 断言看不出自旋写错。
 * `init` 由 LowerSharedBarrier 注入,TANG 有自己的一份
   (src/tang/transform/lower_shared_barrier.cc)。不复用 CUDA 那份是因为
   src/cuda/transform 在 USE_CUDA=OFF 时整个不编译,而 S3 构建正是这个配置;
-  且 CUDA 那份带 cluster barrier 分支,TANG 没有 cluster 层级。漏掉 init 不会
+  且 CUDA 那份带 cluster barrier 分支,TANG 现在也有（shared.cluster_barrier,
+  远端 arrive 走 DSHM）。漏掉 init 不会
   报错,只会让 arrive/wait 在一块未初始化的共享内存上工作 —— §1 的 init 断言
-  钉的是这条静默失败,§6 单独钉这个 pass 自身。
-
-§3 数值用例验证的是什么,需要说清楚,否则容易高估:它确认 barrier.h 过得了
-ptcc、init 真被注入、arrive 真递减了计数、自旋 wait 能退出、并且连续两轮的
-parity 语义正确。它**不**验证互斥 —— TileLang 的 ThreadStorageSync 会因 shared
-上的 RAW 依赖自动插入 __syncthreads(),所以把 arrive/wait 全删掉,同一个 kernel
-的结果依然精确正确(已实测)。真正证明 wait 是阻塞的、parity 是承载语义的,是
-另一个反向对照:传一个永不满足的 parity 会让 kernel 自旋不退出(已实测挂死)。
-那个用例没有收进来 —— 判定它得靠超时,在 CI 里既慢又脆。
+  钉的是这条静默失败,§5 单独钉这个 pass 自身。
 
 expect_tx 只接通指令,不保证与 bulk copy 的 tx 配对语义:递减侧 complete_tx 的
 硬件计数被厂商标为不可靠。所以这里只断言它发射得出来,不做数值配对用例。
+arrive_expect_tx 同样只断言发射:它调用 __mbarrier_arrive_expect_tx,设备库
+把它实现成先 expect_tx 再 arrive,不是一条融合原子指令。
 """
 
 import pathlib
 import re
 
 import pytest
-import torch
 
 import tilelang
 import tilelang.testing
 import tilelang.tang.language as T
 from tilelang import tvm as tvm
-from tilelang.jit import JITKernel
 from tilelang.tang import transform as tang_transform
+from tilelang.testing.tang_ir import mma_descriptors
 
 STCUV2_TARGET = {"kind": "tang", "arch": "stcuv2"}
 STCU_TARGET = {"kind": "tang", "arch": "stcu"}
@@ -66,12 +60,8 @@ def _assert_not_in_ir(txt: str, *patterns: str):
         assert not re.search(pat, txt), f"Unexpected '{pat}' found in IR:\n{txt}"
 
 
-def _sim_jit(func):
-    return JITKernel(func, out_idx=[-1], target=STCUV2_TARGET, execution_backend="simulator", verbose=False)
-
-
 # ===========================================================================
-# §0  API existence — 方言导出链
+# §0  API existence -- the dialect's export chain
 # ===========================================================================
 
 
@@ -186,7 +176,7 @@ def test_expect_tx_lowers_to_expect_transaction():
     """expect_tx 指令存在,必须能发射出来。
 
     注意这只保证指令发得出、跑得动;它与 bulk copy 的 tx 配对语义**不保证**,
-    因为递减侧 complete_tx 的硬件计数不可靠(docs/tang_mbarrier.md §4)。
+    因为递减侧 complete_tx 的硬件计数不可靠。
     """
 
     @T.prim_func
@@ -205,23 +195,12 @@ def test_expect_tx_lowers_to_expect_transaction():
     _assert_in_ir(_lower_src(kernel), r"\.expect_transaction\(512\)")
 
 
-# ===========================================================================
-# §2  拒绝路径 —— 报错必须停在 lowering,而不是 ptcc
-# ===========================================================================
+def test_arrive_expect_tx_lowers_to_device_helper():
+    """接到 __mbarrier_arrive_expect_tx,经 Barrier::arrive_expect_tx 发射。
 
-
-def test_alloc_barrier_rejected_on_stcu():
-    """S2 没有 mbarrier(整个 __mbarrier_* 家族由 __Tang_ARCH__ >= 200 门控)。
-
-    不提前拒绝的话,ptcc 会在 barrier.h 内部报一个既不提 barrier 也不提 arch
-    的错。
+    设备库把这条 shared-memory 接口实现成 expect_tx 之后再 arrive,没有融合
+    硬件指令。这里只钉 lowering,不把 tx 计数和 bulk copy 配成数值用例。
     """
-    with pytest.raises(ValueError, match=r"stcuv2"):
-        _lower_src(_make_block_sync_kernel(), target=STCU_TARGET)
-
-
-def test_arrive_expect_tx_rejected():
-    """ISA 无融合 arrive.expect_tx,静默拆成两条会丢原子性。"""
 
     @T.prim_func
     def kernel(A: T.Tensor((128,), T.float32), B: T.Tensor((128,), T.float32)):
@@ -235,12 +214,30 @@ def test_arrive_expect_tx_rejected():
             for i in T.Parallel(128):
                 B[i] = s[127 - i]
 
-    with pytest.raises(Exception, match=r"fused arrive\.expect_tx|arrive_expect_tx"):
-        _lower_src(kernel)
+    _assert_in_ir(_lower_src(kernel), r"\.arrive_expect_tx\(512\)")
 
 
-def test_cluster_barrier_rejected():
-    """TANG 无 cluster 层级,cluster barrier 在任何 arch 上都没有对应物。"""
+# ===========================================================================
+# §2  Rejection path -- the error must stop in lowering, not in ptcc
+# ===========================================================================
+
+
+def test_alloc_barrier_rejected_on_stcu():
+    """S2 没有 mbarrier(整个 __mbarrier_* 家族由 __Tang_ARCH__ >= 200 门控)。
+
+    不提前拒绝的话,ptcc 会在 barrier.h 内部报一个既不提 barrier 也不提 arch
+    的错。
+    """
+    with pytest.raises(ValueError, match=r"stcuv2"):
+        _lower_src(_make_block_sync_kernel(), target=STCU_TARGET)
+
+
+def test_local_cta_arrive_lowers_to_block_arrive():
+    """cta_id 只接受常量 0,落到本 CTA 的 .arrive()。
+
+    远端 rank 要走 __set_block_rank 加 DSHM __mbarrier_arrive,这条没有接。
+    前端不传 pred,等价于始终 arrive。
+    """
 
     @T.prim_func
     def kernel(A: T.Tensor((128,), T.float32), B: T.Tensor((128,), T.float32)):
@@ -249,103 +246,113 @@ def test_cluster_barrier_rejected():
             bar = T.alloc_cluster_barrier(128)
             for i in T.Parallel(128):
                 s[i] = A[i]
-            T.mbarrier_arrive(bar[0])
-            T.mbarrier_wait_parity(bar[0], 0)
+            T.mbarrier_arrive(bar, 0)
+            T.mbarrier_wait_parity(bar, 0)
             for i in T.Parallel(128):
                 B[i] = s[127 - i]
 
-    with pytest.raises(ValueError, match=r"cluster"):
+    src = _lower_src(kernel)
+    _assert_in_ir(src, r"\.arrive\(\);", r"\.init\(128\)")
+
+
+def test_remote_cta_arrive_lowers_to_cluster_arrive():
+    """非 0 的常量 cta_id 生成远端 arrive：mapa 到 peer CTA 的 mbarrier 后
+    DSHM arrive（tl::cluster_arrive_barrier，依赖 LLVM 的 DSHM builtins）。"""
+
+    @T.prim_func
+    def kernel(A: T.Tensor((128,), T.float32), B: T.Tensor((128,), T.float32)):
+        with T.Kernel(1, threads=128):
+            s = T.alloc_shared((128,), T.float32)
+            bar = T.alloc_cluster_barrier(128)
+            for i in T.Parallel(128):
+                s[i] = A[i]
+            T.mbarrier_arrive(bar, 1)
+            T.mbarrier_wait_parity(bar, 0)
+            for i in T.Parallel(128):
+                B[i] = s[127 - i]
+
+    src = _lower_src(kernel)
+    _assert_in_ir(src, r"tl::cluster_arrive_barrier\([^,]+,\s*\(int\)\(1\)\)")
+    _assert_in_ir(src, r"cluster\.h")
+
+
+def test_nonconstant_cta_arrive_lowers_with_runtime_rank():
+    """运行时 rank 不能静默当成 cta 0：它作为寄存器操作数进入远端 arrive。"""
+
+    @T.prim_func
+    def kernel(A: T.Tensor((128,), T.int32)):
+        with T.Kernel(1, threads=128):
+            bar = T.alloc_cluster_barrier(1)
+            T.mbarrier_arrive(bar, T.block_rank_in_cluster())
+            A[0] = 0
+
+    src = _lower_src(kernel)
+    _assert_in_ir(src, r"tl::cluster_arrive_barrier\([^,]+,\s*\(int\)\(")
+    _assert_not_in_ir(src, r"\.arrive\(\);")
+
+
+def test_negative_arrive_expect_tx_rejected():
+    """负数 tx 不能交给 unsigned 参数截断。"""
+
+    @T.prim_func
+    def kernel(A: T.Tensor((128,), T.float32)):
+        with T.Kernel(1, threads=128):
+            bar = T.alloc_barrier(1)
+            T.mbarrier_arrive_expect_tx(bar[0], -1)
+            A[0] = 0
+
+    with pytest.raises(Exception, match=r"transaction count"):
         _lower_src(kernel)
 
 
-# ===========================================================================
-# §3  数值(ISS)—— 自旋 wait 的唯一判据
-# ===========================================================================
-
-
-@pytest.mark.parametrize(
-    "size,threads",
-    [
-        (128, 128),
-        (256, 128),  # 每个线程搬多个元素
-        (128, 256),  # 线程数 > 元素数
-    ],
-)
-def test_barrier_block_sync_numeric(size, threads):
-    """带 barrier 的 kernel 必须编得过 ptcc、跑得完、结果等于 reverse(A)。
-
-    这条用例的价值在"跑得完":init 若没注入、arrive 若没递减、自旋若不退出,
-    kernel 会挂在 wait 上直到超时,而不是给出错的数。数值本身是精确的(整个通路
-    只有搬运,没有算术),所以用零容差比较。
-    """
-    torch.manual_seed(0)
-    A = torch.randn(size, dtype=torch.float32)
-    jit = _sim_jit(_make_block_sync_kernel(size=size, threads=threads, arrive_count=threads))
-    B = jit(A.ptpu()).cpu()
-    torch.testing.assert_close(B, torch.flip(A, dims=[0]), rtol=0, atol=0)
-
-
-def test_barrier_parity_flip_numeric():
-    """连续两轮复用同一个 barrier,parity 必须按 0/1 交替。
-
-    单轮用例盖不住相位:barrier 的相位从 0 起,第一轮等 parity 0 是"翻离 0",
-    第二轮等 parity 1 是"翻离 1"。若把 parity 钉死成常量,第二轮会永远等不到,
-    kernel 挂死 —— 这是本文件里唯一能区分"相位真的在翻"和"第一轮恰好蒙对"的
-    用例。
-
-    两个 barrier 各司其职:bars[0] 是写完成,bars[1] 是读完成。少了后者,快线程
-    会在慢线程读 s 之前进入下一轮把 s 覆盖掉,那是 kernel 自身的 WAR 竞态,与
-    parity 语义无关。
-    """
-    size = 128
-    rounds = 2
+def test_cp_async_barrier_noinc_lowers_to_g2s_fence_arrive():
+    """没有 cp.async.mbarrier.arrive。noinc 接到 fence.arrive_mbar.mem。"""
 
     @T.prim_func
-    def kernel(A: T.Tensor((rounds, size), T.float32), B: T.Tensor((rounds, size), T.float32)):
-        with T.Kernel(1, threads=size):
-            s = T.alloc_shared((size,), T.float32)
-            bars = T.alloc_barrier([size, size])
-            for k in T.serial(rounds):
-                for i in T.Parallel(size):
-                    s[i] = A[k, i]
-                T.mbarrier_arrive(bars[0])
-                T.mbarrier_wait_parity(bars[0], k % 2)
-                for i in T.Parallel(size):
-                    B[k, i] = s[size - 1 - i]
-                T.mbarrier_arrive(bars[1])
-                T.mbarrier_wait_parity(bars[1], k % 2)
+    def kernel(A: T.Tensor((128,), T.float32), B: T.Tensor((128,), T.float32)):
+        with T.Kernel(1, threads=128):
+            s = T.alloc_shared((128,), T.float32)
+            bar = T.alloc_barrier(1)
+            T.cp_async_barrier_noinc(bar[0])
+            T.mbarrier_wait_parity(bar[0], 0)
+            for i in T.Parallel(128):
+                s[i] = A[i]
+            for i in T.Parallel(128):
+                B[i] = s[127 - i]
 
-    torch.manual_seed(0)
-    A = torch.randn(rounds, size, dtype=torch.float32)
-    B = _sim_jit(kernel)(A.ptpu()).cpu()
-    torch.testing.assert_close(B, torch.flip(A, dims=[1]), rtol=0, atol=0)
+    _assert_in_ir(_lower_src(kernel), r"\.cp_async_arrive_noinc\(\)")
 
 
 # ===========================================================================
-# §4  GEMM + mbarrier —— 对标 CUDA 的 tcgen05 gemm 用例
+# §3  GEMM + mbarrier -- the counterpart of CUDA's tcgen05 gemm case
 # ===========================================================================
 #
-# testing/python/language/test_tilelang_language_tcgen05_gemm.py 那套模式是
-# `gemm(A_s, B_s, C_tmem, mbar)` 让 MMA 自己把完成事件发布进 mbarrier,消费者
-# `mbarrier_wait_parity` 后读 TMEM。那个文件在这台机器上 16/17 跳过(要 sm_100
-# 实卡,且 compile 写死 target="cuda"),无法用来检验 TANG。
+# The pattern in testing/python/language/test_tilelang_language_tcgen05_gemm.py
+# is `gemm(A_s, B_s, C_tmem, mbar)`: the MMA publishes its own completion into an
+# mbarrier and the consumer reads TMEM after `mbarrier_wait_parity`. That file is
+# skipped 16/17 on this machine (it needs a real sm_100 card and hard-codes
+# target="cuda"), so it cannot be used to exercise TANG.
 #
-# 本节复刻的是它的**同步**形状:MMA 与 TMEM 读之间的顺序由 tcgen05 fence 建立,
-# mbarrier 只承担跨线程会合(取代 __syncthreads())。这是新增覆盖:既有 gemm 用例
-# 不碰 mbarrier,而 §1–§3 的 mbarrier 用例不碰 gemm/TMEM。
+# This section reproduces its **synchronisation** shape: the order between the
+# MMA and the TMEM read is established by tcgen05 fences, and the mbarrier only
+# carries the cross-thread rendezvous (in place of __syncthreads()). The coverage
+# is new: the existing gemm cases never touch an mbarrier, and the mbarrier cases
+# of §1-§2 never touch gemm/TMEM.
 #
-# 让 MMA 自己发布完成事件的那条(CUDA 的 mbar= 本义)在 §5,两者不是一回事:
-# 这里的 gemm 是阻塞的,§5 的不是。
+# The variant where the MMA publishes its own completion (the original meaning of
+# CUDA's mbar=) is in §4; the two are not the same thing: the gemm here is
+# blocking, the one there is not.
 #
-# 排水走 T.copy(C_t, D) 直通,与其余 S3 gemm 用例一致。刻意不走
-# TMEM->shared->global 那条三跳:那条路要求显式标注 tang_swizzle_atom_bytes,
-# 漏标会静默出错,把它和 mbarrier 缠在一个用例里会让失败原因难以归属 —— 三跳
-# 本身另有 test_tang_tcgen05_cpt2s.py 覆盖。
+# The drain goes through T.copy(C_t, D) directly, like every other S3 gemm case.
+# The three-hop TMEM->shared->global path is deliberately avoided: it requires an
+# explicit tang_swizzle_atom_bytes annotation, a missing one fails silently, and
+# mixing that into an mbarrier case would make a failure hard to attribute -- the
+# three-hop path has its own coverage in test_tang_tcgen05_cpt2s.py.
 
 
 def _make_gemm_mbarrier_kernel(num_k_tiles=1, fence_group=0):
     M = N = 128
-    BK = 64  # fp16 下 K=64 正好压在每条 MMA 的 128 字节行上限
+    BK = 64  # with fp16, K=64 sits exactly on the 128-byte operand row cap
     K = BK * num_k_tiles
 
     @T.prim_func
@@ -387,52 +394,39 @@ def test_gemm_mbarrier_lowering_keeps_both_fence_and_barrier():
     )
 
 
-@pytest.mark.parametrize("num_k_tiles", [1, 2])
-def test_gemm_mbarrier_rendezvous_numeric(num_k_tiles):
-    """gemm 结果经 mbarrier 会合后读出,必须等于 A @ B^T。
-
-    num_k_tiles=2 让 MMA 累加链跨两轮,顺带确认 mbarrier 与 clear_accum 的累加
-    语义不互相干扰。
-    """
-    M = N = 128
-    K = 64 * num_k_tiles
-    torch.manual_seed(42)
-    A = torch.randn(M, K, dtype=torch.float16)
-    B = torch.randn(N, K, dtype=torch.float16)
-
-    jit = _sim_jit(_make_gemm_mbarrier_kernel(num_k_tiles=num_k_tiles))
-    got = jit(A.ptpu(), B.ptpu()).cpu().float()
-    want = A.float() @ B.float().T
-
-    rel = (got - want).abs().max().item() / (want.abs().max().item() + 1e-6)
-    assert rel < 1e-2, f"gemm+mbarrier rel_err too large: {rel:.3e}"
-
-
 # ===========================================================================
-# §5  完成 mbarrier —— MMA 自己发布完成事件
+# §4  Completion mbarrier -- the MMA publishes its own completion
 # ===========================================================================
 #
-# §4 那套是「fence 建立顺序 + mbarrier 做跨线程会合」,MMA 本身是同步的。这一节
-# 是 CUDA `T.gemm(A, B, C_tmem, mbar=bar)` 的真正对应物:MMA 不阻塞,发起 warp 把
-# 自己的 tensor-core fence group 绑到 barrier 上(fence_tc_arrive_mbarrier),
-# 硬件在该组的 MMA 退休时投递 arrive,消费者等 parity。
+# §3 is "fences establish the order + the mbarrier carries the cross-thread
+# rendezvous", with the MMA itself blocking. This section is the real counterpart
+# of CUDA's `T.gemm(A, B, C_tmem, mbar=bar)`: the MMA does not block; the issuing
+# warp binds its tensor-core fence group to the barrier
+# (fence_tc_arrive_mbarrier), the hardware posts the arrive when that group's MMA
+# retires, and the consumer waits on the parity.
 #
-# 三条硬约束决定了下面的断言(依据 cccl/tang/__ptx/instructions/fence.h):
+# Three hard constraints determine the assertions below (from
+# cccl/tang/__ptx/instructions/fence.h):
 #
-#   1. fence group 是 **warp 私有**的("synchronize operations in current warp"),
-#      所以一个 warp 的 fence 覆盖不了兄弟 warp 的 MMA。
-#   2. arrive 是 **warp 级且恰好一次**(.noinc),不是每线程一次。
-#   3. 于是 N 个发起 warp 就是 N 次 arrive,barrier 的 arrive count 必须等于
-#      warp 数 —— 而 count 定在 T.alloc_barrier(),GEMM lowering 时拿不到。
+#   1. A fence group is **warp private** ("synchronize operations in current
+#      warp"), so one warp's fence cannot cover a sibling warp's MMA.
+#   2. The arrive is **warp level and exactly once** (.noinc), not once per
+#      thread.
+#   3. So N issuing warps post N arrives, and the barrier's arrive count must
+#      equal the warp count -- while the count is fixed in T.alloc_barrier() and
+#      is not available to the GEMM lowering.
 #
-# lowering 因此在 mbar= 时把 warp 切分收敛成单 warp,让 arrive 恒为 1,与 CUDA
-# 源码的 alloc_barrier(1) 对齐。test_..._collapses_to_one_warp 钉的就是这条:
-# 谁要是把多 warp 放回来而不同时解决 count,barrier 会永远等不满而挂死。
+# Lowering therefore collapses the warp partition to a single warp when mbar= is
+# used, keeping the arrive count at 1 to match the CUDA source's
+# alloc_barrier(1). test_..._collapses_to_one_warp pins exactly that: bringing
+# multi-warp back without solving the count at the same time leaves the barrier
+# waiting forever.
 #
-# 「arrive 恰好一次」是实测结论,不是推断。三个对照(见 docs/tang_mbarrier.md
-# T1):wait(0) 正常返回;wait(1) 挂死(说明 phase 只翻了一次);去掉 mbar= 后
-# wait(0) 也挂死(说明 wait 不是空转、确实靠这次 arrive 才放行)。后两条靠超时
-# 判定,太慢也太脆,没有收进 CI。
+# "Arrive exactly once" is a measured conclusion, not an inference. Three
+# controls: wait(0) returns normally; wait(1) hangs (the phase flips only once);
+# and without mbar=, wait(0) hangs too (so the wait is not a no-op and really
+# needs that arrive to be released). The last two are judged by timeout -- too
+# slow and too brittle, so they are not part of CI.
 
 
 def _make_completion_mbarrier_kernel(api="tcgen05"):
@@ -446,7 +440,7 @@ def _make_completion_mbarrier_kernel(api="tcgen05"):
       "mma_arrive" GEMM 自己同步收尾,再由选出的 warp 手工提交完成事件。
     """
     M = N = 128
-    K = 64  # fp16 下 K=64 正好压在每条 MMA 的 128 字节行上限
+    K = 64  # with fp16, K=64 sits exactly on the 128-byte operand row cap
 
     @T.prim_func
     def kernel(A: T.Tensor((M, K), T.float16), B: T.Tensor((N, K), T.float16), D: T.Tensor((M, N), T.float32)):
@@ -472,13 +466,11 @@ def _make_completion_mbarrier_kernel(api="tcgen05"):
     return kernel
 
 
-def _gemm_partition(src):
-    """从 mma_desc 的 subM/subN 反推 warp_m / warp_n (M=N=128)。"""
-    m = re.search(r"mma_desc<([^>]*)>", src)
-    assert m, f"no mma_desc emitted:\n{src}"
-    parts = [p.strip() for p in m.group(1).split(",")]
-    # D_FMT, A_FMT, B_FMT, a_major, b_major, subM, subN, K
-    return 128 // int(parts[5]), 128 // int(parts[6])
+def _gemm_partition(kernel):
+    """从 IR 指令描述符的 subM/subN 反推 warp_m / warp_n (M=N=128)。"""
+    desc = mma_descriptors(kernel, STCUV2_TARGET)
+    assert desc.instr is not None, "no tcgen05 MMA instruction descriptor in the lowered IR"
+    return desc.partition(128, 128)
 
 
 @pytest.mark.parametrize("api", ["tcgen05", "sync"])
@@ -489,7 +481,8 @@ def test_gemm_completion_mbarrier_lowers_to_a_fence_arrive(api):
         src,
         r"#include <tl_templates/tang/barrier\.h>",
         r"\.init\(1\)",
-        # mbar= 下完成协议改为 arrive_on_tc_fence, 而非 fence_tc。
+        # With mbar= the completion protocol becomes arrive_on_tc_fence instead
+        # of fence_tc.
         r"arrive_on_tc_fence\(\)",
         r"\.wait\(0\)",
     )
@@ -508,8 +501,9 @@ def test_sync_gemm_supplies_the_parity_wait_itself():
     src = _lower_src(_make_completion_mbarrier_kernel("sync"))
     _assert_in_ir(src, r"\.wait\(0\)")
 
-    # 反面:异步接口不许自作主张补 wait,否则手工调度就失去意义。这里用一个
-    # 不写 wait 的 tcgen05_gemm kernel 对照。
+    # The other way round: an async interface must not insert a wait on its own,
+    # otherwise manual scheduling would lose its point. A tcgen05_gemm kernel
+    # that writes no wait is the control here.
     M = N = 128
     K = 64
 
@@ -534,29 +528,13 @@ def test_gemm_completion_mbarrier_collapses_to_one_warp():
     同一个 kernel 不传 mbar 时会拿到多 warp 切分,两边对比才能说明这是 mbar=
     造成的收敛,而不是这个 shape 本来就单 warp。
     """
-    wm_with, wn_with = _gemm_partition(_lower_src(_make_completion_mbarrier_kernel()))
-    wm_without, wn_without = _gemm_partition(_lower_src(_make_gemm_mbarrier_kernel()))
+    wm_with, wn_with = _gemm_partition(_make_completion_mbarrier_kernel())
+    wm_without, wn_without = _gemm_partition(_make_gemm_mbarrier_kernel())
 
     assert (wm_with, wn_with) == (1, 1), f"mbar= should collapse the MMA to a single warp, got ({wm_with},{wn_with})"
     assert (wm_without, wn_without) != (1, 1), (
         f"the no-mbar baseline is single-warp too, so this test cannot tell the collapse apart: ({wm_without},{wn_without})"
     )
-
-
-@pytest.mark.parametrize("api", ["tcgen05", "sync"])
-def test_gemm_completion_mbarrier_numeric(api):
-    """MMA 完成事件经 barrier 发布后读出的 TMEM,必须等于 A @ B^T。"""
-    M = N = 128
-    K = 64
-    torch.manual_seed(42)
-    A = torch.randn(M, K, dtype=torch.float16)
-    B = torch.randn(N, K, dtype=torch.float16)
-
-    got = _sim_jit(_make_completion_mbarrier_kernel(api))(A.ptpu(), B.ptpu()).cpu().float()
-    want = A.float() @ B.float().T
-
-    rel = (got - want).abs().max().item() / (want.abs().max().item() + 1e-6)
-    assert rel < 1e-2, f"completion-mbarrier gemm rel_err too large: {rel:.3e}"
 
 
 def test_tcgen05_mma_arrive_lowers_to_a_fence_arrive():
@@ -566,71 +544,22 @@ def test_tcgen05_mma_arrive_lowers_to_a_fence_arrive():
     也不提替代做法。
     """
     src = _lower_src(_make_completion_mbarrier_kernel("mma_arrive"))
-    # 前端把 barrier 过了 retrieve_ptr,所以到 codegen 手里是指针,发射的是 `->`。
+    # The frontend passes the barrier through retrieve_ptr, so codegen sees a
+    # pointer and emits `->`.
     _assert_in_ir(src, r"->arrive_on_tc_fence\(\)", r"\.wait\(0\)")
 
 
-def test_tcgen05_mma_arrive_numeric():
-    """手工提交那条路同样要能放行 parity 等待并读出正确结果。"""
-    M = N = 128
-    K = 64
-    torch.manual_seed(7)
-    A = torch.randn(M, K, dtype=torch.float16)
-    B = torch.randn(N, K, dtype=torch.float16)
-
-    jit = _sim_jit(_make_completion_mbarrier_kernel("mma_arrive"))
-    got = jit(A.ptpu(), B.ptpu()).cpu().float()
-    want = A.float() @ B.float().T
-
-    rel = (got - want).abs().max().item() / (want.abs().max().item() + 1e-6)
-    assert rel < 1e-2, f"tcgen05_mma_arrive gemm rel_err too large: {rel:.3e}"
-
-
-def test_completion_mbarrier_on_the_tmem_a_path():
-    """A 在 TMEM 的 TS 路径同样支持 mbar= (arrive_on_tc_fence + parity wait)。
-
-    早先 TS 模板仍然内联 fence、没接 barrier,所以此处只断言拒绝;现在 Python
-    emitter 的 TS 路径也走 arrive_on_tc_fence,数值必须正确。
-    """
-    M = N = 128
-    K = 64
-
-    @T.prim_func
-    def kernel(A: T.Tensor((M, K), T.float16), B: T.Tensor((N, K), T.float16), D: T.Tensor((M, N), T.float32)):
-        with T.Kernel(1, 1, threads=32):
-            A_f = T.alloc_fragment((M, K), T.float16)
-            A_t = T.alloc_tmem((M, K), T.float16)
-            B_s = T.alloc_shared((N, K), T.float16)
-            C_t = T.alloc_tmem((M, N), T.float32)
-            bar = T.alloc_barrier(1)
-            T.copy(A, A_f)
-            T.copy(A_f, A_t)
-            T.copy(B, B_s)
-            T.gemm(A_t, B_s, C_t, transpose_B=True, clear_accum=True, mbar=bar[0])
-            T.mbarrier_wait_parity(bar[0], 0)
-            T.copy(C_t, D)
-
-    src = _lower_src(kernel)
-    _assert_in_ir(src, r"arrive_on_tc_fence\(\)", r"\.wait\(0\)")
-
-    torch.manual_seed(3)
-    A = torch.randn(M, K, dtype=torch.float16)
-    B = torch.randn(N, K, dtype=torch.float16)
-    got = _sim_jit(kernel)(A.ptpu(), B.ptpu()).cpu().float()
-    want = A.float() @ B.float().T
-    rel = (got - want).abs().max().item() / (want.abs().max().item() + 1e-6)
-    assert rel < 1e-2, f"TS mbar gemm rel_err too large: {rel:.3e}"
-
-
 # ===========================================================================
-# §6  pass 级断言 —— TANG 自有的 LowerSharedBarrier
+# §5  Pass-level assertions -- TANG's own LowerSharedBarrier
 # ===========================================================================
 #
-# §1 是在生成的 C++ 源码上断言的,过的是整条 pipeline。这一节直接调 pass 本身,
-# 断言的是 IR 层面注入了哪些 call。两者的分工:pipeline 接线断了(比如前端导出
-# 名写错、pass_filter 的 arch 条件写错),§1 会挂但指不出原因;pass 自身的重写
-# 逻辑写错,§6 会精确指出。CUDA 那份的同类测试在
-# testing/python/transform/test_tilelang_transform_lower_shared_barrier.py。
+# §1 asserts on the generated C++ source and runs the whole pipeline. This section
+# calls the pass itself and asserts which calls got injected at the IR level. The
+# split of duties: if the pipeline wiring is broken (a wrong FFI export name, a
+# wrong arch condition in pass_filter), §1 fails without pointing anywhere; if the
+# pass's own rewrite is wrong, §5 names it precisely. The CUDA counterpart of this
+# test lives in
+# testing/python/transform/test_tilelang_transform_lower_shared_barrier.py.
 
 
 def _apply_barrier_pass(func):
@@ -733,7 +662,8 @@ def test_tang_fence_barrier_init_is_indexed_under_tang_op():
     body = _apply_barrier_pass(func)
 
     assert len(_collect_calls(body, "tl.tang_fence_barrier_init")) == 1
-    # 旧的 backend-neutral 名字不应再出现:产生点已经改用 TANG 拼写。
+    # The old backend-neutral name must not appear any more: the producer now uses
+    # the TANG spelling.
     assert _collect_calls(body, "tl.ptx_fence_barrier_init") == []
 
 

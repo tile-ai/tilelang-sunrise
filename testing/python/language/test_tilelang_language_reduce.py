@@ -1074,10 +1074,7 @@ def _compile(prim_func):
     """Compile with the target the current run mode selects.
 
     ``env.get_default_target()`` is what ``TILELANG_DEFAULT_TARGET`` /
-    ``TANG_ARCH`` resolve to, so this helper serves both TANG modes without any
-    per-test pin: S2 mode passes ``tang/stcu`` (real hardware, tvm_ffi backend),
-    S3 mode passes ``tang/stcuv2`` and ``TANG_SIMULATOR=1`` makes the simulator
-    the auto-selected execution backend.
+    ``TANG_ARCH`` resolve to, so this helper needs no per-test target pin.
     """
     return tilelang.compile(prim_func, out_idx=-1, target=tilelang.env.get_default_target())
 
@@ -1186,44 +1183,6 @@ def _make_nan_reduce_kernel(reduce_fn, M, N, dtype, threads, *, nan_propagate):
             T.copy(dst, B)
 
     return kernel
-
-
-# S3-only: the fp8 kernel needs the fp8 header that only the S3 toolchain ships,
-# and ptcc selects that toolchain for `arch=stcuv2` alone (see
-# tilelang/contrib/ptcc.py). Both halves come from the run mode, so the shared
-# ``_compile`` helper is enough here:
-#   S3 mode: TILELANG_DEFAULT_TARGET/TANG_ARCH = stcuv2 (the target) and
-#            TANG_SIMULATOR=1 auto-selects the ISS execution backend;
-#   S2 mode: this test skips via @requires_stcuv2.
-@tilelang.testing.requires_stcuv2
-def test_reduce_packed_fp8_to_float16_absmax_runtime():
-    if not hasattr(torch, "float8_e4m3fn"):
-        pytest.skip("torch.float8_e4m3fn is not available")
-
-    @T.prim_func
-    def kernel(A: T.Tensor((4, 32), T.float8_e4m3fn), B: T.Tensor((4,), T.float16)):
-        with T.Kernel(1, threads=32):
-            src = T.alloc_fragment((4, 32), T.float8_e4m3fn)
-            dst = T.alloc_fragment((4,), T.float16)
-            T.copy(A, src)
-            T.reduce_absmax(src, dst, dim=1)
-            T.copy(dst, B)
-
-    k = _compile(kernel)
-    source = k.get_kernel_source()
-    assert "from_uint1<__half2>(*(fp8" not in source
-
-    # Build the input on the CPU and hand the simulator a ptpu copy: the ptpu
-    # backend implements neither aten::linspace nor an fp8 cast.
-    base = torch.linspace(-2.0, 2.0, 128, dtype=torch.float16).reshape(4, 32)
-    base[0, 3] = -7.0
-    base[1, 17] = 5.5
-    base[2, 31] = -3.25
-    base[3, 0] = 4.0
-    A = base.to(torch.float8_e4m3fn)
-    B = k(A.ptpu())
-    ref = A.to(torch.float16).abs().amax(dim=1)
-    _assert_close(B, ref, atol=0, rtol=0)
 
 
 def test_reduce_packed_max_nan_propagate_uses_nan_intrinsics():

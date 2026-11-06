@@ -2,3 +2,4 @@
 tests/ops/test_grouped_gemm.py	2700
 tests/ops/test_mamba.py	3600
 tests/ops/test_convolution.py	1800
+tests/ops/test_kda.py	1800

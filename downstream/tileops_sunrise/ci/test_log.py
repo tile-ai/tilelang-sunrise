@@ -1,9 +1,7 @@
-"""Show live case progress and archive the complete shared-runner output."""
+"""Stream the complete test log and retain it as a plain-text artifact."""
 
 import collections
-import gzip
 import json
-import shutil
 import signal
 import sys
 import time
@@ -20,20 +18,14 @@ def follow(raw_log: Path) -> None:
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
-    prefixes = ("Total test cases:", ">>>>>>> running case ", "Case timeout:", "  -> ", "ERROR:")
-    pending = ""
-    with raw_log.open(encoding="utf-8", errors="replace") as source:
+    # The runner writes this file directly, independently of GitLab's trace limit.
+    with raw_log.open("rb") as source:
         while True:
-            chunk = source.readline()
+            chunk = source.read(65536)
             if chunk:
-                pending += chunk
-                if pending.endswith("\n"):
-                    if pending.startswith(prefixes):
-                        print(pending, end="", flush=True)
-                    pending = ""
+                sys.stdout.buffer.write(chunk)
+                sys.stdout.buffer.flush()
             elif stopping or done.exists():
-                if pending.startswith(prefixes):
-                    print(pending, flush=True)
                 return
             else:
                 time.sleep(0.2)
@@ -41,12 +33,9 @@ def follow(raw_log: Path) -> None:
 
 def finish(report_dir: Path) -> None:
     raw_log = report_dir / "tileops-test.log"
-    archive = raw_log.with_suffix(".log.gz")
-    # Retain the original on any archive failure, including a full filesystem.
-    with raw_log.open("rb") as source, gzip.open(archive, "wb") as target:
-        shutil.copyfileobj(source, target)
-    raw_log.unlink()
-    print(f"Full test log (case/attempt/command boundaries included): {archive}")
+    if not raw_log.is_file():
+        raise RuntimeError("full test log missing")
+    print(f"Full test log (plain-text artifact): {raw_log}")
 
     counts = collections.Counter()
     report = report_dir / "tileops.jsonl"

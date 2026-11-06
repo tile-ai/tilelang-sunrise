@@ -1,18 +1,6 @@
-"""stcuv2 PromoteTmemAccumulator — fragment 累加器自动提升到 tensor memory。
-
-stcuv2 没有累加到寄存器的 MMA 形式:SelectInst 把 C 在 shared.tmem 的路由到
-tcgen5、C 在 shared 的路由到 wgmma,其余落到只存在于 stcu 的 TMMA。所以
-``T.gemm`` 的 C 来自 ``T.alloc_fragment`` 时在 stcuv2 上根本没有可用指令。
-``PromoteTmemAccumulator`` 把这种自然写法改写成 tmem 写法(见
-src/tang/transform/promote_tmem_accumulator.cc)。
-
-§1 改写契约      test_promote_*        (只跑 pass, 断言 IR)
-§2 端到端数值    test_promoted_gemm_numeric_*
-§3 拒绝路径      test_promote_rejects_*
-"""
+"""stcuv2 PromoteTmemAccumulator — fragment 累加器自动提升到 tensor memory。"""
 
 import pytest
-import torch
 
 import tilelang
 import tilelang.language as T
@@ -20,10 +8,6 @@ from tilelang import tvm as tvm
 from tvm import IRModule, tirx
 
 STCUV2_TARGET = {"kind": "tang", "arch": "stcuv2"}
-
-# tcgen5 reads exactly a 128-byte operand row per MMA, so the legal BK is fixed
-# per dtype. Anything else has no legal swizzle -- see CheckOperandRowBytes.
-_LEGAL_BK = {"float16": 64, "bfloat16": 64, "float32": 32}
 
 
 # ===========================================================================
@@ -100,11 +84,7 @@ def test_promote_rewrites_scope_fill_and_clear_accum():
 
 
 def test_promote_keeps_gemm_annotations():
-    """改写 clear_accum 时不能丢掉 gemm 上的 TANG annotations。
-
-    重建 Call 而不是 CopyOnWrite 会静默丢掉 tang_k_step / tang_scale_*,后者决定
-    缩放 GEMM 的描述符,丢了以后是"看起来合理但错"的结果。
-    """
+    """改写 clear_accum 时不能丢掉 gemm 上的 TANG annotations。"""
     annotations = {"tang_k_step": 4, "tang_scale_block": 64, "preserve_marker": 7}
     func = _fragment_matmul(256, 256, 256, 128, 128, 64, gemm_annotations=annotations)
 
@@ -184,36 +164,7 @@ def test_promoted_kernel_lowers_to_tcgen5_mma():
     func = _fragment_matmul(256, 256, 256, 128, 128, 64)
     with tvm.transform.PassContext(), tvm.target.Target(STCUV2_TARGET):
         artifact = tilelang.lower(func, target=STCUV2_TARGET)
-    assert "tang::ptx::mma<" in artifact.kernel_source, artifact.kernel_source
-
-
-# ===========================================================================
-# §2  End-to-end numerics on the ISS
-# ===========================================================================
-
-
-@pytest.mark.parametrize("dtype, tol", [("float16", 2e-2), ("float32", 2e-2)])
-def test_promoted_gemm_numeric(dtype, tol):
-    """多 block + K-tiling 的 fragment 写法必须与 torch CPU 结果一致。
-
-    M=N=K=256 配 128x128 的 tile 同时覆盖两件事:4 个 block(检验 drain 的 per-block
-    base offset)和 K>BK 的多次迭代(检验折出来的 ``clear_accum=(k==0)`` —— 若它恒为
-    真则只剩最后一片 K 的贡献,若恒为假则叠加上一个 tile 的残值)。
-    """
-    M = N = K = 256
-    block_K = _LEGAL_BK[dtype]
-    torch_dtype = getattr(torch, dtype)
-    kernel = tilelang.compile(
-        _fragment_matmul(M, N, K, 128, 128, block_K, dtype),
-        out_idx=[2],
-        target=STCUV2_TARGET,
-        execution_backend="simulator",
-    )
-    a = torch.randn(M, K, dtype=torch_dtype)
-    b = torch.randn(N, K, dtype=torch_dtype)
-    out = kernel(a.ptpu(), b.ptpu())
-    ref = (a.to(torch.float32) @ b.to(torch.float32).T).to(torch_dtype)
-    torch.testing.assert_close(out.cpu(), ref, rtol=tol, atol=tol)
+    assert "tl::tang_tcgen05_mma_ss(" in artifact.kernel_source, artifact.kernel_source
 
 
 # ===========================================================================
@@ -275,11 +226,16 @@ def test_promote_rejects_elementwise_epilogue(epilogue):
     _expect_promotion_error(func, pattern)
 
 
-def test_promote_rejects_copy_to_shared():
-    """累加器只有到 global 的 drain;拷到 shared 没有对应路径。"""
+def test_promote_folds_pure_staging_copy():
+    """`C_local -> shared -> global` 纯中转时,折叠成 `C_local -> global`。
+
+    stcuv2 的累加器只有"融合 drain 到 global"这一条出口,所以这种写法原本直接
+    报错。当中转 buffer 只被这一对 copy 触碰(单写单读、无逐元素访问)时,省掉
+    中转写出的字节完全相同,pass 就把它折掉,让 kernel 原样可用。
+    """
 
     @T.prim_func
-    def drain_to_shared(
+    def staged(
         A: T.Tensor((128, 64), "float16"),
         B: T.Tensor((128, 64), "float16"),
         C: T.Tensor((128, 128), "float32"),
@@ -296,7 +252,67 @@ def test_promote_rejects_copy_to_shared():
             T.copy(C_local, C_shared)
             T.copy(C_shared, C[0, 0])
 
-    _expect_promotion_error(drain_to_shared, r"only a copy to global memory")
+    script = _apply_promotion(staged)["main"].script()
+    assert 'scope="shared.tmem"' in script, script
+    # 中转 buffer 已无任何使用者,连分配一起消失
+    assert "C_shared" not in script, script
+
+
+def test_promote_folds_staged_column_slice():
+    """中转只为了切片写回时也要能折:这里只写回前 96 列。"""
+    M = N = 128
+    K = 64
+
+    @T.prim_func
+    def sliced(
+        A: T.Tensor((M, K), "float16"),
+        B: T.Tensor((N, K), "float16"),
+        C: T.Tensor((N, N), "float32"),
+    ):
+        with T.Kernel(1, 1, threads=128) as (bx, by):
+            A_shared = T.alloc_shared((M, K), "float16")
+            B_shared = T.alloc_shared((N, K), "float16")
+            C_shared = T.alloc_shared((M, N), "float32")
+            C_local = T.alloc_fragment((M, N), "float32")
+            T.clear(C_local)
+            T.copy(A[0, 0], A_shared)
+            T.copy(B[0, 0], B_shared)
+            T.gemm(A_shared, B_shared, C_local, transpose_B=True)
+            T.copy(C_local, C_shared)
+            T.copy(C_shared[:, 0:96], C[0, 0])
+
+    script = _apply_promotion(sliced)["main"].script()
+    assert 'scope="shared.tmem"' in script, script
+    assert "C_shared" not in script, script
+
+
+def test_promote_rejects_staged_tile_with_second_use():
+    """中转 buffer 还有第二个使用者时不能折 —— 仍按原样报错。
+
+    省掉中转会连第二个使用者一起丢掉,所以只有"单写单读"才是纯中转。
+    """
+
+    @T.prim_func
+    def shared_staged_twice(
+        A: T.Tensor((128, 64), "float16"),
+        B: T.Tensor((128, 64), "float16"),
+        C: T.Tensor((128, 128), "float32"),
+        D: T.Tensor((128, 128), "float32"),
+    ):
+        with T.Kernel(1, 1, threads=128) as (bx, by):
+            A_shared = T.alloc_shared((128, 64), "float16")
+            B_shared = T.alloc_shared((128, 64), "float16")
+            C_shared = T.alloc_shared((128, 128), "float32")
+            C_local = T.alloc_fragment((128, 128), "float32")
+            T.clear(C_local)
+            T.copy(A[0, 0], A_shared)
+            T.copy(B[0, 0], B_shared)
+            T.gemm(A_shared, B_shared, C_local, transpose_B=True)
+            T.copy(C_local, C_shared)
+            T.copy(C_shared, C[0, 0])
+            T.copy(C_shared, D[0, 0])
+
+    _expect_promotion_error(shared_staged_twice, r"only a copy to global memory")
 
 
 def test_promote_rejects_nonzero_init():
@@ -324,7 +340,7 @@ def test_promote_rejects_nonzero_init():
 def test_promote_rejects_uninitialized_accumulator():
     """既没有 T.clear 也没有 clear_accum 时报错,而不是从残值开始累加。
 
-    编译期必须拒绝未初始化的累加器,不能依赖运行时内存初值。
+    ISS 上 TMEM 上电为零,所以这个 bug 在模拟器里是不可观测的 —— 必须在编译期拦住。
     """
 
     @T.prim_func
@@ -392,6 +408,106 @@ def test_promote_does_not_mask_fragment_operand_error():
         tvm.target.Target(STCUV2_TARGET),
     ):
         tilelang.lower(frag_a, target=STCUV2_TARGET)
+
+
+# ===========================================================================
+# §9  A staging pair that runs under different guards is not folded
+# ===========================================================================
+#
+# The fold moves the *producer*'s copy onto the consumer's global destination
+# and deletes the consumer statement, so the two must run exactly where each
+# other runs. Requiring the same loop nest is not enough: with the producer at
+# the top level and the write-back under ``if cond``, folding makes the global
+# write unconditional -- the output is written on iterations where the kernel
+# never asked for it. Tracked as the same guard stack now, and reported with
+# the reason instead of the generic "it is copied to shared".
+
+
+def _guarded_staging_pair(where, M=128, N=128, K=64):
+    """`C_local -> C_shared -> C`, with the guard on the consumer or producer."""
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, K), "float16"),
+        B: T.Tensor((N, K), "float16"),
+        C: T.Tensor((M, N), "float32"),
+        flag: T.int32,
+    ):
+        with T.Kernel(1, 1, threads=128) as (bx, by):
+            A_shared = T.alloc_shared((M, K), "float16")
+            B_shared = T.alloc_shared((N, K), "float16")
+            C_shared = T.alloc_shared((M, N), "float32")
+            C_local = T.alloc_fragment((M, N), "float32")
+            T.clear(C_local)
+            T.copy(A[0, 0], A_shared)
+            T.copy(B[0, 0], B_shared)
+            T.gemm(A_shared, B_shared, C_local, transpose_B=True)
+            if where == "consumer":
+                T.copy(C_local, C_shared)
+                if flag > 0:
+                    T.copy(C_shared, C[0, 0])
+            elif where == "producer":
+                if flag > 0:
+                    T.copy(C_local, C_shared)
+                T.copy(C_shared, C[0, 0])
+            else:  # both: same guard, folding is still valid
+                if flag > 0:
+                    T.copy(C_local, C_shared)
+                    T.copy(C_shared, C[0, 0])
+
+    return main
+
+
+@pytest.mark.parametrize("where", ["consumer", "producer"])
+def test_promote_rejects_a_staging_pair_under_different_guards(where):
+    """折叠会把 global 写搬过 if 边界,必须拒绝,并说明真正的原因。"""
+    _expect_promotion_error(
+        _guarded_staging_pair(where),
+        r"do not run in the same loop nest and under the same guards",
+    )
+
+
+def test_promote_rejects_an_undrainable_write_back_width():
+    """写回列数必须是 8 的倍数,报错要指名 buffer 和修复方向。
+
+    LDT 的列粒度是 8 列(每行一个 32 字节 atom),没有更窄的指令去补余数,所以
+    `[:, 0:100]` 这种切片只能拒绝 —— 但拒绝时要说清是哪块 buffer、多少列、怎么
+    改,而不是抛一条内部检查。
+    """
+
+    @T.prim_func
+    def odd_slice(
+        A: T.Tensor((128, 64), "float16"),
+        B: T.Tensor((128, 64), "float16"),
+        C: T.Tensor((128, 128), "float32"),
+    ):
+        with T.Kernel(1, 1, threads=128) as (bx, by):
+            A_shared = T.alloc_shared((128, 64), "float16")
+            B_shared = T.alloc_shared((128, 64), "float16")
+            C_shared = T.alloc_shared((128, 128), "float32")
+            C_local = T.alloc_fragment((128, 128), "float32")
+            T.clear(C_local)
+            T.copy(A[0, 0], A_shared)
+            T.copy(B[0, 0], B_shared)
+            T.gemm(A_shared, B_shared, C_local, transpose_B=True)
+            T.copy(C_local, C_shared)
+            T.copy(C_shared[:, 0:100], C[0, 0])
+
+    with pytest.raises(Exception) as err:
+        tilelang.lower(odd_slice, target=STCUV2_TARGET)
+
+    msg = str(err.value)
+    assert "written back to 'C' over 100 columns" in msg, msg
+    assert "not a multiple of 8" in msg, msg
+    assert "[:, 0:96] is drainable" in msg, msg
+
+
+def test_promote_folds_a_pair_under_the_same_guard():
+    """两边同处一个 if:折叠把写回留在同一个分支里,语义不变,仍要折。"""
+    script = _apply_promotion(_guarded_staging_pair("both"))["main"].script()
+    assert 'scope="shared.tmem"' in script, script
+    assert "C_shared" not in script, script
+    assert "if flag > 0:" in script, script
 
 
 if __name__ == "__main__":
