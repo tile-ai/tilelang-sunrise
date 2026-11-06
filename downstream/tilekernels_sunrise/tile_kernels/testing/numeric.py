@@ -2,45 +2,52 @@ import math
 import torch
 
 
-def assert_equal(x: torch.Tensor, y: torch.Tensor,
-                    check_dtype: bool = True,
-                    check_shape: bool = True,
-                    check_stride: bool = True) -> None:
-    # Move to CPU for device-agnostic comparison (avoid unsupported ops on PTPU, etc.)
-    x = x.cpu()
-    y = y.cpu()
-    assert not check_dtype or x.dtype == y.dtype, \
-        f'Tensor dtypes are not equal: {x.dtype} vs {y.dtype}'
-    assert not check_shape or x.shape == y.shape, \
-        f'Tensor shapes are not equal: {x.shape} vs {y.shape}'
-    assert not check_stride or x.numel() == 0 or x.stride() == y.stride(), \
-        f'Tensor strides are not equal: {x.stride()} vs {y.stride()}'
-    assert x.device == y.device, \
-        f'Tensor devices are not equal: {x.device} vs {y.device}'
+def assert_equal(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    check_dtype: bool = True,
+    check_shape: bool = True,
+    check_stride: bool = True,
+) -> None:
+    assert not check_dtype or x.dtype == y.dtype, f'Tensor dtypes are not equal: {x.dtype} vs {y.dtype}'
+    assert not check_shape or x.shape == y.shape, f'Tensor shapes are not equal: {x.shape} vs {y.shape}'
+    assert not check_stride or x.numel() == 0 or x.stride() == y.stride(), f'Tensor strides are not equal: {x.stride()} vs {y.stride()}'
+    assert x.device == y.device, f'Tensor devices are not equal: {x.device} vs {y.device}'
     # Hints: The tensor with a size of [32768, 1] and a stride of [1, 32768] is considered contiguous,
     # but using .view will cause an error. Therefore, .flatten is used to ensure the stride of the last dimension is 1.
-    mask = x != y
-    assert torch.equal(x.contiguous().flatten().view(torch.uint8), y.contiguous().flatten().view(torch.uint8)), \
-        f'Tensor values are not equal: {x.shape=} vs {y.shape=}\n' \
-        f'mask={torch.nonzero(mask)}\n' \
-        f'{x[mask]}\nvs\n{y[mask]}' \
+    if x.device.type == 'ptpu':
+        torch.ptpu.synchronize()
+        x, y = x.cpu(), y.cpu()
+    x_bytes = x.contiguous().flatten().as_strided((x.numel(),), (1,)).view(torch.uint8)
+    y_bytes = y.contiguous().flatten().as_strided((y.numel(),), (1,)).view(torch.uint8)
+    if torch.equal(x_bytes, y_bytes):
+        return
+
+    try:
+        mask = x != y
+        detail = f'mask={torch.nonzero(mask)}\n{x[mask]}\nvs\n{y[mask]}'
+    except RuntimeError:
+        # Some dtypes (e.g. float8_e4m3fn on Ascend) don't support `!=`; compare raw bytes.
+        byte_mask = x_bytes != y_bytes
+        detail = f'byte_mask={torch.nonzero(byte_mask)}\n{x_bytes[byte_mask]}\nvs\n{y_bytes[byte_mask]}'
+    raise AssertionError(f'Tensor values are not equal: {x.shape=} vs {y.shape=}\n{detail}')
 
 
-def calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
-    # Compute sum((x - y)^2) / sum(x^2 + y^2) directly. The mathematically
-    # equivalent ``1 - 2 * sum(x*y) / sum(x^2 + y^2)`` form suffers catastrophic
-    # cancellation when x ~= y: ``sim`` is within float32 eps of 1, so ``1 - sim``
-    # collapses to 0 (CPU) or eps noise (PTPU) instead of the true ~1e-16 value.
-    # Move to CPU first so the result is a plain float usable in
-    # ``assert diff < tol`` without a device scalar cast (PTPU lacks it).
-    x, y = x.float().cpu(), y.float().cpu()
+def calc_diff(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    if x.device.type == 'ptpu' or y.device.type == 'ptpu':
+        torch.ptpu.synchronize()
+        x, y = x.cpu(), y.cpu()
+    x, y = x.double(), y.double()
     denominator = (x * x + y * y).sum()
-    if denominator.item() == 0:
-        return 0.0
-    return float(((x - y) * (x - y)).sum() / denominator)
+    delta = x - y
+    diff = (delta * delta).sum() / denominator
+    return diff if denominator != 0 else 0
 
 
 def check_bias(x: torch.Tensor, ref_x: torch.Tensor) -> None:
+    if x.device.type == 'ptpu' or ref_x.device.type == 'ptpu':
+        torch.ptpu.synchronize()
+        x, ref_x = x.cpu(), ref_x.cpu()
     count = x.numel()
     if count == 0:
         return
@@ -58,11 +65,12 @@ def check_bias(x: torch.Tensor, ref_x: torch.Tensor) -> None:
     # So 99.99999% confidence interval should be something like this:
     # (-c / sqrt(count), c / sqrt(count)) around 0.5
     allowed_diff_ratio = 10 / math.sqrt(x.numel())
-    assert abs(less_ratio - 0.5) < allowed_diff_ratio, \
-        f'Less than ratio not close to 0.5 (size = {x.numel()}): {less_ratio=:.4f}\n' \
-        f'Expected:\n  {ref_x.view(-1, 4)}\n' \
-        f'Actual:\n   {x.view(-1, 4)}\n' \
-        f'  Less than: {less_count}\n  Equal to:  {equal_count}\n  Greater than: {count - less_count - equal_count}\n'\
+    assert abs(less_ratio - 0.5) < allowed_diff_ratio, (
+        f'Less than ratio not close to 0.5 (size = {x.numel()}): {less_ratio=:.4f}\n'
+        f'Expected:\n  {ref_x.view(-1, 4)}\n'
+        f'Actual:\n   {x.view(-1, 4)}\n'
+        f'  Less than: {less_count}\n  Equal to:  {equal_count}\n  Greater than: {count - less_count - equal_count}\n'
+    )
 
 
 def count_bytes(*tensors) -> int:

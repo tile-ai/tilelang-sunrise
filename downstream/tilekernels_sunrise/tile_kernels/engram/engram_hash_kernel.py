@@ -1,65 +1,7 @@
-import os
-
 import torch
-import tilelang
-from tilelang import language as T
 
-
-@tilelang.jit(
-    pass_configs={
-        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-        tilelang.PassConfigKey.TL_DISABLE_VECTORIZE_256: True,
-    },
-)
-def get_engram_hash_kernel(
-    max_ngram_size: int = 3,
-    num_ngram_layers: int = 2,
-    num_embed_table_per_ngram: int = 8,
-):
-    num_tokens = T.dynamic('num_tokens')
-    threads = 32
-    blk_m = threads
-    num_out_cols = (max_ngram_size - 1) * num_embed_table_per_ngram
-
-    @T.prim_func
-    def engram_hash_kernel(
-        ngram_token_ids: T.Tensor[(num_tokens, max_ngram_size), T.int32],
-        multipliers: T.Tensor[(num_ngram_layers, max_ngram_size), T.int64],
-        vocab_sizes: T.Tensor[(num_ngram_layers, max_ngram_size - 1, num_embed_table_per_ngram), T.int32],
-        offsets: T.Tensor[(num_ngram_layers, num_out_cols), T.int32],
-        output: T.Tensor[(num_ngram_layers, num_tokens, num_out_cols), T.int32],
-    ):
-        with T.Kernel(num_ngram_layers, T.ceildiv(num_tokens, blk_m), threads=threads) as (pid_h, pid_s):
-            tid = T.get_thread_binding()
-            token_idx = pid_s * blk_m + tid
-            if token_idx >= num_tokens:
-                T.thread_return()
-            x_local = T.alloc_local((max_ngram_size,), T.int32)
-            multipliers_local = T.alloc_local((max_ngram_size,), T.int64)
-            vocab_sizes_local = T.alloc_local((max_ngram_size - 1, num_embed_table_per_ngram), T.int32)
-            offsets_local = T.alloc_local((num_out_cols,), T.int32)
-            output_local = T.alloc_local((num_out_cols,), T.int32)
-            hash_local = T.alloc_var(T.int64)
-
-            T.copy(multipliers[pid_h, :], multipliers_local)
-            T.copy(vocab_sizes[pid_h, :, :], vocab_sizes_local)
-            T.copy(offsets[pid_h, :], offsets_local)
-            T.copy(ngram_token_ids[token_idx, :], x_local)
-
-            hash_local = 0
-            for ngram_idx in T.unroll(0, max_ngram_size):
-                hash_local = T.bitwise_xor(
-                    hash_local,
-                    T.cast(x_local[ngram_idx], T.int64) * multipliers_local[ngram_idx],
-                )
-                if ngram_idx > 0:
-                    for j in T.unroll(num_embed_table_per_ngram):
-                        col = (ngram_idx - 1) * num_embed_table_per_ngram + j
-                        output_local[col] = (hash_local % T.cast(vocab_sizes_local[ngram_idx - 1, j], T.int64)) + offsets_local[col]
-
-            T.copy(output_local, output[pid_h, token_idx, :])
-
-    return engram_hash_kernel
+from tile_kernels.config import get_is_tang, get_num_vec_cores, get_pdl, is_ascend
+from tile_kernels.engram.engram_hash_cuda import get_engram_hash_kernel_cuda
 
 
 def engram_hash(
@@ -67,6 +9,7 @@ def engram_hash(
     multipliers: torch.Tensor,
     vocab_sizes: torch.Tensor,
     offsets: torch.Tensor,
+    image_token_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute n-gram hash embedding indices.
 
@@ -77,6 +20,7 @@ def engram_hash(
             shape (num_ngram_layers, max_ngram_size - 1, num_embed_table_per_ngram), int32.
         offsets: Per-layer embedding table offsets,
             shape (num_ngram_layers, (max_ngram_size - 1) * num_embed_table_per_ngram), int32.
+        image_token_mask: Optional, ``True`` stands for image tokens, shape (num_tokens,), bool.
 
     Returns:
         Embedding indices, shape (num_ngram_layers, num_tokens, (max_ngram_size - 1) * num_embed_table_per_ngram), int32.
@@ -87,11 +31,34 @@ def engram_hash(
 
     output = torch.empty((num_ngram_layers, num_tokens, num_out_cols), dtype=torch.int32, device=ngram_token_ids.device)
 
-    kernel = get_engram_hash_kernel(max_ngram_size, num_ngram_layers, num_embed_table_per_ngram)
-    if int(os.getenv('TK_PRINT_KERNEL_SOURCE', 0)):
-        print(kernel.get_kernel_source())
+    if is_ascend():
+        from tile_kernels.engram.engram_hash_asc import get_engram_hash_kernel_asc
+
+        kernel = get_engram_hash_kernel_asc(
+            max_ngram_size,
+            num_ngram_layers,
+            num_embed_table_per_ngram,
+            has_image_token_mask=image_token_mask is not None,
+            num_vec_cores=get_num_vec_cores(),
+        )
+    else:
+        kernel = get_engram_hash_kernel_cuda(
+            max_ngram_size,
+            num_ngram_layers,
+            num_embed_table_per_ngram,
+            has_image_token_mask=image_token_mask is not None and not get_is_tang(),
+            use_pdl=get_pdl(),
+        )
 
     if num_tokens > 0:
-        kernel(ngram_token_ids, multipliers, vocab_sizes, offsets, output)
+        kernel_mask = image_token_mask
+        if get_is_tang() and kernel_mask is None:
+            kernel_mask = torch.empty((num_tokens,), dtype=torch.bool, device=ngram_token_ids.device)
+        kernel(ngram_token_ids, multipliers, vocab_sizes, offsets, kernel_mask, output)
+        if get_is_tang() and image_token_mask is not None:
+            from tile_kernels.engram.engram_hash_tang import get_engram_hash_mask_kernel_tang
+
+            mask_kernel = get_engram_hash_mask_kernel_tang(num_ngram_layers, num_out_cols)
+            mask_kernel(image_token_mask, output)
 
     return output
