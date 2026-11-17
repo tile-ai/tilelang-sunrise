@@ -70,7 +70,12 @@ def test_topk_select_op(
         op.request_tune()
     inputs = test.gen_inputs()
 
-    test.check(op, *inputs)
+    logits = inputs[0]
+    # The 2**32-score case exceeds the host budget of whole-tensor verification.
+    if logits.device.type == "ptpu" and logits.numel() > 2**31:
+        test.check(op, *inputs, verify_call=test.verify_in_query_blocks)
+    else:
+        test.check(op, *inputs)
 
 
 @pytest.mark.smoke

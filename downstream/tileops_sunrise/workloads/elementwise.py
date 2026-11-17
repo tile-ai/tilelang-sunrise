@@ -930,6 +930,19 @@ class Exhaustive16BitWorkload(ElementwiseWorkload):
         codes = torch.arange(1 << 16, dtype=torch.int32, device=run_device()).to(torch.int16)
         super().__init__(op_name, (codes.view(dtype).repeat(repeats),))
 
+    def ref_program(self, x):
+        reference = super().ref_program
+        if (
+            self.name == "ReciprocalFwdOp"
+            and x.dtype == torch.float16
+            and x.device.type == "cpu"
+            and x.numel() > 1 << 16
+        ):
+            # CPU parallel half-to-float casts can canonicalize NaNs at chunk tails.
+            # Keep each complete 16-bit domain aligned for the exact payload comparison.
+            return torch.cat([reference(block) for block in x.split(1 << 16)])
+        return reference(x)
+
     def verification(self, *inputs):
         from workloads.numerics import Custom
 

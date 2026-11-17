@@ -80,12 +80,13 @@ class TestBase(WorkloadBase):
         """
         raise NotImplementedError
 
-    def check(self, op, *inputs: torch.Tensor, runs=None) -> None:
+    def check(self, op, *inputs: torch.Tensor, runs=None, verify_call=None) -> None:
         """Verify a workload's declaration and attribute the result to its Op.
 
         Numerical policy belongs to verification(), never to the call site.
         runs supplies a compiled or wrapped form of the op. *inputs* are in signature order;
         the op receives a ``kw_only`` one by name.
+        verify_call can supply a bounded verifier taking the bound run and the original inputs.
         """
         _check_result.op_name = None
         _check_result.op_module = None
@@ -95,12 +96,16 @@ class TestBase(WorkloadBase):
         _refuse_non_op(op, name, runs)
         _check_result.op_name = name
         _check_result.op_module = module
-        result = verify(
-            self.ref_program,
-            inputs,
-            evidence=verification_for(self.verification, inputs),
-            requests={name: Request(_by_signature(op, op if runs is None else runs), inputs)},
-        )[name]
+        run = _by_signature(op, op if runs is None else runs)
+        if verify_call is None:
+            result = verify(
+                self.ref_program,
+                inputs,
+                evidence=verification_for(self.verification, inputs),
+                requests={name: Request(run, inputs)},
+            )[name]
+        else:
+            result = verify_call(run, *inputs)
         if not result.checked_outputs:
             pytest.skip(result.unchecked_reason)
         _check_result.checked_outputs = result.checked_outputs

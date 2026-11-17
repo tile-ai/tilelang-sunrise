@@ -3,6 +3,7 @@ import torch
 
 from tests.workload_test_base import FixtureBase, TestBase
 from tileops._ops.gemm.grouped_gemm import GroupedGEMMFwdOp
+from workloads.device import run_device_is_cuda
 from workloads.gemm import (
     GroupedGEMMWorkload,
 )
@@ -109,7 +110,10 @@ def test_grouped_gemm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The kernel accumulates in fp32; by default PyTorch lets cuBLAS reduce fp16 in fp16.
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_fp16_reduced_precision_reduction", False)
+    if run_device_is_cuda():
+        monkeypatch.setattr(
+            torch.backends.cuda.matmul, "allow_fp16_reduced_precision_reduction", False
+        )
     test = GroupedGEMMTest(batch_sum, batch_count, N, K, dtype, trans_a, trans_b)
     op = GroupedGEMMFwdOp(trans_a=trans_a, trans_b=trans_b)
     if tune:
@@ -128,7 +132,10 @@ def test_k_grouped_gemm_with_ragged_groups(
     A group whose length is not a multiple of 8 starts mid-vector, and the empty group's
     output block is zero.
     """
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_fp16_reduced_precision_reduction", False)
+    if run_device_is_cuda():
+        monkeypatch.setattr(
+            torch.backends.cuda.matmul, "allow_fp16_reduced_precision_reduction", False
+        )
     sizes = [100, 0, 300, 64, 7, 1]
     test = GroupedGEMMTest(sum(sizes), len(sizes), 200, 136, dtype, True, trans_b)
     test.batch_sizes_list = sizes

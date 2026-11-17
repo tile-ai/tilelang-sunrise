@@ -78,6 +78,78 @@ def test_custom_comparison_cannot_bypass_structure():
         compare_outputs(got, torch.ones(2), Custom(lambda *_: None, "always accepts"))
 
 
+@pytest.mark.parametrize("wrong_tail", [False, True])
+def test_topk_query_blocks_check_the_tail(monkeypatch, wrong_tail):
+    from types import SimpleNamespace
+
+    from tests import workload_test_base
+    from tileops.attention import TopKSelectFwdOp
+    from workloads.attention.topk_select import TopKSelectWorkload
+
+    workload = TopKSelectWorkload(2, 129, 6, 2, 2, torch.float32, torch.int32)
+    below_tie = torch.nextafter(torch.tensor(7.0), torch.tensor(0.0)).item()
+    scores = torch.tensor([10.0, 7.0, 7.0, below_tie, 1.0, 0.0])
+    logits = scores.view(1, 1, 6, 1).expand(2, 129, 6, 2).contiguous()
+    starts = torch.zeros((2, 129), dtype=torch.int32)
+    ends = torch.full_like(starts, 6)
+    ends[0, 1] = 1  # One selected key and one padding slot.
+    starts[-1, -1], ends[-1, -1] = 1, 4
+    inputs = (logits, starts, ends)
+    expected = workload.ref_program(*inputs)
+    got = expected.flip(-1)
+    got[0, 0, 0, 0] = 3 - expected[0, 0, 0, 1]
+    if wrong_tail:
+        got[-1, -1, 0] = torch.tensor([1, 3], dtype=torch.int32)
+
+    calls = []
+
+    def run(*args):
+        calls.append(args)
+        return got
+
+    audit = SimpleNamespace()
+    monkeypatch.setattr(workload_test_base, "_check_result", audit)
+    op = TopKSelectFwdOp(top_k=2)
+
+    def check():
+        workload_test_base.TestBase.check(
+            workload, op, *inputs, runs=run, verify_call=workload.verify_in_query_blocks
+        )
+
+    if wrong_tail:
+        with pytest.raises(AssertionError):
+            check()
+    else:
+        check()
+    assert len(calls) == 1
+    assert all(a is b for a, b in zip(calls[0], inputs, strict=True))
+    assert audit.op_name == "TopKSelectFwdOp" and audit.checked_outputs == int(not wrong_tail)
+
+
+@pytest.mark.parametrize(
+    "device, keys, top_k, chunked",
+    [("ptpu", 65536, 1024, False), ("ptpu", 131072, 2048, True), ("cpu", 131072, 2048, False)],
+)
+def test_topk_large_case_opts_in_at_the_test_entry(monkeypatch, device, keys, top_k, chunked):
+    from types import SimpleNamespace
+
+    from tests.ops import test_topk_select as topk
+
+    logits = SimpleNamespace(device=SimpleNamespace(type=device), numel=lambda: 32768 * keys)
+    inputs = (logits, None, None)
+    calls = []
+
+    def check(workload, op, *args, verify_call=None):
+        assert args == inputs
+        assert verify_call == (workload.verify_in_query_blocks if chunked else None)
+        calls.append(op.top_k)
+
+    monkeypatch.setattr(topk.TopKSelectTest, "gen_inputs", lambda self: inputs)
+    monkeypatch.setattr(topk.TopKSelectTest, "check", check)
+    topk.test_topk_select_op(1, 32768, keys, 1, top_k, "float32", "int32", False)
+    assert calls == [top_k]
+
+
 def test_each_output_uses_its_own_dtype_bound():
     expected = (torch.ones(2, dtype=torch.bfloat16), torch.ones(2))
     with pytest.raises(AssertionError):
@@ -383,6 +455,23 @@ def test_check_refuses_a_kernel_in_place_of_the_op_path():
     for op, runs in ((kernel, None), (ReLUFwdOp(), kernel), (ReLUFwdOp(), kernel.forward)):
         with pytest.raises(AssertionError, match="runs="):
             TestBase.check(workload, op, torch.ones(1), runs=runs)
+
+
+def test_check_supports_a_plain_workload(monkeypatch):
+    from types import SimpleNamespace
+
+    from tests import workload_test_base
+    from tileops._ops.elementwise import GELUFwdOp
+    from workloads import elementwise
+
+    monkeypatch.setattr(elementwise, "run_device", lambda: "cpu")
+    audit = SimpleNamespace()
+    monkeypatch.setattr(workload_test_base, "_check_result", audit)
+    workload = elementwise.GELUTailWorkload(torch.float32)
+    workload_test_base.TestBase.check(
+        workload, GELUFwdOp(), *workload.gen_inputs(), runs=torch.nn.functional.gelu
+    )
+    assert (audit.op_name, audit.checked_outputs, audit.max_abs_err) == ("GELUFwdOp", 1, 0.0)
 
 
 @pytest.mark.parametrize(

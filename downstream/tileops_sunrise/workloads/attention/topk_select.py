@@ -1,6 +1,7 @@
 import torch
 
 from workloads.device import run_device
+from workloads.numerics import CheckResult, compare_outputs
 from workloads.workload_base import CallWorkload, WorkloadBase
 
 
@@ -74,6 +75,28 @@ class TopKSelectWorkload(WorkloadBase):
             )
 
         return Custom(validate, "selected values, unique indices and exact padding")
+
+    def verify_in_query_blocks(self, run, logits, starts, ends):
+        """Run once at full size and keep the CPU oracle and validator bounded by query rows."""
+        batch, queries = logits.shape[:2]
+        with torch.no_grad():
+            got = run(logits, starts, ends)
+        if logits.device.type == "ptpu":
+            torch.ptpu.synchronize(logits.device)
+
+        # TopKSelect's inputs are read-only. At the largest shape, 128 rows use 64 MiB.
+        rows_per_block = 128
+        max_abs_err = 0.0
+        for b in range(batch):
+            for first in range(0, queries, rows_per_block):
+                rows = (slice(b, b + 1), slice(first, first + rows_per_block))
+                inputs = tuple(t[rows].detach().cpu() for t in (logits, starts, ends))
+                result = compare_outputs(
+                    got[rows].detach().cpu(), self.ref_program(*inputs), self.verification(*inputs)
+                )
+                max_abs_err = max(max_abs_err, result.max_abs_err)
+                del inputs
+        return CheckResult(1, 1, max_abs_err)
 
 
 class TopKSelectCall(CallWorkload, TopKSelectWorkload):

@@ -11,7 +11,7 @@ from tileops._kernels.gemm.w4a16_row_major import (
 from tileops._utils import get_sm_count
 from tileops.backend import BUILTIN
 from tileops.gemm import GEMMFP8FwdOp, GEMMFwdOp, GEMMINT8W8A8FwdOp, GEMMW4A8FwdOp, GEMMW4A16FwdOp
-from workloads.device import run_device, run_device_is_ptpu
+from workloads.device import run_device, run_device_is_cuda, run_device_is_ptpu
 from workloads.gemm import (
     GEMMFP8Workload,
     GEMMINT8W8A8Workload,
@@ -854,7 +854,10 @@ def test_gemm(
     tune: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_fp16_reduced_precision_reduction", False)
+    if run_device_is_cuda():
+        monkeypatch.setattr(
+            torch.backends.cuda.matmul, "allow_fp16_reduced_precision_reduction", False
+        )
     test = GEMMTest(m, n, k, dtype, trans_a, trans_b)
     op = GEMMFwdOp(trans_a=trans_a, trans_b=trans_b)
     if tune:

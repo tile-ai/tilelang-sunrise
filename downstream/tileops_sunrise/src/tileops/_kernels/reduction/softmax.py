@@ -561,11 +561,17 @@ class _SoftmaxKernelBase(Kernel, SoftmaxFwdInterface):
         n_padded = align_up(call.n, DEFAULT_ALIGNMENT)
         elem_bytes = call.dtype.itemsize
         num_buffers = cls.num_buffers(call)
-        block_m, tile_n = cls._plan_rows(n_padded, elem_bytes, call.smem_budget, num_buffers)
+        # PTPU launches the untuned row kernel at DEFAULT_THREADS, so plan its
+        # fragments for that width rather than the widest autotune candidate.
+        ptpu = call.device is not None and call.device.type == "ptpu"
+        threads = DEFAULT_THREADS if ptpu else max(AUTOTUNE_THREADS)
+        block_m, tile_n = cls._plan_rows(
+            n_padded, elem_bytes, call.smem_budget, num_buffers, threads
+        )
         staged = block_m * n_padded * elem_bytes + DEFAULT_THREADS * 4
         if call.op_kind == "log_softmax" and tile_n == 0 and staged > call.smem_budget:
             budget = call.smem_budget - DEFAULT_THREADS * 4
-            return cls._plan_rows(n_padded, elem_bytes, budget, num_buffers)
+            return cls._plan_rows(n_padded, elem_bytes, budget, num_buffers, threads)
         return block_m, tile_n
 
     @classmethod
@@ -602,14 +608,13 @@ class _SoftmaxKernelBase(Kernel, SoftmaxFwdInterface):
     @staticmethod
     @functools.lru_cache(maxsize=256)
     def _plan_rows(
-        n_padded: int, elem_bytes: int, smem_budget: int, num_buffers: int
+        n_padded: int, elem_bytes: int, smem_budget: int, num_buffers: int, threads: int
     ) -> "tuple[int, int]":
         """One tile keeps the *smallest* block_m: each extra row hands every thread
         another ``N_padded / threads`` registers until the fragment spills. Tiled rows
         take the block_m with strictly the fewest tiles, since fewer tiles means fewer
         global passes, and the smallest one on a tie, for occupancy."""
         planner = BlockConfigPlanner(n_padded, elem_bytes, smem_budget, num_buffers=num_buffers)
-        threads = max(AUTOTUNE_THREADS)
         best_bm = 1
         best_tile_n = planner.tile_n_for(1, threads)
         for bm in [2, 4, 8, 16]:
