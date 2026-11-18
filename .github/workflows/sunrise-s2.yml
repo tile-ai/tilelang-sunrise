@@ -44,7 +44,7 @@ jobs:
       - name: Check S2 health
         run: source ci/lib.sh && ci_check_card_state
       - name: Build TileLang-Sunrise wheels
-        run: bash ci/build.sh
+        run: bash ci/github_actions.sh build
       - name: Upload the tested wheels
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
