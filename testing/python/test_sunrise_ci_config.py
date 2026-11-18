@@ -5,6 +5,7 @@ import sys
 import subprocess
 import importlib.util
 from pathlib import Path
+from zipfile import ZipFile
 
 import pytest
 
@@ -457,3 +458,61 @@ def test_github_adapter_accepts_only_same_repository_push_or_dispatch(tmp_path):
     rejected = subprocess.run(["bash", str(adapter), "trust"], cwd=ROOT, env=env, text=True, capture_output=True)
     assert rejected.returncode != 0
     assert "refusing untrusted GitHub event" in rejected.stderr
+
+
+@pytest.mark.parametrize(
+    ("ref", "version_suffix", "matching_commit", "expected_label", "error"),
+    [
+        ("main", "", True, "1", ""),
+        ("main", ".git12345678", True, "1", "expected TileLang-Sunrise wheel version"),
+        ("main", None, True, "1", "expected one TileLang-Sunrise wheel"),
+        ("main", "", False, None, "checkout does not match GITHUB_SHA"),
+        ("candidate", ".git12345678", True, "0", ""),
+    ],
+)
+def test_github_build_verifies_exact_wheel_only_on_main(tmp_path, ref, version_suffix, matching_commit, expected_label, error):
+    version = "0.1.15+sunrise.1.2.1"
+    (tmp_path / "VERSION").write_text(f"{version}\n", encoding="utf-8")
+    git = ["git", "-C", str(tmp_path)]
+    subprocess.run([*git, "init", "-q"], check=True)
+    subprocess.run([*git, "add", "VERSION"], check=True)
+    git_commit = [*git, "-c", "user.name=TileLang Test", "-c", "user.email=tilelang@example.invalid", "commit", "-qm"]
+    subprocess.run([*git_commit, "Release version"], check=True)
+    subprocess.run([*git_commit, "Merge with no version change", "--allow-empty"], check=True)
+    commit = subprocess.check_output([*git, "rev-parse", "HEAD"], text=True).strip()
+
+    (tmp_path / "ci").mkdir()
+    (tmp_path / "ci" / "build.sh").write_text(
+        'printf "%s\\n" "$NO_VERSION_LABEL" > build-label\n'
+        "mkdir dist\n"
+        f'if [ -f fixture.whl ]; then cp fixture.whl "dist/tilelang_sunrise-{version}-py3-none-any.whl"; fi\n',
+        encoding="utf-8",
+    )
+    if version_suffix is not None:
+        with ZipFile(tmp_path / "fixture.whl", "w") as archive:
+            archive.writestr(
+                "tilelang_sunrise.dist-info/METADATA",
+                f"Name: tilelang-sunrise\nVersion: {version}{version_suffix}\n",
+            )
+
+    result = subprocess.run(
+        ["bash", str(ROOT / "ci" / "github_actions.sh"), "build"],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "GITHUB_REF": f"refs/heads/{ref}",
+            "GITHUB_SHA": commit if matching_commit else "0" * 40,
+            "NO_VERSION_LABEL": "0",
+        },
+        capture_output=True,
+        text=True,
+    )
+    if expected_label is None:
+        assert not (tmp_path / "build-label").exists()
+    else:
+        assert (tmp_path / "build-label").read_text(encoding="utf-8").strip() == expected_label
+    if error:
+        assert result.returncode != 0
+        assert error in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr

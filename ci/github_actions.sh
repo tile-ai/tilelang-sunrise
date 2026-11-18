@@ -102,11 +102,51 @@ with open(output_path, "a", encoding="utf-8") as output:
 PY
 }
 
+build_wheels () {
+    if [[ "${GITHUB_REF:-}" != "refs/heads/main" ]]; then
+        bash ci/build.sh
+        return
+    fi
+
+    local commit
+    commit="$(git rev-parse HEAD)"
+    if [[ "$commit" != "${GITHUB_SHA:-}" ]]; then
+        echo "checkout does not match GITHUB_SHA for the formal wheel build" >&2
+        return 2
+    fi
+
+    NO_VERSION_LABEL=1 bash ci/build.sh
+    python3 -I - "$commit" <<'PY'
+import subprocess
+import sys
+from email import message_from_bytes
+from pathlib import Path
+from zipfile import ZipFile
+
+commit = sys.argv[1]
+expected = subprocess.check_output(["git", "show", f"{commit}:VERSION"], text=True).strip()
+wheels = list(Path("dist").glob("tilelang_sunrise-*.whl"))
+if len(wheels) != 1:
+    raise SystemExit(f"expected one TileLang-Sunrise wheel, found {len(wheels)}")
+with ZipFile(wheels[0]) as archive:
+    entries = [entry for entry in archive.namelist() if entry.endswith(".dist-info/METADATA")]
+    if len(entries) != 1:
+        raise SystemExit("expected one METADATA entry in the TileLang-Sunrise wheel")
+    metadata = message_from_bytes(archive.read(entries[0]))
+names = metadata.get_all("Name")
+versions = metadata.get_all("Version")
+if names != ["tilelang-sunrise"] or versions != [expected]:
+    raise SystemExit(f"expected TileLang-Sunrise wheel version {expected}, got Name={names}, Version={versions}")
+print(f"Verified TileLang-Sunrise wheel version {expected} from {commit}")
+PY
+}
+
 case "$command_name" in
     trust) trust_boundary ;;
     export) export_environment ;;
+    build) build_wheels ;;
     *)
-        echo "usage: $0 {trust|export JOB_NAME}" >&2
+        echo "usage: $0 {trust|export JOB_NAME|build}" >&2
         exit 2
         ;;
 esac
