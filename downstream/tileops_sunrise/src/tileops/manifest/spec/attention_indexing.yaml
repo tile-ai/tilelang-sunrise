@@ -1,0 +1,73 @@
+# Attention indexing and sparse selection operators.
+
+FP8LightningIndexerFwdOp:
+  family: attention
+  status: implemented
+  ref_api: deep_gemm.fp8_mqa_logits  # gitleaks:allow (public API path)
+  signature:
+    forall: {B: Dim, S: Dim, S_kv: Dim, H: Dim, G: Dim, D: Dim, first: Dim, T: "DType[bfloat16 | float8_e4m3fn]", seq_lens: "Seq[Int]"}
+    params:
+      clean_logits: {type: bool, default: true}
+    inputs:
+      index_q: {dtype: T, shape: "[B, S, H, D]"}
+      index_k: {dtype: T, shape: "[B, S_kv, G, D]"}
+      weights: {dtype: float32, shape: "[S, H]"}
+      # Query s scores the keys in [starts[s], ends[s]): its own segment up to
+      # itself, for queries at packed positions first .. first + S - 1 of segments seq_lens.
+      starts: {dtype: int32, shape: "[S]", values: "key_windows(seq_lens, first, S, 'start')", requires: ["in_range(0, S_kv + 1)"]}
+      ends: {dtype: int32, shape: "[S]", values: "key_windows(seq_lens, first, S, 'end')", requires: ["in_range(0, S_kv + 1)"]}
+      # Per-key scales of pre-quantized FP8 keys; a bf16 call is quantized by the op.
+      index_k_scale: {dtype: float32, shape: "[B, S_kv, G]", optional: true}
+    outputs:
+      logits: {dtype: float32, shape: "[B, S, S_kv, G]"}
+    shape_rules:
+    - "G > 0 and H % G == 0"
+    - "not present(index_k_scale) or T == 'float8_e4m3fn'"
+  workloads:
+  - {B: 1, S: 8192, H: 32, D: 64, S_kv: 32768, G: 1, seq_lens: "repeat(512, 64)", first: 24576, clean_logits: true, dtype_cases: [{T: bfloat16}], label: chunk-prefill}
+  - {B: 1, S: 8192, H: 32, D: 64, S_kv: 32768, G: 1, seq_lens: "repeat(512, 64)", first: 24576, clean_logits: true, dtype_cases: [{T: float8_e4m3fn}], label: chunk-prefill}
+  - {B: 1, S: 8192, H: 32, D: 64, S_kv: 32768, G: 1, seq_lens: "repeat(512, 64)", first: 24576, clean_logits: true, some: [index_k_scale], dtype_cases: [{T: float8_e4m3fn}], label: chunk-prefill-kscale}
+  - {B: 1, S: 2048, H: 32, D: 64, S_kv: 2048, G: 1, seq_lens: [2048], first: 0, clean_logits: true, dtype_cases: [{T: bfloat16}], label: short-prefill}
+  - {B: 1, S: 3072, H: 32, D: 64, S_kv: 8192, G: 1, seq_lens: [8192], first: 5120, clean_logits: true, dtype_cases: [{T: bfloat16}], label: context-chunk}
+  - {B: 1, S: 2048, H: 64, D: 128, S_kv: 4096, G: 1, seq_lens: [4096], first: 2048, clean_logits: true, some: [index_k_scale], dtype_cases: [{T: float8_e4m3fn}], label: index-q2048-ctx4096}
+  - {B: 1, S: 2048, H: 64, D: 128, S_kv: 8192, G: 1, seq_lens: [8192], first: 6144, clean_logits: true, some: [index_k_scale], dtype_cases: [{T: float8_e4m3fn}], label: index-q2048-ctx8192}
+  - {B: 1, S: 2048, H: 64, D: 128, S_kv: 16384, G: 1, seq_lens: [16384], first: 14336, clean_logits: true, some: [index_k_scale], dtype_cases: [{T: float8_e4m3fn}], label: index-q2048-ctx16384}
+  - {B: 1, S: 2048, H: 64, D: 128, S_kv: 32768, G: 1, seq_lens: [32768], first: 30720, clean_logits: true, some: [index_k_scale], dtype_cases: [{T: float8_e4m3fn}], label: index-q2048-ctx32768}
+  - {B: 1, S: 2048, H: 64, D: 128, S_kv: 65536, G: 1, seq_lens: [65536], first: 63488, clean_logits: true, some: [index_k_scale], dtype_cases: [{T: float8_e4m3fn}], label: index-q2048-ctx65536}
+  - {B: 1, S: 2048, H: 64, D: 128, S_kv: 131072, G: 1, seq_lens: [131072], first: 129024, clean_logits: true, some: [index_k_scale], dtype_cases: [{T: float8_e4m3fn}], label: index-q2048-ctx131072}
+  - {B: 1, S: 4096, H: 64, D: 128, S_kv: 4096, G: 1, seq_lens: [4096], first: 0, clean_logits: true, some: [index_k_scale], dtype_cases: [{T: float8_e4m3fn}], label: index-q4096-ctx4096}
+  - {B: 1, S: 4096, H: 64, D: 128, S_kv: 8192, G: 1, seq_lens: [8192], first: 4096, clean_logits: true, some: [index_k_scale], dtype_cases: [{T: float8_e4m3fn}], label: index-q4096-ctx8192}
+  - {B: 1, S: 4096, H: 64, D: 128, S_kv: 16384, G: 1, seq_lens: [16384], first: 12288, clean_logits: true, some: [index_k_scale], dtype_cases: [{T: float8_e4m3fn}], label: index-q4096-ctx16384}
+  - {B: 1, S: 4096, H: 64, D: 128, S_kv: 32768, G: 1, seq_lens: [32768], first: 28672, clean_logits: true, some: [index_k_scale], dtype_cases: [{T: float8_e4m3fn}], label: index-q4096-ctx32768}
+  - {B: 1, S: 4096, H: 64, D: 128, S_kv: 65536, G: 1, seq_lens: [65536], first: 61440, clean_logits: true, some: [index_k_scale], dtype_cases: [{T: float8_e4m3fn}], label: index-q4096-ctx65536}
+  - {B: 1, S: 4096, H: 64, D: 128, S_kv: 131072, G: 1, seq_lens: [131072], first: 126976, clean_logits: true, some: [index_k_scale], dtype_cases: [{T: float8_e4m3fn}], label: index-q4096-ctx131072}
+  - {B: 1, S: 1, H: 64, D: 128, S_kv: 16384, G: 1, seq_lens: [16384], first: 16383, clean_logits: true, some: [index_k_scale], dtype_cases: [{T: float8_e4m3fn}], label: ds-v32-decode-b1}
+  roofline:
+    func: tileops._perf.formulas.fp8_lightning_indexer_roofline
+
+TopKSelectFwdOp:
+  # Unordered along the top_k axis: a row selects the same positions every call and may
+  # place them in different slots. A window holding fewer than top_k positions fills the
+  # rest with S_kv, which selects nothing.
+  family: attention
+  status: implemented
+  ref_api: flashinfer.top_k
+  signature:
+    forall: {B: Dim, S: Dim, S_kv: Dim, G: Dim}
+    params:
+      top_k: {type: int}
+    inputs:
+      logits: {dtype: float32, shape: "[B, S, S_kv, G]"}
+      # Row (b, s) selects from logits[b, s, starts[b, s]:ends[b, s]].
+      starts: {dtype: int32, shape: "[B, S]", values: "full((B, S), 0)", requires: ["in_range(0, S_kv + 1)"]}
+      ends: {dtype: int32, shape: "[B, S]", values: "full((B, S), S_kv)", requires: ["in_range(0, S_kv + 1)"]}
+    outputs:
+      indices: {dtype: int32, shape: "[B, S, G, top_k]"}
+    shape_rules:
+    - "0 < top_k and top_k <= S_kv"
+  workloads:
+  - {B: 1, S: 32768, S_kv: 65536, G: 1, top_k: 1024, label: prefill-k1024}
+  - {B: 1, S: 32768, S_kv: 65536, G: 1, top_k: 2048, label: prefill-k2048}
+  - {B: 1, S: 1, S_kv: 16384, G: 1, top_k: 2048, label: ds-v32-topk-decode-b1}
+  roofline:
+    func: tileops._perf.formulas.topk_select_roofline

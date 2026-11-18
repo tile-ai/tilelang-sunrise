@@ -1,0 +1,392 @@
+import torch
+
+from workloads.device import run_device
+from workloads.linear_attention.input_values import _log_gates, _small, _step_sizes
+from workloads.numerics import reference_for
+from workloads.workload_base import CallWorkload, WorkloadBase
+
+__all__ = ["GDNFwdCall", "GDNFwdWorkload"]
+
+
+class GDNFwdWorkload(WorkloadBase):
+    """BTHD Gated DeltaNet (GDN) inference prefill or decode, equal-length or packed.
+
+    ``sequence_lengths`` packs the rows into one ``B = 1`` token axis and makes the call
+    carry ``cu_seqlens``; ``value_heads`` gives the recurrence more heads than the key
+    carries, with key head ``h // (value_heads // heads)`` serving value head ``h``.
+    ``l2norm``, ``raw_gate`` and ``beta_sigmoid`` hand each of Q and K, the gate and the
+    step size over untransformed, and ``raw_gate`` adds ``A_log`` and ``dt_bias`` to the
+    call.
+    """
+
+    def __init__(
+        self,
+        batch: int,
+        seq_len: int,
+        heads: int,
+        dim: int,
+        dtype: torch.dtype,
+        scale: float | None = None,
+        has_initial_state: bool = False,
+        value_heads: int | None = None,
+        sequence_lengths: tuple[int, ...] | None = None,
+        l2norm: bool = False,
+        raw_gate: bool = False,
+        beta_sigmoid: bool = False,
+        allow_neg_eigval: bool = False,
+        state_v_first: bool = False,
+    ) -> None:
+        self.batch = batch
+        self.seq_len = seq_len
+        self.heads = heads
+        self.dim = dim
+        self.dtype = dtype
+        self.scale = scale
+        self.has_initial_state = has_initial_state
+        self.value_heads = heads if value_heads is None else value_heads
+        self.sequence_lengths = sequence_lengths
+        self.l2norm = l2norm
+        self.raw_gate = raw_gate
+        self.beta_sigmoid = beta_sigmoid
+        self.allow_neg_eigval = allow_neg_eigval
+        self.state_v_first = state_v_first
+
+    @property
+    def _spans(self) -> tuple[tuple[int, int], ...]:
+        """The ``(start, end)`` token span of every sequence in the call."""
+        lengths = (
+            (self.seq_len,) * self.batch if self.sequence_lengths is None else self.sequence_lengths
+        )
+        spans, start = [], 0
+        for length in lengths:
+            spans.append((start, start + length))
+            start += length
+        return tuple(spans)
+
+    def gen_inputs(self) -> tuple[torch.Tensor | None, ...]:
+        packed = self.sequence_lengths is not None
+        rows = (1, sum(self.sequence_lengths)) if packed else (self.batch, self.seq_len)
+        q = torch.randn((*rows, self.heads, self.dim), device=run_device(), dtype=self.dtype) * 0.1
+        k = torch.randn((*rows, self.heads, self.dim), device=run_device(), dtype=self.dtype) * 0.1
+        shape = (*rows, self.value_heads, self.dim)
+        v = torch.randn(shape, device=run_device(), dtype=self.dtype) * 0.1
+        g = (
+            torch.randn(shape[:3], device=run_device(), dtype=self.dtype)
+            if self.raw_gate
+            else -torch.rand(shape[:3], device=run_device(), dtype=self.dtype)
+        )
+        beta = (
+            torch.randn(shape[:3], device=run_device(), dtype=self.dtype)
+            if self.beta_sigmoid
+            else torch.rand(shape[:3], device=run_device(), dtype=self.dtype) * 0.5
+        )
+        initial_state = (
+            torch.randn(
+                len(self._spans),
+                self.value_heads,
+                self.dim,
+                self.dim,
+                device=run_device(),
+                dtype=torch.float32,
+            )
+            * 0.01
+            if self.has_initial_state
+            else None
+        )
+        offsets = (
+            torch.tensor(
+                [0, *(end for _, end in self._spans)], dtype=torch.int64, device=run_device()
+            )
+            if packed
+            else None
+        )
+        if self.raw_gate:
+            rates = torch.empty(
+                self.value_heads, device=run_device(), dtype=torch.float32
+            ).uniform_(1.0, 16.0)
+            steps = torch.empty(
+                self.value_heads, device=run_device(), dtype=torch.float32
+            ).uniform_(1e-3, 0.1)
+            return (
+                q,
+                k,
+                v,
+                g,
+                beta,
+                initial_state,
+                offsets,
+                None if offsets is None else offsets.cpu(),
+                rates.log(),
+                reference_for(lambda x: x.expm1().log(), steps).to(steps.device),
+            )
+        if not packed:
+            return (
+                (q, k, v, g, beta) if initial_state is None else (q, k, v, g, beta, initial_state)
+            )
+        return q, k, v, g, beta, initial_state, offsets, offsets.cpu()
+
+    def ref_program(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        cu_seqlens_cpu: torch.Tensor | None = None,
+        A_log: torch.Tensor | None = None,
+        dt_bias: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return gdn_ref(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            initial_state,
+            cu_seqlens,
+            cu_seqlens_cpu,
+            A_log,
+            dt_bias,
+            scale=self.scale,
+            raw_gate=self.raw_gate,
+            beta_sigmoid=self.beta_sigmoid,
+            allow_neg_eigval=self.allow_neg_eigval,
+            l2norm=self.l2norm,
+            state_v_first=self.state_v_first,
+        )
+
+    def verification(self, *inputs):
+        return gated_verification(
+            inputs,
+            l2norm=self.l2norm,
+            state_v_first=self.state_v_first,
+        )
+
+
+class GDNFwdCall(CallWorkload):
+    """A manifest call sharing the focused workload's FP32 recurrence and verification."""
+
+    def gen_inputs(self):
+        q, k, v, g, beta, initial_state, cu_seqlens, cu_seqlens_cpu, a_log, dt_bias = (
+            super().gen_inputs()
+        )
+        raw_gate = self.call.indices["use_gate_in_kernel"]
+        if raw_gate:
+            # Log decay rates in [1, 16] and inverse-softplus time steps in [1e-3, 0.1].
+            a_log = torch.empty_like(a_log).uniform_(1.0, 16.0).log()
+            dt_bias = torch.empty_like(dt_bias).uniform_(1e-3, 0.1).expm1().log()
+        return (
+            _small(q),
+            _small(k),
+            _small(v),
+            g if raw_gate else _log_gates(g),
+            beta if self.call.indices["use_beta_sigmoid_in_kernel"] else _step_sizes(beta),
+            _small(initial_state, 0.01),
+            cu_seqlens,
+            cu_seqlens_cpu,
+            a_log,
+            dt_bias,
+        )
+
+    def ref_program(
+        self, q, k, v, g, beta, initial_state, cu_seqlens, cu_seqlens_cpu, a_log, dt_bias
+    ):
+        p = self.call.indices
+        return gdn_ref(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            initial_state,
+            cu_seqlens,
+            cu_seqlens_cpu,
+            a_log,
+            dt_bias,
+            scale=p["scale"],
+            raw_gate=p["use_gate_in_kernel"],
+            beta_sigmoid=p["use_beta_sigmoid_in_kernel"],
+            allow_neg_eigval=p["allow_neg_eigval"],
+            l2norm=p["use_qk_l2norm_in_kernel"],
+            state_v_first=p["state_v_first"],
+        )
+
+    def verification(self, *inputs):
+        p = self.call.indices
+        return gated_verification(
+            inputs,
+            l2norm=p["use_qk_l2norm_in_kernel"],
+            state_v_first=p["state_v_first"],
+        )
+
+
+def gdn_ref(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    initial_state=None,
+    cu_seqlens=None,
+    cu_seqlens_cpu=None,
+    a_log=None,
+    dt_bias=None,
+    *,
+    scale=None,
+    raw_gate=False,
+    beta_sigmoid=False,
+    allow_neg_eigval=False,
+    l2norm=False,
+    state_v_first=False,
+):
+    """The delta rule evaluated independently of the chunked kernels and of FLA.
+
+    A decode call, one token per sequence, runs the FP32 recurrence token by token. A
+    longer call evaluates the same recurrence chunk by chunk in FP64: within a chunk the
+    written values solve the unit lower-triangular system exactly, with no truncated
+    inverse, and the outputs and final state follow in closed form. The sequence
+    boundaries come from the call's offsets, never from the fixture's lengths, and every
+    sequence still running advances in the same step.
+    """
+    scale = q.shape[-1] ** -0.5 if scale is None else scale
+    group = v.shape[2] // q.shape[2]
+    if cu_seqlens is None:
+        rows = list(range(q.shape[0]))
+        starts, lengths = [0] * q.shape[0], [q.shape[1]] * q.shape[0]
+    else:
+        bounds = (cu_seqlens if cu_seqlens_cpu is None else cu_seqlens_cpu).tolist()
+        rows, starts = [0] * (len(bounds) - 1), bounds[:-1]
+        lengths = [end - start for start, end in zip(bounds[:-1], bounds[1:], strict=True)]
+    if raw_gate:
+        g = -torch.exp(a_log) * torch.nn.functional.softplus(g.float() + dt_bias)
+    if beta_sigmoid:
+        beta = torch.sigmoid(beta.float()) * (2.0 if allow_neg_eigval else 1.0)
+    longest = max(lengths, default=0)
+    chunk, dtype = (1, torch.float32) if longest <= 1 else (64, torch.float64)
+    # Longest first, so the sequences still running at a step are a prefix.
+    order = sorted(range(len(lengths)), key=lambda sequence: -lengths[sequence])
+    row = torch.tensor([rows[s] for s in order], dtype=torch.long, device=q.device)
+    start = torch.tensor([starts[s] for s in order], dtype=torch.long, device=q.device)
+    length = torch.tensor([lengths[s] for s in order], dtype=torch.long, device=q.device)
+    if initial_state is None:
+        state = torch.zeros(
+            len(order), v.shape[2], q.shape[-1], v.shape[-1], dtype=dtype, device=q.device
+        )
+    else:
+        state = initial_state[order].to(dtype)
+        state = state.transpose(-1, -2).contiguous() if state_v_first else state
+    output = torch.empty_like(v)
+    offset = torch.arange(chunk, device=q.device)
+    inclusive = torch.ones(chunk, chunk, dtype=torch.bool, device=q.device).tril()
+    strict = inclusive.tril(-1)
+    running = len(order)
+    for first in range(0, longest, chunk):
+        while lengths[order[running - 1]] <= first:
+            running -= 1
+        r = row[:running, None]
+        valid = first + offset < length[:running, None]
+        t = (start[:running, None] + first + offset).clamp(max=q.shape[1] - 1)
+        mask = valid.to(dtype)[..., None]
+        # [running, chunk, value heads, ...]; value head h reads the key head its group shares.
+        q_c = q[r, t].to(dtype).repeat_interleave(group, dim=2)
+        k_c = k[r, t].to(dtype).repeat_interleave(group, dim=2)
+        if l2norm:
+            q_c = q_c * torch.rsqrt(q_c.square().sum(-1, keepdim=True) + 1e-6)
+            k_c = k_c * torch.rsqrt(k_c.square().sum(-1, keepdim=True) + 1e-6)
+        live = state[:running]
+        if chunk == 1:
+            q_t, k_t = q_c[:, 0] * scale, k_c[:, 0]
+            decay = g[r, t][:, 0].float().exp()
+            old_value = torch.einsum("nhkv,nhk->nhv", live, k_t)
+            value = beta[r, t][:, 0].float().unsqueeze(-1) * (
+                v[r, t][:, 0].float() - decay.unsqueeze(-1) * old_value
+            )
+            live = decay[..., None, None] * live + k_t.unsqueeze(-1) * value.unsqueeze(-2)
+            out = torch.einsum("nhk,nhkv->nhv", q_t, live)[:, None]
+        else:
+            # Padding carries no key, value or step size and no decay, so it leaves the state.
+            q_c, k_c = (x.transpose(1, 2) for x in (q_c * scale, k_c * mask[..., None]))
+            v_c = (v[r, t].to(dtype) * mask[..., None]).transpose(1, 2)
+            log_decay = (g[r, t].to(dtype) * mask).transpose(1, 2).cumsum(-1)
+            step = (beta[r, t].to(dtype) * mask).transpose(1, 2)
+            gap = log_decay[..., :, None] - log_decay[..., None, :]
+            system = (
+                step[..., None]
+                * gap.masked_fill(~strict, -torch.inf).exp()
+                * (k_c @ k_c.transpose(-1, -2))
+            )
+            rhs = step[..., None] * (v_c - log_decay.exp()[..., None] * (k_c @ live))
+            written = torch.linalg.solve_triangular(system, rhs, upper=False, unitriangular=True)
+            attention = gap.masked_fill(~inclusive, -torch.inf).exp() * (
+                q_c @ k_c.transpose(-1, -2)
+            )
+            out = (log_decay.exp()[..., None] * (q_c @ live) + attention @ written).transpose(1, 2)
+            carry = (log_decay[..., -1:] - log_decay).exp()[..., None]
+            live = (
+                log_decay[..., -1].exp()[..., None, None] * live
+                + (k_c * carry).transpose(-1, -2) @ written
+            )
+        state[:running] = live
+        output[r.expand_as(t)[valid], t[valid]] = out[valid].to(q.dtype)
+    final = torch.empty_like(state)
+    final[order] = state
+    final = final.transpose(-1, -2) if state_v_first else final
+    return output, final.float()
+
+
+def gated_verification(
+    inputs,
+    *,
+    l2norm=False,
+    state_v_first=False,
+):
+    from workloads.numerics import (
+        Custom,
+        assert_close,
+        assert_normalized_error,
+        assert_rounded,
+        zeroed_input,
+    )
+
+    q = inputs[0]
+    if q.shape[1] == 1:
+        tol = 6e-7 if q.dtype == torch.float16 else 1e-7
+        if q.shape[-1] == 64:
+            tol = 1e-5
+        if state_v_first or l2norm:
+            tol = 4e-8
+        output_atol, state_atol, rtol = tol, tol, tol
+    else:
+        output_atol = rtol = 1e-3 if q.dtype == torch.float16 else 1.6e-2
+        state_atol = (
+            1e-4
+            if q.shape[1] == 64
+            and q.shape[-1] == 128
+            and all(value is None for value in inputs[5:])
+            else output_atol
+        )
+
+    def validate(got, expected):
+        compare_output = assert_rounded if q.shape[1] == 1 else assert_close
+        compare_output(got[0], expected[0], atol=output_atol, rtol=rtol)
+        assert_close(got[1], expected[1], atol=state_atol, rtol=rtol)
+        if q.shape[1] != 1:
+            # Absolute bounds cover cancellation in the chunked recurrence, but can
+            # exceed small outputs. Also apply the shared normalized-error budget
+            # (1e-3 of combined energy, ~4.5% relative RMS) to each tensor. Clearing
+            # a nonzero tensor has ratio 1 and cannot pass, regardless of magnitude.
+            assert_normalized_error(got, expected)
+
+    controls = ()
+    if q.shape[1] == 1:
+        controls = (zeroed_input(0, "query-zeroed"),)
+        # A single token from zero state does not depend on the gate.
+        if len(inputs) > 5 and inputs[5] is not None:
+            controls += (zeroed_input(3, "gate-zeroed"),)
+    return Custom(
+        validate,
+        "output and FP32 recurrence state, including input transforms",
+        controls=controls,
+    )

@@ -1,77 +1,118 @@
-from typing import Callable
-
 import pytest
 import torch
-from tile_kernels.modeling.mhc.ops import expand_to_mhc
-from tile_kernels.torch.mhc import expand_to_mhc_ref
+
+from tile_kernels.config import get_device
+from tile_kernels.mhc.expand_kernel import expand_to_mhc_bwd, expand_to_mhc_fwd
+from tile_kernels.rand import randn
 from tile_kernels.testing.numeric import count_bytes
+from tile_kernels.torch.mhc import expand_to_mhc_ref
 
 
-def generate_expand_test_data(
-    n0: int, n1: int, mhc_mult: int, h: int, device: str = 'ptpu'
-) -> dict[str, torch.Tensor]:
-    torch.random.manual_seed(42)
-
-    x = torch.randn(n0, n1, h, dtype=torch.bfloat16).to(device)
-    o_grad = torch.randn(n0, n1, mhc_mult, h, dtype=torch.bfloat16).to(device)
+def generate_expand_test_data(n0: int, n1: int, mhc_mult: int, h: int, device: str | None = None) -> dict[str, torch.Tensor]:
+    device = get_device() if device is None else device
+    x = randn(n0, n1, h, dtype=torch.bfloat16, device=device)
+    o_grad = randn(n0, n1, mhc_mult, h, dtype=torch.bfloat16, device=device)
 
     return {'x': x, 'o_grad': o_grad, 'mhc_mult': mhc_mult}
 
 
+def _run_expand_fwd(x: torch.Tensor, mhc_mult: int) -> torch.Tensor:
+    out = x.new_empty(*x.shape[:-1], mhc_mult, x.shape[-1])
+    assert x.is_contiguous()
+    expand_to_mhc_fwd(x.flatten(0, -2), out.flatten(0, -3))
+    return out
+
+
+def _run_expand_bwd(o_grad: torch.Tensor) -> torch.Tensor:
+    x_grad = o_grad.new_empty(*o_grad.shape[:-2], o_grad.shape[-1])
+    expand_to_mhc_bwd(o_grad.flatten(0, -3), x_grad.flatten(0, -2))
+    return x_grad
+
+
 @pytest.mark.parametrize('n0', [1, 2])
 @pytest.mark.parametrize('n1', [1024, 4096])
-@pytest.mark.parametrize('mhc_mult', [2, 4, 8])
-@pytest.mark.parametrize('h', [1280, 2560, 7168])
+@pytest.mark.parametrize('mhc_mult', [4])
+@pytest.mark.parametrize('h', [1280, 1920, 2560, 4224, 5120, 7168])
 def test_expand_comprehensive(n0: int, n1: int, mhc_mult: int, h: int) -> None:
     test_data = generate_expand_test_data(n0=n0, n1=n1, mhc_mult=mhc_mult, h=h)
 
-    with torch.no_grad():
-        out_tl = expand_to_mhc(test_data['x'], test_data['mhc_mult'])
-        out_ref = expand_to_mhc_ref(test_data['x'], test_data['mhc_mult'])
-        torch.ptpu.synchronize()
-        out_tl = out_tl.cpu()
-
+    out_tl = _run_expand_fwd(test_data['x'], test_data['mhc_mult'])
+    out_ref = expand_to_mhc_ref(test_data['x'], test_data['mhc_mult'])
     torch.testing.assert_close(out_tl, out_ref)
 
-    # NOTE backward skip temporarily
-    # def _tester(
-    #     impl: Callable[[torch.Tensor, int], torch.Tensor],
-    # ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    #     x_ = test_data['x'].clone().requires_grad_()
-    #     o_ = impl(x_, test_data['mhc_mult'])
-    #     torch.autograd.backward([o_], [test_data['o_grad']])
-    #     return o_, x_.grad
+    x_grad_tl = _run_expand_bwd(test_data['o_grad'])
 
-    # o_tl, x_grad_tl = _tester(expand_to_mhc)
-    # o_ref, x_grad_ref = _tester(expand_to_mhc_ref)
+    x_ref = test_data['x'].clone().requires_grad_()
+    out_ref = expand_to_mhc_ref(x_ref, test_data['mhc_mult'])
+    torch.autograd.backward([out_ref], [test_data['o_grad']])
+    assert x_ref.grad is not None
 
-    # torch.testing.assert_close(o_tl, o_ref)
-    # torch.testing.assert_close(x_grad_tl, x_grad_ref)
+    torch.testing.assert_close(x_grad_tl, x_ref.grad)
 
-@pytest.mark.parametrize('n0', [1, 2])
-@pytest.mark.parametrize('n1', [1024, 4096])
-@pytest.mark.parametrize('mhc_mult', [2, 4, 8])
-@pytest.mark.parametrize('h', [1280, 2560, 7168])
+
+_EXPAND_BENCH_CASES = [
+    (1, 512, 4, 7168),
+    (1, 512, 4, 5120),
+    (1, 512, 4, 4096),
+    (1, 8192, 4, 7168),
+    (1, 8192, 4, 5120),
+    (1, 8192, 4, 4096),
+]
+
+
 @pytest.mark.benchmark
-def test_expand_comprehensive_benchmark(benchmark_timer, benchmark_record, n0: int, n1: int, mhc_mult: int, h: int) -> None:
-    test_data = generate_expand_test_data(n0=n0, n1=n1, mhc_mult=mhc_mult, h=h)
+@pytest.mark.parametrize('n0,n1,mhc_mult,h', _EXPAND_BENCH_CASES)
+def test_expand_fwd_benchmark(
+    n0: int,
+    n1: int,
+    mhc_mult: int,
+    h: int,
+    benchmark_timer,
+    benchmark_record,
+) -> None:
+    num_tokens = n0 * n1
+    device = get_device()
+    x = randn(num_tokens, h, dtype=torch.bfloat16, device=device)
+    o = torch.empty(num_tokens, mhc_mult, h, dtype=torch.bfloat16, device=device)
 
-    with torch.no_grad():
-        out_tl = expand_to_mhc(test_data['x'], test_data['mhc_mult'])
-        out_tl = out_tl.cpu()
+    io_gb = count_bytes(x, o) / 1e9
 
-    x_tl = test_data['x'].clone()
-    mhc_mult_tl = test_data['mhc_mult']
-    output_tl = expand_to_mhc(x_tl, mhc_mult_tl)
-
-    t_save_us = benchmark_timer(lambda: expand_to_mhc(x_tl, mhc_mult_tl))
-    num_bytes_save = count_bytes(x_tl, output_tl)
+    t_us = benchmark_timer(lambda: expand_to_mhc_fwd(x, o))
 
     benchmark_record(
-        kernel='expand_to_mhc',
-        operation='fwd',
-        params={'x': x_tl.cpu() if x_tl is not None else x_tl,
-                'mhc_mult': mhc_mult_tl},
-        time_us=t_save_us,
-        bandwidth_gbs=num_bytes_save / t_save_us / 1e3,
+        kernel='expand_to_mhc_fwd',
+        operation='expand_forward',
+        params={'n0': n0, 'n1': n1, 'mhc_mult': mhc_mult, 'h': h},
+        time_us=t_us,
+        bandwidth_gbs=io_gb / t_us * 1e6,
+        extras={'io_gb': io_gb},
+    )
+
+
+@pytest.mark.benchmark
+@pytest.mark.parametrize('n0,n1,mhc_mult,h', _EXPAND_BENCH_CASES)
+def test_expand_bwd_benchmark(
+    n0: int,
+    n1: int,
+    mhc_mult: int,
+    h: int,
+    benchmark_timer,
+    benchmark_record,
+) -> None:
+    num_tokens = n0 * n1
+    device = get_device()
+    o_grad = randn(num_tokens, mhc_mult, h, dtype=torch.bfloat16, device=device)
+    x_grad = torch.empty(num_tokens, h, dtype=torch.bfloat16, device=device)
+
+    io_gb = count_bytes(o_grad, x_grad) / 1e9
+
+    t_us = benchmark_timer(lambda: expand_to_mhc_bwd(o_grad, x_grad))
+
+    benchmark_record(
+        kernel='expand_to_mhc_bwd',
+        operation='expand_backward',
+        params={'n0': n0, 'n1': n1, 'mhc_mult': mhc_mult, 'h': h},
+        time_us=t_us,
+        bandwidth_gbs=io_gb / t_us * 1e6,
+        extras={'io_gb': io_gb},
     )

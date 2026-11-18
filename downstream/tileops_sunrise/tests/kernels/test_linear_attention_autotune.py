@@ -3,7 +3,7 @@
 The real sweep compiles fifteen kernels, so the selection logic is checked here
 against stub JIT builders: which candidates reach the autotuner, which sub-kernel
 winner lands in which merged key, and what happens when a sub-kernel cannot be
-tuned. ``tests/ops/test_deltanet_fwd.py`` covers the same helper on the device.
+tuned. ``tests/ops/test_deltanet.py`` covers the same helper on the device.
 """
 
 import inspect
@@ -11,9 +11,8 @@ import sys
 
 import pytest
 
-from tileops.kernels.linear_attention import autotune as la
-from tileops.kernels.linear_attention.deltanet import deltanet_fwd
-from tileops.kernels.linear_attention.gated_deltanet import gated_deltanet_fwd
+from tileops._kernels.linear_attention.deltanet import autotune as la
+from tileops._kernels.linear_attention.deltanet import chunk_fwd as deltanet_fwd
 
 pytestmark = pytest.mark.smoke
 
@@ -44,6 +43,8 @@ class _StubKernel:
         self.chunk_size, self.dim_k, self.dim_v = chunk_size, 64, dim_v
         self.dtype_str = "bfloat16"
         self.sweeps: list[tuple[str, dict, tuple[dict, ...]]] = []
+        #: ``(sub-kernel name, block_v) -> seed_config`` each sweep was handed.
+        self.seeds: dict[tuple[str, int], dict] = {}
         #: ``(sub-kernel name, block_v) -> (config, latency)`` the stub reports.
         self.results: dict[tuple[str, int], tuple[dict | None, float | None]] = {}
 
@@ -61,10 +62,10 @@ class _StubKernel:
         }
 
     def tune_jit_kernel(self, jit_kernel, configs, warmup, rep, seed_config, supply_prog):
-        assert seed_config is configs[0], "the sweep must seed from its first candidate"
         assert supply_prog is None, "a sub-kernel sweep must not inherit the kernel's supplier"
         self.sweeps.append((jit_kernel.name, jit_kernel.build_kwargs, tuple(configs)))
         key = (jit_kernel.name, jit_kernel.build_kwargs.get("block_v", 0))
+        self.seeds[key] = seed_config
         config, latency = self.results.get(key, (configs[-1], 1.0))
         return _StubTuned(config, latency)
 
@@ -106,6 +107,25 @@ def test_every_candidate_is_swept_and_the_winner_lands_in_its_key() -> None:
         "h_threads": 256,
         "h_block_v": 0,
         "o_threads": 64,
+    }
+
+
+def test_each_sweep_is_seeded_with_its_sub_kernel_untuned_launch() -> None:
+    """``tune_jit_kernel`` times its seed among the candidates.
+
+    So the seed is what keeps each sub-kernel's untuned launch in its sweep; a width
+    the untuned kernel does not build seeds from its first candidate.
+    """
+    kernel = _StubKernel(chunk_size=64, dim_v=64)
+
+    _run(kernel)
+
+    assert kernel.default_config["h_block_v"] == 32
+    assert kernel.seeds == {
+        ("fused", 0): {"num_stages": 2, "threads": 256},
+        ("h", 0): dict(la.PIPELINE_CONFIGS[0]),
+        ("h", 32): {"num_stages": 2, "threads": 256},
+        ("o", 0): {"threads": 256},
     }
 
 
@@ -361,22 +381,19 @@ def test_default_h_block_v_prefers_a_tiled_width_and_stays_declared() -> None:
         assert la.default_h_block_v(dim_v, chunk_size) in declared
 
 
-@pytest.mark.parametrize(
-    "kernel_cls",
-    [deltanet_fwd.DeltaNetFwdKernel, gated_deltanet_fwd.GatedDeltaNetFwdKernel],
-)
-def test_default_config_width_is_one_the_kernel_builds(kernel_cls) -> None:
-    """Both kernels draw their untuned width from the shared candidates.
+@pytest.mark.cuda_only
+def test_default_config_width_is_one_the_kernel_builds() -> None:
+    """The kernel draws its untuned width from the shared candidates.
 
-    dim_v=48 is the shape that regressed silently: a tiled width of 32 gives
-    one tile covering 32 of 48 columns. The width rules themselves are checked
-    on the helper; this checks the kernels are wired to them.
+    At dim_v=48 a tiled width of 32 gives one tile covering 32 of 48 columns.
+    The width rules are checked on the helper; this checks the kernel uses them.
     """
+    kernel_cls = deltanet_fwd.DeltaNetChunkFwdKernel
     kernel = kernel_cls(
         batch=1,
         head=1,
         seq_len=128,
-        chunk_size=64,
+        chunk_size=32,  # dim_k = 2 x chunk: the recurrence
         dim_k=64,
         dim_v=48,
         dtype="bfloat16",
@@ -388,12 +405,10 @@ def test_default_config_width_is_one_the_kernel_builds(kernel_cls) -> None:
     assert sys.modules[kernel_cls.__module__].tune_delta_rule_fwd is la.tune_delta_rule_fwd
 
 
-@pytest.mark.parametrize(
-    "kernel_cls",
-    [deltanet_fwd.DeltaNetFwdKernel, gated_deltanet_fwd.GatedDeltaNetFwdKernel],
-)
-def test_tune_true_reaches_the_sweep(monkeypatch, kernel_cls) -> None:
+@pytest.mark.cuda_only
+def test_tune_true_reaches_the_sweep(monkeypatch) -> None:
     """``init_config`` must not fall back for want of declared candidates."""
+    kernel_cls = deltanet_fwd.DeltaNetChunkFwdKernel
     calls: list[str] = []
     monkeypatch.setattr(
         kernel_cls, "autotune", lambda self, **kwargs: calls.append(type(self).__name__)
@@ -403,12 +418,43 @@ def test_tune_true_reaches_the_sweep(monkeypatch, kernel_cls) -> None:
         batch=1,
         head=1,
         seq_len=128,
-        chunk_size=64,
+        chunk_size=32,  # dim_k = 2 x chunk: the recurrence
         dim_k=64,
         dim_v=64,
         dtype="bfloat16",
-        tune=True,
     )
+    kernel.autotune()
 
     assert calls == [kernel_cls.__name__]
     assert kernel.autotune_configs == la.delta_rule_fwd_autotune_configs(64)
+
+
+@pytest.mark.cuda_only
+def test_state_walk_default_config_is_one_its_tuning_times() -> None:
+    """Below dim_k = 2 x chunk the state walk runs, with its own widths and search space."""
+    kernel = deltanet_fwd.DeltaNetChunkFwdKernel(
+        batch=1, head=1, seq_len=128, chunk_size=64, dim_k=64, dim_v=48, dtype="bfloat16"
+    )
+
+    assert kernel.config["h_block_v"] == 8
+    assert kernel.config in kernel.autotune_configs
+
+
+def test_gla_chunked_default_names_the_keys_its_search_space_tunes() -> None:
+    """Tuning times the untuned config, which it can only do under the tuned keys."""
+    from tileops._kernels.linear_attention.gla.chunk_fwd import GLAChunkFwdKernel
+
+    kernel = object.__new__(GLAChunkFwdKernel)
+    kernel.dim_v = 128
+    default = GLAChunkFwdKernel._default_config_for(227 * 1024, 64, 128, 128, 2)
+
+    assert {tuple(sorted(config)) for config in kernel.autotune_configs} == {tuple(sorted(default))}
+
+
+def test_partitioned_gla_offers_no_search_space_it_cannot_build() -> None:
+    """Its schedule reads none of the chunked kernel's launch keys it would inherit."""
+    from tileops._kernels.linear_attention.gla.dense_prefill_partitioned import (
+        GLADensePrefillPartitionedKernel,
+    )
+
+    assert object.__new__(GLADensePrefillPartitionedKernel).autotune_configs is None

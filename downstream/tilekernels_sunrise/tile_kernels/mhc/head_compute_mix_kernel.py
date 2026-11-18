@@ -1,85 +1,113 @@
-import tilelang
-import torch
-from tilelang import language as T
+from tile_kernels.config import get_is_tang, get_num_vec_cores, get_pdl, is_ascend
+from tile_kernels.mhc.head_compute_mix_cuda import (
+    mhc_head_compute_mix_bwd_cuda,
+)
+from tile_kernels.mhc.head_compute_mix_cuda import (
+    mhc_head_compute_mix_fwd_cuda,
+)
 
-_PASS_CONFIGS = {
-    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-}
+
+def _get_ascend_token_block_size(num_tokens: int, mhc_mult: int) -> int:
+    assert mhc_mult == 4, f'Ascend head_compute_mix only supports mHC4, got {mhc_mult}'
+    # Target: each core handles >= 2 blocks for pipeline overlap,
+    # and each block is as large as possible to amortize launch overhead.
+    num_cores = get_num_vec_cores()
+    min_blocks_per_core = 2
+    # T.SimtVF uses 256 threads. Larger blocks vectorize T.sigmoid and expose
+    # an unsupported vector tirx.exp in the current Ascend codegen.
+    max_tb = min(64, num_tokens // (num_cores * min_blocks_per_core))
+    if max_tb < 1:
+        max_tb = 1
+    # Round down to power of 2, keep >= 1
+    tb = 1
+    while tb * 2 <= max_tb:
+        tb *= 2
+    return tb
 
 
-@tilelang.jit(pass_configs=_PASS_CONFIGS)
-def _mhc_head_compute_mix_fwd(
-    mhc_mult: int,
+def mhc_head_compute_mix_fwd(
+    input_mix,
+    mhc_scale,
+    mhc_base,
+    output_mix,
     mhc_pre_eps: float,
-    token_block_size: int,
-) -> tilelang.JITKernel:
-    num_tokens = T.dynamic('num_tokens')
+    token_block_size: int = 0,
+):
+    if get_is_tang() and input_mix.shape[0] == 0:
+        return
+    if is_ascend():
+        assert input_mix.shape[1] == 4, f'Ascend head_compute_mix only supports mHC4, got {input_mix.shape[1]}'
+        from tile_kernels.mhc.head_compute_mix_asc import mhc_head_compute_mix_fwd_asc
 
-    @T.prim_func
-    def mhc_head_compute_mix_fwd_kernel(
-        # Input
-        input_mix: T.Tensor[(num_tokens, mhc_mult), T.float32],
-        mhc_scale: T.Tensor[(1,), T.float32],
-        mhc_base: T.Tensor[(mhc_mult,), T.float32],
-        # Output
-        output_mix: T.Tensor[(num_tokens, mhc_mult), T.float32],
-    ) -> None:
-        with T.Kernel(T.ceildiv(num_tokens, token_block_size)) as pid:
-            for i1, j in T.Parallel(token_block_size, mhc_mult):
-                i = pid * token_block_size + i1
-                if i < num_tokens:
-                    output_mix[i, j] = T.sigmoid(input_mix[i, j] * mhc_scale[0] + mhc_base[j]) + mhc_pre_eps
+        if token_block_size == 0:
+            token_block_size = _get_ascend_token_block_size(input_mix.shape[0], input_mix.shape[1])
+        mhc_head_compute_mix_fwd_asc(
+            input_mix,
+            mhc_scale,
+            mhc_base,
+            output_mix,
+            mhc_pre_eps,
+            token_block_size=token_block_size,
+            num_vec_cores=get_num_vec_cores(),
+        )
+    else:
+        if token_block_size == 0:
+            token_block_size = 32
+        mhc_head_compute_mix_fwd_cuda(
+            input_mix,
+            mhc_scale,
+            mhc_base,
+            output_mix,
+            mhc_pre_eps,
+            token_block_size=token_block_size,
+            use_pdl=get_pdl() and not get_is_tang(),
+        )
 
-    return mhc_head_compute_mix_fwd_kernel
 
-
-@tilelang.jit(pass_configs=_PASS_CONFIGS)
-def _mhc_head_compute_mix_bwd(
-    mhc_mult: int,
-    token_block_size: int,
+def mhc_head_compute_mix_bwd(
+    output_mix_grad,
+    input_mix,
+    mhc_scale,
+    mhc_base,
+    input_mix_grad,
+    mhc_scale_grad_partial,
+    mhc_base_grad_partial,
     num_sms: int,
-) -> tilelang.JITKernel:
-    num_tokens = T.dynamic('num_tokens')
+    token_block_size: int = 0,
+):
+    if get_is_tang() and input_mix.shape[0] == 0:
+        mhc_scale_grad_partial.zero_()
+        mhc_base_grad_partial.zero_()
+        return
+    if is_ascend():
+        assert input_mix.shape[1] == 4, f'Ascend head_compute_mix only supports mHC4, got {input_mix.shape[1]}'
+        from tile_kernels.mhc.head_compute_mix_asc import mhc_head_compute_mix_bwd_asc
 
-    @T.prim_func
-    def mhc_head_compute_mix_bwd_kernel(
-        # Gradient of output
-        output_mix_grad: T.Tensor[(num_tokens, mhc_mult), T.float32],
-        # Cached activation
-        input_mix: T.Tensor[(num_tokens, mhc_mult), T.float32],
-        mhc_scale: T.Tensor[(1,), T.float32],
-        mhc_base: T.Tensor[(mhc_mult,), T.float32],
-        # Gradient of input
-        input_mix_grad: T.Tensor[(num_tokens, mhc_mult), T.float32],
-        mhc_scale_grad_partial: T.Tensor[(num_sms, 1), T.float32],
-        mhc_base_grad_partial: T.Tensor[(num_sms, mhc_mult), T.float32],
-    ) -> None:
-        with T.Kernel(num_sms) as pid:
-            mhc_scale_grad_reducer = T.alloc_reducer(1, T.float32, replication='all')
-            mhc_base_grad_reducer = T.alloc_reducer(mhc_mult, T.float32, replication='all')
-            T.fill(mhc_scale_grad_reducer, 0)
-            T.fill(mhc_base_grad_reducer, 0)
-            for t in T.Persistent(
-                [T.ceildiv(num_tokens, token_block_size)],
-                num_sms,
-                pid,
-                group_size=1,
-            ):
-                grad_frag = T.alloc_fragment((token_block_size, mhc_mult), T.float32)
-                input_recompute_frag = T.alloc_fragment((token_block_size, mhc_mult), T.float32)
-                for i1, j in T.Parallel(token_block_size, mhc_mult):
-                    i = t * token_block_size + i1
-                    if i < num_tokens:
-                        input_recompute_frag[i1, j] = T.sigmoid(
-                            input_mix[i, j] * mhc_scale[0] + mhc_base[j],
-                        )
-                        grad_frag[i1, j] = input_recompute_frag[i1, j] * (1 - input_recompute_frag[i1, j]) * output_mix_grad[i, j]
-                        input_mix_grad[i, j] = grad_frag[i1, j] * mhc_scale[0]
-                        mhc_scale_grad_reducer[0] += grad_frag[i1, j] * input_mix[i, j]
-                        mhc_base_grad_reducer[j] += grad_frag[i1, j]
-            T.finalize_reducer(mhc_scale_grad_reducer)
-            T.finalize_reducer(mhc_base_grad_reducer)
-            T.copy(mhc_scale_grad_reducer, mhc_scale_grad_partial[pid, :])
-            T.copy(mhc_base_grad_reducer, mhc_base_grad_partial[pid, :])
-
-    return mhc_head_compute_mix_bwd_kernel
+        if token_block_size == 0:
+            token_block_size = _get_ascend_token_block_size(input_mix.shape[0], input_mix.shape[1])
+        mhc_head_compute_mix_bwd_asc(
+            output_mix_grad,
+            input_mix,
+            mhc_scale,
+            mhc_base,
+            input_mix_grad,
+            mhc_scale_grad_partial,
+            mhc_base_grad_partial,
+            token_block_size=token_block_size,
+            num_vec_cores=num_sms,
+        )
+    else:
+        if token_block_size == 0:
+            token_block_size = 32
+        mhc_head_compute_mix_bwd_cuda(
+            output_mix_grad,
+            input_mix,
+            mhc_scale,
+            mhc_base,
+            input_mix_grad,
+            mhc_scale_grad_partial,
+            mhc_base_grad_partial,
+            num_sms,
+            token_block_size=token_block_size,
+            use_pdl=get_pdl() and not get_is_tang(),
+        )

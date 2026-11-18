@@ -1,0 +1,215 @@
+"""
+Fused prepare_wy_repr + compute_w_u kernel for DeltaNet (ungated).
+
+Combines:
+  prepare_wy_repr: (k, beta) -> Aw, Au  (Neumann series inversion)
+  compute_w_u:     (Aw, Au, k, v, beta) -> w, u  (matmul)
+
+Into a single kernel where Aw/Au stay in shared memory:
+  fused: (k, v, beta) -> (Aw, Au, w, u)
+
+This eliminates the Aw/Au global memory round-trip between the two kernels. With
+*walk_operands* it also writes the state walk's per-chunk operands -(k^T w) and k^T u, so the
+walk h <- h + k^T u - (k^T w) h carries one matmul a chunk.
+Unlike Gated DeltaNet (GDN), there is no gate parameter g and no Gamma decay matrix.
+"""
+
+import functools
+import math
+
+import tilelang
+import tilelang.language as T
+
+__all__ = ["fused_prepare_compute_w_u_tl"]
+
+
+@functools.lru_cache(maxsize=32)
+def fused_prepare_compute_w_u_tl(
+    batch: int,
+    head: int,
+    seq_len: int,
+    chunk_size: int,
+    dim_k: int,
+    dim_v: int,
+    dtype: str = "float32",
+    late_v: bool = False,
+    ptpu: bool = False,
+    walk_operands: bool = False,
+):
+    """Fused TileLang kernel: (k, v, beta) -> (Aw, Au, w, u) per chunk.
+
+    *walk_operands* adds two outputs: neg_kw = -(k^T w), ``[batch, head, num_chunks, dim_k,
+    dim_k]`` in *dtype*, and ku = k^T u, ``[batch, head, num_chunks, dim_k, dim_v]`` in
+    float32, both from the w and u the kernel writes, rounded to *dtype*.
+
+    *late_v* loads v once w is written, so v does not share the peak with k and the inverse,
+    and scales it by beta in place, so v and v_beta do not take two buffers; it costs the load
+    its overlap, so only a chunk that does not fit otherwise takes it.
+    """
+    accum_dtype = "float32"
+    block_C = chunk_size
+    num_chunks = seq_len // block_C
+    num_rounds = int(math.ceil(math.log2(chunk_size))) if chunk_size > 1 else 0
+
+    @tilelang.jit(
+        out_idx=list(range(-6 if walk_operands else -4, 0)),
+        pass_configs={
+            tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: False,
+        },
+        compile_flags=["-O3", "-DENABLE_BF16"],
+    )
+    def _fused_func(num_stages, threads=128):
+        @T.macro
+        def _fused_body(
+            k: T.Tensor([batch, head, seq_len, dim_k], dtype),
+            v: T.Tensor([batch, head, seq_len, dim_v], dtype),
+            beta: T.Tensor([batch, head, seq_len], dtype),
+            Aw: T.Tensor([batch, head, seq_len, chunk_size], dtype),
+            Au: T.Tensor([batch, head, seq_len, chunk_size], dtype),
+            w: T.Tensor([batch, head, seq_len, dim_k], dtype),
+            u: T.Tensor([batch, head, seq_len, dim_v], dtype),
+            neg_kw: T.Tensor([batch, head, num_chunks, dim_k, dim_k], dtype),
+            ku: T.Tensor([batch, head, num_chunks, dim_k, dim_v], accum_dtype),
+        ):
+            with T.Kernel(batch, head, seq_len // block_C, threads=threads) as (bid, hid, by):
+                k_shared = T.alloc_shared([block_C, dim_k], dtype)
+                v_shared = T.alloc_shared([block_C, dim_v], dtype)
+                beta_shared = T.alloc_shared([block_C], dtype)
+                k_beta_shared = T.alloc_shared([block_C, dim_k], dtype)
+                v_beta_shared = v_shared if late_v else T.alloc_shared([block_C, dim_v], dtype)
+                S_shared = T.alloc_shared([block_C, block_C], dtype)
+                P_shared = T.alloc_shared([block_C, block_C], dtype)
+                P_shared_b = T.alloc_shared([block_C, block_C], dtype) if ptpu else P_shared
+                S_shared_b = T.alloc_shared([block_C, block_C], dtype) if ptpu else S_shared
+                gram_frag = T.alloc_fragment([block_C, block_C], accum_dtype)
+                temp_frag = T.alloc_fragment([block_C, block_C], accum_dtype)
+                w_frag = T.alloc_fragment([block_C, dim_k], accum_dtype)
+                u_frag = T.alloc_fragment([block_C, dim_v], accum_dtype)
+                if walk_operands:
+                    kw_frag = T.alloc_fragment([dim_k, dim_k], accum_dtype)
+                    ku_frag = T.alloc_fragment([dim_k, dim_v], accum_dtype)
+
+                T.copy(
+                    k[bid, hid, by * block_C : (by + 1) * block_C, :], k_shared, disable_tma=True
+                )
+                if not late_v:
+                    T.copy(
+                        v[bid, hid, by * block_C : (by + 1) * block_C, :],
+                        v_shared,
+                        disable_tma=True,
+                    )
+                T.copy(
+                    beta[bid, hid, by * block_C : (by + 1) * block_C], beta_shared, disable_tma=True
+                )
+
+                # KKT = k @ k^T
+                T.clear(gram_frag)
+                k_shared_t = T.alloc_shared([block_C, dim_k], dtype) if ptpu else k_shared
+                if ptpu:
+                    T.copy(k_shared, k_shared_t)
+                T.gemm(k_shared, k_shared_t, gram_frag, transpose_B=True)
+
+                # A = (I + strictLower(diag(beta) * KK^T))^{-1}
+                # No gate: P = -strictLower(diag(beta) * KK^T)
+                for i, j in T.Parallel(block_C, block_C):
+                    P_shared[i, j] = T.if_then_else(
+                        i > j, -gram_frag[i, j] * beta_shared[i], T.float32(0.0)
+                    )
+                for i, j in T.Parallel(block_C, block_C):
+                    S_shared[i, j] = T.if_then_else(i == j, T.float32(1.0), T.float32(0.0))
+
+                for _r in T.Serial(num_rounds):
+                    T.clear(temp_frag)
+                    if ptpu:
+                        T.copy(S_shared, S_shared_b)
+                    T.gemm(P_shared, S_shared_b, temp_frag)
+                    for i, j in T.Parallel(block_C, block_C):
+                        S_shared[i, j] = S_shared[i, j] + temp_frag[i, j]
+                    # The last round's square is never read.
+                    if _r < num_rounds - 1:
+                        T.clear(temp_frag)
+                        if ptpu:
+                            T.copy(P_shared, P_shared_b)
+                        T.gemm(P_shared, P_shared_b, temp_frag)
+                        T.copy(temp_frag, P_shared)
+
+                # S_shared = A^{-1}; write to both Aw and Au (same matrix)
+                T.copy(S_shared, temp_frag)
+                T.copy(
+                    temp_frag, Aw[bid, hid, by * block_C : (by + 1) * block_C, :], disable_tma=True
+                )
+                T.copy(
+                    temp_frag, Au[bid, hid, by * block_C : (by + 1) * block_C, :], disable_tma=True
+                )
+
+                # k_beta = k * beta
+                for i_s, i_k in T.Parallel(block_C, dim_k):
+                    k_beta_shared[i_s, i_k] = k_shared[i_s, i_k] * beta_shared[i_s]
+
+                # w = A^{-1} @ k_beta
+                T.clear(w_frag)
+                T.gemm(S_shared, k_beta_shared, w_frag)
+                T.copy(w_frag, w[bid, hid, by * block_C : (by + 1) * block_C, :], disable_tma=True)
+                if walk_operands:
+                    # Reuse k_beta for w as stored, so k^T w matches the written w.
+                    T.copy(w_frag, k_beta_shared)
+                    T.clear(kw_frag)
+                    T.gemm(k_shared, k_beta_shared, kw_frag, transpose_A=True)
+                    for i, j in T.Parallel(dim_k, dim_k):
+                        neg_kw[bid, hid, by, i, j] = -kw_frag[i, j]
+
+                if late_v:
+                    T.copy(
+                        v[bid, hid, by * block_C : (by + 1) * block_C, :],
+                        v_shared,
+                        disable_tma=True,
+                    )
+
+                # v_beta = v * beta
+                for i, j in T.Parallel(block_C, dim_v):
+                    v_beta_shared[i, j] = v_shared[i, j] * beta_shared[i]
+
+                # u = A^{-1} @ v_beta
+                T.clear(u_frag)
+                T.gemm(S_shared, v_beta_shared, u_frag)
+                T.copy(u_frag, u[bid, hid, by * block_C : (by + 1) * block_C, :], disable_tma=True)
+                if walk_operands:
+                    # Reuse v_beta for u as stored, so k^T u matches the written u.
+                    T.copy(u_frag, v_beta_shared)
+                    T.clear(ku_frag)
+                    T.gemm(k_shared, v_beta_shared, ku_frag, transpose_A=True)
+                    T.copy(ku_frag, ku[bid, hid, by, :, :], disable_tma=True)
+
+        if walk_operands:
+
+            @T.prim_func
+            def fused_prepare_compute_w_u(
+                k: T.Tensor([batch, head, seq_len, dim_k], dtype),
+                v: T.Tensor([batch, head, seq_len, dim_v], dtype),
+                beta: T.Tensor([batch, head, seq_len], dtype),
+                Aw: T.Tensor([batch, head, seq_len, chunk_size], dtype),
+                Au: T.Tensor([batch, head, seq_len, chunk_size], dtype),
+                w: T.Tensor([batch, head, seq_len, dim_k], dtype),
+                u: T.Tensor([batch, head, seq_len, dim_v], dtype),
+                neg_kw: T.Tensor([batch, head, num_chunks, dim_k, dim_k], dtype),
+                ku: T.Tensor([batch, head, num_chunks, dim_k, dim_v], accum_dtype),
+            ):
+                _fused_body(k, v, beta, Aw, Au, w, u, neg_kw, ku)
+
+            return fused_prepare_compute_w_u
+
+        @T.prim_func
+        def fused_prepare_compute_w_u(
+            k: T.Tensor([batch, head, seq_len, dim_k], dtype),
+            v: T.Tensor([batch, head, seq_len, dim_v], dtype),
+            beta: T.Tensor([batch, head, seq_len], dtype),
+            Aw: T.Tensor([batch, head, seq_len, chunk_size], dtype),
+            Au: T.Tensor([batch, head, seq_len, chunk_size], dtype),
+            w: T.Tensor([batch, head, seq_len, dim_k], dtype),
+            u: T.Tensor([batch, head, seq_len, dim_v], dtype),
+        ):
+            _fused_body(k, v, beta, Aw, Au, w, u, None, None)
+
+        return fused_prepare_compute_w_u
+
+    return _fused_func

@@ -15,9 +15,11 @@ Interface note:
 import pytest
 import torch
 
-from tests.test_base import FixtureBase, TestBase
-from tileops.ops.moe import ContiguousLayoutSpec, MoePostPermuteFwdOp, RoutingEpilogueSpec
-from workloads.moe import MoeUnpermuteWorkload as _MoeUnpermuteTestWorkload
+from tests.workload_test_base import FixtureBase, TestBase
+from tileops._ops.moe import ContiguousLayoutSpec, MoEPostPermuteFwdOp, RoutingEpilogueSpec
+from workloads.device import run_device
+from workloads.moe import MoEPostPermuteWorkload
+from workloads.workload_base import manifest_call
 
 
 def _ref_moe_unpermute(
@@ -42,9 +44,8 @@ def _ref_moe_unpermute(
     return output.to(dtype)
 
 
-class MoeUnpermuteTest(_MoeUnpermuteTestWorkload, TestBase):
-    def ref_program(self, mm2_pad, fwd_idx, topk_weights):
-        return _ref_moe_unpermute(mm2_pad, fwd_idx, topk_weights)
+class MoeUnpermuteTest(MoEPostPermuteWorkload, TestBase):
+    pass
 
 
 # Reference implementation
@@ -90,14 +91,28 @@ class MoeUnpermuteFixture(FixtureBase):
 
 @MoeUnpermuteFixture
 def test_moe_unpermute_op(total_tokens, top_k, hidden_size, dtype):
-    test = MoeUnpermuteTest(total_tokens, top_k, hidden_size, dtype)
-    op = MoePostPermuteFwdOp(
+    test = MoeUnpermuteTest(
+        manifest_call(
+            "MoEPostPermuteFwdOp",
+            {"D": str(dtype).removeprefix("torch.")},
+            T=total_tokens,
+            K=top_k,
+            P=total_tokens * top_k,
+            H=hidden_size,
+            layout={
+                "contiguous": {"packing": "tight", "metadata_kind": "physical_psum", "alignment": 1}
+            },
+        )
+    )
+    op = MoEPostPermuteFwdOp(
         ContiguousLayoutSpec.tight_physical_psum(), RoutingEpilogueSpec(routed_scaling_factor=1.0)
     )
-    mm2_pad, fwd_idx, topk_weights = test.gen_inputs()
+    mm2_pad, topk_weights, fwd_idx = test.gen_inputs()
 
-    output = op(mm2_pad.ptpu(), topk_weights.ptpu(), fwd_idx.ptpu())
-    output_ref = test.ref_program(mm2_pad, fwd_idx, topk_weights)
+    output = op(mm2_pad.to(run_device()), topk_weights.to(run_device()), fwd_idx.to(run_device()))
+    if output.device.type == "ptpu":
+        torch.ptpu.synchronize()
+    output_ref = test.ref_program(mm2_pad.cpu(), topk_weights.cpu(), fwd_idx.cpu())
 
     rtol = 1.6e-2 if dtype == torch.bfloat16 else 1e-3
     atol = 1.6e-2 if dtype == torch.bfloat16 else 1e-3
@@ -114,10 +129,12 @@ def test_moe_unpermute_skewed():
     fwd_idx = torch.arange(numel, dtype=torch.int32) % K
     topk_weights = torch.rand(T, K, dtype=torch.float32)
 
-    op = MoePostPermuteFwdOp(
+    op = MoEPostPermuteFwdOp(
         ContiguousLayoutSpec.tight_physical_psum(), RoutingEpilogueSpec(routed_scaling_factor=1.0)
     )
-    output = op(mm2_pad.ptpu(), topk_weights.ptpu(), fwd_idx.ptpu())
+    output = op(mm2_pad.to(run_device()), topk_weights.to(run_device()), fwd_idx.to(run_device()))
+    if output.device.type == "ptpu":
+        torch.ptpu.synchronize()
     output_ref = _ref_moe_unpermute(mm2_pad, fwd_idx, topk_weights)
 
     assert torch.allclose(output.cpu().float(), output_ref.float(), atol=1e-2), (
@@ -130,13 +147,13 @@ def test_moe_unpermute_ep_masking():
     """EP mode: fwd_idx == -1 (non-local expert) must contribute zero, even
     inside the pipelined K-loop (the slot-0 dummy read is zeroed by weight=0).
 
-    The shared `_ref_moe_unpermute` would index `mm2_pad[-1]` for a -1 slot, so
-    this test uses a reference that skips -1 — matching the kernel's masking.
+    EPDispatch translates foreign routes into valid local indices with zero
+    weights before the public post-permute call. The CPU reference skips -1.
     """
     torch.manual_seed(0)
     T, K, H = 16, 4, 256
     numel = T * K
-    dev = "ptpu"
+    dev = run_device()
     # Device principle: build all random inputs on CPU, then move to the device
     # for the kernel; keep the CPU copies for the CPU reference.
     mm2_pad_cpu = torch.randn(numel, H, dtype=torch.bfloat16) * 0.02
@@ -146,12 +163,12 @@ def test_moe_unpermute_ep_masking():
     topk_weights_cpu = torch.rand(T, K, dtype=torch.float32)
 
     mm2_pad = mm2_pad_cpu.to(dev)
-    topk_weights = topk_weights_cpu.to(dev)
-
-    op = MoePostPermuteFwdOp(
+    op = MoEPostPermuteFwdOp(
         ContiguousLayoutSpec.tight_physical_psum(), RoutingEpilogueSpec(routed_scaling_factor=1.0)
     )
-    output = op(mm2_pad, topk_weights, fwd_idx.to(dev))
+    local_weights = torch.where(fwd_idx.view(T, K) >= 0, topk_weights_cpu, 0).to(dev)
+    inverse_indices = fwd_idx.clamp_min(0).to(dev)
+    output = op(mm2_pad, local_weights, inverse_indices)
 
     # Reference on CPU, matching the kernel's -1 semantics: skip non-local slots.
     ref = torch.zeros(T, H, dtype=torch.float32)
@@ -161,6 +178,8 @@ def test_moe_unpermute_ep_masking():
             if slot >= 0:
                 ref[i] += mm2_pad_cpu[slot].float() * topk_weights_cpu[i, k].item()
 
+    if output.device.type == "ptpu":
+        torch.ptpu.synchronize()
     out_cpu = output.cpu().float()
     assert torch.allclose(out_cpu, ref, atol=1e-2), (
         f"EP -1 masking mismatch: max_err={(out_cpu - ref).abs().max()}"
@@ -173,19 +192,21 @@ def test_moe_unpermute_out_param():
     torch.manual_seed(0)
     T, K, H = 8, 2, 256
     numel = T * K
-    dev = "ptpu"
+    dev = run_device()
     # Device principle: random inputs generated on CPU, then moved to device.
     mm2_pad = (torch.randn(numel, H, dtype=torch.bfloat16) * 0.02).to(dev)
     fwd_idx = torch.arange(numel, dtype=torch.int32, device=dev)  # deterministic
     topk_weights = torch.softmax(torch.randn(T, K, dtype=torch.float32), dim=-1).to(dev)
 
-    op = MoePostPermuteFwdOp(
+    op = MoEPostPermuteFwdOp(
         ContiguousLayoutSpec.tight_physical_psum(), RoutingEpilogueSpec(routed_scaling_factor=1.0)
     )
     ref = op(mm2_pad, topk_weights, fwd_idx)
 
     out = torch.empty((T, H), dtype=torch.bfloat16, device=dev)
     got = op(mm2_pad, topk_weights, fwd_idx, out=out)
+    if got.device.type == "ptpu":
+        torch.ptpu.synchronize()
     assert got.data_ptr() == out.data_ptr()  # wrote into the provided buffer
     torch.testing.assert_close(out.float().cpu(), ref.float().cpu(), rtol=1e-2, atol=1e-2)
 
@@ -196,22 +217,24 @@ def test_moe_unpermute_scaling():
     torch.manual_seed(0)
     T, K, H = 8, 2, 256
     numel = T * K
-    dev = "ptpu"
+    dev = run_device()
     # Device principle: random inputs generated on CPU, then moved to device.
     mm2_pad = (torch.randn(numel, H, dtype=torch.bfloat16) * 0.02).to(dev)
     fwd_idx = torch.arange(numel, dtype=torch.int32, device=dev)  # deterministic
     topk_weights = torch.softmax(torch.randn(T, K, dtype=torch.float32), dim=-1).to(dev)
 
     scale = 2.827
-    base = MoePostPermuteFwdOp(
+    base = MoEPostPermuteFwdOp(
         ContiguousLayoutSpec.tight_physical_psum(), RoutingEpilogueSpec(routed_scaling_factor=1.0)
     )
     ref = base(mm2_pad, topk_weights, fwd_idx).float() * scale
 
-    scaled = MoePostPermuteFwdOp(
+    scaled = MoEPostPermuteFwdOp(
         ContiguousLayoutSpec.tight_physical_psum(), RoutingEpilogueSpec(routed_scaling_factor=scale)
     )
     got = scaled(mm2_pad, topk_weights, fwd_idx).float()
+    if got.device.type == "ptpu":
+        torch.ptpu.synchronize()
     torch.testing.assert_close(got.cpu(), ref.cpu(), rtol=2e-2, atol=2e-2)
 
 
@@ -222,12 +245,12 @@ def test_moe_unpermute_out_buffer_validation():
     torch.manual_seed(0)
     T, K, H = 8, 2, 256
     numel = T * K
-    dev = "ptpu"
+    dev = run_device()
     # Device principle: random inputs generated on CPU, then moved to device.
     mm2_pad = (torch.randn(numel, H, dtype=torch.bfloat16) * 0.02).to(dev)
     fwd_idx = torch.arange(numel, dtype=torch.int32, device=dev)  # deterministic
     topk_weights = torch.softmax(torch.randn(T, K, dtype=torch.float32), dim=-1).to(dev)
-    op = MoePostPermuteFwdOp(
+    op = MoEPostPermuteFwdOp(
         ContiguousLayoutSpec.tight_physical_psum(), RoutingEpilogueSpec(routed_scaling_factor=1.0)
     )
 
@@ -252,6 +275,8 @@ def test_moe_unpermute_out_buffer_validation():
     out_ws = ws2[numel * H :].view(T, H)
     mm2_ws.copy_(mm2_pad)
     got = op(mm2_ws, topk_weights, fwd_idx, out=out_ws)
+    if got.device.type == "ptpu":
+        torch.ptpu.synchronize()
     torch.testing.assert_close(got.float().cpu(), ref.float().cpu(), rtol=1e-2, atol=1e-2)
 
 

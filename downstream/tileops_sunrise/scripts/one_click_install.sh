@@ -605,8 +605,8 @@ phase_tests() {
         return
     fi
     local targets extra_args
-    split_into targets    "${TEST_TARGETS:-}" tests/ops/test_fused_add_rms_norm.py
-    split_into extra_args "${PYTEST_ARGS:-}"
+    split_into targets    "${TEST_TARGETS:-}" tests/ops/test_rms_norm.py
+    split_into extra_args "${PYTEST_ARGS:---tileops-device=ptpu --tileops-target=builtin}"
     log INFO "targets    : ${targets[*]}"
     log INFO "extra args : ${extra_args[*]:-<none>}"
     pushd "${TILEOPS_HOME}" >/dev/null

@@ -138,7 +138,7 @@ bash ./one_click_install.sh
 
 ### 性能测试 (Benchmark)
 
-仓库自带性能测试插件 `tests/pytest_benchmark_plugin.py`，能力：
+仓库自带性能测试插件 `tile_kernels/testing/pytest/benchmark.py`，能力：
 
 - `@pytest.mark.benchmark` 标记的用例默认跳过，需加 `--run-benchmark` 才会执行
 - 通过 `--benchmark-output` 把结果写成 JSONL

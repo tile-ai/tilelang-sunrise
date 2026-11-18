@@ -1,0 +1,181 @@
+# Sequence-modeling operators with existing runtime, tests and benchmarks.
+
+EngramGateConvFwdOp:
+  family: sequence_modeling
+  status: implemented
+  ref_api: workloads.sequence_modeling.engram.EngramGateConvFwdWorkload.ref_program
+
+  signature:
+    forall: {M: Dim, seq_len: Dim, d: Dim, T: "DType[float16 | bfloat16]"}
+    params:
+      eps: {type: float, default: 1.0e-6}
+    inputs:
+      H: {dtype: T, shape: "[M, seq_len, d]"}
+      k: {dtype: T, shape: "[M, seq_len, d]"}
+      v: {dtype: T, shape: "[M, seq_len, d]"}
+      rms_w_h: {dtype: T, shape: "[d]"}
+      rms_w_v: {dtype: T, shape: "[d]"}
+      conv_w: {dtype: T, shape: "[4, d]"}
+    outputs:
+      Y: {dtype: T, shape: "[M, seq_len, d]"}
+      vhat: {dtype: T, shape: "[M, seq_len, d]"}
+      alpha: {dtype: float32, shape: "[M, seq_len]"}
+      rrms_h: {dtype: float32, shape: "[M, seq_len]"}
+      rrms_k: {dtype: float32, shape: "[M, seq_len]"}
+      rrms_v: {dtype: float32, shape: "[M, seq_len]"}
+    shape_rules:
+    - "d > 0"
+
+  workloads:
+  # d is kept 256-aligned so runtime padding does not distort roofline.
+  - {M: 1, seq_len: 32, d: 256, dtype_cases: [{T: float16}], label: train-s32}
+  - {M: 2, seq_len: 64, d: 512, dtype_cases: [{T: float16}], label: train-s64}
+  - {M: 1, seq_len: 128, d: 256, dtype_cases: [{T: bfloat16}], label: train-s128}
+  - {M: 3, seq_len: 96, d: 768, dtype_cases: [{T: bfloat16}], label: train-s96}
+
+  roofline:
+    # Per position: three RMSNorms, the gate dot and sigmoid, vhat, SiLU and the residual
+    # (21d + 14), and the causal width-4 depthwise convolution over the taps inside the input.
+    flops: "M * (seq_len * (21 * d + 14) + 2 * d * (seq_len + max((seq_len - 1, 0)) + max((seq_len - 2, 0)) + max((seq_len - 3, 0))))"
+
+EngramGateConvBwdOp:
+  family: sequence_modeling
+  status: implemented
+  ref_api: workloads.sequence_modeling.engram.EngramGateConvBwdWorkload.ref_program
+
+  signature:
+    forall: {M: Dim, seq_len: Dim, d: Dim, T: "DType[float16 | bfloat16]"}
+    params:
+      eps: {type: float, default: 1.0e-6}
+    inputs:
+      dY: {dtype: T, shape: "[M, seq_len, d]"}
+      H: {dtype: T, shape: "[M, seq_len, d]"}
+      k: {dtype: T, shape: "[M, seq_len, d]"}
+      v: {dtype: T, shape: "[M, seq_len, d]"}
+      rms_w_h: {dtype: T, shape: "[d]"}
+      rms_w_v: {dtype: T, shape: "[d]"}
+      conv_w: {dtype: T, shape: "[4, d]"}
+      vhat: {dtype: T, shape: "[M, seq_len, d]"}
+      alpha: {dtype: float32, shape: "[M, seq_len]"}
+      rrms_h: {dtype: float32, shape: "[M, seq_len]"}
+      rrms_k: {dtype: float32, shape: "[M, seq_len]"}
+      rrms_v: {dtype: float32, shape: "[M, seq_len]"}
+    outputs:
+      dH: {dtype: T, shape: "[M, seq_len, d]"}
+      dk: {dtype: T, shape: "[M, seq_len, d]"}
+      dv: {dtype: T, shape: "[M, seq_len, d]"}
+      drms_w_h: {dtype: float32, shape: "[d]"}
+      drms_w_v: {dtype: float32, shape: "[d]"}
+      dconv_w: {dtype: float32, shape: "[4, d]"}
+    shape_rules:
+    - "d > 0"
+
+  workloads:
+  - {M: 1, seq_len: 32, d: 256, dtype_cases: [{T: float16}], label: train-s32}
+  - {M: 2, seq_len: 64, d: 512, dtype_cases: [{T: float16}], label: train-s64}
+  - {M: 1, seq_len: 128, d: 256, dtype_cases: [{T: bfloat16}], label: train-s128}
+  - {M: 3, seq_len: 96, d: 768, dtype_cases: [{T: bfloat16}], label: train-s96}
+
+  roofline:
+    # Per position: the normalized-value recomputes, SiLU, RMSNorm, gate and dot backward
+    # (45d + 10), and three convolution passes (recompute, weight and input gradients) over
+    # the taps inside the input.
+    flops: "M * (seq_len * (45 * d + 10) + 6 * d * (seq_len + max((seq_len - 1, 0)) + max((seq_len - 2, 0)) + max((seq_len - 3, 0))))"
+
+EngramDecodeFwdOp:
+  # `conv_state` holds the last L steps, L <= max_conv_len, left-padded to
+  # max_conv_len; `new_conv_state` is always max_conv_len long.
+  family: sequence_modeling
+  status: implemented
+  ref_api: workloads.sequence_modeling.engram.EngramDecodeWorkload.ref_program
+
+  signature:
+    forall: {batch: Dim, d_mem: Dim, d: Dim, L: Dim, T: "DType[float16 | bfloat16]"}
+    params:
+      max_conv_len: {type: int}
+      conv_kernel_size: {type: int}
+      dilation: {type: int}
+      eps: {type: float, default: 1.0e-6}
+    inputs:
+      e_t: {dtype: T, shape: "[batch, d_mem]"}
+      h_t: {dtype: T, shape: "[batch, d]"}
+      conv_state: {dtype: T, shape: "[batch, L, d]"}
+      W_K: {dtype: T, shape: "[d_mem, d]"}
+      W_V: {dtype: T, shape: "[d_mem, d]"}
+      rms_w_h: {dtype: T, shape: "[d]"}
+      rms_w_v: {dtype: T, shape: "[d]"}
+      conv_w: {dtype: T, shape: "[conv_kernel_size, d]"}
+    outputs:
+      y_t: {dtype: T, shape: "[batch, d]"}
+      new_conv_state: {dtype: T, shape: "[batch, max_conv_len, d]"}
+    shape_rules:
+    - "conv_kernel_size > 0 and dilation > 0 and max_conv_len > 0 and max_conv_len >= dilation * (conv_kernel_size - 1)"
+    - "d > 0"
+    - "L <= max_conv_len"
+
+  workloads:
+  - {batch: 1, d_mem: 512, d: 256, max_conv_len: 12, conv_kernel_size: 4, dilation: 3, L: 12, dtype_cases: [{T: float16}], label: serving-b1}
+  - {batch: 4, d_mem: 1024, d: 512, max_conv_len: 20, conv_kernel_size: 4, dilation: 5, L: 20, dtype_cases: [{T: float16}], label: serving-b4}
+  - {batch: 8, d_mem: 512, d: 256, max_conv_len: 18, conv_kernel_size: 4, dilation: 3, L: 18, dtype_cases: [{T: bfloat16}], label: serving-b8}
+
+  roofline:
+    flops: "4 * batch * d_mem * d + batch * (16 * d + conv_kernel_size * 2 * d) + 20 * batch"
+
+MHCPreFwdOp:
+  # The expansion width n is read off phi's second axis, n * n + 2 * n; the stream
+  # is C = n * c_x wide.
+  family: sequence_modeling
+  status: implemented
+  ref_api: workloads.sequence_modeling.mhc.MHCPreWorkload.ref_program
+
+  signature:
+    forall: {B: Dim, C: Dim, Q: Dim}
+    params:
+      alpha_pre: {type: float}
+      alpha_post: {type: float}
+      alpha_res: {type: float}
+      sinkhorn_repeat: {type: int}
+      sinkhorn_eps: {type: float, default: 0.02}
+    inputs:
+      phi: {dtype: float32, shape: "[C, Q]"}
+      x: {dtype: bfloat16, shape: "[B, C]"}
+      b: {dtype: float32, shape: "[Q]"}
+    outputs:
+      x_res: {dtype: bfloat16, shape: "[B, C]"}
+      x_layer: {dtype: bfloat16, shape: "[B, c_x]"}
+      h_post: {dtype: float32, shape: "[B, n]"}
+    let:
+      n: "mhc.expansion(Q)"
+      c_x: "C // n"
+    shape_rules:
+    - "C > 0 and C % n == 0"
+
+  workloads:
+  - {B: 1, C: 5120, Q: 24, alpha_pre: 1.0, alpha_post: 1.0, alpha_res: 1.0, sinkhorn_repeat: 1, label: hidden-1280}
+  - {B: 2, C: 7680, Q: 24, alpha_pre: 1.0, alpha_post: 1.0, alpha_res: 1.0, sinkhorn_repeat: 1, label: hidden-1920}
+  - {B: 4, C: 10240, Q: 24, alpha_pre: 1.0, alpha_post: 1.0, alpha_res: 1.0, sinkhorn_repeat: 1, label: hidden-2560}
+
+  roofline:
+    flops: "2 * B * C * Q + 2 * B * c_x * n + 2 * B * n * C"
+
+MHCPostFwdOp:
+  family: sequence_modeling
+  status: implemented
+  ref_api: workloads.sequence_modeling.mhc.MHCPostWorkload.ref_program
+
+  signature:
+    forall: {B: Dim, n: Dim, c_x: Dim}
+    inputs:
+      x_layer_out: {dtype: bfloat16, shape: "[B, c_x]"}
+      h_post: {dtype: float32, shape: "[B, n]"}
+      x_res: {dtype: bfloat16, shape: "[B, n * c_x]"}
+    outputs:
+      x_out: {dtype: bfloat16, shape: "[B, n * c_x]"}
+
+  workloads:
+  - {B: 1, n: 4, c_x: 1280, label: hidden-1280}
+  - {B: 2, n: 4, c_x: 1920, label: hidden-1920}
+  - {B: 4, n: 4, c_x: 2560, label: hidden-2560}
+
+  roofline:
+    flops: "2 * B * n * c_x"

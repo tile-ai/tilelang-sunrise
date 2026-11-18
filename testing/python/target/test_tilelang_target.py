@@ -129,23 +129,6 @@ def test_execution_backend_registry_rejects_invalid_backend():
         backend.resolve_execution_backend("nvrtc", target)
 
 
-@pytest.mark.parametrize("simulator_enabled", [False, True])
-def test_tang_backend_preserves_simulator_selection(monkeypatch, simulator_enabled):
-    from tilelang.jit.adapter import simulator
-
-    monkeypatch.setattr(simulator, "_is_simulator_enabled", lambda: simulator_enabled)
-    backend = get_backend("tang")
-    stcu = Target({"kind": "tang", "arch": "stcu"})
-    stcuv2 = Target({"kind": "tang", "arch": "stcuv2"})
-
-    assert backend.resolve_execution_backend("auto", stcu).name == "tvm_ffi"
-    expected = "simulator" if simulator_enabled else "tvm_ffi"
-    assert backend.resolve_execution_backend("auto", stcuv2).name == expected
-    assert backend.resolve_execution_backend("simulator", stcuv2).name == "simulator"
-    with pytest.raises(ValueError, match="Invalid execution backend"):
-        backend.resolve_execution_backend("simulator", stcu)
-
-
 def test_execution_backend_registry_rejects_removed_dlpack_backend():
     target = Target("llvm")
     backend = get_backend("cpu")

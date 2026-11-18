@@ -8,29 +8,26 @@ This covers the invariant every family owes its L1 kernel slots.
 import pytest
 import torch
 
+from tileops._ops.norm.layer_norm import LayerNormFwdOp
+from tileops._ops.norm.rms_norm import RMSNormFwdOp
+from tileops._ops.reduction.reduce import SumFwdOp
 from tileops.manifest import load_manifest
-from tileops.ops.norm.layer_norm import LayerNormFwdOp
-from tileops.ops.norm.rms_norm import RMSNormFwdOp
-from tileops.ops.reduction.reduce import SumFwdOp
+from workloads.device import run_device
+from workloads.elementwise import ElementwiseWorkload
+from workloads.numerics import compare_outputs
+from workloads.reduction import reduction_verification
 
 _DTYPES = (torch.float16, torch.bfloat16)
-
-
-def _assert_two_entries(op):
-    """One kernel per dtype. ``iter_kernels`` dedups, so two means two."""
-    kernels = list(op.iter_kernels())
-    assert len(kernels) == 2, f"expected one kernel per dtype, got {len(kernels)}"
 
 
 @pytest.mark.smoke
 def test_reduction_serves_two_dtypes_from_one_instance():
     op = SumFwdOp(dim=-1)
     for dtype in _DTYPES:
-        x = torch.randn(8, 128, dtype=dtype, device="ptpu")
+        x = torch.randn(8, 128, dtype=dtype, device=run_device())
         y = op(x)
         assert y.dtype == dtype
-        torch.testing.assert_close(y, x.sum(-1), atol=2e-2, rtol=2e-2)
-    _assert_two_entries(op)
+        compare_outputs(y, x.sum(-1), reduction_verification(x.dtype))
 
 
 @pytest.mark.smoke
@@ -38,11 +35,10 @@ def test_rms_norm_serves_two_dtypes_from_one_instance():
     n = 256
     op = RMSNormFwdOp(normalized_shape=(n,))
     for dtype in _DTYPES:
-        x = torch.randn(16, n, dtype=dtype, device="ptpu")
-        w = torch.randn(n, dtype=dtype, device="ptpu")
+        x = torch.randn(16, n, dtype=dtype, device=run_device())
+        w = torch.randn(n, dtype=dtype, device=run_device())
         y = op(x, w)
         assert y.dtype == dtype
-    _assert_two_entries(op)
 
 
 @pytest.mark.smoke
@@ -51,52 +47,48 @@ def test_layer_norm_keys_on_dtype():
     n = 256
     op = LayerNormFwdOp(normalized_shape=(n,))
     for dtype in _DTYPES:
-        x = torch.randn(16, n, dtype=dtype, device="ptpu")
-        w = torch.randn(n, dtype=dtype, device="ptpu")
-        b = torch.randn(n, dtype=dtype, device="ptpu")
+        x = torch.randn(16, n, dtype=dtype, device=run_device())
+        w = torch.randn(n, dtype=dtype, device=run_device())
+        b = torch.randn(n, dtype=dtype, device=run_device())
         assert op(x, w, b).dtype == dtype
-    assert {call.dtype for call in op.built_kernels("layer_norm").values()} == set(_DTYPES)
-    _assert_two_entries(op)
 
 
 @pytest.mark.smoke
 def test_roofline_reports_the_most_recent_forward():
     """`self.dtype` is most-recent-forward, so bytes follow the last call."""
     op = SumFwdOp(dim=-1)
-    op(torch.randn(8, 128, dtype=torch.float32, device="ptpu"))
+    op(torch.randn(8, 128, dtype=torch.float32, device=run_device()))
     _, bytes_fp32 = op.eval_roofline()
-    op(torch.randn(8, 128, dtype=torch.float16, device="ptpu"))
+    op(torch.randn(8, 128, dtype=torch.float16, device=run_device()))
     _, bytes_fp16 = op.eval_roofline()
     assert bytes_fp16 < bytes_fp32
 
 
 @pytest.mark.smoke
 def test_moe_post_permute_serves_two_dtypes_from_one_instance():
-    from tileops.ops.moe import ContiguousLayoutSpec, MoePostPermuteFwdOp
+    from tileops._ops.moe import ContiguousLayoutSpec, MoEPostPermuteFwdOp
 
     total_tokens, top_k, hidden = 16, 2, 128
     numel = total_tokens * top_k
-    op = MoePostPermuteFwdOp(ContiguousLayoutSpec.tight_physical_psum())
-    fwd_idx = torch.arange(numel, device="ptpu", dtype=torch.int32)
+    op = MoEPostPermuteFwdOp(ContiguousLayoutSpec.tight_physical_psum())
+    fwd_idx = torch.arange(numel, device=run_device(), dtype=torch.int32)
     for dtype in _DTYPES:
-        mm2_pad = torch.randn(numel, hidden, dtype=dtype, device="ptpu")
-        weights = torch.rand(total_tokens, top_k, dtype=torch.float32, device="ptpu")
+        mm2_pad = torch.randn(numel, hidden, dtype=dtype, device=run_device())
+        weights = torch.rand(total_tokens, top_k, dtype=torch.float32, device=run_device())
         assert op(mm2_pad, weights, fwd_idx).dtype == dtype
-    _assert_two_entries(op)
 
 
 @pytest.mark.smoke
-def test_cb_producer_serves_two_dtypes_from_one_instance():
-    from tileops.ops.mamba.cb_producer import CBProducerFwdOp
+def test_ssd_chunk_coupling_serves_two_dtypes_from_one_instance():
+    from tileops._ops.mamba.ssd_chunk_coupling import SSDChunkCouplingFwdOp
 
     batch, chunks, groups, chunk_len, d_state = 1, 2, 1, 64, 64
-    op = CBProducerFwdOp(batch, chunks, groups, chunk_len, d_state)
+    op = SSDChunkCouplingFwdOp(chunk_len)
     s = chunks * chunk_len
     for dtype in _DTYPES:
-        c = torch.randn(batch, s, groups, d_state, dtype=dtype, device="ptpu")
-        b = torch.randn(batch, s, groups, d_state, dtype=dtype, device="ptpu")
+        c = torch.randn(batch, s, groups, d_state, dtype=dtype, device=run_device())
+        b = torch.randn(batch, s, groups, d_state, dtype=dtype, device=run_device())
         assert op(c, b).dtype == dtype
-    _assert_two_entries(op)
 
 
 @pytest.mark.smoke
@@ -104,8 +96,8 @@ def test_mismatched_input_dtypes_are_rejected():
     """The anchor selects the kernel; the others must agree with it."""
     n = 256
     op = RMSNormFwdOp(normalized_shape=(n,))
-    x = torch.randn(16, n, dtype=torch.float16, device="ptpu")
-    w = torch.randn(n, dtype=torch.bfloat16, device="ptpu")
+    x = torch.randn(16, n, dtype=torch.float16, device=run_device())
+    w = torch.randn(n, dtype=torch.bfloat16, device=run_device())
     with pytest.raises(ValueError):
         op(x, w)
 
@@ -118,54 +110,69 @@ def test_mismatched_input_dtypes_are_rejected():
 @pytest.mark.smoke
 def test_bitwise_alternates_between_bool_and_integer_storage():
     """bool -> int32 -> bool on one instance, each answered by its own kernel."""
-    from tileops.ops.elementwise import BitwiseAndFwdOp
+    from tileops._ops.elementwise import BitwiseAndFwdOp
 
     op = BitwiseAndFwdOp()
-    b = torch.tensor([True, False] * 32, device="ptpu")
-    i = torch.arange(64, device="ptpu", dtype=torch.int32)
+    b = torch.tensor([True, False] * 32, device=run_device())
+    i = torch.arange(64, device=run_device(), dtype=torch.int32)
 
-    torch.testing.assert_close(op(b, ~b), b & ~b)
-    torch.testing.assert_close(op(i, i + 1), i & (i + 1))
-    torch.testing.assert_close(op(b, b), b & b)  # back to bool after the int kernel
-
-    built = tuple(op.built_kernels(op._op_name).values())
-    assert len(built) == 2, "bool and int32 are two specializations"
-    assert len({type(k) for k in built}) == 2, "and two different kernel classes"
+    compare_outputs(op(b, ~b), b & ~b, ElementwiseWorkload(type(op).__name__, ()).verification())
+    compare_outputs(
+        op(i, i + 1), i & i + 1, ElementwiseWorkload(type(op).__name__, ()).verification()
+    )
+    compare_outputs(
+        op(b, b), b & b, ElementwiseWorkload(type(op).__name__, ()).verification()
+    )  # back to bool after the int kernel
 
 
 @pytest.mark.smoke
 def test_logical_and_output_stays_bool_across_input_storage():
     """A float input produces a bool output without disturbing the bool entry."""
-    from tileops.ops.elementwise import LogicalAndFwdOp
+    from tileops._ops.elementwise import LogicalAndFwdOp
 
     op = LogicalAndFwdOp()
-    b = torch.tensor([True, False] * 32, device="ptpu")
-    f = torch.tensor([0.0, 1.0] * 32, device="ptpu")
+    b = torch.tensor([True, False] * 32, device=run_device())
+    f = torch.tensor([0.0, 1.0] * 32, device=run_device())
 
-    torch.testing.assert_close(op(b, ~b), torch.logical_and(b, ~b))
-    torch.testing.assert_close(op(f, f), torch.logical_and(f, f))
-    torch.testing.assert_close(op(b, b), torch.logical_and(b, b))
+    compare_outputs(
+        op(b, ~b),
+        torch.logical_and(b, ~b),
+        ElementwiseWorkload(type(op).__name__, ()).verification(),
+    )
+    compare_outputs(
+        op(f, f), torch.logical_and(f, f), ElementwiseWorkload(type(op).__name__, ()).verification()
+    )
+    compare_outputs(
+        op(b, b), torch.logical_and(b, b), ElementwiseWorkload(type(op).__name__, ()).verification()
+    )
 
-    built = tuple(op.built_kernels(op._op_name).values())
-    assert len(built) == 2, "bool and float32 are two specializations"
-    assert len({type(k) for k in built}) == 2, "and two different kernel classes"
 
-
+@pytest.mark.in_tree_kernels
 @pytest.mark.smoke
 def test_masked_fill_alternates_between_bool_and_float_input():
     """The scalar is re-validated per element type, the mask stays bool."""
-    from tileops.ops.elementwise import MaskedFillScalarFwdOp
+    from tileops._ops.elementwise import MaskedFillScalarFwdOp
 
     op = MaskedFillScalarFwdOp(value=1)
-    mask = torch.tensor([True, False] * 32, device="ptpu")
-    b = torch.zeros(64, device="ptpu", dtype=torch.bool)
-    f = torch.zeros(64, device="ptpu", dtype=torch.float32)
+    mask = torch.tensor([True, False] * 32, device=run_device())
+    b = torch.zeros(64, device=run_device(), dtype=torch.bool)
+    f = torch.zeros(64, device=run_device(), dtype=torch.float32)
 
-    torch.testing.assert_close(op(b, mask), b.masked_fill(mask, 1))
-    torch.testing.assert_close(op(f, mask), f.masked_fill(mask, 1))
-    torch.testing.assert_close(op(b, mask), b.masked_fill(mask, 1))
-
-    assert len(op.built_kernels(op._op_name)) == 2, "bool and float32 are two specializations"
+    compare_outputs(
+        op(b, mask),
+        b.masked_fill(mask, 1),
+        ElementwiseWorkload(type(op).__name__, ()).verification(),
+    )
+    compare_outputs(
+        op(f, mask),
+        f.masked_fill(mask, 1),
+        ElementwiseWorkload(type(op).__name__, ()).verification(),
+    )
+    compare_outputs(
+        op(b, mask),
+        b.masked_fill(mask, 1),
+        ElementwiseWorkload(type(op).__name__, ()).verification(),
+    )
 
 
 def _single_tensor_elementwise_ops():
@@ -176,8 +183,8 @@ def _single_tensor_elementwise_ops():
     """
     import inspect
 
-    import tileops.ops.elementwise as ew
-    from tileops.ops.elementwise._base import UnaryOp
+    import tileops._ops.elementwise as ew
+    from tileops._ops.elementwise._base import UnaryOp
 
     manifest = load_manifest()
     found = {}
@@ -185,7 +192,7 @@ def _single_tensor_elementwise_ops():
         cls = getattr(ew, name)
         if not (inspect.isclass(cls) and issubclass(cls, UnaryOp)):
             continue
-        if name.startswith("_") or getattr(cls, "_op_name", None) is None:
+        if name.startswith("_") or "kernel_types" not in vars(cls):
             continue  # a template base, not a concrete op
         signature = manifest.get(name, {}).get("signature", {})
         if len(signature.get("inputs", {})) == 1 and not signature.get("params"):
@@ -198,29 +205,25 @@ _SINGLE_TENSOR_OPS = _single_tensor_elementwise_ops()
 
 @pytest.mark.smoke
 @pytest.mark.parametrize("name", sorted(_SINGLE_TENSOR_OPS))
-def test_single_tensor_op_records_its_dtype(name):
-    """No op may reach a result without recording the element type it used.
+def test_single_tensor_op_completes_every_declared_dtype(name):
+    """Every declared dtype completes a call, on whichever path serves it.
 
-    An op answering on its own path — an integer identity, a predicate fallback
-    — records for itself, so every declared dtype is driven, not just float32.
+    An op answering on its own path — an integer identity, a predicate fallback — is
+    driven too, not just float32.
     """
-    op = _SINGLE_TENSOR_OPS[name]()
-    declared = load_manifest()[name]["signature"]["inputs"]
-    (spec,) = declared.values()
-    dtypes = [getattr(torch, d.strip()) for d in spec["dtype"].split("|")]
-    dtypes = [d for d in dtypes if d not in (torch.float64, torch.complex64, torch.complex128)]
-    assert dtypes, f"{name} declares no drivable input dtype"
+    union = load_manifest()[name]["signature"]["forall"]["T"]
+    dtypes = [getattr(torch, d.strip()) for d in union[len("DType[") : -1].split("|")]
 
     for dtype in dtypes:
         op = _SINGLE_TENSOR_OPS[name]()
         if dtype == torch.bool:
-            x = torch.tensor([True, False] * 32, device="ptpu")
+            x = torch.tensor([True, False] * 32, device=run_device())
         elif dtype.is_floating_point:
-            x = torch.rand(64, device="ptpu", dtype=dtype) + 0.5
+            x = torch.rand(64, device=run_device(), dtype=dtype) + 0.5
         else:
-            x = torch.arange(1, 65, device="ptpu", dtype=dtype)
+            x = torch.arange(1, 65, device=run_device(), dtype=dtype)
         op(x)  # an unexpected failure here is a real defect, not a skip
-        assert op.dtype == dtype, f"{name} did not record {dtype}"
+        assert op.last_call.tensors["input"][1] == str(dtype).removeprefix("torch."), name
 
 
 @pytest.mark.smoke

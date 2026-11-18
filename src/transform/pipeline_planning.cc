@@ -41,6 +41,9 @@ public:
   Array<BufferRegion> GetWrites() const;
   bool GetGlobalCopyPattern() const;
   bool GetTmaCopyPattern() const;
+  /*! \brief A global-to-shared ``T.copy`` that stcuv2 will lower as a bulk
+   *         engine copy (not a SIMT fallback, not ``disable_tma``). */
+  bool GetEngineCopyPattern() const;
   bool HasNonCopyTileOp() const;
 
 private:
@@ -59,6 +62,7 @@ private:
   bool is_global_read_ = false;
   bool is_global_copy_pattern_ = false;
   bool is_tma_copy_ = false;
+  bool is_engine_copy_ = false;
   bool has_non_copy_tile_op_ = false;
   bool within_condition_expr_ = false;
 };
@@ -97,6 +101,10 @@ bool BufferRegionCollector::GetGlobalCopyPattern() const {
 
 bool BufferRegionCollector::GetTmaCopyPattern() const { return is_tma_copy_; }
 
+bool BufferRegionCollector::GetEngineCopyPattern() const {
+  return is_engine_copy_;
+}
+
 bool BufferRegionCollector::HasNonCopyTileOp() const {
   return has_non_copy_tile_op_;
 }
@@ -116,6 +124,7 @@ void BufferRegionCollector::HandleTileOp(const TileOperator &tile_op) {
     is_global_copy_pattern_ =
         is_global_copy_pattern_ || nested.GetGlobalCopyPattern();
     is_tma_copy_ = is_tma_copy_ || nested.GetTmaCopyPattern();
+    is_engine_copy_ = is_engine_copy_ || nested.GetEngineCopyPattern();
     has_non_copy_tile_op_ = has_non_copy_tile_op_ || nested.HasNonCopyTileOp();
     return;
   }
@@ -125,6 +134,19 @@ void BufferRegionCollector::HandleTileOp(const TileOperator &tile_op) {
   if (const auto *copy = tile_op.as<CopyNode>()) {
     if (IsGlobalLikeBuffer(copy->src) && IsSharedBuffer(copy->dst)) {
       is_global_copy_pattern_ = true;
+      // stcuv2 bulk g2s is an engine copy: the generic pipeline owns its
+      // barrier the way Hopper owns a TMA copy's. A copy that opted out of
+      // bulk lowering (``disable_tma``) must not be declared one, because it
+      // will not post the arrival the pipeline's wait expects.
+      bool disabled = false;
+      if (auto value = copy->annotations.Get("disable_tma")) {
+        if (const auto *flag = value->as<IntImmNode>()) {
+          disabled = flag->value != 0;
+        }
+      }
+      if (!disabled) {
+        is_engine_copy_ = true;
+      }
     }
   }
   // Im2Col always uses TMA on Hopper.
@@ -1000,8 +1022,20 @@ public:
     bool pure_copy_stage =
         collector.GetGlobalCopyPattern() && IsPureCopyStmt(block->body);
     pinfo.copy_stage = pure_copy_stage;
+    // ``tma_copy`` is the generic pipeline's name for "this copy's barrier is
+    // mine": Hopper sets it for TMA, stcuv2 sets it for an unconditional bulk
+    // g2s. InjectSoftwarePipeline then creates the barrier, annotates the copy
+    // and inserts the consumer wait. ``tl.disable_tma_lower`` keeps the SIMT
+    // fallback, which never arrives on that barrier, so it must not be set.
+    const bool bulk_lower_off =
+        tvm::transform::PassContext::Current()
+            ->GetConfig<Bool>("tl.disable_tma_lower", Bool(false))
+            .value();
+    const bool tang_engine_copy = TargetTangIsSTCUV2(target_) &&
+                                  !bulk_lower_off &&
+                                  collector.GetEngineCopyPattern();
     pinfo.tma_copy = pure_copy_stage && !pinfo.conditional_execution &&
-                     collector.GetTmaCopyPattern();
+                     (collector.GetTmaCopyPattern() || tang_engine_copy);
     ClassifyCopyLikeStage(block->body, &pinfo);
     return pinfo;
   }

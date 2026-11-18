@@ -1,12 +1,14 @@
 """The normalization ops, at the public path ``tileops.norm``."""
 
-from .ops.norm import (
+from tileops._ops.norm import (
     AdaLayerNormFwdOp,
     AdaLayerNormZeroFwdOp,
     BatchNormBwdOp,
     BatchNormFwdOp,
     FusedAddLayerNormFwdOp,
     FusedAddRMSNormFwdOp,
+    FusedAddRMSNormPerTokenQuantFwdOp,
+    FusedQKNormRoPEFwdOp,
     GroupNormFwdOp,
     InstanceNormFwdOp,
     LayerNormFwdOp,
@@ -14,14 +16,16 @@ from .ops.norm import (
 )
 
 __all__ = [
-    "LayerNormFwdOp",
-    "FusedAddLayerNormFwdOp",
-    "RMSNormFwdOp",
-    "FusedAddRMSNormFwdOp",
     "AdaLayerNormFwdOp",
     "AdaLayerNormZeroFwdOp",
-    "BatchNormFwdOp",
     "BatchNormBwdOp",
+    "BatchNormFwdOp",
+    "FusedAddLayerNormFwdOp",
+    "FusedAddRMSNormFwdOp",
+    "FusedAddRMSNormPerTokenQuantFwdOp",
+    "FusedQKNormRoPEFwdOp",
     "GroupNormFwdOp",
     "InstanceNormFwdOp",
+    "LayerNormFwdOp",
+    "RMSNormFwdOp",
 ]

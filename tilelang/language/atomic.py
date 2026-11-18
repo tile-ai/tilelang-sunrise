@@ -655,30 +655,43 @@ def _atomic_add_vector(
     dst_extent = get_extent(dst)
     value_extent = get_extent(value)
     if dst_extent is not None or value_extent is not None:
-        if return_prev:
-            # Region-based return values use the CUDA/HIP vector intrinsic.
-            # TANG's scalar-addressed path below intentionally remains
-            # lane-expanded so its runtime contract is preserved.
+        exact_width = (
+            dst_extent is not None
+            and value_extent is not None
+            and len(dst_extent) == 1
+            and len(value_extent) == 1
+            and isinstance(dst_extent[0], T.IntImm)
+            and isinstance(value_extent[0], T.IntImm)
+            and dst_extent[0].value == width
+            and value_extent[0].value == width
+        )
+        if exact_width:
             atomic_op = op.Op.get(f"tl.atomic_addx{width}_ret_elem_op")
-            return_type = _vector_atomic_return_dtype(dst, width)
+            if not return_prev:
+                atomic_op = op.Op.get(f"tl.atomic_addx{width}_elem_op")
+            return_type = _vector_atomic_return_dtype(dst, width) if return_prev else "handle"
             return T.call_intrin(
                 return_type,
                 atomic_op,
                 T.access_ptr(dst, "rw"),
                 T.access_ptr(value, "r"),
             )
-        # Region operations are lowered by the common tile atomic path.  The
-        # backend owns any physical grouping; the public x2/x4 API is a
-        # semantic shorthand for consecutive atomic additions when no value
-        # is requested back.
+        # Wider regions remain tile operations and let the target planner
+        # choose physical grouping.
         return atomic_add(
             dst,
             value,
             return_prev=return_prev,
             uint_atomic=uint_atomic,
         )
-    # TANG expands explicit x2/x4 calls lane by lane for every option
-    # combination.
+
+    # A scalar-addressed floating call without a returned value can preserve
+    # the physical x2/x4 operation. Integer and tuple-returning forms retain
+    # their established lane-wise contract.
+    if not return_prev and not uint_atomic and isinstance(dst, BufferLoad) and str(dst.buffer.dtype) in {"float16", "bfloat16", "float32"}:
+        atomic_op = op.Op.get(f"tl.atomic_addx{width}_elem_op")
+        return T.call_intrin("handle", atomic_op, T.access_ptr(dst, "rw"), T.access_ptr(value, "r"))
+
     return _scalar_atomic_add_vector(
         dst,
         value,

@@ -10,19 +10,30 @@ fallback_version = "0.1.0"
 name = "tile_kernels"
 dynamic = ["version"]
 description = "Tilelang-based kernels."
-readme = "docs/README.md"
+readme = "README.md"
 license = "MIT"
 authors = [
     { name = "Chenhao Xu", email = "xch@deepseek.com" },
     { name = "Xiangwen Wang", email = "xiangwen.wang@deepseek.com" },
     { name = "Huanqi Cao", email = "caohuanqi@deepseek.com" },
-    { name = "Rui Tian", email = "tianr22@deepseek.com"},
+    { name = "Luotian Huang", email = "huanglt@deepseek.com" },
+    { name = "Yuxuan Zhou", email = "yzhou@deepseek.com" },
     { name = "Weilin Zhao", email = "zhaoweilin@deepseek.com" },
+    { name = "Rui Tian", email = "tianr22@deepseek.com" },
+    { name = "Anyi Xu", email = "xay5421@deepseek.com" },
+    { name = "Fucong Dai", email = "daifucong@deepseek.com" },
     { name = "Kuai Yu", email = "yukuai@deepseek.com" },
-    { name = "Chenggang Zhao", email = "chenggangz@deepseek.com"}
+    { name = "Ruifan Xu", email = "xuruifan@deepseek.com" },
+    { name = "Yi Qian", email = "qianyi@deepseek.com" },
+    { name = "Shengyuan Jia", email = "jia_shengyuan@deepseek.com" },
+    { name = "Chenggang Zhao", email = "chenggangz@deepseek.com" },
+    { name = "Wei Zhang", email = "recker@deepseek.com" },
+    { name = "Lei Wang", email = "lei@deepseek.com" }
 ]
 dependencies = [
-    "tilelang-sunrise>=0.1.13,<0.2.0"
+    "torch>=2.10",
+    "torch_ptpu>=0.2.3",
+    "tilelang-sunrise>=0.1.15,<0.2.0"
 ]
 requires-python = ">=3.10"
 classifiers = [
@@ -32,6 +43,7 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
@@ -54,5 +66,25 @@ line-length = 150
 select = ["Q000"]
 fixable = ["Q000"]
 
+[tool.ruff.format]
+quote-style = "single"
+
 [tool.ruff.lint.flake8-quotes]
 inline-quotes = "single"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--strict-markers"]
+filterwarnings = [
+    # torch internal deprecation, unrelated to our code
+    "ignore:`torch.jit.script_method` is deprecated:DeprecationWarning",
+    # torch_npu environment owner/permission mismatch warnings, unrelated to our code
+    "ignore:.*owner does not match the current owner.*:UserWarning",
+    "ignore:.*Permission mismatch.*does not match.*:UserWarning",
+    # torch_npu internal format fallback notice, unrelated to our code
+    "ignore:.*Cannot create tensor with internal format.*:UserWarning",
+    # benchmark_timer intentionally disables TileLang profiler warmup
+    "ignore:Profiler won't be using warmup, this can skew profiler results:UserWarning:tilelang.profiler.bench",
+    # Benchmarks only consume events from the profiler's current cycle
+    "ignore:Warning.*Profiler clears events at the end of each cycle.*:UserWarning:torch.profiler.profiler",
+]

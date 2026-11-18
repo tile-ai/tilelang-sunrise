@@ -5,7 +5,7 @@
 Activate a virtual environment, then:
 
 ```bash
-pip install -e '.[dev]' -c constraints.txt
+pip install -e . --group dev -c constraints.txt
 pre-commit install
 ```
 
@@ -14,23 +14,27 @@ pre-commit install
 ## Design first
 
 [`docs/design/`](docs/design/) and [`src/tileops/manifest/`](src/tileops/manifest/) are the spec.
-Code conforms to them; a change that does not fit the spec changes the spec first, in its own PR.
+Code conforms to them; a change that does not fit the spec changes the spec with it.
 Read the document for the area before changing it, and review against the same one.
 
-| Changing         | Read                                                                                                                                                     |
-| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| an op or kernel  | [ops-design.md](docs/design/ops-design.md), [op-slot-rules.md](docs/design/op-slot-rules.md), [.claude/rules/code-style.md](.claude/rules/code-style.md) |
-| a manifest entry | [manifest.md](docs/design/manifest.md), [.claude/domain-rules/manifest-spec.md](.claude/domain-rules/manifest-spec.md)                                   |
-| a test           | [testing.md](docs/design/testing.md), [trust-model.md](docs/design/trust-model.md)                                                                       |
-| a benchmark      | [testing.md § Benchmarks](docs/design/testing.md#benchmarks), [.claude/domain-rules/benchmark.md](.claude/domain-rules/benchmark.md)                     |
-| a design doc     | [.claude/domain-rules/design-docs.md](.claude/domain-rules/design-docs.md)                                                                               |
+| Changing         | Read                                                                                                                              |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| an op or kernel  | [ops-design.md](docs/design/ops-design.md), [op-slot-rules.md](docs/design/op-slot-rules.md), [code-style.md](docs/code-style.md) |
+| a manifest entry | [manifest.md](docs/design/manifest.md)                                                                                            |
+| a test           | [testing.md](docs/design/testing.md), [layer-boundaries.md](docs/design/layer-boundaries.md)                                      |
+| a benchmark      | [testing.md § Benchmarks](docs/design/testing.md#benchmarks)                                                                      |
 
 A rule that can be checked mechanically is a hook, not a line in a document. Run
 `pre-commit run --all-files` before pushing; CI runs the same set, and what it says is the rule.
+A justified exception carries `# lint: <rule> allow: <reason>`, with the rule its finding names,
+on the line the finding points at (a constant's or a manifest row's first line); it exempts that
+line from that hook only, and a marker without a reason exempts nothing. A file the `file-set`
+hook rejects carries `lint: file-set allow: <reason>` in a comment, outside any Markdown code
+fence.
 
 ## Naming
 
-[`.claude/conventions/types.sh`](.claude/conventions/types.sh) is the single source of truth for
+[`scripts/ci/types.sh`](scripts/ci/types.sh) is the single source of truth for
 types, branch names and labels — CI sources it. Conventional Commits (`feat(scope): …`) is not used.
 
 |                   | Form                                                                |

@@ -7,14 +7,13 @@ BM/16 个 16-行 strip 轮转分摊给 block 的所有 warp,每个 warp 用 warp
 关键点:tcgen05 的 MMA 是**异步**且**只由 warp0 发起并 fence** 的,所以在多 warp
 写回前必须插入一次 block 级 barrier(``__syncthreads``),让所有参与写回的 warp
 都能看到已完成的累加器 —— 否则 warp>0 会读到尚未落地的 TMEM(garbage)。这条
-barrier 由 `tl.tang.transform.ExpandTangTmemDrain` pass 在 IR 里生成
+barrier 由 `tl.tang.transform.ExpandS3TmemDrain` pass 在 IR 里生成
 (``nwarps>1`` 时,位于 ``warp < nwarps`` guard 之外,因此 block-wide)。
 
 一个标准的 ``T.copy(C_tmem, C_global)`` 在 128 线程 block 上会自动展开成 4-warp
 写回,无需用户手写切分。
 
 §1 Lowering 断言   test_drain_lowering_is_multiwarp
-§2 数值 (via ISS)  test_multiwarp_drain_numeric / test_multiwarp_drain_per_strip
 
 这些特性仅在 stcuv2 上支持。
 """
@@ -22,18 +21,15 @@ barrier 由 `tl.tang.transform.ExpandTangTmemDrain` pass 在 IR 里生成
 import re
 
 import pytest
-import torch
 
 import tilelang
 import tilelang.testing
 import tilelang.language as T
 from tilelang import tvm as tvm
-from tilelang.jit import JITKernel
 
 STCUV2_TARGET = {"kind": "tang", "arch": "stcuv2"}
 
 _TL_DTYPE = {"float16": T.float16, "bfloat16": T.bfloat16}
-_PT_DTYPE = {"float16": torch.float16, "bfloat16": torch.bfloat16}
 
 
 def _make_gemm(M, N, K, BK, dtype, drain_warps=None):
@@ -69,17 +65,6 @@ def _lower_src(func, target=STCUV2_TARGET):
         return tilelang.lower(func, target=target).kernel_source
 
 
-def _run(kernel, M, N, K, dtype):
-    pt = _PT_DTYPE[dtype]
-    torch.manual_seed(0)
-    A = torch.randn(M, K, dtype=pt)
-    B = torch.randn(N, K, dtype=pt)
-    ref = A.float() @ B.float().T
-    jit = JITKernel(kernel, out_idx=[-1], target=STCUV2_TARGET, execution_backend="simulator", verbose=False)
-    C = jit(A.ptpu(), B.ptpu()).cpu().float()
-    return C, ref
-
-
 # ===========================================================================
 # §1  Lowering assertions
 # ===========================================================================
@@ -88,7 +73,7 @@ def _run(kernel, M, N, K, dtype):
 def test_drain_lowering_is_multiwarp():
     """A plain drain lowers to a per-warp strip loop + a block barrier.
 
-    The drain's geometry is emitted by the ExpandTangTmemDrain pass (in IR), so
+    The drain's geometry is emitted by the ExpandS3TmemDrain pass (in IR), so
     the shape pinned here is the round-robin strip split across all four warps of
     the 128-thread block: BM/(nwarps*16) = 2 strips per warp, with the
     MMA-publish barrier in front of the warp guard (block-wide, never guarded).
@@ -120,56 +105,6 @@ def test_drain_warps_knob_lowering(drain_warps, strips):
         assert re.search(rf"if \(\(\(int\)threadIdx\.x\) < {drain_warps * 32}\)", src), (
             f"expected drain restricted to {drain_warps} warp(s)"
         )
-
-
-# ===========================================================================
-# §2  Numeric (via ISS)
-# ===========================================================================
-
-
-# N is fixed to 128 (the standard TMEM accumulator tile width the drain
-# supports); BM (=M) is varied to exercise 8/4/2 row-strips across 4 warps.
-@pytest.mark.parametrize(
-    "M,N,K,BK,dtype",
-    [
-        (128, 128, 64, 64, "float16"),
-        (64, 128, 64, 64, "float16"),
-        (32, 128, 64, 64, "float16"),
-        (128, 128, 64, 64, "bfloat16"),
-    ],
-)
-def test_multiwarp_drain_numeric(M, N, K, BK, dtype):
-    """Multi-warp drain must reproduce the GEMM result."""
-    C, ref = _run(_make_gemm(M, N, K, BK, dtype), M, N, K, dtype)
-    rel = (C - ref).abs().max().item() / (ref.abs().max().item() + 1e-6)
-    assert rel < 1e-2, f"rel_err too large: {rel:.3e}"
-
-
-@pytest.mark.parametrize("drain_warps", [1, 2, 4])
-def test_drain_warps_knob_numeric(drain_warps):
-    """A capped-warp drain (decoupled writeback) still reproduces the GEMM.
-
-    drain_warps=1 => a single warp writes back while the other 3 only cross the
-    MMA-publish barrier; drain_warps=2/4 => 2/4 warps share the writeback.
-    """
-    M, N, K, BK = 128, 128, 64, 64
-    C, ref = _run(_make_gemm(M, N, K, BK, "float16", drain_warps=drain_warps), M, N, K, "float16")
-    rel = (C - ref).abs().max().item() / (ref.abs().max().item() + 1e-6)
-    assert rel < 1e-2, f"drain_warps={drain_warps}: rel_err too large: {rel:.3e}"
-
-
-def test_multiwarp_drain_per_strip():
-    """Every 16-row strip (each owned by a different warp) is correct.
-
-    A per-strip check pins down that ALL warps -- not just warp 0 -- wrote their
-    slice, i.e. that the block barrier really published the accumulator to the
-    non-issuing warps.
-    """
-    M, N, K, BK = 128, 128, 64, 64
-    C, ref = _run(_make_gemm(M, N, K, BK, "float16"), M, N, K, "float16")
-    for s in range(0, M, 16):
-        band = (C[s : s + 16] - ref[s : s + 16]).abs().max().item() / (ref[s : s + 16].abs().max().item() + 1e-6)
-        assert band < 1e-2, f"strip rows[{s}:{s + 16}] wrong: rel={band:.3e}"
 
 
 if __name__ == "__main__":

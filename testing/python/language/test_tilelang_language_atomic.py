@@ -1136,64 +1136,12 @@ def run_tile_atomic_min(K, M, N, block_M, block_N, dtype=T.float32):
     _assert_close(B, ref_B, atol=1e-3, rtol=1e-3)
 
 
-def tile_atomic_max_expr_program(M, N, block_M, block_N, dtype=T.float32):
-    @T.prim_func
-    def atomic_max(A: T.Tensor((M, N), dtype), C: T.Tensor((M, N), dtype)):
-        with T.Kernel(T.ceildiv(M, block_M), T.ceildiv(N, block_N), threads=32) as (bx, by):
-            # The ISS simulator models in/out buffers separately (an output
-            # buffer is freshly allocated by the adapter), so the in-place
-            # original (atomic_max on A) is expressed as C = A then
-            # atomic_max(C, 0.5) == max(A, 0.5).
-            T.copy(
-                A[bx * block_M : (bx + 1) * block_M, by * block_N : (by + 1) * block_N],
-                C[bx * block_M : (bx + 1) * block_M, by * block_N : (by + 1) * block_N],
-            )
-            T.atomic_max(
-                C[bx * block_M : (bx + 1) * block_M, by * block_N : (by + 1) * block_N],
-                0.5,
-            )
-
-    return atomic_max
-
-
-def run_tile_atomic_max_expr(M, N, block_M, block_N, dtype=T.float32):
-    from tilelang.jit import JITKernel
-
-    # stcuv2-only: S2/stcu has no float* atomicMax overload (the stcu clang header
-    # declares unsigned int/int/long only), which is why upstream skipped this
-    # test with "S2 atomicMax has no float* overload (int/uint only)". The ISS
-    # simulator models in/out buffers separately, hence the out-of-place
-    # C = A then atomic_max(C, 0.5) form.
-    kernel = JITKernel(
-        tile_atomic_max_expr_program(M, N, block_M, block_N, dtype=dtype),
-        out_idx=[-1],
-        target={"kind": "tang", "arch": "stcuv2"},
-        execution_backend="simulator",
-    )
-
-    def ref_program(A):
-        for i in range(M):
-            for j in range(N):
-                A[i, j] = max(A[i, j], 0.5)
-
-    A = torch.randn(M, N, dtype=torch.float32)
-    ref_A = A.clone()
-    ref_program(ref_A)
-    C = kernel(A.ptpu())
-    torch.testing.assert_close(C.cpu(), ref_A, atol=1e-3, rtol=1e-3)
-
-
 def test_tile_atomic_max():
     run_tile_atomic_max(8, 128, 128, 32, 32, dtype=T.int32)
 
 
 def test_tile_atomic_min():
     run_tile_atomic_min(8, 128, 128, 32, 32, dtype=T.int32)
-
-
-@tilelang.testing.requires_stcuv2
-def test_tile_atomic_max_expr():
-    run_tile_atomic_max_expr(128, 128, 32, 32)
 
 
 def atomic_scalar_return_prev_program(op_name, val):

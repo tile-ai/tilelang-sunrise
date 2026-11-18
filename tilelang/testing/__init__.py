@@ -113,8 +113,8 @@ def is_stcu_target() -> bool:
     """Whether the default target resolves to TANG S2 (``stcu``).
 
     Which arch a run targets is a property of the run *mode*, not of the machine:
-    ``ci/run.sh --arch s3`` and ``ci/s3/test_s3.sh`` select ``stcuv2`` through
-    ``TILELANG_DEFAULT_TARGET``/``TANG_ARCH``, and the S2 entry keeps ``stcu``.
+    ``TILELANG_DEFAULT_TARGET``/``TANG_ARCH`` select it, and the S2 CI entry
+    keeps ``stcu``.
     An arch-specific test should gate on this instead of pinning a target of its
     own, so one test file serves both modes.
     """

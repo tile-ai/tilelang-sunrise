@@ -1,10 +1,12 @@
 import pytest
 import torch
 
-from tests.test_base import FixtureBase, TestBase
-from tileops.ops.sequence_modeling.engram import EngramGateConvBwdOp, EngramGateConvFwdOp
-from tileops.ops.sequence_modeling.engram_decode import EngramDecodeFwdOp
-from workloads.engram import (
+from tests.workload_test_base import FixtureBase, TestBase
+from tileops._ops.sequence_modeling.engram import EngramGateConvBwdOp, EngramGateConvFwdOp
+from tileops._ops.sequence_modeling.engram_decode import EngramDecodeFwdOp
+from workloads.device import run_device
+from workloads.numerics import reference_for
+from workloads.sequence_modeling.engram import (
     EngramDecodeWorkload,
     EngramGateConvBwdWorkload,
     EngramGateConvFwdWorkload,
@@ -33,22 +35,15 @@ class EngramGateConvFwdFixture(FixtureBase):
 @EngramGateConvFwdFixture
 def test_engram_gate_conv_fwd(M, seq_len, d, dtype, tune):
     test = EngramGateConvFwdTest(M, seq_len, d, dtype)
-    op = EngramGateConvFwdOp(M, seq_len, d, tune=tune)
+    op = EngramGateConvFwdOp()
+    if tune:
+        op.request_tune()
     inputs = test.gen_inputs()
-    atol = 1e-1 if dtype == torch.float16 else 2e-1
-    rtol = 1e-1
-    test.check(op, *inputs, atol=atol, rtol=rtol)
+    test.check(op, *inputs)
 
 
 class EngramGateConvBwdTest(EngramGateConvBwdWorkload, TestBase):
     pass
-
-
-def _ref_rmsnorm(x, w, eps=1e-6):
-    x_f = x.float()
-    rrms = (x_f**2).mean(dim=-1, keepdim=True).add(eps).rsqrt()
-    normed = x_f * rrms * w.float()
-    return normed, rrms.squeeze(-1)
 
 
 class EngramGateConvBwdFixture(FixtureBase):
@@ -61,6 +56,13 @@ class EngramGateConvBwdFixture(FixtureBase):
                 pytest.param(2, 64, 512, torch.float16, False, marks=pytest.mark.full),
                 pytest.param(2, 16, 256, torch.bfloat16, False, marks=pytest.mark.full),
                 pytest.param(2, 512, 256, torch.float16, False, marks=pytest.mark.full),
+                # 1203 tokens: the capped run count lengthens dconv_w runs to 10 tokens,
+                # the last run is short, and some runs cross a batch boundary.
+                pytest.param(3, 401, 256, torch.bfloat16, False, marks=pytest.mark.full),
+                # 8 tokens: one dconv_w run, stored without the atomic add.
+                pytest.param(1, 8, 256, torch.float16, False, marks=pytest.mark.full),
+                # One-token sequences: every dconv_w source row but one is conv padding.
+                pytest.param(2, 1, 256, torch.float16, False, marks=pytest.mark.full),
             ],
         ),
     ]
@@ -69,13 +71,11 @@ class EngramGateConvBwdFixture(FixtureBase):
 @EngramGateConvBwdFixture
 def test_engram_gate_conv_bwd(M, seq_len, d, dtype, tune):
     test = EngramGateConvBwdTest(M, seq_len, d, dtype)
-    op = EngramGateConvBwdOp(M, seq_len, d, tune=tune)
+    op = EngramGateConvBwdOp()
+    if tune:
+        op.request_tune()
     inputs = test.gen_inputs()
-    atol = 2e-1 if dtype == torch.float16 else 3e-1
-    rtol = 2e-1
-    test.check(op, *inputs, atol=atol, rtol=rtol)
-
-    # A data race varies run to run; allclose can still pass, so require two runs to match.
+    test.check(op, *inputs)
     run1 = [o.clone() for o in op(*inputs)]
     run2 = [o.clone() for o in op(*inputs)]
     for i, name in ((0, "dH"), (1, "dk"), (2, "dv")):
@@ -83,6 +83,27 @@ def test_engram_gate_conv_bwd(M, seq_len, d, dtype, tune):
         assert torch.equal(run1[i], run2[i]), (
             f"{name} non-deterministic across runs (data race): max_err={max_err:.4e}"
         )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(float("inf"), marks=pytest.mark.smoke),
+        pytest.param(-float("inf"), marks=pytest.mark.full),
+    ],
+)
+def test_engram_gate_conv_bwd_dconv_w_keeps_nonfinite_like_torch(value) -> None:
+    # 9 tokens split into two dconv_w runs of 5: the last step of the second run lies
+    # past the last token and must add nothing, not zero times an infinite gradient.
+    test = EngramGateConvBwdTest(1, 9, 256, torch.float16)
+    op = EngramGateConvBwdOp()
+    inputs = list(test.gen_inputs())
+    inputs[0][0, -1, :] = value
+    expected = reference_for(test.ref_program, *inputs)[-1]
+    # torch_ptpu lacks isposinf and isneginf, so PTPU classifies the host copy.
+    actual = op(*inputs)[-1].to(expected.device)
+    for kind in (torch.isposinf, torch.isneginf, torch.isnan):
+        assert torch.equal(kind(actual), kind(expected)), kind.__name__
 
 
 class EngramDecodeTest(EngramDecodeWorkload, TestBase):
@@ -97,7 +118,9 @@ class EngramDecodeFixture(FixtureBase):
             [
                 pytest.param(1, 512, 256, 12, 4, 3, torch.float16, False, marks=pytest.mark.smoke),
                 pytest.param(1, 512, 256, 12, 4, 3, torch.bfloat16, False, marks=pytest.mark.smoke),
-                pytest.param(4, 1024, 512, 20, 4, 5, torch.float16, False, marks=pytest.mark.full),
+                pytest.param(17, 519, 256, 12, 4, 3, torch.float16, False, marks=pytest.mark.smoke),
+                pytest.param(1, 512, 256, 1, 1, 1, torch.float16, False, marks=pytest.mark.smoke),
+                pytest.param(4, 1024, 512, 20, 4, 5, torch.float16, True, marks=pytest.mark.full),
                 pytest.param(8, 512, 256, 18, 4, 3, torch.bfloat16, False, marks=pytest.mark.full),
             ],
         ),
@@ -107,19 +130,11 @@ class EngramDecodeFixture(FixtureBase):
 @EngramDecodeFixture
 def test_engram_decode(batch, d_mem, d, max_conv_len, conv_kernel_size, dilation, dtype, tune):
     test = EngramDecodeTest(batch, d_mem, d, max_conv_len, conv_kernel_size, dilation, dtype)
-    op = EngramDecodeFwdOp(
-        batch,
-        d_mem,
-        d,
-        max_conv_len,
-        conv_kernel_size,
-        dilation,
-        tune=tune,
-    )
+    op = EngramDecodeFwdOp(max_conv_len, conv_kernel_size, dilation)
+    if tune:
+        op.request_tune()
     inputs = test.gen_inputs()
-    atol = 5e-2 if dtype == torch.float16 else 1e-1
-    rtol = 5e-2
-    test.check(op, *inputs, atol=atol, rtol=rtol)
+    test.check(op, *inputs)
 
 
 @pytest.mark.smoke
@@ -133,22 +148,22 @@ def test_engram_decode_multi_step():
     eps = 1e-6
 
     torch.manual_seed(123)
-    W_K = torch.randn(d_mem, d, dtype=dtype).ptpu() * 0.02
-    W_V = torch.randn(d_mem, d, dtype=dtype).ptpu() * 0.02
-    rms_w_h = torch.ones(d, dtype=dtype, device="ptpu")
-    rms_w_v = torch.ones(d, dtype=dtype, device="ptpu")
-    conv_w = torch.randn(conv_kernel_size, d, dtype=dtype).ptpu() * 0.02
+    W_K = torch.randn(d_mem, d, dtype=dtype, device=run_device()) * 0.02
+    W_V = torch.randn(d_mem, d, dtype=dtype, device=run_device()) * 0.02
+    rms_w_h = torch.ones(d, dtype=dtype, device=run_device())
+    rms_w_v = torch.ones(d, dtype=dtype, device=run_device())
+    conv_w = torch.randn(conv_kernel_size, d, dtype=dtype, device=run_device()) * 0.02
 
-    op = EngramDecodeFwdOp(B, d_mem, d, max_conv_len, conv_kernel_size, dilation)
+    op = EngramDecodeFwdOp(max_conv_len, conv_kernel_size, dilation)
 
     # Start with empty conv_state (like empty KV cache)
-    conv_state = torch.zeros(B, 0, d, dtype=dtype, device="ptpu")
+    conv_state = torch.zeros(B, 0, d, dtype=dtype, device=run_device())
     conv_state_ref = conv_state.clone()
 
     num_steps = max_conv_len + 8  # go past growing phase into steady state
     for step in range(num_steps):
-        e_t = torch.randn(B, d_mem, dtype=dtype).ptpu() * 0.1
-        h_t = torch.randn(B, d, dtype=dtype).ptpu()
+        e_t = torch.randn(B, d_mem, dtype=dtype, device=run_device()) * 0.1
+        h_t = torch.randn(B, d, dtype=dtype, device=run_device())
 
         y_op, conv_state = op(e_t, h_t, conv_state, W_K, W_V, rms_w_h, rms_w_v, conv_w)
         y_ref, conv_state_ref = engram_decode_step_torch(

@@ -302,7 +302,7 @@ phase_tests() {
 # ============================================================
 # Phase 6: Benchmarks (performance tests)
 # ============================================================
-# Driven by repo's tests/pytest_benchmark_plugin.py:
+# Driven by repo's tile_kernels/testing/pytest/benchmark.py:
 #   --run-benchmark                     enable benchmark tests
 #   --benchmark-output PATH             write JSONL results
 #   --benchmark-regression-threshold X  fail if regression > X (e.g. 0.1 = 10%)

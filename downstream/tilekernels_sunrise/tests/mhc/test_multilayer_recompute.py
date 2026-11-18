@@ -1,9 +1,11 @@
 import pytest
 import torch
-from tile_kernels.modeling.mhc.ops.multilayer_recompute import mhc_multilayer_recompute
-from tile_kernels.modeling.mhc.ops.post import mhc_post
-from tile_kernels.modeling.mhc.ops.pre_apply_mix import mhc_pre_apply_mix
 
+from tile_kernels.config import get_device
+from tile_kernels.mhc.multilayer_recompute_kernel import mhc_multilayer_recompute
+from tile_kernels.mhc.post_kernel import mhc_post_fwd
+from tile_kernels.mhc.pre_apply_mix_kernel import mhc_pre_apply_mix_fwd
+from tile_kernels.rand import randn
 
 _CORRECTNESS_CASES = [
     (1, 1, 2560),
@@ -13,10 +15,16 @@ _CORRECTNESS_CASES = [
     (10, 10, 2560),
     (10, 9, 4096),
     (10, 10, 4096),
+    (10, 9, 5120),
+    (10, 10, 5120),
     (10, 9, 7168),
     (10, 10, 7168),
     (10, 9, 8192),
     (10, 10, 8192),
+    (10, 9, 1280),
+    (10, 10, 1280),
+    (10, 9, 2304),
+    (10, 10, 2304),
 ]
 
 _BENCH_CASES = [
@@ -24,6 +32,8 @@ _BENCH_CASES = [
     (10, 10, 1, 8192, 4, 2560),
     (10, 9, 1, 8192, 4, 4096),
     (10, 10, 1, 8192, 4, 4096),
+    (10, 9, 1, 8192, 4, 5120),
+    (10, 10, 1, 8192, 4, 5120),
     (10, 9, 1, 8192, 4, 7168),
     (10, 10, 1, 8192, 4, 7168),
     (10, 9, 1, 8192, 4, 8192),
@@ -47,13 +57,14 @@ def generate_multilayer_recompute_test_data(
     list[torch.Tensor],
     list[torch.Tensor],
 ]:
-    initial_residual = torch.randn(bs, seq, mhc_mult, hidden, dtype=torch.bfloat16).ptpu()
-    pre_mix_list = [torch.randn(bs, seq, mhc_mult, 1, dtype=torch.float32).ptpu() for _ in range(num_layers)]
-    layer_output_list = [torch.randn(bs, seq, hidden, dtype=torch.bfloat16).ptpu() for _ in range(num_post)]
-    post_mix_list = [torch.randn(bs, seq, mhc_mult, 1, dtype=torch.float32).ptpu() for _ in range(num_post)]
-    comb_mix_list = [torch.randn(bs, seq, mhc_mult, mhc_mult, dtype=torch.float32).ptpu() for _ in range(num_post)]
-    layer_input_list = [torch.empty(bs, seq, hidden, dtype=torch.bfloat16).ptpu() for _ in range(num_layers)]
-    residual_list = [torch.empty(bs, seq, mhc_mult, hidden, dtype=torch.bfloat16).ptpu() for _ in range(num_post)]
+    device = get_device()
+    initial_residual = randn(bs, seq, mhc_mult, hidden, device=device, dtype=torch.bfloat16)
+    pre_mix_list = [randn(bs, seq, mhc_mult, 1, device=device, dtype=torch.float32) for _ in range(num_layers)]
+    layer_output_list = [randn(bs, seq, hidden, device=device, dtype=torch.bfloat16) for _ in range(num_post)]
+    post_mix_list = [randn(bs, seq, mhc_mult, 1, device=device, dtype=torch.float32) for _ in range(num_post)]
+    comb_mix_list = [randn(bs, seq, mhc_mult, mhc_mult, device=device, dtype=torch.float32) for _ in range(num_post)]
+    layer_input_list = [torch.empty(bs, seq, hidden, device=device, dtype=torch.bfloat16) for _ in range(num_layers)]
+    residual_list = [torch.empty(bs, seq, mhc_mult, hidden, device=device, dtype=torch.bfloat16) for _ in range(num_post)]
     return initial_residual, pre_mix_list, layer_output_list, post_mix_list, comb_mix_list, layer_input_list, residual_list
 
 
@@ -67,11 +78,20 @@ def _mhc_multilayer_recompute_ref(
     layer_input_refs: list[torch.Tensor] = []
     residual_refs: list[torch.Tensor] = []
     residual = initial_residual
+    mhc_mult = initial_residual.shape[-2]
+    hidden = initial_residual.shape[-1]
+    num_tokens = initial_residual.numel() // (mhc_mult * hidden)
     for i in range(len(pre_mix_list)):
-        layer_input = mhc_pre_apply_mix(residual, pre_mix_list[i])
+        layer_input = torch.empty(num_tokens, hidden, dtype=torch.bfloat16, device=residual.device)
+        mhc_pre_apply_mix_fwd(
+            residual.view(num_tokens, mhc_mult, hidden),
+            pre_mix_list[i].view(num_tokens, mhc_mult),
+            layer_input,
+        )
+        layer_input = layer_input.view(*residual.shape[:-2], hidden)
         layer_input_refs.append(layer_input)
         if i < len(layer_output_list):
-            residual = mhc_post(layer_output_list[i], residual, post_mix_list[i], comb_mix_list[i])
+            residual = mhc_post_fwd(layer_output_list[i], residual, post_mix_list[i], comb_mix_list[i])
             residual_refs.append(residual)
     return layer_input_refs, residual_refs
 

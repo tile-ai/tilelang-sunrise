@@ -1,1 +1,1 @@
-from .engram_gate import engram_gate, EngramGateFn
+from .engram_gate import EngramGateFn, engram_gate

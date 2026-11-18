@@ -1,0 +1,166 @@
+"""The moe generators and their `requires` predicate (docs/design/manifest.md § Generators)."""
+
+import random
+
+import pytest
+
+from tileops.manifest._values import ADTValue
+from tileops.manifest.primitives import GENERATOR_SHAPES, GENERATORS, PREDICATES
+
+pytestmark = pytest.mark.smoke
+
+_layout_metadata = GENERATORS["moe.layout_metadata"]
+_layout_valid = PREDICATES["moe.layout_valid"]
+
+
+def _contiguous(packing: str, metadata_kind: str, alignment: int = 1) -> ADTValue:
+    fields = {"packing": packing, "metadata_kind": metadata_kind, "alignment": alignment}
+    return ADTValue("MGroupedLayout", {"contiguous": fields})
+
+
+def _masked(max_m: int) -> ADTValue:
+    return ADTValue("MGroupedLayout", {"masked": {"max_m": max_m}})
+
+
+_LAYOUTS = {
+    "tight-psum": _contiguous("tight", "physical_psum"),
+    "tight-per-row": _contiguous("tight", "per_row"),
+    "aligned-psum": _contiguous("aligned", "physical_psum", 4),
+    "aligned-per-row": _contiguous("aligned", "per_row", 4),
+}
+
+
+@pytest.mark.parametrize("name", _LAYOUTS)
+def test_layout_metadata_satisfies_its_predicate(name):
+    """No rows, fewer tiles than experts, empty tail experts, several tiles per expert."""
+    layout = _LAYOUTS[name]
+    for rows, experts in [(0, 3), (8, 3), (12, 5), (40, 3)]:
+        values = _layout_metadata(layout, rows, experts)
+        assert (len(values),) == GENERATOR_SHAPES["moe.layout_metadata"](layout, rows, experts)
+        assert _layout_valid(values, layout, rows, experts), (rows, experts)
+
+
+def test_layout_metadata_psum_ends_are_exclusive_and_masked_counts_vary():
+    assert _layout_metadata(_LAYOUTS["tight-psum"], 8, 2) == [4, 8]
+    assert _layout_metadata(_LAYOUTS["aligned-psum"], 8, 3) == [2, 6, 8]
+    masked = _masked(4)
+    counts = _layout_metadata(masked, 12, 3)
+    assert counts == [4, 2, 4] and _layout_valid(counts, masked, 12, 3)
+
+
+@pytest.mark.parametrize(
+    "layout,rows,experts",
+    [
+        (_LAYOUTS["aligned-psum"], 6, 2),  # not a whole number of tiles
+        (_masked(4), 8, 3),  # not E * max_m
+        (_LAYOUTS["tight-psum"], 4, 0),  # no experts
+    ],
+)
+def test_layout_metadata_raises_outside_its_domain(layout, rows, experts):
+    with pytest.raises(ValueError):
+        _layout_metadata(layout, rows, experts)
+
+
+@pytest.mark.parametrize(
+    "layout,metadata,rows,expected",
+    [
+        pytest.param(_LAYOUTS["tight-psum"], [2, 2, 5], 5, True, id="tight-psum-ok"),
+        pytest.param(_LAYOUTS["tight-psum"], [2, 2, 4], 5, False, id="tight-psum-short"),
+        pytest.param(_LAYOUTS["tight-psum"], [2, 1, 5], 5, False, id="tight-psum-decreasing"),
+        pytest.param(_LAYOUTS["aligned-psum"], [2, 6, 12], 12, True, id="aligned-psum-ok"),
+        pytest.param(_LAYOUTS["aligned-psum"], [2, 3, 12], 12, False, id="aligned-psum-mid-tile"),
+        pytest.param(_LAYOUTS["aligned-psum"], [2, 6, 13], 12, False, id="aligned-psum-overrun"),
+        pytest.param(
+            _contiguous("aligned", "per_row", 2),
+            [0, 0, 1, 1, 3, 3],
+            6,
+            True,
+            id="aligned-per-row-padded-tail",
+        ),
+        pytest.param(
+            _contiguous("aligned", "per_row", 2),
+            [0, 1, 1, 1, 3, 3],
+            6,
+            False,
+            id="aligned-per-row-change-mid-tile",
+        ),
+        pytest.param(_LAYOUTS["tight-per-row"], [0, 0, 1, 2, 2], 5, True, id="tight-per-row-ok"),
+        pytest.param(
+            _LAYOUTS["tight-per-row"], [0, 0, 1, 3, 3], 5, False, id="tight-per-row-no-padding"
+        ),
+        pytest.param(_masked(4), [4, 0, 2], 12, True, id="masked-ok"),
+        pytest.param(_masked(4), [5, 0, 2], 12, False, id="masked-over-capacity"),
+    ],
+)
+def test_layout_valid_table(layout, metadata, rows, expected):
+    assert _layout_valid(metadata, layout, rows, 3) is expected
+
+
+def test_masked_routed_metadata_splits_tokens_two_to_one_within_capacity():
+    """Even busy experts take twice the odd ones' share; 768 rows over 8 reproduce 128/64."""
+    routed = GENERATORS["moe.masked_routed_metadata"]
+    assert routed(_masked(128), 8, 768) == [128, 64] * 4
+    for experts, tokens in [(32, 64), (48, 256), (3, 0)]:
+        counts = routed(_masked(tokens or 1), experts, tokens)
+        assert sum(counts) == tokens
+        assert (len(counts),) == GENERATOR_SHAPES["moe.masked_routed_metadata"](
+            _masked(tokens or 1), experts, tokens
+        )
+        assert _layout_valid(counts, _masked(tokens or 1), experts * (tokens or 1), experts)
+    with pytest.raises(ValueError):
+        routed(_masked(100), 8, 768)  # an expert would hold 128 rows
+    with pytest.raises(ValueError):
+        routed(_LAYOUTS["tight-psum"], 8, 768)
+
+
+def test_masked_routed_metadata_leaves_the_experts_uniform_routing_leaves_empty():
+    """round(E * exp(-T / E)) experts get no rows, at evenly spaced positions; the busy ones
+    split T two to one, and a split the model leaves no expert idle in is the plain one."""
+    routed = GENERATORS["moe.masked_routed_metadata"]
+    counts = routed(_masked(64), 32, 64)  # 32 * exp(-2) = 4.33
+    assert [i for i, c in enumerate(counts) if c == 0] == [4, 12, 20, 28]
+    busy = [c for c in counts if c > 0]
+    assert len(busy) == 28 and sum(counts) == 64 and max(counts) <= 64
+    # 64 over weights 2, 1, ... (total 42): floors 3 and 1, the 8 leftover rows to the first
+    # 8 odd experts, whose remainder 22 / 42 beats the even ones' 2 / 42.
+    assert busy == [3, 2] * 8 + [3, 1] * 6
+    # 16 * exp(-4) = 0.29 rounds to no idle expert: the counts are the plain 2:1 split.
+    assert routed(_masked(64), 16, 64) == [5, 3] * 8
+    assert routed(_masked(1), 5, 0) == [0] * 5
+    # One expert: idle only without tokens; one token is the smallest busy split.
+    assert routed(_masked(1), 1, 0) == [0]
+    assert routed(_masked(1), 1, 1) == [1]
+
+
+def test_sample_indices_draws_distinct_values_in_range():
+    values = GENERATORS["sample_indices"](random.Random(0), 6, 8)
+    assert len(set(values)) == 6 and all(0 <= v < 8 for v in values)
+    assert sorted(GENERATORS["sample_indices"](random.Random(0), 5, 5)) == list(range(5))
+    with pytest.raises(ValueError):
+        GENERATORS["sample_indices"](random.Random(0), 3, 2)
+
+
+def test_sparse_topk_positions_draw_visible_positions_and_pad():
+    # Request lengths 3 and 5, two queries: query s of a length-n request sees n - 1 + s positions.
+    rows = GENERATORS["attn.sparse_topk_positions"](random.Random(0), [3, 5], 2, 4)
+    assert (len(rows), len(rows[0]), len(rows[0][0])) == (2, 2, 4)
+    for n, per_query in zip([3, 5], rows, strict=True):
+        for s, slots in enumerate(per_query):
+            visible = n - 1 + s
+            picked = [j for j in slots if j != -1]
+            assert len(picked) == len(set(picked)) == min(4, visible)
+            assert all(0 <= j < visible for j in picked) and slots[len(picked) :] == [-1] * (
+                4 - len(picked)
+            )
+    with pytest.raises(ValueError):
+        GENERATORS["attn.sparse_topk_positions"](random.Random(0), [1], 2, 4)
+
+
+def test_sampling_chain_ids_allow_more_drafts_than_vocabulary():
+    from workloads.workload_base import manifest_call
+
+    call = manifest_call("ChainSpeculativeSamplingFwdOp", B=4, N=600, V=64)
+    rows = call.metadata_values("draft_token_ids")
+    assert len(rows) == 4 and all(len(row) == 600 for row in rows)
+    assert all(0 <= token < 64 for row in rows for token in row)
+    assert any(len(set(row)) < len(row) for row in rows)

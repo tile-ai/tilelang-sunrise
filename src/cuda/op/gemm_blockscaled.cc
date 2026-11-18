@@ -27,20 +27,6 @@ namespace cuda {
 constexpr const char *kCudaTCGEN05BlockScaled = "cuda.tcgen05.blockscaled";
 constexpr const char *kCudaMMABlockScaled = "cuda.mma.blockscaled";
 
-TVM_REGISTER_OP("tl.tileop.tcgen05_gemm_blockscaled")
-    .set_attr<tirx::TScriptPrinterName>("TScriptPrinterName",
-                                        "tcgen05_gemm_blockscaled")
-    .set_attr<OpBuilderFunc>(
-        "TLOpBuilder",
-        [](ffi::Array<PrimExpr> args,
-           ffi::Map<ffi::String, ffi::ObjectRef> annotations) {
-          annotations.Set("is_tcgen05", IntImm(DataType::Int(32), 1));
-          return GemmBlockScaled(std::move(args), std::move(annotations));
-        })
-    .set_num_inputs(-1)
-    .set_attr<tirx::TCallEffectKind>("TCallEffectKind",
-                                     Integer(tirx::CallEffectKind::kOpaque));
-
 namespace {
 
 ffi::String SelectBlockScaledGemmInst(const GemmBlockScaled &op,

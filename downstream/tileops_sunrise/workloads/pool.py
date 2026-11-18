@@ -1,227 +1,18 @@
 """Workload definitions for the pool op family."""
 
 from collections.abc import Sequence
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import torch
 import torch.nn.functional as F
 
-from workloads.workload_base import WorkloadBase  # noqa: F401
+from workloads.device import run_device
+from workloads.workload_base import CallWorkload, WorkloadBase
 
 
 def max_pool_ref(ndim: int) -> Callable:
     """Return ``torch.nn.functional.max_pool{ndim}d``."""
     return getattr(F, f"max_pool{ndim}d")
-
-
-class AvgPool1dBenchCase:
-    def __init__(
-        self,
-        n: int,
-        c_in: int,
-        l_in: int,
-        kernel_size: int,
-        stride: Optional[int],
-        padding: int,
-        ceil_mode: bool,
-        count_include_pad: bool,
-        dtype: torch.dtype,
-    ) -> None:
-        self.n = n
-        self.c_in = c_in
-        self.l_in = l_in
-        self.kernel_size = kernel_size
-        self.stride = kernel_size if stride is None else stride
-        self.padding = padding
-        self.ceil_mode = ceil_mode
-        self.count_include_pad = count_include_pad
-        self.dtype = dtype
-
-    def gen_inputs(self) -> tuple[torch.Tensor]:
-        x = torch.randn(self.n, self.c_in, self.l_in, device="ptpu", dtype=self.dtype).contiguous()
-        return (x,)
-
-
-class AvgPool2dBenchCase:
-    def __init__(
-        self,
-        n: int,
-        c_in: int,
-        h_in: int,
-        w_in: int,
-        kernel_size: tuple[int, int],
-        stride: Optional[tuple[int, int]],
-        padding: tuple[int, int],
-        ceil_mode: bool,
-        count_include_pad: bool,
-        divisor_override: Optional[int],
-        dtype: torch.dtype,
-    ) -> None:
-        self.n = n
-        self.c_in = c_in
-        self.h_in = h_in
-        self.w_in = w_in
-        self.kernel_size = kernel_size
-        self.stride = kernel_size if stride is None else stride
-        self.padding = padding
-        self.ceil_mode = ceil_mode
-        self.count_include_pad = count_include_pad
-        self.divisor_override = divisor_override
-        self.dtype = dtype
-
-    def gen_inputs(self) -> tuple[torch.Tensor]:
-        x = torch.randn(
-            self.n, self.c_in, self.h_in, self.w_in, device="ptpu", dtype=self.dtype
-        ).contiguous()
-        return (x,)
-
-
-class AvgPool3dBenchCase:
-    def __init__(
-        self,
-        n: int,
-        c_in: int,
-        d_in: int,
-        h_in: int,
-        w_in: int,
-        kernel_size: tuple[int, int, int],
-        stride: Optional[tuple[int, int, int]],
-        padding: tuple[int, int, int],
-        ceil_mode: bool,
-        count_include_pad: bool,
-        divisor_override: Optional[int],
-        dtype: torch.dtype,
-    ) -> None:
-        self.n = n
-        self.c_in = c_in
-        self.d_in = d_in
-        self.h_in = h_in
-        self.w_in = w_in
-        self.kernel_size = kernel_size
-        self.stride = kernel_size if stride is None else stride
-        self.padding = padding
-        self.ceil_mode = ceil_mode
-        self.count_include_pad = count_include_pad
-        self.divisor_override = divisor_override
-        self.dtype = dtype
-
-    def gen_inputs(self) -> tuple[torch.Tensor]:
-        x = torch.randn(
-            self.n,
-            self.c_in,
-            self.d_in,
-            self.h_in,
-            self.w_in,
-            device="ptpu",
-            dtype=self.dtype,
-        ).contiguous()
-        return (x,)
-
-
-class MaxPool2dBenchCase:
-    def __init__(
-        self,
-        n: int,
-        c_in: int,
-        h_in: int,
-        w_in: int,
-        kernel_size: tuple[int, int],
-        stride: Optional[tuple[int, int]],
-        padding: tuple[int, int],
-        dilation: tuple[int, int],
-        ceil_mode: bool,
-        dtype: torch.dtype,
-        return_indices: bool = False,
-    ) -> None:
-        self.n = n
-        self.c_in = c_in
-        self.h_in = h_in
-        self.w_in = w_in
-        self.kernel_size = kernel_size
-        self.stride = kernel_size if stride is None else stride
-        self.padding = padding
-        self.dilation = dilation
-        self.ceil_mode = ceil_mode
-        self.dtype = dtype
-        self.return_indices = return_indices
-
-    def gen_inputs(self) -> tuple[torch.Tensor]:
-        x = torch.randn(
-            self.n, self.c_in, self.h_in, self.w_in, device="ptpu", dtype=self.dtype
-        ).contiguous()
-        return (x,)
-
-
-class MaxPool1dBenchCase:
-    def __init__(
-        self,
-        n: int,
-        c_in: int,
-        l_in: int,
-        kernel_size: tuple[int],
-        stride: Optional[tuple[int]],
-        padding: tuple[int],
-        dilation: tuple[int],
-        ceil_mode: bool,
-        dtype: torch.dtype,
-        return_indices: bool = False,
-    ) -> None:
-        self.n = n
-        self.c_in = c_in
-        self.l_in = l_in
-        self.kernel_size = kernel_size
-        self.stride = kernel_size if stride is None else stride
-        self.padding = padding
-        self.dilation = dilation
-        self.ceil_mode = ceil_mode
-        self.dtype = dtype
-        self.return_indices = return_indices
-
-    def gen_inputs(self) -> tuple[torch.Tensor]:
-        x = torch.randn(self.n, self.c_in, self.l_in, device="ptpu", dtype=self.dtype).contiguous()
-        return (x,)
-
-
-class MaxPool3dBenchCase:
-    def __init__(
-        self,
-        n: int,
-        c_in: int,
-        d_in: int,
-        h_in: int,
-        w_in: int,
-        kernel_size: tuple[int, int, int],
-        stride: Optional[tuple[int, int, int]],
-        padding: tuple[int, int, int],
-        dilation: tuple[int, int, int],
-        ceil_mode: bool,
-        dtype: torch.dtype,
-        return_indices: bool = False,
-    ) -> None:
-        self.n = n
-        self.c_in = c_in
-        self.d_in = d_in
-        self.h_in = h_in
-        self.w_in = w_in
-        self.kernel_size = kernel_size
-        self.stride = kernel_size if stride is None else stride
-        self.padding = padding
-        self.dilation = dilation
-        self.ceil_mode = ceil_mode
-        self.dtype = dtype
-        self.return_indices = return_indices
-
-    def gen_inputs(self) -> tuple[torch.Tensor]:
-        x = torch.randn(
-            self.n,
-            self.c_in,
-            self.d_in,
-            self.h_in,
-            self.w_in,
-            device="ptpu",
-            dtype=self.dtype,
-        ).contiguous()
-        return (x,)
 
 
 class AvgPoolWorkload(WorkloadBase):
@@ -246,10 +37,13 @@ class AvgPoolWorkload(WorkloadBase):
         self.dtype = dtype
 
     def gen_inputs(self, *shape: int) -> tuple[torch.Tensor]:
-        x = torch.randn(*shape, device="ptpu", dtype=self.dtype).contiguous()
+        x = torch.randn(*shape, device=run_device(), dtype=self.dtype).contiguous()
         return (x,)
 
     def ref_program(self, input: torch.Tensor) -> torch.Tensor:
+        return self.torch_program(input.float()).to(input.dtype)
+
+    def torch_program(self, input: torch.Tensor) -> torch.Tensor:
         kwargs: dict[str, object] = {
             "kernel_size": self.kernel_size,
             "stride": self.stride,
@@ -259,7 +53,10 @@ class AvgPoolWorkload(WorkloadBase):
         }
         if self.ndim > 1:
             kwargs["divisor_override"] = self.divisor_override
-        return getattr(F, f"avg_pool{self.ndim}d")(input.float(), **kwargs).to(input.dtype)
+        return getattr(F, f"avg_pool{self.ndim}d")(input, **kwargs)
+
+    def verification(self, *inputs):
+        return pool_verification(maximum=False)
 
 
 class MaxPoolWorkload(WorkloadBase):
@@ -286,7 +83,7 @@ class MaxPoolWorkload(WorkloadBase):
         self.return_indices = return_indices
 
     def gen_inputs(self, *shape: int) -> tuple[torch.Tensor]:
-        x = torch.randn(*shape, device="ptpu", dtype=self.dtype)
+        x = torch.randn(*shape, device=run_device(), dtype=self.dtype)
         if self.contiguous:
             x = x.contiguous()
         else:
@@ -306,6 +103,9 @@ class MaxPoolWorkload(WorkloadBase):
             ceil_mode=self.ceil_mode,
             return_indices=self.return_indices,
         )
+
+    def verification(self, *inputs):
+        return pool_verification(maximum=True)
 
 
 class AdaptivePool2dWorkload(WorkloadBase):
@@ -332,37 +132,154 @@ class AdaptivePool2dWorkload(WorkloadBase):
 
     def gen_inputs(self) -> tuple[torch.Tensor]:
         x = torch.randn(
-            self.n, self.c_in, self.h_in, self.w_in, device="ptpu", dtype=self.dtype
+            self.n, self.c_in, self.h_in, self.w_in, device=run_device(), dtype=self.dtype
         ).contiguous()
         return (x,)
+
+
+class AdaptiveAvgPool2dWorkload(AdaptivePool2dWorkload):
+    """AdaptiveAvgPool2dFwdOp's input and reference."""
+
+    def ref_program(self, input: torch.Tensor) -> torch.Tensor:
+        return self.torch_program(input.float()).to(input.dtype)
+
+    def torch_program(self, input: torch.Tensor) -> torch.Tensor:
+        # torch rejects a scalar None here; (None, None) means the same.
+        size = (None, None) if self.output_size is None else self.output_size
+        return F.adaptive_avg_pool2d(input, size)
+
+    def verification(self, *inputs):
+        return pool_verification(maximum=False)
+
+
+class AdaptiveMaxPool2dWorkload(AdaptivePool2dWorkload):
+    """AdaptiveMaxPool2dFwdOp's input and reference, or its ``Indices`` variant's."""
+
+    def __init__(self, *args: Any, return_indices: bool = False, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.return_indices = return_indices
+
+    def ref_program(self, input: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # torch rejects a scalar None here; (None, None) means the same.
+        size = (None, None) if self.output_size is None else self.output_size
+        if (
+            self.return_indices
+            and input.device.type == "cpu"
+            and input.dtype in (torch.float16, torch.bfloat16)
+            and torch.device(run_device()).type == "ptpu"
+        ):
+            # CPU 16-bit adaptive max pooling narrows its indices through the value dtype.
+            values, _ = F.adaptive_max_pool2d(input, size, return_indices=True)
+            _, indices = F.adaptive_max_pool2d(input.float(), size, return_indices=True)
+            return values, indices
+        return F.adaptive_max_pool2d(input, size, return_indices=self.return_indices)
+
+    def verification(self, *inputs):
+        return pool_verification(maximum=True)
+
+
+def _input_spec(call: Any) -> tuple[tuple[int, ...], torch.dtype]:
+    shape, dtype = call.tensors["input"]
+    return tuple(shape), getattr(torch, dtype)
+
+
+class AvgPoolCall(CallWorkload, AvgPoolWorkload):
+    """A manifest call of an ``AvgPool{1,2,3}dFwdOp``; the rank is the input's."""
+
+    def __init__(self, call: Any) -> None:
+        CallWorkload.__init__(self, call)
+        shape, dtype = _input_spec(call)
+        params = call.params
+        AvgPoolWorkload.__init__(
+            self,
+            ndim=len(shape) - 2,
+            kernel_size=params["kernel_size"],
+            stride=params["stride"],
+            padding=params["padding"],
+            ceil_mode=params["ceil_mode"],
+            count_include_pad=params["count_include_pad"],
+            divisor_override=params.get("divisor_override"),
+            dtype=dtype,
+        )
+
+    gen_inputs = CallWorkload.gen_inputs
+
+
+class MaxPoolCall(CallWorkload, MaxPoolWorkload):
+    """A manifest call of a ``MaxPool{1,2,3}d[Indices]FwdOp``; the rank is the input's."""
+
+    def __init__(self, call: Any, return_indices: bool = False) -> None:
+        CallWorkload.__init__(self, call)
+        shape, dtype = _input_spec(call)
+        params = call.params
+        MaxPoolWorkload.__init__(
+            self,
+            ndim=len(shape) - 2,
+            kernel_size=params["kernel_size"],
+            stride=params["stride"],
+            padding=params["padding"],
+            dilation=params["dilation"],
+            ceil_mode=params["ceil_mode"],
+            dtype=dtype,
+            return_indices=return_indices,
+        )
+
+    gen_inputs = CallWorkload.gen_inputs
+
+
+class AdaptiveAvgPool2dCall(CallWorkload, AdaptiveAvgPool2dWorkload):
+    """A manifest call of AdaptiveAvgPool2dFwdOp.
+
+    The input, batched or not, comes from the call, so only what the reference reads is set.
+    """
+
+    def __init__(self, call: Any) -> None:
+        CallWorkload.__init__(self, call)
+        self.output_size = call.params["output_size"]
+
+    gen_inputs = CallWorkload.gen_inputs
+
+
+class AdaptiveMaxPool2dCall(CallWorkload, AdaptiveMaxPool2dWorkload):
+    """A manifest call of AdaptiveMaxPool2dFwdOp or its ``Indices`` variant.
+
+    The input, batched or not, comes from the call, so only what the reference reads is set.
+    """
+
+    def __init__(self, call: Any, return_indices: bool = False) -> None:
+        CallWorkload.__init__(self, call)
+        self.output_size = call.params["output_size"]
+        self.return_indices = return_indices
+
+    gen_inputs = CallWorkload.gen_inputs
 
 
 def mean_pooling_chunk_index(
     seq_lens: Sequence[int], chunk_size: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """The ``offsets`` and ``indices`` a ragged mean-pooling call takes.
+    """The ``cu_seqlens`` and ``chunk_indices`` a ragged mean-pooling call takes.
 
     Args:
         seq_lens: Length of each sequence, in tokens.
         chunk_size: Tokens per chunk; a sequence's last chunk may hold fewer.
 
     Returns:
-        ``offsets``, the ``len(seq_lens) + 1`` cumulative boundaries, and ``indices``, one
+        ``cu_seqlens``, the ``len(seq_lens) + 1`` cumulative boundaries, and ``chunk_indices``, one
         ``(sequence, chunk-within-sequence)`` pair per chunk.
     """
-    from workloads.nsa_utils import prepare_chunk_indices
+    from workloads.sequence_metadata import prepare_chunk_indices
 
     bounds = [0]
     for length in seq_lens:
         bounds.append(bounds[-1] + length)
-    offsets = torch.tensor(bounds, dtype=torch.int32, device="ptpu")
-    return offsets, prepare_chunk_indices(offsets, chunk_size)
+    cu_seqlens = torch.tensor(bounds, dtype=torch.int32, device=run_device())
+    return cu_seqlens, prepare_chunk_indices(cu_seqlens, chunk_size)
 
 
 class MeanPoolingWorkload(WorkloadBase):
     """One chunked-sequence-mean case: its shape, its dtype, and how it is split.
 
-    ``seq_lens`` selects the ragged split and is what ``offsets`` and ``indices`` are built
+    ``seq_lens`` selects the ragged split and is what ``cu_seqlens`` and ``chunk_indices`` are built
     from; without it the split is uniform and the call passes neither tensor.
     """
 
@@ -388,40 +305,87 @@ class MeanPoolingWorkload(WorkloadBase):
 
     def gen_inputs(self) -> tuple:
         x = torch.randn(
-            self.batch, self.seq_len, self.heads, self.dim, device="ptpu", dtype=self.dtype
+            self.batch, self.seq_len, self.heads, self.dim, device=run_device(), dtype=self.dtype
         )
         if self.seq_lens is None:
             return (x,)
         return (x, *mean_pooling_chunk_index(self.seq_lens, self.chunk_size))
 
+    def chunk_slices(
+        self,
+        x: torch.Tensor,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        chunk_indices: Optional[torch.Tensor] = None,
+    ) -> tuple[tuple[int, int], ...]:
+        """Resolve metadata outside a compiled reference; the math stays shared."""
+        if cu_seqlens is None:
+            return tuple(
+                (start, min(start + self.chunk_size, x.shape[1]))
+                for start in range(0, x.shape[1], self.chunk_size)
+            )
+        bounds = cu_seqlens.tolist()
+        return tuple(
+            (
+                bounds[sequence] + chunk * self.chunk_size,
+                min(bounds[sequence] + (chunk + 1) * self.chunk_size, bounds[sequence + 1]),
+            )
+            for sequence, chunk in chunk_indices.tolist()
+        )
+
+    @staticmethod
+    def torch_slices(x: torch.Tensor, slices: tuple[tuple[int, int], ...]) -> torch.Tensor:
+        """Mean of each named chunk in the caller's order, with no padding in its divisor."""
+        if not slices:
+            return x.new_empty((x.shape[0], 0, *x.shape[2:]))
+        return torch.stack([x[:, start:end].mean(1) for start, end in slices], dim=1)
+
+    @staticmethod
+    def reference_slices(x: torch.Tensor, slices: tuple[tuple[int, int], ...]) -> torch.Tensor:
+        """``torch_slices`` in fp32, rounded once to ``x.dtype``."""
+        return MeanPoolingWorkload.torch_slices(x.float(), slices).to(x.dtype)
+
     def ref_program(
         self,
         x: torch.Tensor,
-        offsets: Optional[torch.Tensor] = None,
-        indices: Optional[torch.Tensor] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        chunk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        _ = indices
-        batch, seq_len, heads, dim = x.shape
-        if offsets is None:
-            chunks = -(-seq_len // self.chunk_size)
-            output = torch.empty(batch, chunks, heads, dim, dtype=x.dtype, device=x.device)
-            for chunk_id in range(chunks):
-                start = chunk_id * self.chunk_size
-                output[:, chunk_id] = x[:, start : start + self.chunk_size].mean(dim=1)
-            return output
+        return self.reference_slices(x, self.chunk_slices(x, cu_seqlens, chunk_indices))
 
-        lengths = (offsets[1:] - offsets[:-1]).tolist()
-        counts = [-(-n // self.chunk_size) for n in lengths]
-        output = torch.empty(batch, sum(counts), heads, dim, dtype=x.dtype, device=x.device)
-        for b in range(batch):
-            # Reset per row: `offsets` partitions every batch row the same way, so each
-            # row's chunks fill the same output slots.
-            chunk_idx = 0
-            for seq_id, chunks_i in enumerate(counts):
-                seq_start, seq_end = int(offsets[seq_id]), int(offsets[seq_id + 1])
-                for local in range(chunks_i):
-                    chunk_start = seq_start + local * self.chunk_size
-                    chunk_end = min(chunk_start + self.chunk_size, seq_end)
-                    output[b, chunk_idx] = x[b, chunk_start:chunk_end].mean(dim=0)
-                    chunk_idx += 1
-        return output
+    def torch_program(
+        self,
+        x: torch.Tensor,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        chunk_indices: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return self.torch_slices(x, self.chunk_slices(x, cu_seqlens, chunk_indices))
+
+
+class MeanPoolingCallWorkload(CallWorkload, MeanPoolingWorkload):
+    """One manifest call of ``MeanPoolingFwdOp``: its tensors, ``cu_seqlens`` and ``chunk_indices``
+    holding the call's generated values, checked against the reference the workload states."""
+
+    def __init__(self, call: Any) -> None:
+        CallWorkload.__init__(self, call)
+        batch, seq_len, heads, dim = call.tensors["x"][0]
+        cu_seqlens = call.metadata_values("cu_seqlens") if call.present("cu_seqlens") else None
+        MeanPoolingWorkload.__init__(
+            self,
+            batch=batch,
+            seq_len=seq_len,
+            heads=heads,
+            dim=dim,
+            chunk_size=call.params["chunk_size"],
+            dtype=getattr(torch, call.tensors["x"][1]),
+            accum_dtype=getattr(torch, call.params["accum_dtype"]),
+            seq_lens=None
+            if cu_seqlens is None
+            else [b - a for a, b in zip(cu_seqlens, cu_seqlens[1:], strict=False)],
+        )
+
+
+def pool_verification(*, maximum):
+    """Max pooling selects values and indices exactly; averages incur rounding."""
+    from workloads.numerics import Exact
+
+    return Exact(atol=0, rtol=0) if maximum else Exact()

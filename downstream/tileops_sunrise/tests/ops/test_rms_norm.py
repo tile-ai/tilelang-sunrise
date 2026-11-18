@@ -1,14 +1,27 @@
+"""Tests for RMSNorm and fused-add RMSNorm."""
+
 import pytest
 import torch
+import torch.nn.functional as F
 
 from tests.compile_contract import (
     assert_op_owns_graph_nodes,
     compile_fullgraph,
     register_compile_contract,
 )
-from tests.test_base import FixtureBase, TestBase
-from tileops.ops.norm.rms_norm import RMSNormFwdOp
-from workloads.normalization import RMSNormWorkload
+from tests.workload_test_base import FixtureBase, TestBase
+from tileops._kernels.tiling import ALIGNMENT
+from tileops._ops.norm.fused_add_rms_norm import FusedAddRMSNormFwdOp
+from tileops._ops.norm.rms_norm import RMSNormFwdOp
+from tileops._utils import get_shared_memory_optin, get_sm_count
+from workloads.device import run_device
+from workloads.norm import (
+    FusedAddRMSNormWorkload,
+    RMSNormWorkload,
+    norm_verification,
+    normalization_verification,
+)
+from workloads.numerics import compare_outputs, reference_for
 
 register_compile_contract(RMSNormFwdOp)
 
@@ -28,7 +41,7 @@ class RMSNormFixture(FixtureBase):
                     4096,
                     torch.float16,
                     False,
-                    marks=[pytest.mark.smoke, pytest.mark.packaging],
+                    marks=[pytest.mark.smoke, pytest.mark.packaging(family="norm")],
                 ),
                 pytest.param(1024, 4096, torch.bfloat16, False, marks=pytest.mark.smoke),
                 pytest.param(4096, 4096, torch.float16, False, marks=pytest.mark.full),
@@ -43,6 +56,12 @@ class RMSNormFixture(FixtureBase):
                 # Tail-M: M not divisible by block_m (proves T.copy partial block safety)
                 pytest.param(1025, 4096, torch.float16, False, marks=pytest.mark.full),
                 pytest.param(1025, 4096, torch.bfloat16, False, marks=pytest.mark.full),
+                # A short unaligned row: several share a block, with a tail block.
+                pytest.param(17, 96, torch.bfloat16, False, marks=pytest.mark.full),
+                # Rows a group of a warp's lanes holds, with a tail; and a row read twice.
+                pytest.param(33, 256, torch.float16, False, marks=pytest.mark.full),
+                pytest.param(64, 2048, torch.bfloat16, False, marks=pytest.mark.full),
+                pytest.param(4, 32768, torch.float16, False, marks=pytest.mark.full),
             ],
         ),
     ]
@@ -52,9 +71,7 @@ class RMSNormFixture(FixtureBase):
 def test_rms_norm_op(m: int, n: int, dtype: torch.dtype, tune: bool) -> None:
     test = RMSNormTest(m, n, dtype)
     op = RMSNormFwdOp(normalized_shape=(n,))
-    atol = 1e-2 if dtype == torch.float16 else 1.6e-2
-    rtol = atol
-    test.check(op, *test.gen_inputs(), atol=atol, rtol=rtol)
+    test.check(op, *test.gen_inputs())
 
 
 class RMSNormNonContigFixture(FixtureBase):
@@ -72,26 +89,26 @@ class RMSNormNonContigFixture(FixtureBase):
 @RMSNormNonContigFixture
 def test_rms_norm_non_contiguous(m: int, n: int, dtype: torch.dtype) -> None:
     """Test with non-contiguous input (sliced tensor)."""
-    x_full = torch.randn(m, n * 2, dtype=dtype)
+    x_full = torch.randn(m, n * 2, dtype=dtype, device=run_device())
     x = x_full[:, :n]  # non-contiguous slice
-    weight = torch.randn(n, dtype=dtype)
+    weight = torch.randn(n, dtype=dtype, device=run_device())
 
     op = RMSNormFwdOp(normalized_shape=(n,))
 
     # Reference on contiguous copy
     eps = 1e-6
     x_ref = x.contiguous()
-    x_f32 = x_ref.float()
-    rms = torch.sqrt(x_f32.pow(2).mean(dim=-1, keepdim=True) + eps)
-    y_ref = ((x_f32 / rms) * weight.float()).to(dtype)
 
-    y = op(x.ptpu(), weight.ptpu())
+    def reference(x_ref, weight):
+        x_f32 = x_ref.float()
+        rms = torch.sqrt(x_f32.pow(2).mean(dim=-1, keepdim=True) + eps)
+        y_ref = ((x_f32 / rms) * weight.float()).to(dtype)
+        return y_ref
 
-    y = y.cpu()
-    atol = 1e-2 if dtype == torch.float16 else 1.6e-2
-    assert torch.allclose(y, y_ref, atol=atol, rtol=atol), (
-        f"Non-contiguous test failed, max err: {(y - y_ref).abs().max()}"
-    )
+    y_ref = reference_for(reference, x_ref, weight)
+
+    y = op(x, weight)
+    compare_outputs(y, y_ref, norm_verification(dtype))
 
 
 class RMSNorm3DFixture(FixtureBase):
@@ -109,82 +126,47 @@ class RMSNorm3DFixture(FixtureBase):
 @RMSNorm3DFixture
 def test_rms_norm_3d(batch: int, seq: int, hidden: int, dtype: torch.dtype) -> None:
     """Test with 3D input (batch, seq, hidden)."""
-    x = torch.randn(batch, seq, hidden, dtype=dtype)
-    weight = torch.randn(hidden, dtype=dtype)
+    x = torch.randn(batch, seq, hidden, dtype=dtype, device=run_device())
+    weight = torch.randn(hidden, dtype=dtype, device=run_device())
 
     op = RMSNormFwdOp(normalized_shape=(hidden,))
 
     # Reference
     eps = 1e-6
-    x_f32 = x.float()
-    rms = torch.sqrt(x_f32.pow(2).mean(dim=-1, keepdim=True) + eps)
-    y_ref = ((x_f32 / rms) * weight.float()).to(dtype)
 
-    y = op(x.ptpu(), weight.ptpu())
+    def reference(x, weight):
+        x_f32 = x.float()
+        rms = torch.sqrt(x_f32.pow(2).mean(dim=-1, keepdim=True) + eps)
+        y_ref = ((x_f32 / rms) * weight.float()).to(dtype)
+        return y_ref
 
-    y = y.cpu()
-    atol = 1e-2 if dtype == torch.float16 else 1.6e-2
-    assert torch.allclose(y, y_ref, atol=atol, rtol=atol), (
-        f"3D test failed, max err: {(y - y_ref).abs().max()}"
-    )
+    y_ref = reference_for(reference, x, weight)
 
-
-# --------------------------------------------------------------------------------------
-# What the seam must not cost: one memo entry per dtype, and a capturable replay
-# --------------------------------------------------------------------------------------
+    y = op(x, weight)
+    compare_outputs(y, y_ref, norm_verification(dtype))
 
 
-@pytest.mark.smoke
-def test_the_op_holds_one_kernel_per_dtype_whatever_the_row_count() -> None:
-    """The op keys on dtype: the row count reaches the kernel as an argument.
-
-    The TileLang program is still specialized per row count inside
-    ``_rms_norm_kernel``; moving that into the kernel's own cache is kernel-side work.
-    """
-    from tileops.kernels.norm.rms_norm import _rms_norm_kernel
-
-    op = RMSNormFwdOp(normalized_shape=(4096,))
-    weight = torch.randn(4096, dtype=torch.float16, device="ptpu")
-    programs_before = _rms_norm_kernel.cache_info().currsize
-
-    for rows in (128, 129, 1024):
-        op(torch.randn(rows, 4096, dtype=torch.float16, device="ptpu"), weight)
-    op(torch.randn(2, 8, 4096, dtype=torch.float16, device="ptpu"), weight)
-
-    assert list(op.built_kernels("rms_norm")) == [torch.float16], "one kernel object"
-    grew = _rms_norm_kernel.cache_info().currsize - programs_before
-    assert grew == 3, "one program per distinct row count, held by the kernel not the op"
-
-
-@pytest.mark.smoke
-def test_the_in_tree_kernel_requires_a_gpu() -> None:
-    """The op layer is device-agnostic; the requirement belongs to these kernels."""
-    op = RMSNormFwdOp(normalized_shape=(256,))
-
-    with pytest.raises(ValueError, match="requires GPU tensors"):
-        op(torch.randn(4, 256, dtype=torch.float16), torch.randn(256, dtype=torch.float16))
-
-
+@pytest.mark.sm90
+@pytest.mark.cuda_graph(op="RMSNormFwdOp")
 @pytest.mark.smoke
 def test_a_warmed_up_op_can_be_captured_and_replayed() -> None:
-    """Building a kernel may compile, so capture only ever sees a memo hit and a launch."""
+    """Replay consumes changed input and weight contents at their captured addresses."""
+    test = RMSNormTest(1024, 4096, torch.float16)
     op = RMSNormFwdOp(normalized_shape=(4096,))
-    x = torch.randn(1024, 4096, dtype=torch.float16, device="ptpu")
-    weight = torch.randn(4096, dtype=torch.float16, device="ptpu")
-
-    expected = op(x, weight)  # warm-up, outside the capture
-    torch.ptpu.synchronize()
-
-    graph = torch.ptpu.PTPUGraph()
-    static_x = x.clone()
-    with torch.ptpu.graph(graph):
-        static_out = op(static_x, weight)
-
-    static_x.copy_(x)
+    inputs = test.gen_inputs()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        op(*inputs)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = op(*inputs)
+    inputs[0].add_(0.5)
+    inputs[1].mul_(0.5)
+    output.fill_(float("nan"))
     graph.replay()
-    torch.ptpu.synchronize()
-
-    assert torch.allclose(static_out, expected, atol=1e-3, rtol=1e-3)
+    test.check(op, *inputs, runs=lambda *args: output)
 
 
 @pytest.mark.smoke
@@ -192,10 +174,10 @@ def test_a_warmed_up_op_can_be_captured_and_replayed() -> None:
 def test_a_cold_op_traces_fullgraph_and_matches_eager() -> None:
     """Cold is the whole contract: a warm op has nothing left for dynamo to trace into."""
     op = RMSNormFwdOp(normalized_shape=(4096,))
-    x = torch.randn(64, 4096, dtype=torch.float16, device="ptpu")
-    weight = torch.randn(4096, dtype=torch.float16, device="ptpu")
+    x = torch.randn(64, 4096, dtype=torch.float16, device=run_device())
+    weight = torch.randn(4096, dtype=torch.float16, device=run_device())
 
-    torch.testing.assert_close(compile_fullgraph(op, fullgraph=True)(x, weight), op(x, weight))
+    assert torch.equal(compile_fullgraph(op, fullgraph=True)(x, weight), op(x, weight))
 
 
 @pytest.mark.smoke
@@ -203,8 +185,8 @@ def test_a_cold_op_traces_fullgraph_and_matches_eager() -> None:
 def test_the_traced_graph_holds_only_this_ops_operator() -> None:
     """The node is the op's, so replacing the kernel cannot change the graph."""
     op = RMSNormFwdOp(normalized_shape=(256,))
-    x = torch.randn(8, 256, dtype=torch.float16, device="ptpu")
-    weight = torch.randn(256, dtype=torch.float16, device="ptpu")
+    x = torch.randn(8, 256, dtype=torch.float16, device=run_device())
+    weight = torch.randn(256, dtype=torch.float16, device=run_device())
 
     assert_op_owns_graph_nodes(op, x, weight)
 
@@ -214,11 +196,263 @@ def test_the_traced_graph_holds_only_this_ops_operator() -> None:
 def test_a_non_contiguous_input_compiles_to_the_shape_the_fake_promised() -> None:
     """The fake speaks before the body normalizes contiguity, so it promises contiguous."""
     op = RMSNormFwdOp(normalized_shape=(256,))
-    x = torch.randn(8, 512, dtype=torch.float16, device="ptpu")[:, ::2]
-    weight = torch.randn(256, dtype=torch.float16, device="ptpu")
+    x = torch.randn(8, 512, dtype=torch.float16, device=run_device())[:, ::2]
+    weight = torch.randn(256, dtype=torch.float16, device=run_device())
     assert not x.is_contiguous()
 
     output = compile_fullgraph(op, fullgraph=True)(x, weight)
 
     assert output.is_contiguous()
-    torch.testing.assert_close(output, op(x, weight))
+    assert torch.equal(output, op(x, weight))
+
+
+@pytest.mark.smoke
+def test_an_unaligned_row_comes_back_contiguous() -> None:
+    """A row width that is not a multiple of the alignment still returns a contiguous output."""
+    x = torch.randn(3, 96, dtype=torch.float16, device=run_device())
+    assert RMSNormFwdOp(normalized_shape=(96,))(x).is_contiguous()
+
+
+@pytest.mark.smoke
+def test_no_weight_and_no_eps_match_torch() -> None:
+    """An absent weight scales by one; ``eps=None`` is torch's float32 machine epsilon."""
+    x = torch.full((2, 4), 1e-3, dtype=torch.float16, device=run_device())
+    compare_outputs(
+        RMSNormFwdOp(normalized_shape=(4,))(x),
+        reference_for(lambda x: F.rms_norm(x, [4]), x),
+        normalization_verification("RMSNormFwdOp", x.dtype),
+    )
+
+
+@pytest.mark.parametrize(
+    "n,many_rows",
+    [
+        # Warp rows: 16 lanes a row at 256, three vectors a lane at 768, and the bound 2048;
+        # the widest held row; a row of 12288 read twice past four rows an SM, weighted, and
+        # held in registers below them; a row of 32768 read twice.
+        pytest.param(256, False, marks=pytest.mark.smoke),
+        pytest.param(768, False, marks=pytest.mark.smoke),
+        pytest.param(2048, False, marks=pytest.mark.smoke),
+        pytest.param(8192, False, marks=pytest.mark.smoke),
+        pytest.param(12288, True, marks=pytest.mark.smoke),
+        pytest.param(12288, False, marks=pytest.mark.smoke),
+        pytest.param(32768, False, marks=pytest.mark.smoke),
+        # Warp rows at 32 lanes a row; the fragment body just past the warp-row bound; and
+        # the widest row read twice one vector a thread at a time, weighted.
+        pytest.param(512, False, marks=pytest.mark.full),
+        pytest.param(2304, False, marks=pytest.mark.full),
+        pytest.param(16384, True, marks=pytest.mark.full),
+    ],
+)
+def test_tuned_rms_norm_in_each_row_body(n: int, many_rows: bool) -> None:
+    """Each body a row width and row count select is right tuned; the launches of more than
+    four rows an SM carry a weight, the others scale by one."""
+    rows = 4 * get_sm_count() + 1 if many_rows else 5
+    x = torch.randn(rows, n, dtype=torch.bfloat16, device=run_device())
+    weight = torch.randn(n, dtype=torch.bfloat16, device=run_device()) if many_rows else None
+    op = RMSNormFwdOp(normalized_shape=(n,), eps=1e-6)
+    op.request_tune()
+    ref_weight = None if weight is None else weight.float()
+    compare_outputs(
+        op(x, weight),
+        reference_for(
+            lambda x, w: F.rms_norm(x.float(), (n,), w, eps=1e-6).to(x.dtype), x, ref_weight
+        ),
+        normalization_verification("RMSNormFwdOp", x.dtype),
+    )
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "rows,n,dtype,has_weight",
+    [
+        # On SM90 these four reach the on-chip kernel: one CTA staging by cp.async, a
+        # cluster of two, and one CTA read synchronously with and without weight.
+        pytest.param(3, 131072, torch.float16, True, id="on-chip-async-fp16"),
+        pytest.param(3, 262144, torch.bfloat16, True, id="on-chip-cluster-bf16"),
+        pytest.param(3, 65536, torch.float16, True, id="on-chip-fp16"),
+        pytest.param(3, 65536, torch.bfloat16, False, id="on-chip-no-weight"),
+        # Widths the on-chip kernel cannot split reach the streaming kernel: an odd width,
+        # and more rows than resident CTAs, so each CTA walks several rows.
+        pytest.param(3, 131073, torch.bfloat16, False, id="tail-no-weight"),
+        pytest.param(600, 131080, torch.bfloat16, True, id="rows-per-cta"),
+    ],
+)
+def test_rms_norm_rows_exceeding_shared_memory(rows, n, dtype, has_weight) -> None:
+    x = torch.randn(rows, n, device=run_device(), dtype=dtype)
+    weight = torch.randn(n, device=x.device, dtype=dtype) if has_weight else None
+    expected = reference_for(
+        lambda x, weight: F.rms_norm(
+            x.float(), (n,), None if weight is None else weight.float(), eps=1e-6
+        ).to(dtype),
+        x,
+        weight,
+    )
+    op = RMSNormFwdOp(normalized_shape=(n,), eps=1e-6)
+    op.request_tune()
+    actual = op(x, weight)
+    compare_outputs(actual, expected, normalization_verification("RMSNormFwdOp", x.dtype))
+
+
+@pytest.mark.smoke
+def test_rms_norm_widest_row_past_the_sm_count() -> None:
+    # The widest row shared memory holds, at more rows than SMs: staged beside the reduction's
+    # scratch it would pass the budget, so the row kernel holds it in registers.
+    n = get_shared_memory_optin() // 2 // ALIGNMENT * ALIGNMENT
+    x = torch.randn(get_sm_count() + 1, n, device=run_device(), dtype=torch.float16)
+    weight = torch.randn(n, device=x.device, dtype=x.dtype)
+    expected = reference_for(
+        lambda x, weight: F.rms_norm(x.float(), (n,), weight.float(), eps=1e-6).to(x.dtype),
+        x,
+        weight,
+    )
+    actual = RMSNormFwdOp(normalized_shape=(n,), eps=1e-6)(x, weight)
+    compare_outputs(actual, expected, normalization_verification("RMSNormFwdOp", x.dtype))
+
+
+def _misaligned(t: torch.Tensor) -> torch.Tensor:
+    """*t* copied into a contiguous view that starts one element into its storage."""
+    view = torch.empty(t.numel() + 1, dtype=t.dtype, device=t.device)[1:].view(t.shape)
+    view.copy_(t)
+    return view
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "n",
+    [
+        pytest.param(4096, id="register-row"),
+        pytest.param(131080, id="streaming"),
+        # The on-chip kernel on SM90, the streaming kernel before it.
+        pytest.param(131072, id="on-chip"),
+    ],
+)
+def test_rms_norm_reads_an_input_and_weight_off_the_vector_boundary(n: int) -> None:
+    """A contiguous input and weight may start anywhere in their storage."""
+    dtype = torch.bfloat16
+    x = _misaligned(torch.randn(2, n, device=run_device(), dtype=dtype))
+    weight = _misaligned(torch.randn(n, device=x.device, dtype=dtype))
+    expected = reference_for(
+        lambda x, weight: F.rms_norm(x.float(), (n,), weight.float(), eps=1e-6).to(dtype), x, weight
+    )
+    actual = RMSNormFwdOp(normalized_shape=(n,), eps=1e-6)(x, weight)
+    compare_outputs(actual, expected, normalization_verification("RMSNormFwdOp", dtype))
+
+
+class FusedAddRMSNormTest(FusedAddRMSNormWorkload, TestBase):
+    pass
+
+
+class FusedAddRMSNormFixture(FixtureBase):
+    PARAMS = [
+        (
+            "m, n, dtype, tune",
+            [
+                # Standard aligned shapes -- fp16
+                pytest.param(1024, 4096, torch.float16, False, marks=pytest.mark.smoke),
+                pytest.param(1024, 4096, torch.bfloat16, False, marks=pytest.mark.smoke),
+                pytest.param(4096, 4096, torch.float16, False, marks=pytest.mark.full),
+                # Standard aligned shapes -- bf16
+                pytest.param(4096, 4096, torch.bfloat16, False, marks=pytest.mark.full),
+                # Non-aligned N
+                pytest.param(1024, 3000, torch.float16, False, marks=pytest.mark.full),
+                pytest.param(1024, 3000, torch.bfloat16, False, marks=pytest.mark.full),
+                pytest.param(2048, 5120, torch.float16, False, marks=pytest.mark.full),
+                pytest.param(2048, 5120, torch.bfloat16, False, marks=pytest.mark.full),
+                # Tail-M: M not divisible by block_m
+                pytest.param(1025, 4096, torch.float16, False, marks=pytest.mark.full),
+                pytest.param(1025, 4096, torch.bfloat16, False, marks=pytest.mark.full),
+                # A row long enough for the split path, at the row counts
+                # around which it turns on: one row takes it, a few rows do
+                # not, and a full grid does not.
+                pytest.param(1, 16384, torch.bfloat16, False, marks=pytest.mark.full),
+                pytest.param(2, 16384, torch.bfloat16, False, marks=pytest.mark.full),
+                pytest.param(4, 16384, torch.float16, False, marks=pytest.mark.full),
+            ],
+        ),
+    ]
+
+
+@FusedAddRMSNormFixture
+def test_fused_add_rms_norm_op(m: int, n: int, dtype: torch.dtype, tune: bool) -> None:
+    test = FusedAddRMSNormTest(m, n, dtype)
+    op = FusedAddRMSNormFwdOp()
+    if tune:
+        op.request_tune()
+    test.check(op, *test.gen_inputs())
+
+
+class FusedAddRMSNormNonContigFixture(FixtureBase):
+    PARAMS = [
+        (
+            "m, n, dtype",
+            [
+                pytest.param(1024, 4096, torch.float16, marks=pytest.mark.smoke),
+                pytest.param(1024, 4096, torch.bfloat16, marks=pytest.mark.smoke),
+            ],
+        ),
+    ]
+
+
+@FusedAddRMSNormNonContigFixture
+def test_fused_add_rms_norm_non_contiguous(m: int, n: int, dtype: torch.dtype) -> None:
+    """Test with non-contiguous input (sliced tensor)."""
+    x_full = torch.randn(m, n * 2, dtype=dtype, device=run_device())
+    r_full = torch.randn(m, n * 2, dtype=dtype, device=run_device())
+    x = x_full[:, :n]  # non-contiguous slice
+    residual = r_full[:, :n]
+    weight = torch.randn(n, dtype=dtype, device=run_device())
+
+    op = FusedAddRMSNormFwdOp()
+
+    # Reference on contiguous copies
+    test = FusedAddRMSNormTest(m, n, dtype)
+    y_ref, add_ref = reference_for(
+        lambda x, residual, weight: test.ref_program(x.contiguous(), residual.contiguous(), weight),
+        x,
+        residual,
+        weight,
+    )
+
+    y, residual_out = op(x, residual, weight)
+    compare_outputs(y, y_ref, norm_verification(dtype))
+    compare_outputs(residual_out, add_ref, norm_verification(dtype))
+
+
+class FusedAddRMSNorm3DFixture(FixtureBase):
+    PARAMS = [
+        (
+            "batch, seq, hidden, dtype",
+            [
+                pytest.param(2, 512, 4096, torch.float16, marks=pytest.mark.smoke),
+                pytest.param(2, 512, 4096, torch.bfloat16, marks=pytest.mark.smoke),
+            ],
+        ),
+    ]
+
+
+@FusedAddRMSNorm3DFixture
+def test_fused_add_rms_norm_3d(batch: int, seq: int, hidden: int, dtype: torch.dtype) -> None:
+    """Test with 3D input (batch, seq, hidden)."""
+    x = torch.randn(batch, seq, hidden, dtype=dtype, device=run_device())
+    residual = torch.randn(batch, seq, hidden, dtype=dtype, device=run_device())
+    weight = torch.randn(hidden, dtype=dtype, device=run_device())
+
+    M = batch * seq
+    op = FusedAddRMSNormFwdOp()
+
+    test = FusedAddRMSNormTest(M, hidden, dtype)
+    y_ref, add_ref = reference_for(
+        lambda x, residual, weight: test.ref_program(x, residual, weight), x, residual, weight
+    )
+
+    y, residual_out = op(x, residual, weight)
+    compare_outputs(y, y_ref, norm_verification(dtype))
+    compare_outputs(residual_out, add_ref, norm_verification(dtype))
+
+
+@pytest.mark.smoke
+def test_fused_add_rms_norm_reads_inputs_off_the_vector_boundary() -> None:
+    """A contiguous input, residual and weight may start anywhere in their storage."""
+    test = FusedAddRMSNormTest(4, 1024, torch.float16)
+    test.check(FusedAddRMSNormFwdOp(), *(_misaligned(t) for t in test.gen_inputs()))

@@ -19,10 +19,30 @@ env:
   TILELANG_CACHE_DIR: /ci-cache/tilelang
   TILELANG_TMP_DIR: /ci-cache/tilelang/tmp
   TRITON_CACHE_DIR: /ci-cache/triton
+  TORCHINDUCTOR_CACHE_DIR: /ci-cache/torchinductor
   PIP_CACHE_DIR: /ci-cache/pip
   MAX_JOBS: "64"
 
 jobs:
+  validate-refs:
+    if: ${{ github.repository == 'tile-ai/TileOPs' && (github.event_name == 'schedule' || github.ref == 'refs/heads/main') }}
+    timeout-minutes: 15
+    runs-on: [self-hosted, tile-ops, shared]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - name: Verify nightly runner environment
+        run: bash scripts/ci/verify_nightly_runner.sh
+
+      - name: Install TileOPs (image-baked stack, --no-deps)
+        run: bash scripts/ci/install_tileops.sh
+
+      - name: Validate all registered reference APIs
+        run: python3 scripts/validate_manifest.py --levels refs --verbose
+
   # =========================================================================
   # Phase 1 — Benchmark (exclusive GPU access for accurate profiling)
   #
@@ -33,18 +53,17 @@ jobs:
   # =========================================================================
   benchmark:
     if: ${{ github.repository == 'tile-ai/TileOPs' && (github.event_name == 'schedule' || github.ref == 'refs/heads/main') }}
-    # Sized for a cold cache: the full sweep takes hours with nothing cached and
-    # minutes once it is. Must exceed --total-budget below so the runner, not
-    # GitHub, ends the sweep.
+    # Six-hour safety ceiling, plus time to retain reports and artifacts.
     timeout-minutes: 380
     runs-on: [self-hosted, tile-ops, bench]
     env:
+      BENCH_WARN_SECONDS: ${{ vars.NIGHTLY_BENCH_WARN_SECONDS || '7200' }}
       # Keep the long benchmark suite from fragmenting CUDA allocator segments
       # before late large MoE input tensors allocate 14-21 GiB weight blocks.
       PYTORCH_ALLOC_CONF: expandable_segments:True
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
@@ -135,6 +154,7 @@ jobs:
           done
         shell: bash
 
+      # Each case checks its warmup outputs before sampling; there is no second sweep.
       - name: Run benchmark ops
         id: benchmark_tests
         continue-on-error: true
@@ -150,9 +170,7 @@ jobs:
           # One pytest process per bench file: a native hang / segfault / OOM
           # kill costs only that file's results. py-spy captures the stack of
           # a hung child before the runner kills it.
-          # --stall-timeout bounds silence, not runtime. A file killed mid-run
-          # never writes its kernels to the persistent cache, so capping total
-          # runtime would keep the same files cold every night.
+          # Bound stalled cases separately from the total sweep budget.
           set -o pipefail
           # Best-effort: on a network failure the run proceeds without stack
           # dumps (the runner records the absence) instead of dying here.
@@ -161,6 +179,7 @@ jobs:
           python3 scripts/ci/run_benchmarks.py benchmarks/ops \
             --junit-xml bench_results.xml \
             --stall-timeout 900 \
+            --warn-after "${BENCH_WARN_SECONDS}" \
             --total-budget 21600 \
             --dump-dir bench_stack_dumps | tee tileops_benchmarks.log
 
@@ -194,11 +213,40 @@ jobs:
           cat env.json
         shell: bash
 
+      # Two attempts, neither fatal: this job's conclusion states whether the
+      # benchmark passed. A snapshot that never reaches the artifact API fails
+      # `publish-bench-data`, where the missing data is what the failure names.
       - name: Upload benchmark artifacts
-        uses: actions/upload-artifact@v4
+        id: upload_bench
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: ${{ always() }}
+        continue-on-error: true
         with:
-          name: tileops_benchmark_${{ github.run_id }}
+          name: tileops_benchmark_${{ github.run_id }}_${{ github.run_attempt }}
+          path: |
+            tileops_benchmarks.log
+            bench_results.xml
+            bench_coverage.md
+            env.json
+            bench_stack_dumps/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Wait out the reset before retrying the upload
+        if: ${{ always() && steps.upload_bench.outcome == 'failure' }}
+        run: sleep 30
+        shell: bash
+
+      - name: Upload benchmark artifacts (retry)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ always() && steps.upload_bench.outcome == 'failure' }}
+        continue-on-error: true
+        with:
+          name: tileops_benchmark_${{ github.run_id }}_${{ github.run_attempt }}
+          # A create request whose response was lost may still have created the
+          # artifact, and v4 names are immutable: without this the retry is
+          # rejected for the name the failed attempt left behind.
+          overwrite: true
           path: |
             tileops_benchmarks.log
             bench_results.xml
@@ -231,7 +279,7 @@ jobs:
     runs-on: [self-hosted, tile-ops, shared]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
@@ -263,74 +311,43 @@ jobs:
         shell: bash
 
       - name: Download benchmark artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         if: ${{ always() }}
         with:
-          name: tileops_benchmark_${{ github.run_id }}
+          name: tileops_benchmark_${{ github.run_id }}_${{ github.run_attempt }}
         continue-on-error: true
 
-      - name: Resolve previous perf history artifact
-        id: perf_history_source
+      - name: Build the perf history window
         if: ${{ always() }}
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const { owner, repo } = context.repo;
-            const workflowId = "nightly.yml";
-            const currentRunId = context.runId;
-            const runs = await github.paginate(
-              github.rest.actions.listWorkflowRuns,
-              {
-                owner,
-                repo,
-                workflow_id: workflowId,
-                branch: "main",
-                status: "completed",
-                per_page: 100,
-              },
-            );
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          mkdir -p .perf_history
+          python3 scripts/build_perf_history.py \
+            --url https://github.com/tile-ai/TileOPs-nightly.git \
+            --out .perf_history/perf_history.json
+        shell: bash
 
-            for (const run of runs) {
-              if (run.id === currentRunId || run.conclusion !== "success") {
-                continue;
-              }
 
-              const artifacts = await github.paginate(
-                github.rest.actions.listWorkflowRunArtifacts,
-                {
-                  owner,
-                  repo,
-                  run_id: run.id,
-                  per_page: 100,
-                },
-              );
-
-              const artifact = artifacts.find(
-                (candidate) =>
-                  !candidate.expired && candidate.name === "tileops_perf_history",
-              );
-              if (!artifact) {
-                continue;
-              }
-
-              core.info(
-                `Using perf history artifact from run ${run.id} (${run.html_url})`,
-              );
-              core.setOutput("run_id", String(run.id));
-              return;
-            }
-
-            core.info("No previous perf history artifact found; nightly report will start a new history baseline.");
-
-      - name: Download previous perf history
-        uses: actions/download-artifact@v4
-        if: ${{ always() && steps.perf_history_source.outputs.run_id != '' }}
-        with:
-          name: tileops_perf_history
-          path: .perf_history
-          github-token: ${{ github.token }}
-          repository: ${{ github.repository }}
-          run-id: ${{ steps.perf_history_source.outputs.run_id }}
+      - name: Fetch the previous nightly's benchmark results
+        if: ${{ always() }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          # The badge's noise rule compares against the newest snapshot that another run published.
+          git clone --quiet --depth 20 --branch snapshots \
+            https://github.com/tile-ai/TileOPs-nightly.git .previous_snapshot
+          for commit in $(git -C .previous_snapshot rev-list HEAD); do
+            run_id=$(git -C .previous_snapshot show "$commit:meta.json" \
+              | python3 -c 'import json, sys; print(json.load(sys.stdin).get("run_id", ""))')
+            if [ "$run_id" != "$GITHUB_RUN_ID" ]; then
+              git -C .previous_snapshot show "$commit:bench_results.xml" > previous_bench_results.xml.tmp
+              mv previous_bench_results.xml.tmp previous_bench_results.xml
+              break
+            fi
+          done
+          [ -f previous_bench_results.xml ] || echo "::warning::no previous nightly; the badge counts small rows ahead"
+        shell: bash
 
       - name: Generate nightly report
         if: ${{ always() }}
@@ -349,8 +366,9 @@ jobs:
             --bench-xml bench_results.xml \
             "${HISTORY_ARGS[@]}" \
             --output nightly_report.md \
-            --history-out perf_history.json \
             --coverage-xml coverage.xml \
+            --badge-output nightly-vs-baseline.json \
+            --previous-bench-xml previous_bench_results.xml \
             || echo "::warning::nightly_report.py failed"
         shell: bash
 
@@ -360,25 +378,18 @@ jobs:
         shell: bash
 
       - name: Upload op test artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: ${{ always() }}
         with:
-          name: tileops_op_test_${{ github.run_id }}
+          name: tileops_op_test_${{ github.run_id }}_${{ github.run_attempt }}
           path: |
             test_results.xml
+            coverage.xml
             tileops_op_test.log
             nightly_report.md
+            nightly-vs-baseline.json
             htmlcov/
           if-no-files-found: warn
-          retention-days: 14
-
-      - name: Upload perf history
-        uses: actions/upload-artifact@v4
-        if: ${{ always() && hashFiles('perf_history.json') != '' }}
-        with:
-          name: tileops_perf_history
-          path: perf_history.json
-          overwrite: true
           retention-days: 14
 
       - name: Fail op test job if pytest failed
@@ -401,21 +412,21 @@ jobs:
       contents: read
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 1
 
       - name: Download benchmark artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: tileops_benchmark_${{ github.run_id }}
+          name: tileops_benchmark_${{ github.run_id }}_${{ github.run_attempt }}
           path: _bench
         continue-on-error: true
 
       - name: Download op test artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: tileops_op_test_${{ github.run_id }}
+          name: tileops_op_test_${{ github.run_id }}_${{ github.run_attempt }}
           path: _optest
         continue-on-error: true
 
@@ -428,13 +439,21 @@ jobs:
           if [ -f _bench/bench_results.xml ]; then
             cp _bench/bench_results.xml _publish/bench_results.xml
           else
-            echo "::warning::bench_results.xml missing; skipping nightly-bench publish"
+            echo "bench_results.xml missing; skipping nightly-bench publish"
             ok=0
           fi
           if [ -f _optest/test_results.xml ]; then
             cp _optest/test_results.xml _publish/test_results.xml
           else
             echo "::warning::test_results.xml missing; page will render without test status"
+          fi
+          if [ -f _optest/coverage.xml ]; then
+            cp _optest/coverage.xml _publish/coverage.xml
+          fi
+          # The README badge reads this file from the snapshot, so it changes with
+          # each night's data.
+          if [ -f _optest/nightly-vs-baseline.json ]; then
+            cp _optest/nightly-vs-baseline.json _publish/nightly-vs-baseline.json
           fi
           if [ "$ok" -eq 1 ]; then
             # The environment the benchmark job read off its own machine.
@@ -454,7 +473,7 @@ jobs:
       # repository that everyone clones.
       - name: Publish the snapshot to TileOPs-nightly
         if: ${{ steps.assemble.outputs.ok == '1' }}
-        uses: peaceiris/actions-gh-pages@v4
+        uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453 # v4.1.0
         with:
           # GITHUB_TOKEN cannot reach another repository.
           personal_token: ${{ secrets.BENCH_ARCHIVE_TOKEN }}
@@ -470,6 +489,13 @@ jobs:
           user_name: "github-actions[bot]"
           user_email: "41898282+github-actions[bot]@users.noreply.github.com"
 
+      - name: Fail when tonight's benchmark data was not published
+        if: ${{ steps.assemble.outputs.ok != '1' }}
+        run: |
+          echo "::error::bench_results.xml is missing, so the snapshot still shows the previous run. Check whether the benchmark job produced it and whether its artifact upload reached GitHub."
+          exit 1
+        shell: bash
+
   # =========================================================================
   # Phase 3 — Packaging and smoke test
   # =========================================================================
@@ -479,7 +505,7 @@ jobs:
     runs-on: [self-hosted, tile-ops, shared]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # setuptools-scm needs full history; a shallow clone yields the fallback.
           fetch-depth: 0
@@ -488,59 +514,43 @@ jobs:
         run: scripts/ci/verify_nightly_runner.sh
         shell: bash
 
-      - name: Install TileOPs (image-baked stack, --no-deps)
-        run: bash scripts/ci/install_tileops.sh
-        shell: bash
-
       - name: Build and test wheel package
         run: |
           set -euo pipefail
           exec > >(tee packaging.log) 2>&1
 
-          python3 -m pip install -c constraints.txt build pytest pytest-timeout
-
-          echo "=== Build wheel package ==="
+          python3 -m pip install -c constraints.txt build
           python3 -m build --wheel
-          echo "=== Build artifacts ==="
           ls -lh dist/*.whl
-
-          echo "=== Install built wheel ==="
-          python3 -m pip install dist/*.whl
-
-          # Run outside the checkout so `tileops` resolves to the wheel, not src/.
-          TMP_TEST_DIR="$(mktemp -d "${RUNNER_TEMP}/packaging-test.XXXXXX")"
-          cp -r tests "${TMP_TEST_DIR}/tests"
-          cp -r workloads "${TMP_TEST_DIR}/workloads"
-          cp pyproject.toml "${TMP_TEST_DIR}/"
-          cd "${TMP_TEST_DIR}"
 
           echo "=== Runtime cache env ==="
           echo "TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR:-}"
           echo "TILELANG_TMP_DIR=${TILELANG_TMP_DIR:-}"
           echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-}"
 
-          echo "=== Run pytest packaging ==="
-          python3 -m pytest -q tests/ops -m "packaging" \
-            --timeout=900 --timeout-method=thread \
-            --junit-xml="${GITHUB_WORKSPACE}/packaging_smoke.xml"
+          # torch and tilelang come from the image; the release workflow runs the same
+          # script with --deps pypi.
+          bash scripts/ci/verify_installed_wheel.sh \
+            --wheel "$(ls dist/*.whl)" --deps image --work-dir packaging-verify
         shell: bash
 
       - name: Upload wheel artifact
         if: ${{ success() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: tileops-wheel-${{ github.sha }}
+          name: tileops-wheel-${{ github.sha }}_${{ github.run_attempt }}
           path: dist/*.whl
           if-no-files-found: error
           retention-days: 14
 
       - name: Upload packaging logs
         if: ${{ always() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: packaging-logs-${{ github.sha }}
+          name: packaging-logs-${{ github.sha }}_${{ github.run_attempt }}
           path: |
             packaging.log
-            packaging_smoke.xml
+            packaging-verify/packaging.xml
+            packaging-verify/env.json
           if-no-files-found: warn
           retention-days: 14

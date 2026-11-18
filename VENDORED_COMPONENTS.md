@@ -11,8 +11,8 @@ distribution-specific edits carry explicit modification notices where required.
 | Apache TVM FFI | `3rdparty/tvm_sunrise/3rdparty/tvm-ffi/` | <https://github.com/apache/tvm-ffi> | `66400b2f22dc713f4c999b8f19ce3c5a273a9719` | Apache-2.0 |
 | DLPack | `3rdparty/tvm_sunrise/3rdparty/tvm-ffi/3rdparty/dlpack/` | <https://github.com/dmlc/dlpack> | `5cfd3fb7adf6b1a56a26e3408a887a6cca73aec8` | Apache-2.0 |
 | libbacktrace | `3rdparty/tvm_sunrise/3rdparty/tvm-ffi/3rdparty/libbacktrace/` | <https://github.com/ianlancetaylor/libbacktrace> | `793921876c981ce49759114d7bb89bb89b2d3a2d` | BSD-3-Clause |
-| TileOPs | `downstream/tileops_sunrise/` | <https://github.com/tile-ai/TileOPs> | `1f8e299d272d10471b01a94560122583e8009a2e` | MIT |
-| TileKernels | `downstream/tilekernels_sunrise/` | <https://github.com/deepseek-ai/TileKernels> | `b1a149cb8daa25b280b2bde6df50a99c0e3b8592` | MIT |
+| TileOPs | `downstream/tileops_sunrise/` | <https://github.com/tile-ai/TileOPs> | `0f3e93bd5a269be77eea6987ee7e33c1592bd338` | MIT |
+| TileKernels | `downstream/tilekernels_sunrise/` | <https://github.com/deepseek-ai/TileKernels> | `eb736c3d7067b76a45e108eb1810d339a1c9fae1` | MIT |
 
 Each component retains its own license, attribution files, and source copyright
 notices in its repository path. TVM and Apache TVM FFI also retain their

@@ -6,10 +6,7 @@ ldt drain。正确做法是把 drain(sync_wait + tcgen05_ld + 消费拷贝)包�
 这样 ``thread_bounds`` 对 ldt 与其 fragment 消费者一并收窄到该 warp;再配合
 生产者→消费者的 ``tcgen05_sync_arrive`` / ``tcgen05_sync_wait`` 握手。
 
-详见 docs/s3_tcgen05_ldst_warp_specialize.md。
-
 §1 Lowering 断言   test_ws_drain_lowering_* / test_standalone_warp_param_fails
-§2 数值 (via ISS)  test_ws_drain_numeric
 
 这些原语仅在 stcuv2 上支持。
 """
@@ -17,18 +14,15 @@ ldt drain。正确做法是把 drain(sync_wait + tcgen05_ld + 消费拷贝)包�
 import re
 
 import pytest
-import torch
 
 import tilelang
 import tilelang.testing
 import tilelang.tang.language as T
 from tilelang import tvm as tvm
-from tilelang.jit import JITKernel
 
 STCUV2_TARGET = {"kind": "tang", "arch": "stcuv2"}
 
 _TL_DTYPE = {"float16": T.float16, "bfloat16": T.bfloat16}
-_PT_DTYPE = {"float16": torch.float16, "bfloat16": torch.bfloat16}
 
 
 # ===========================================================================
@@ -65,53 +59,9 @@ def _make_ws_drain_kernel(M, N, K, drain_warp, dtype, barrier_id=1):
     return kernel
 
 
-def _make_ws_st_roundtrip_kernel(M, N, K, warp, dtype, barrier_id=1):
-    """gemm (warp0) -> drain warp does ld->st->ld->global inside T.ws(warp,32).
-
-    Exercises ``tcgen05_st`` (fragment->fresh TMEM) under warp specialization:
-    the drain warp reads the MMA output, stores it into a second TMEM region,
-    reads it back and drains to global. A correct round-trip reproduces the GEMM.
-    """
-    dt = _TL_DTYPE[dtype]
-
-    @T.prim_func
-    def kernel(A: T.Tensor((M, K), dt), B: T.Tensor((N, K), dt), C: T.Tensor((M, N), T.float32)):
-        with T.Kernel(1, 1, threads=128):
-            A_s = T.alloc_shared((M, K), dt)
-            B_s = T.alloc_shared((N, K), dt)
-            C_t = T.alloc_tmem((M, N), T.float32)
-            C_t2 = T.alloc_tmem((M, N), T.float32)
-            C_f = T.alloc_fragment((M, N), T.float32)
-            C_f2 = T.alloc_fragment((M, N), T.float32)
-            T.copy(A, A_s)
-            T.copy(B, B_s)
-            with T.ws(0, warp_group_size=32):
-                T.gemm(A_s, B_s, C_t, transpose_B=True, clear_accum=True)
-                T.tcgen05_sync_arrive(barrier_id)
-            with T.ws(warp, warp_group_size=32):
-                T.tcgen05_sync_wait(barrier_id, 1, 1)
-                T.tcgen05_ld(C_f, C_t)
-                T.tcgen05_st(C_t2, C_f)
-                T.tcgen05_ld(C_f2, C_t2)
-                T.copy(C_f2, C)
-
-    return kernel
-
-
 def _lower_src(func, target=STCUV2_TARGET):
     with tvm.target.Target(target):
         return tilelang.lower(func, target=target).kernel_source
-
-
-def _sim_rel_err(kernel, M, N, K, dtype):
-    pt = _PT_DTYPE[dtype]
-    torch.manual_seed(0)
-    A = torch.randn(M, K, dtype=pt)
-    B = torch.randn(N, K, dtype=pt)
-    ref = A.float() @ B.float().T
-    jit = JITKernel(kernel, out_idx=[-1], target=STCUV2_TARGET, execution_backend="simulator", verbose=False)
-    C = jit(A.ptpu(), B.ptpu()).cpu().float()
-    return (C - ref).abs().max().item() / (ref.abs().max().item() + 1e-6)
 
 
 # ===========================================================================
@@ -181,67 +131,45 @@ def test_fused_drain_in_ws_fails_loudly():
     assert "warp-specialized" in msg or "T.ws" in msg, f"guard message should mention the T.ws misuse, got: {msg[:400]}"
 
 
-# ===========================================================================
-# §2  Numeric (via ISS)
-# ===========================================================================
+def _make_ws_region_kernel(group, warp_group_size, threads=128):
+    """The smallest kernel that has a ``T.ws`` region, for the range check.
 
-
-@pytest.mark.parametrize(
-    "M,N,K,drain_warp,dtype",
-    [
-        (128, 64, 64, 2, "float16"),
-        (128, 64, 64, 3, "float16"),
-        (128, 64, 64, 2, "bfloat16"),
-    ],
-)
-def test_ws_drain_numeric(M, N, K, drain_warp, dtype):
-    """A warp>0 tcgen05_ld drain must reproduce the GEMM result."""
-    rel = _sim_rel_err(_make_ws_drain_kernel(M, N, K, drain_warp, dtype), M, N, K, dtype)
-    assert rel < 1e-2, f"rel_err too large: {rel:.3e}"
-
-
-def test_ws_drain_numeric_large_tile_is_toolchain_limited():
-    """Record the largest tile a single-warp ws drain sustains -- that limit
-    belongs to ptcc, not to TileLang.
-
-    A single drain warp materializing a full 128x128 fp32 fragment needs
-    ~512 regs/lane. Whether it fits is decided by ptcc's register allocator:
-    the ptcc shipped with the simulator reports 'ran out of registers', while
-    the one on CI compiles it and produces correct numbers.
-
-    So "must fail" cannot be written as a strict xfail -- it flips into an
-    XPASS(strict) failure the moment CI compiles it, and the failure reads like
-    a known limitation, which invites the conclusion that the drain broke.
-
-    Both outcomes are accepted, and both keep an assertion: either the known
-    register-allocation limit is hit, or the kernel compiles and the numbers
-    are correct. A third outcome (compiles but wrong numbers) still fails.
-
-    Draining a 128x128 tile on one warp needs a tiled ldt epilogue, tracked
-    separately.
+    Deliberately not the drain kernel: the check is argument validation in
+    ``T.ws`` itself and raises while the function is still being traced, so
+    nothing about TMEM is involved.
     """
-    try:
-        rel = _sim_rel_err(_make_ws_drain_kernel(128, 128, 64, 2, "float16"), 128, 128, 64, "float16")
-    except RuntimeError as exc:
-        assert "ran out of registers" in str(exc), (
-            f"expected the known register-allocation limit, but ptcc failed for another reason:\n{exc}"
-        )
-        return
-    assert rel < 1e-2, f"rel_err too large: {rel:.3e}"
+
+    @T.prim_func
+    def kernel(A: T.Tensor((threads,), T.float16), C: T.Tensor((threads,), T.float16)):
+        with T.Kernel(1, threads=threads):
+            A_s = T.alloc_shared((threads,), T.float16)
+            with T.ws(group, warp_group_size=warp_group_size):
+                T.copy(A, A_s)
+            T.copy(A_s, C)
+
+    return kernel
 
 
-@pytest.mark.parametrize(
-    "M,N,K,warp,dtype",
-    [
-        (128, 64, 64, 2, "float16"),
-        (128, 64, 64, 3, "float16"),
-        (128, 32, 64, 2, "float16"),
-    ],
-)
-def test_ws_st_roundtrip_numeric(M, N, K, warp, dtype):
-    """A warp>0 tcgen05_st round-trip (ld->st->ld) must be lossless."""
-    rel = _sim_rel_err(_make_ws_st_roundtrip_kernel(M, N, K, warp, dtype), M, N, K, dtype)
-    assert rel < 1e-2, f"rel_err too large: {rel:.3e}"
+@pytest.mark.parametrize("group,size", [(4, 32), (2, 64), (1, 128)])
+def test_ws_group_outside_the_block_is_refused(group, size):
+    """A region the kernel never launches must be named at the T.ws, not later.
+
+    The threads simply never enter it, so whatever it was supposed to produce is
+    missing and the first pass to care reports something unrelated: an MMA in
+    ``T.ws(2, warp_group_size=64)`` of a 128-thread kernel used to surface as
+    ``The layout of tmem buffer C_t is not defined in the layout map`` from
+    lower_s3_shared_tmem.cc, which sends the reader to the wrong file.
+    """
+    with pytest.raises(ValueError) as excinfo:
+        _lower_src(_make_ws_region_kernel(group, size))
+    msg = str(excinfo.value)
+    assert "covers threads" in msg and "128" in msg, msg
+
+
+@pytest.mark.parametrize("group,size", [(3, 32), (1, 64), (0, 128)])
+def test_ws_group_at_the_last_slot_is_allowed(group, size):
+    """The boundary the check must not eat: the block's final group."""
+    assert _lower_src(_make_ws_region_kernel(group, size))
 
 
 if __name__ == "__main__":

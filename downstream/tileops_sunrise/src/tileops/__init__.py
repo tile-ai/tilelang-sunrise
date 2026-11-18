@@ -4,31 +4,21 @@ Ops are reached in two levels, `tileops.<family>.<Op>`:
 
     from tileops.elementwise import HardtanhFwdOp
 
-`_FAMILIES` lists the families. Each is a module of its own; `tileops.ops` is where
+`_FAMILIES` lists the families. Each is a module of its own; `tileops._ops` is where
 the classes are implemented, and is not the path to import them from.
 
 The names below steer dispatch; a *backend* imports `tileops.backend` instead. Every
 name here, families included, resolves on first access (PEP 562), so importing this
 package pulls in neither torch nor any backend — the manifest tooling reads YAML where
 neither is installed. Reaching into a family is what imports torch.
+
+`__version__` is the installed distribution's version, read from its metadata.
 """
 
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # type checkers and IDEs do not run __getattr__
-    from tileops.backend import (
-        BUILTIN,
-        AmbiguousTargetError,
-        BackendError,
-        OpNotAvailableError,
-        UnknownTargetError,
-        default_target,
-        load_failures,
-        registered_targets,
-        set_default_target,
-    )
-
-    from . import (
+    from tileops import (
         attention,
         convolution,
         elementwise,
@@ -42,11 +32,24 @@ if TYPE_CHECKING:  # type checkers and IDEs do not run __getattr__
         quantization,
         reduction,
         rope,
+        sampling,
         sequence_modeling,
+        transform,
     )
-    from .ops.op_base import Op
+    from tileops._ops.op_base import Op
+    from tileops.backend import (
+        BUILTIN,
+        AmbiguousTargetError,
+        BackendError,
+        OpNotAvailableError,
+        UnknownTargetError,
+        default_target,
+        load_failures,
+        registered_targets,
+        set_default_target,
+    )
 
-# One entry per op family, ordered as `tileops.ops.__all__` groups them.
+# One entry per op family, ordered simple to composite; the docs nav follows this order.
 _FAMILIES = (
     "elementwise",
     "reduction",
@@ -56,7 +59,9 @@ _FAMILIES = (
     "pool",
     "convolution",
     "fft",
+    "transform",
     "moe",
+    "sampling",
     "rope",
     "attention",
     "linear_attention",
@@ -79,7 +84,7 @@ _LAZY = {
         ),
         "tileops.backend",
     ),
-    "Op": "tileops.ops.op_base",
+    "Op": "tileops._ops.op_base",
 }
 
 __all__ = sorted({*_LAZY, *_FAMILIES})
@@ -88,7 +93,11 @@ __all__ = sorted({*_LAZY, *_FAMILIES})
 def __getattr__(name: str) -> Any:
     import importlib
 
-    if name in _FAMILIES:
+    if name == "__version__":
+        from importlib.metadata import version
+
+        value = version("tileops")
+    elif name in _FAMILIES:
         # `__package__`, not `__name__`: a tool may load this file as `tileops.__init__`.
         value = importlib.import_module(f".{name}", __package__)
     else:
@@ -101,4 +110,4 @@ def __getattr__(name: str) -> Any:
 
 
 def __dir__() -> list[str]:
-    return sorted({*globals(), *_LAZY, *_FAMILIES})
+    return sorted({*globals(), *_LAZY, *_FAMILIES, "__version__"})

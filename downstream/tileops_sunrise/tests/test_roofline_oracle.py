@@ -19,393 +19,1032 @@ def _nbytes(*tensors: tuple[tuple[int, ...], torch.dtype]) -> int:
     return sum(prod(shape) * dtype.itemsize for shape, dtype in tensors)
 
 
+# Ops a hand-written case recounted in this run, which the completeness test reads.
+_RECOUNTED: set[str] = set()
+
+
+def _ledger(op_name: str, **tensors: "tuple[tuple[int, ...], torch.dtype] | None") -> int:
+    """Sum the named tensors a call binds, and require the names to be the signature's.
+
+    A hand-written case states a tensor per name, ``None`` for an optional input the
+    call does not pass, a ``<name>_write``
+    entry for a write that is not an output's -- a ``mutated`` input's -- and
+    ``<name>_unread=True`` for an input the call passes and the algorithm does not
+    read. Every declared input and output has to appear,
+    and a name the signature does not declare is rejected, so a case cannot quietly
+    drop, duplicate or substitute one of them.
+    """
+    from tileops.manifest import load_manifest
+
+    signature = load_manifest()[op_name]["signature"]
+    inputs = signature.get("inputs") or {}
+    outputs = signature.get("outputs") or {}
+    declared = (
+        set(inputs)
+        | set(outputs)
+        | {f"{name}_write" for name in inputs}
+        | {f"{name}_unread" for name in inputs}
+    )
+    unknown = sorted(set(tensors) - declared)
+    assert not unknown, f"{op_name}: {unknown} are not in the signature"
+    _RECOUNTED.add(op_name)
+    written = {name for name in inputs if tensors.get(f"{name}_write") is not None}
+    undeclared = sorted(name for name in written if not (inputs[name] or {}).get("mutated"))
+    assert not undeclared, (
+        f"{op_name}: {undeclared} are written by the case and the signature does not "
+        "mark them mutated; the write half a read half is taken off reads that marker"
+    )
+    unread = {name for name in inputs if tensors.get(f"{name}_unread")}
+    accounted = set(tensors) | unread
+    missing = sorted((set(inputs) | set(outputs)) - accounted)
+    assert not missing, f"{op_name}: the case says nothing about {missing}"
+    for name, spec in inputs.items():
+        if name in unread:
+            # Declared and passed, and the algorithm does not read it: no traffic.
+            continue
+        if tensors[name] is not None:
+            continue
+        assert (spec or {}).get("optional"), (
+            f"{op_name}: {name} is not optional and the case passes None"
+        )
+    return _nbytes(
+        *(
+            entry
+            for name, entry in tensors.items()
+            if entry is not None and not name.endswith("_unread")
+        )
+    )
+
+
+def _manifest_rows(op_name: str) -> list:
+    from tileops.manifest import load_manifest
+
+    return load_manifest()[op_name]["workloads"]
+
+
+def _manifest_call(op_name: str, row: "dict | None" = None):
+    """The call a workload row of *op_name* states, its metadata generated; the first row
+    and dtype case unless *row* is given."""
+    from tileops.manifest import load_adts, load_manifest
+    from tileops.manifest._plan import entry_plan
+    from tileops.manifest._workload import instantiate
+
+    plan = entry_plan(op_name, load_manifest()[op_name], load_adts())
+    row = row if row is not None else _manifest_rows(op_name)[0]
+    return instantiate(plan, row, (row.get("dtype_cases") or [{}])[0])
+
+
 class TestBytesOracle:
     # __new__ + attribute binding keeps the oracle CUDA-free; each case binds
     # exactly the state the op's eval_roofline reads after a forward().
 
-    def test_conv2d_counts_input_weight_output_and_bias(self):
-        from tileops.ops.convolution import Conv2dFwdOp
+    @staticmethod
+    def _priced(op, tensors, **stages):
+        """``(flops, bytes)`` of *op*'s formula on the checked call of *tensors* (CPU)."""
+        import dataclasses
 
-        n, c_in, h, w = 8, 64, 56, 56
-        c_out, c_in_g, kh, kw = 128, 64, 3, 3
-        out_h = out_w = 54  # stride 1, no padding
-        for has_bias in (True, False):
-            op = Conv2dFwdOp.__new__(Conv2dFwdOp)
-            op._last_roofline_spec = (
-                n, c_in, h, w, c_out, c_in_g, kh, kw, out_h, out_w,
-                torch.float16, has_bias,
-            )  # fmt: skip
-            oracle = _nbytes(
-                ((n, c_in, h, w), torch.float16),
-                ((c_out, c_in_g, kh, kw), torch.float16),
-                ((n, c_out, out_h, out_w), torch.float16),
-                *((((c_out,), torch.float16),) if has_bias else ()),
+        plan = type(op)._signature
+        call = plan.check(op, tensors)
+        return plan.eval_roofline(dataclasses.replace(call, stages=stages))
+
+    @staticmethod
+    def _routed_tensors(tokens, experts, top_k, hidden, ffn, ids):
+        bf16 = torch.bfloat16
+        return {
+            "output": torch.empty(tokens, hidden, dtype=bf16),
+            "hidden_states": torch.empty(tokens, hidden, dtype=bf16),
+            "w_gate_up": torch.empty(experts, 2 * ffn, hidden, dtype=bf16),
+            "w_down": torch.empty(experts, hidden, ffn, dtype=bf16),
+            "topk_weights": torch.empty(tokens, top_k),
+            "topk_ids": torch.tensor(ids, dtype=torch.int32),
+        }
+
+    def test_routed_expert_mlp_counts_active_experts_and_the_routing(self):
+        from tileops.moe import FusedMoEExpertsFwdOp, IndexedExpertMLPFwdOp
+
+        tokens, experts, top_k, hidden, ffn = 2, 8, 2, 64, 32
+        # Only experts 0, 3 and 7 receive rows.
+        tensors = self._routed_tensors(tokens, experts, top_k, hidden, ffn, [[0, 3], [3, 7]])
+        # FusedMoEExpertsFwdOp takes the optional expert biases; IndexedExpertMLPFwdOp none.
+        unbiased = {"b_gate_up": None, "b_down": None}
+        for cls, biases in ((FusedMoEExpertsFwdOp, unbiased), (IndexedExpertMLPFwdOp, {})):
+            oracle = _ledger(
+                cls.__name__,
+                hidden_states=((tokens, hidden), torch.bfloat16),
+                w_gate_up=((3, 2 * ffn, hidden), torch.bfloat16),  # active experts only
+                w_down=((3, hidden, ffn), torch.bfloat16),  # active experts only
+                topk_ids=((tokens, top_k), torch.int32),
+                topk_weights=((tokens, top_k), torch.float32),
+                # the caller's buffer is the output, written once
+                output=((tokens, hidden), torch.bfloat16),
+                **biases,
             )
-            assert op.eval_roofline()[1] == oracle, f"has_bias={has_bias}"
+            assert self._priced(cls(), tensors)[1] == oracle, cls.__name__
+        # The biases are read with their experts' weights: the active experts' rows only.
+        biased = {
+            **tensors,
+            "b_gate_up": torch.empty(experts, 2 * ffn, dtype=torch.bfloat16),
+            "b_down": torch.empty(experts, hidden, dtype=torch.bfloat16),
+        }
+        oracle = _ledger(
+            "FusedMoEExpertsFwdOp",
+            hidden_states=((tokens, hidden), torch.bfloat16),
+            w_gate_up=((3, 2 * ffn, hidden), torch.bfloat16),
+            w_down=((3, hidden, ffn), torch.bfloat16),
+            topk_ids=((tokens, top_k), torch.int32),
+            topk_weights=((tokens, top_k), torch.float32),
+            output=((tokens, hidden), torch.bfloat16),
+            b_gate_up=((3, 2 * ffn), torch.bfloat16),
+            b_down=((3, hidden), torch.bfloat16),
+        )
+        assert self._priced(FusedMoEExpertsFwdOp(), biased)[1] == oracle
 
-    def test_gemm_fp8_counts_fp8_inputs_fp32_scales_and_out_dtype(self):
-        from tileops.ops.gemm.gemm import GemmFp8FwdOp
+    def test_fused_moe_counts_the_experts_its_stage_read_and_the_bias(self):
+        from tileops.moe import FusedMoEExpertsFwdOp, FusedMoEFwdOp
 
-        m, n, k = 4096, 4096, 8192
+        tokens, experts, top_k, hidden, ffn = 2, 8, 2, 64, 32
+        routed = self._routed_tensors(tokens, experts, top_k, hidden, ffn, [[0, 3], [3, 7]])
+        stage = FusedMoEExpertsFwdOp()._signature.check(FusedMoEExpertsFwdOp(), routed)
         for has_bias in (True, False):
-            op = GemmFp8FwdOp.__new__(GemmFp8FwdOp)
-            op.m, op.n, op.k = m, n, k
-            op.dtype = torch.float8_e4m3fn
-            op.out_dtype = torch.bfloat16
-            op.scale_a_shape = (m, 1)
-            op.scale_b_shape = (1, n)
-            op.has_bias = has_bias
-            oracle = _nbytes(
-                ((m, k), torch.float8_e4m3fn),
-                ((k, n), torch.float8_e4m3fn),
-                ((m, n), torch.bfloat16),
-                ((m, 1), torch.float32),
-                ((1, n), torch.float32),
-                *((((n,), torch.bfloat16),) if has_bias else ()),
+            op = FusedMoEFwdOp(top_k, scoring_func="sigmoid")
+            tensors = {
+                "hidden_states": routed["hidden_states"],
+                "gating_output": torch.empty(tokens, experts),
+                "w_gate_up": routed["w_gate_up"],
+                "w_down": routed["w_down"],
+                "correction_bias": torch.empty(experts) if has_bias else None,
+            }
+
+            def ledger(active, has_bias=has_bias):
+                return _ledger(
+                    "FusedMoEFwdOp",
+                    hidden_states=((tokens, hidden), torch.bfloat16),
+                    gating_output=((tokens, experts), torch.float32),
+                    w_gate_up=((active, 2 * ffn, hidden), torch.bfloat16),  # read experts
+                    w_down=((active, hidden, ffn), torch.bfloat16),  # read experts
+                    correction_bias=(((experts,), torch.float32) if has_bias else None),
+                    output=((tokens, hidden), torch.bfloat16),
+                    b_gate_up=None,
+                    b_down=None,
+                )
+
+            # Experts 0, 3 and 7, from the routed-experts stage's checked call.
+            assert self._priced(op, tensors, routed_experts=(stage,))[1] == ledger(3)
+            # No stage call: each token's top_k experts, the bound for every routing.
+            assert self._priced(op, tensors)[1] == ledger(top_k), f"has_bias={has_bias}"
+
+    def test_shared_expert_adds_its_shard_to_the_routed_cost(self):
+        from tileops.moe import FusedMoESharedExpertFwdOp
+
+        tokens, experts, top_k, hidden, ffn, shared_ffn, tp = 2, 8, 2, 64, 32, 32, 2
+        bf16 = torch.bfloat16
+        op = FusedMoESharedExpertFwdOp(top_k, tp_size=tp, tp_rank=1)
+        tensors = {
+            "hidden_states": torch.empty(tokens, hidden, dtype=bf16),
+            "gating_output": torch.empty(tokens, experts),
+            "w_gate_up": torch.empty(experts, 2 * ffn, hidden, dtype=bf16),
+            "w_down": torch.empty(experts, hidden, ffn, dtype=bf16),
+            "correction_bias": None,
+            "shared_w_gate_up": None,
+            "shared_w_down": None,
+        }
+        routed = _ledger(
+            "FusedMoESharedExpertFwdOp",
+            hidden_states=((tokens, hidden), bf16),
+            gating_output=((tokens, experts), torch.float32),
+            w_gate_up=((top_k, 2 * ffn, hidden), bf16),  # the bound: top_k experts
+            w_down=((top_k, hidden, ffn), bf16),
+            correction_bias=None,
+            shared_w_gate_up=None,
+            shared_w_down=None,
+            routed_output=((tokens, hidden), bf16),
+            shared_output=None,
+        )
+        assert self._priced(op, tensors)[1] == routed
+
+        tensors["shared_w_gate_up"] = torch.empty(2 * shared_ffn, hidden, dtype=bf16)
+        tensors["shared_w_down"] = torch.empty(hidden, shared_ffn, dtype=bf16)
+        shared = _nbytes(
+            ((3 * shared_ffn // tp, hidden), bf16),  # this rank's shared weights
+            ((tokens, hidden), bf16),  # shared_output, returned separately
+        )
+        assert self._priced(op, tensors)[1] == routed + shared
+
+    def test_masked_grouped_gemm_moves_only_valid_rows_and_active_weights(self):
+        """A sparse masked slab, as a decode shard holds: of 4 x 64 slab rows, 3 are valid and
+        two experts are empty, so the rows of ``a``, ``a_scale`` and ``output`` past each
+        count and the empty experts' weights move nothing."""
+        from tileops._ops.moe import MaskedLayoutSpec, MoEGroupedGEMMFP8FwdOp, MoEGroupedGEMMFwdOp
+
+        experts, max_m, n, k, counts = 4, 64, 256, 512, [2, 0, 1, 0]
+        valid, active = sum(counts), 2
+        fp8, bf16 = torch.float8_e4m3fn, torch.bfloat16
+        metadata = torch.tensor(counts, dtype=torch.int32)
+        layout = MaskedLayoutSpec(max_m=max_m)
+        fp8_tensors = {
+            "a": torch.empty(experts, max_m, k, dtype=fp8),
+            "a_scale": torch.empty(experts, max_m, k // 128),
+            "b": torch.empty(experts, n, k, dtype=fp8),
+            "b_scale": torch.empty(experts, n // 128, k // 128),
+            "layout_metadata": metadata,
+            "out": None,
+        }
+        oracle = _ledger(
+            "MoEGroupedGEMMFP8FwdOp",
+            a=((valid, k), fp8),  # valid rows only
+            a_scale=((valid, k // 128), torch.float32),  # valid rows only
+            b=((active, n, k), fp8),  # active experts only
+            b_scale=((active, n // 128, k // 128), torch.float32),  # active experts only
+            layout_metadata=((experts,), torch.int32),
+            output=((valid, n), bf16),  # valid rows only
+        )
+        assert self._priced(MoEGroupedGEMMFP8FwdOp(layout), fp8_tensors)[1] == oracle
+
+        bf16_tensors = {
+            "a": torch.empty(experts, max_m, k, dtype=bf16),
+            "b": torch.empty(experts, n, k, dtype=bf16),
+            "layout_metadata": metadata,
+            "bias": None,
+            "out": None,
+        }
+        oracle = _ledger(
+            "MoEGroupedGEMMFwdOp",
+            a=((valid, k), bf16),  # valid rows only
+            b=((active, n, k), bf16),  # active experts only
+            layout_metadata=((experts,), torch.int32),
+            bias=None,
+            output=((valid, n), bf16),  # valid rows only
+        )
+        assert self._priced(MoEGroupedGEMMFwdOp(layout), bf16_tensors)[1] == oracle
+
+    def test_masked_grouped_gemm_without_slab_rows_moves_only_the_metadata(self):
+        """A masked layout of ``max_m = 0`` holds no row, so no expert is active: the row
+        tensors and the weights move nothing, and only ``layout_metadata`` is read."""
+        from tileops._ops.moe import MaskedLayoutSpec, MoEGroupedGEMMFP8FwdOp, MoEGroupedGEMMFwdOp
+
+        experts, n, k = 2, 256, 512
+        fp8, bf16 = torch.float8_e4m3fn, torch.bfloat16
+        metadata = torch.zeros(experts, dtype=torch.int32)
+        layout = MaskedLayoutSpec(max_m=0)
+        fp8_tensors = {
+            "a": torch.empty(experts, 0, k, dtype=fp8),
+            "a_scale": torch.empty(experts, 0, k // 128),
+            "b": torch.empty(experts, n, k, dtype=fp8),
+            "b_scale": torch.empty(experts, n // 128, k // 128),
+            "layout_metadata": metadata,
+            "out": None,
+        }
+        oracle = _ledger(
+            "MoEGroupedGEMMFP8FwdOp",
+            a=((0, k), fp8),
+            a_scale=((0, k // 128), torch.float32),
+            b=((0, n, k), fp8),  # no active expert
+            b_scale=((0, n // 128, k // 128), torch.float32),  # no active expert
+            layout_metadata=((experts,), torch.int32),
+            output=((0, n), bf16),
+        )
+        assert self._priced(MoEGroupedGEMMFP8FwdOp(layout), fp8_tensors) == (0, oracle)
+
+        bf16_tensors = {
+            "a": torch.empty(experts, 0, k, dtype=bf16),
+            "b": torch.empty(experts, n, k, dtype=bf16),
+            "layout_metadata": metadata,
+            "bias": None,
+            "out": None,
+        }
+        oracle = _ledger(
+            "MoEGroupedGEMMFwdOp",
+            a=((0, k), bf16),
+            b=((0, n, k), bf16),  # no active expert
+            layout_metadata=((experts,), torch.int32),
+            bias=None,
+            output=((0, n), bf16),
+        )
+        assert self._priced(MoEGroupedGEMMFwdOp(layout), bf16_tensors) == (0, oracle)
+
+    def test_nsa_forward_reads_the_rows_its_selection_kept(self):
+        """How much this call reads follows `block_counts`, so the case reads the
+        selection the manifest row generates rather than inventing one of its own."""
+        row = _manifest_rows("NSAVarlenFwdOp")[0]
+        for is_causal in (True, False):
+            self._nsa_forward_case(_manifest_call("NSAVarlenFwdOp", dict(row, is_causal=is_causal)))
+
+    @staticmethod
+    def _nsa_forward_case(call):
+        from tileops._perf.formulas import nsa_fwd_varlen_roofline
+
+        indices = call.indices
+        c_seq_len, heads, head_kv, dim = indices["T_q"], indices["H"], indices["H_kv"], indices["D"]
+        block_size, selected = indices["block_size"], indices["SEL"]
+        # Key rows some token scores, per KV head: each kept block cut at the token (causal)
+        # or the sequence end; a row several tokens score is read once.
+        cu_seqlens = call.metadata_values("cu_seqlens")
+        rows = {
+            (h, cu_seqlens[request] + r)
+            for (request, position), counts, picks in zip(
+                call.metadata_values("token_indices"),
+                call.metadata_values("block_counts"),
+                call.metadata_values("block_indices"),
+                strict=True,
             )
-            assert op.eval_roofline()[1] == oracle, f"has_bias={has_bias}"
-
-    def test_add_broadcast_counts_the_operand_at_its_own_shape(self):
-        from tileops.ops.elementwise.arithmetic import AddFwdOp
-
-        a_shape, b_shape, out_shape = (4, 4096, 4096), (1, 1, 4096), (4, 4096, 4096)
-        op = AddFwdOp.__new__(AddFwdOp)
-        op.input_shape = a_shape
-        op.other_shape = b_shape  # out_shape derives via _infer_output_shapes
-        op.dtype = torch.bfloat16
-        oracle = _nbytes(
-            (a_shape, torch.bfloat16),
-            (b_shape, torch.bfloat16),
-            (out_shape, torch.bfloat16),
-        )
-        assert op.eval_roofline()[1] == oracle
-
-    def test_var_mean_counts_both_outputs(self):
-        from tileops.ops.reduction.reduce import VarMeanFwdOp
-
-        m, n = 8192, 4096
-        op = VarMeanFwdOp.__new__(VarMeanFwdOp)
-        op._last_roofline_mn = (m, n)
-        op.dtype = torch.float32
-        oracle = _nbytes(
-            ((m, n), torch.float32),
-            ((m,), torch.float32),  # var
-            ((m,), torch.float32),  # mean
-        )
-        assert op.eval_roofline()[1] == oracle
-
-    def test_argmax_counts_int64_indices(self):
-        from tileops.ops.reduction.argreduce import ArgmaxFwdOp
-
-        m, n = 8192, 4096
-        op = ArgmaxFwdOp.__new__(ArgmaxFwdOp)
-        op._last_roofline_mn = (m, n)
-        op.dtype = torch.float16
-        oracle = _nbytes(((m, n), torch.float16), ((m,), torch.int64))
-        assert op.eval_roofline()[1] == oracle
-
-    def test_rms_norm_counts_x_weight_and_output(self):
-        from tileops.ops.norm.rms_norm import RMSNormFwdOp
-
-        m, n = 16384, 8192
-        op = RMSNormFwdOp.__new__(RMSNormFwdOp)
-        op._last_m = m
-        op.N = n
-        op.dtype = torch.float16
-        oracle = _nbytes(
-            ((m, n), torch.float16),
-            ((n,), torch.float16),
-            ((m, n), torch.float16),
-        )
-        assert op.eval_roofline()[1] == oracle
-
-    def test_moe_pre_permute_counts_inputs_and_three_outputs(self):
-        from tileops.ops.moe import ContiguousLayoutSpec, MoePrePermuteFwdOp
-
-        tokens, top_k, experts, hidden = 512, 2, 4, 128
-        op = MoePrePermuteFwdOp.__new__(MoePrePermuteFwdOp)
-        op.layout = ContiguousLayoutSpec.tight_physical_psum()
-        op.num_local_experts = experts
-        op.input_shapes = [(tokens, hidden), (tokens, top_k)]
-        op.dtype = torch.bfloat16
-        oracle = _nbytes(
-            ((tokens, hidden), torch.bfloat16),
-            ((tokens, top_k), torch.int32),
-            ((tokens * top_k, hidden), torch.bfloat16),
-            ((experts,), torch.int32),
-            ((tokens * top_k,), torch.int32),
-        )
-        assert op.eval_roofline()[1] == oracle
-
-    def test_moe_post_permute_counts_inputs_and_output(self):
-        from tileops.ops.moe import MoePostPermuteFwdOp
-
-        tokens, top_k, hidden = 512, 2, 128
-        rows = tokens * top_k
-        op = MoePostPermuteFwdOp.__new__(MoePostPermuteFwdOp)
-        op.input_shapes = [(rows, hidden), (tokens, top_k), (rows,)]
-        op.dtype = torch.bfloat16
-        oracle = _nbytes(
-            ((rows, hidden), torch.bfloat16),
-            ((tokens, top_k), torch.float32),
-            ((rows,), torch.int32),
-            ((tokens, hidden), torch.bfloat16),
-        )
-        assert op.eval_roofline()[1] == oracle
-
-    def test_w4a16_counts_packed_weights_and_group_metadata(self):
-        from tileops.ops.gemm.gemm import GemmW4A16FwdOp
-
-        m, n, k, group_size = 4096, 8192, 8192, 128
-        op = GemmW4A16FwdOp.__new__(GemmW4A16FwdOp)
-        op.m, op.n, op.k = m, n, k
-        op.dtype = torch.float16
-        op.group_size = group_size
-        groups = k // group_size
-        oracle = (
-            _nbytes(((m, k), torch.float16), ((m, n), torch.float16))
-            + n * k // 2  # int4 weights: two per byte
-            + n * groups * 4  # per-group scales, float32
-            + n * groups * 1  # per-group zero points, int8
-        )
-        assert op.eval_roofline()[1] == oracle
-
-    def test_fused_moe_counts_the_bias_the_call_passed(self):
-        from tileops.ops.moe.fused_moe import FusedMoeFwdOp
-
-        tokens, experts, top_k, hidden, ffn = 4096, 64, 8, 4096, 1408
-        for has_bias in (True, False):
-            op = FusedMoeFwdOp.__new__(FusedMoeFwdOp)
-            op.num_tokens, op.num_experts, op.top_k = tokens, experts, top_k
-            op.hidden_size, op.ffn_size = hidden, ffn
-            op.dtype = torch.bfloat16
-            op.correction_bias_shape = (experts,) if has_bias else None
-            oracle = _nbytes(
-                ((tokens, hidden), torch.bfloat16),  # hidden states in
-                ((experts, 2 * ffn, hidden), torch.bfloat16),  # w_gate_up
-                ((experts, hidden, ffn), torch.bfloat16),  # w_down
-                ((tokens, experts), torch.float32),  # gating logits
-                ((tokens, hidden), torch.bfloat16),  # output
-                *((((experts,), torch.float32),) if has_bias else ()),
+            for h in range(head_kv)
+            for start in picks[h][: counts[h]]
+            for r in range(
+                start * block_size,
+                min(
+                    (start + 1) * block_size,
+                    position + 1
+                    if indices["is_causal"]
+                    else cu_seqlens[request + 1] - cu_seqlens[request],
+                ),
             )
-            assert op.eval_roofline()[1] == oracle, f"has_bias={has_bias}"
+        }
+        gathered = len(rows) * dim
+        oracle = _ledger(
+            "NSAVarlenFwdOp",
+            q=((c_seq_len, heads, dim), torch.float16),
+            # k and v are read through the selection, not end to end
+            k=((gathered,), torch.float16),
+            v=((gathered,), torch.float16),
+            block_indices=((c_seq_len, head_kv, selected), torch.int32),
+            block_counts=((c_seq_len, head_kv), torch.int32),
+            cu_seqlens=((len(cu_seqlens),), torch.int32),
+            token_indices=((c_seq_len, 2), torch.int32),
+            o=((c_seq_len, heads, dim), torch.float16),
+        )
+        assert nsa_fwd_varlen_roofline(call)[1] == oracle
+
+    def test_gqa_paged_reads_the_rows_its_page_table_names(self):
+        """The cache is one pool, and the call reads the rows its page table names as far
+        as each request's cached length; the pages it never names move nothing."""
+        from tileops._perf.formulas import gqa_paged_fwd_roofline
+
+        name = "GQAPagedFwdOp"
+        call = _manifest_call(name)
+        indices = call.indices
+        heads, heads_kv, dim, page = indices["H"], indices["H_kv"], indices["D"], indices["PS"]
+        table, cached = call.metadata_values("block_table"), call.metadata_values("cache_seqlens")
+        rows = {(table[b][r // page], r % page) for b, n in enumerate(cached) for r in range(n)}
+        kv = ((len(rows), heads_kv, dim), torch.float16)
+        oracle = _ledger(
+            name,
+            q=((indices["T_q"], heads, dim), torch.float16),
+            k_cache=kv,
+            v_cache=kv,
+            block_table=((sum(-(-n // page) for n in cached),), torch.int32),
+            cache_seqlens=((len(cached),), torch.int32),
+            cu_seqlens_q=((len(cached) + 1,), torch.int32),
+            q_scale=None,
+            k_scale=None,
+            v_scale=None,
+            rope_cos=None,
+            rope_sin=None,
+            sinks=None,
+            o=((indices["T_q"], heads, dim), torch.float16),
+        )
+        assert gqa_paged_fwd_roofline(call)[1] == oracle
+
+    def test_gqa_varlen_sink_adds_no_key_or_value_contraction(self):
+        row = {
+            "T_q": 3,
+            "T_kv": 4,
+            "H": 8,
+            "H_kv": 2,
+            "D": 64,
+            "q_lens": [2, 1],
+            "kv_lens": [4, 0],
+            "is_causal": True,
+        }
+        plain, _ = _evaluated("GQAVarlenFwdOp", row, {"T": "float16"})
+        sink, _ = _evaluated("GQAVarlenFwdOp", {**row, "some": ["sinks"]}, {"T": "float16"})
+        # Two nonempty rows per head each add subtract/exp/add, and one FP32 logit
+        # per head is read. The last request stays zero regardless of its sink.
+        assert sink == (plain[0] + 8 * 2 * 3, plain[1] + 8 * 4)
+
+    def test_topk_select_reads_only_its_windows(self):
+        """The manifest rows select from whole rows; a narrower window reads and compares
+        only the scores inside it."""
+        from tileops.attention import TopKSelectFwdOp
+
+        batch, seq, extent, top_k = 1, 4, 16, 2
+        starts = torch.tensor([[0, 4, 8, 12]], dtype=torch.int32)
+        ends = torch.tensor([[4, 8, 16, 12]], dtype=torch.int32)
+        tensors = {
+            "logits": torch.empty(batch, seq, extent, 1),
+            "starts": starts,
+            "ends": ends,
+        }
+        scores = int((ends - starts).clamp(min=0).sum())
+        oracle = _ledger(
+            "TopKSelectFwdOp",
+            logits=((scores,), torch.float32),
+            starts=((batch, seq), torch.int32),
+            ends=((batch, seq), torch.int32),
+            indices=((batch, seq, 1, top_k), torch.int32),
+        )
+        assert self._priced(TopKSelectFwdOp(top_k), tensors) == (scores, oracle)
+
+    def test_windowed_pools_read_the_positions_some_window_reaches(self):
+        """A stride past the kernel span, or a dilation, leaves input positions no window
+        reads; the case recounts the positions from the row's geometry."""
+        from tileops._perf.formulas import pool_roofline
+
+        for op_name in ("AvgPool1dFwdOp", "MaxPool1dFwdOp", "MaxPool1dIndicesFwdOp"):
+            for row in _manifest_rows(op_name):
+                call = _manifest_call(op_name, row)
+                indices = call.indices
+                read = {
+                    o * indices["sW"] - indices["pW"] + j * indices.get("dW", 1)
+                    for o in range(indices["L_out"])
+                    for j in range(indices["kW"])
+                } & set(range(indices["L_in"]))
+                dtype = getattr(torch, call.tensors["input"][1])
+                out = ((indices["N"], indices["C"], indices["L_out"]), dtype)
+                tensors = {"input": ((indices["N"], indices["C"], len(read)), dtype), "output": out}
+                if op_name == "MaxPool1dIndicesFwdOp":
+                    tensors["indices"] = (
+                        (indices["N"], indices["C"], indices["L_out"]),
+                        torch.int64,
+                    )
+                assert pool_roofline(call)[1] == _ledger(op_name, **tensors), row["label"]
+
+    def test_dsa_decode_reads_the_kv_rows_some_query_selects(self):
+        """Top-k slots past the causal bound or repeated select nothing more, so `kv` is
+        read at the rows the row's generated indices reach."""
+        from tileops._perf.formulas import dsa_decode_roofline
+
+        op_name = "DSADenseFwdOp"
+        for row in _manifest_rows(op_name):
+            call = _manifest_call(op_name, row)
+            indices = call.indices
+            rows = {
+                (b, g, j)
+                for b, batch in enumerate(call.metadata_values("indices"))
+                for s, heads in enumerate(batch)
+                for g, slots in enumerate(heads)
+                for j in slots
+                if 0 <= j < indices["S_kv"]
+                and (j + 1) * indices["stride_kv"] - 1 <= indices["q_start_index_s"] + s
+            }
+            dtype = getattr(torch, call.tensors["q"][1])
+            width = indices["D"] + indices["dim_tail"]
+            oracle = _ledger(
+                op_name,
+                q=((indices["B"], indices["S"], indices["H"], width), dtype),
+                kv=((len(rows), width), dtype),
+                indices=((indices["B"], indices["S"], indices["H_kv"], indices["K"]), torch.int32),
+                o=((indices["B"], indices["S"], indices["H"], indices["D"]), dtype),
+            )
+            assert dsa_decode_roofline(call)[1] == oracle, row["label"]
+
+    def test_deltanet_bwd_reads_the_strict_lower_triangle_of_aw_and_au(self):
+        """Each chunk's C x C block of Aw and Au has a unit diagonal and a zero upper
+        triangle, so only the strict-lower C * (C - 1) / 2 entries are read."""
+        from tests.roofline_binder import manifest_cases
+
+        op_name = "DeltaNetChunkBwdOp"
+        rows = {row["label"]: row for row in _manifest_rows(op_name)}
+        for label, dtype_name, op, _oracle, _reads in manifest_cases(op_name):
+            indices = _manifest_call(op_name, rows[label]).indices
+            b, h, n, dk, dv, c = (
+                indices["B"],
+                indices["H"],
+                indices["L"],
+                indices["DK"],
+                indices["DV"],
+                indices["chunk_size"],
+            )
+            dtype = getattr(torch, dtype_name)
+            triangle = ((b, h, n // c, c * (c - 1) // 2), dtype)
+            oracle = _ledger(
+                op_name,
+                do=((b, h, n, dv), dtype),
+                q=((b, h, n, dk), dtype),
+                k=((b, h, n, dk), dtype),
+                v=((b, h, n, dv), dtype),
+                beta=((b, h, n), dtype),
+                h=((b, h, n // c + 1, dk, dv), torch.float32),
+                Aw=triangle,
+                Au=triangle,
+                w=((b, h, n, dk), dtype),
+                u=((b, h, n, dv), dtype),
+                dq=((b, h, n, dk), dtype),
+                dk=((b, h, n, dk), dtype),
+                dv=((b, h, n, dv), dtype),
+                dbeta=((b, h, n), dtype),
+            )
+            assert op.eval_roofline()[1] == oracle, label
+
+    def test_dropout_short_circuits_read_and_write_what_they_touch(self):
+        """The generated case covers the masking path its workloads state. The three
+        short-circuit paths have no row -- the manifest keeps them out of the
+        release-facing rows -- so they are recounted here: eval mode and `p == 0`
+        copy, and `p == 1` writes zeros without reading the input."""
+        from tileops.elementwise import DropoutFwdOp
+
+        n = 1024 * 4096
+        x = torch.empty((n,), dtype=torch.float16, device="meta")
+
+        def priced(**params):
+            op = DropoutFwdOp(**params)
+            # The formula prices the op's last completed call; this one is that call.
+            op._last_call = type(op)._signature.check(op, {"input": x})
+            return op.eval_roofline()[1]
+
+        copied = _ledger(
+            "DropoutFwdOp",
+            input=((n,), torch.float16),
+            output=((n,), torch.float16),
+        )
+        assert priced(p=0.5, training=False) == copied
+        assert priced(p=0.0) == copied
+
+        zeroed = _ledger("DropoutFwdOp", input_unread=True, output=((n,), torch.float16))
+        assert priced(p=1.0) == zeroed
 
 
-# Classification registry: every implemented op appears in exactly one of
-# AUDITED (has a bytes-oracle case above), EXEMPT (traffic depends on tensor
-# content; audited by the NCU script instead, roofline.md §4.5), or PENDING.
-# Adding an op to the manifest forces a choice here.
-AUDITED = frozenset(
-    {
-        "AddFwdOp",
-        "ArgmaxFwdOp",
-        "Conv2dFwdOp",
-        "FusedMoeFwdOp",
-        "GemmFp8FwdOp",
-        "GemmW4A16FwdOp",
-        "MoePostPermuteFwdOp",
-        "MoePrePermuteFwdOp",
-        "RMSNormFwdOp",
-        "VarMeanFwdOp",
+def _evaluated(op_name: str, row: dict, case: dict, **values):
+    """``(flops, bytes)`` the generated evaluator prices for a row of a spec-only entry, and the
+    call; *values* replace the named metadata tensors' generated contents."""
+    import dataclasses
+
+    from tests.roofline_binder import signature_class
+    from tileops.manifest import load_adts, load_manifest
+    from tileops.manifest._plan import entry_plan
+    from tileops.manifest._workload import instantiate
+
+    entry = load_manifest()[op_name]
+    plan = entry_plan(op_name, entry, load_adts())
+    call = instantiate(plan, {**row, "label": "recount"}, case)
+    specs = {
+        **call.specs,
+        **{n: dataclasses.replace(call.specs[n], values=v) for n, v in values.items()},
     }
+    call = dataclasses.replace(call, specs=specs)
+    tensors = call.materialize("meta")
+    cls = signature_class(op_name, entry)
+    op = cls(**call.arguments(tensors))
+    checked = cls._signature.check(op, {t: tensors[t] for t in plan.sig.inputs})
+    metadata = {n: torch.tensor(call.metadata_values(n)) for n in checked.metadata}
+    op._last_call = dataclasses.replace(checked, metadata=metadata)
+    return op.eval_roofline(), call
+
+
+@pytest.mark.parametrize(
+    "batch,seq,window_left",
+    [
+        pytest.param(2, 256, 0, id="causal-wl0"),
+        pytest.param(1, 512, 128, id="causal-wl128"),
+        pytest.param(2, 512, -1, id="gqa-bytes"),
+    ],
+)
+def test_gqa_dense_preserves_sliding_roofline_contract(batch, seq, window_left):
+    heads, heads_kv, dim = 8, 2, 64
+    row = dict(
+        B=batch,
+        S_q=seq,
+        S_kv=seq,
+        H=heads,
+        H_kv=heads_kv,
+        D=dim,
+        is_causal=True,
+        window_size_left=window_left,
+    )
+    (flops, moved), _ = _evaluated("GQADenseFwdOp", row, {"T": "float16"})
+    scores = sum(
+        min(window_left + 1, query + 1) if window_left >= 0 else query + 1 for query in range(seq)
+    )
+    # Count both contractions, softmax per score, and the output normalization.
+    assert flops == batch * heads * (scores * (4 * dim + 5) + seq * dim)
+    assert moved == 2 * batch * seq * (heads + heads_kv) * dim * torch.float16.itemsize
+
+
+def _attention_flops(heads, qk, v, scores, rows):
+    # Per score two contractions and the softmax (5); per output element its divide.
+    return heads * (scores * (2 * qk + 2 * v + 5) + rows * v)
+
+
+def _attention_bwd_flops(heads, qk, v, scores, rows):
+    # Per score three contractions over qk and two over v, P (3) and dS (2); per row the delta.
+    return heads * (scores * (2 * (3 * qk + 2 * v) + 5) + rows * 2 * v)
+
+
+_BF16, _F32, _FP8, _I32, _I64 = (
+    torch.bfloat16,
+    torch.float32,
+    torch.float8_e4m3fn,
+    torch.int32,
+    torch.int64,
 )
 
-# op name -> why the shape-level oracle cannot count its traffic
-EXEMPT: dict[str, str] = {}
 
-# FIXME(staged-rollout): most implemented ops lack a bytes-oracle case.
+class TestSpecOnlyRecounts:
+    """Spec-only entries whose traffic or arithmetic follows their metadata values, recounted
+    by walking the call. Each case picks metadata that reaches the branches the values decide."""
+
+    @pytest.mark.parametrize(
+        "row,case",
+        [
+            # Two requests with disjoint pages; two causal query rows each.
+            (
+                {"S_q": 2, "NP": 8, "W": 4, "cache_lens": [5, 9], "is_causal": True},
+                {"T": "bfloat16", "KV": "bfloat16"},
+            ),
+            # A pool smaller than the requests' pages, so requests share rows; an FP8 cache.
+            (
+                {"S_q": 1, "NP": 3, "W": 3, "cache_lens": [5, 9, 12], "some": ["kv_scale"]},
+                {"T": "bfloat16", "KV": "float8_e4m3fn"},
+            ),
+        ],
+    )
+    def test_mla_paged_reads_the_rows_its_block_table_reaches(self, row, case):
+        name = "MLAPagedFwdOp"
+        row = {"H": 3, "DK": 12, "PS": 4, "kv_lora_rank": 8, **row}
+        (flops, moved), call = _evaluated(name, row, case)
+        heads, dk, rank, page, s_q = row["H"], row["DK"], row["kv_lora_rank"], row["PS"], row["S_q"]
+        table, lengths = call.metadata_values("block_table"), call.metadata_values("cache_seqlens")
+        fp8 = case["KV"] == "float8_e4m3fn"
+        scores = rows = 0
+        for c in lengths:
+            for i in range(s_q):
+                seen = c - s_q + i + 1
+                scores, rows = scores + seen, rows + 1
+        cache_rows = {
+            (table[b][j // page], j % page) for b, c in enumerate(lengths) for j in range(c)
+        }
+        pages = {(b, j // page) for b, c in enumerate(lengths) for j in range(c)}
+        batch = len(lengths)
+        assert moved == _ledger(
+            name,
+            q=((batch, s_q, heads, dk), _BF16),
+            kv_cache=((len(cache_rows), dk), _FP8 if fp8 else _BF16),
+            block_table=((len(pages),), _I32),
+            cache_seqlens=((batch,), _I32),
+            kv_scale=((1,), _F32) if fp8 else None,
+            o=((batch, s_q, heads, rank), _BF16),
+            lse=((batch, s_q, heads), _F32),
+        )
+        assert flops == _attention_flops(heads, dk, rank, scores, rows) + (
+            heads * rows if fp8 else 0
+        )
+
+    def test_dsa_paged_scores_each_valid_slot_and_reads_the_rows_they_name(self):
+        name = "DSAPagedFwdOp"
+        row = {"S_q": 2, "H": 2, "K": 4, "NP": 6, "PS": 4, "W": 3, "cache_lens": [5, 10]}
+        # Request 0: query 0 selects nothing, query 1 three positions on two pages.
+        # Request 1: a repeated slot, then nothing.
+        indices = [[[-1, -1, -1, -1], [0, 4, 3, -1]], [[3, 3, -1, -1], [-1, -1, -1, -1]]]
+        (flops, moved), call = _evaluated(name, row, {}, indices=indices)
+        table, lengths, page = (
+            call.metadata_values("block_table"),
+            call.metadata_values("cache_seqlens"),
+            row["PS"],
+        )
+        valid = [
+            [[j for j in slots if 0 <= j < lengths[b]] for slots in per_q]
+            for b, per_q in enumerate(indices)
+        ]
+        scores = sum(len(v) for per_q in valid for v in per_q)
+        rows = sum(1 for per_q in valid for v in per_q if v)
+        cache_rows = {
+            (table[b][j // page], j % page)
+            for b, per_q in enumerate(valid)
+            for v in per_q
+            for j in v
+        }
+        pages = {(b, j // page) for b, per_q in enumerate(valid) for v in per_q for j in v}
+        assert moved == _ledger(
+            name,
+            q=((rows, row["H"], 576), _BF16),  # the query rows that score something
+            kv_cache=((len(cache_rows), 656), torch.uint8),
+            block_table=((len(pages),), _I32),
+            cache_seqlens=((2,), _I32),
+            indices=((2, 2, 4), _I32),
+            o=((2, 2, row["H"], 512), _BF16),
+            lse=((2, 2, row["H"]), _F32),
+        )
+        # Each distinct row's 512 latent values are dequantized once.
+        assert flops == _attention_flops(row["H"], 576, 512, scores, rows) + 512 * len(cache_rows)
+
+    def test_paged_kv_cache_write_moves_only_the_tokens_with_a_slot(self):
+        name = "PagedKVCacheWriteFwdOp"
+        row = {"N": 5, "H_kv": 2, "D": 4, "NP": 4, "PS": 3, "some": ["k_scale"]}
+        slots = [7, -1, 2, -1, 11]
+        (flops, moved), _call = _evaluated(
+            name, row, {"T": "bfloat16", "KV": "float8_e4m3fn"}, slot_mapping=slots
+        )
+        written = ((3, 2, 4), _FP8)
+        assert moved == _ledger(
+            name,
+            k=((3, 2, 4), _BF16),
+            v=((3, 2, 4), _BF16),
+            k_cache_unread=True,
+            k_cache_write=written,
+            v_cache_unread=True,
+            v_cache_write=written,
+            slot_mapping=((5,), _I64),
+            k_scale=((1,), _F32),
+            v_scale=((1,), _F32),
+        )
+        # Per stored FP8 value, the scale and the saturating cast.
+        assert flops == 2 * 2 * 3 * 2 * 4
+
+    def test_mla_kv_cache_write_rotates_and_moves_only_the_tokens_with_a_slot(self):
+        name = "MLAKVCacheWriteFwdOp"
+        row = {
+            "DC": 6,
+            "PE": 4,
+            "NP": 4,
+            "PS": 3,
+            "P": 16,
+            "seq_lens": [3, 2],
+            "fuse_rope": True,
+            "some": ["kv_scale"],
+        }
+        slots = [5, -1, 0, 8, -1]  # tokens 0, 2 and 3, at positions 0, 2 and 0
+        case = {"T": "bfloat16", "KV": "float8_e4m3fn", "C": "float32"}
+        (flops, moved), _call = _evaluated(name, row, case, slot_mapping=slots)
+        assert moved == _ledger(
+            name,
+            kv_c=((3, 6), _BF16),
+            k_pe=((3, 4), _BF16),
+            kv_cache_unread=True,
+            kv_cache_write=((3, 10), _FP8),
+            slot_mapping=((5,), _I64),
+            kv_scale=((1,), _F32),
+            positions=((3,), _I64),
+            cos_sin_cache=((2, 4), _F32),  # positions 0 and 2
+        )
+        assert flops == 3 * (2 * 10 + 3 * 4)
+
+    @pytest.mark.parametrize(
+        "row,case",
+        [
+            ({"seq_lens": [3, 4], "starts": [2, 5], "some": ["seq_starts"]}, {"KV": "bfloat16"}),
+            (
+                {"seq_lens": [3, 4], "out_dtype": "float16", "some": ["kv_scale"]},
+                {"KV": "float8_e4m3fn"},
+            ),
+        ],
+    )
+    def test_paged_kv_cache_gather_reads_the_rows_each_range_reaches(self, row, case):
+        name = "PagedKVCacheGatherFwdOp"
+        row = {"T_q": 7, "NP": 6, "PS": 4, "W": 3, "E": [2, 3], **row}
+        (flops, moved), call = _evaluated(name, row, case)
+        table, page = call.metadata_values("block_table"), row["PS"]
+        starts = row.get("starts", [0, 0])
+        ranges = [range(s, s + n) for s, n in zip(starts, row["seq_lens"], strict=True)]
+        cache_rows = {(table[b][j // page], j % page) for b, r in enumerate(ranges) for j in r}
+        pages = {(b, j // page) for b, r in enumerate(ranges) for j in r}
+        fp8 = case["KV"] == "float8_e4m3fn"
+        assert moved == _ledger(
+            name,
+            out_unread=True,
+            out_write=((7, 2, 3), torch.float16 if fp8 else _BF16),
+            output=None,  # the `out` written above
+            kv_cache=((len(cache_rows), 2, 3), _FP8 if fp8 else _BF16),
+            block_table=((len(pages),), _I32),
+            cu_seqlens=((3,), _I32),
+            seq_starts=None if fp8 else ((2,), _I32),
+            kv_scale=((1,), _F32) if fp8 else None,
+        )
+        assert flops == (7 * 2 * 3 if fp8 else 0)
+
+    def test_fused_qk_norm_rope_touches_the_q_and_k_columns_and_the_named_rows(self):
+        name = "FusedQKNormRoPEFwdOp"
+        row = {"D": 8, "P": 16, "R": 4, "num_heads": 3, "num_kv_heads": 1, "seq_lens": [3, 2]}
+        (flops, moved), _call = _evaluated(name, row, {"T": "bfloat16", "C": "float32"})
+        qk = ((5, 4 * 8), _BF16)  # 5 tokens, 3 q heads and 1 k head of width 8
+        assert moved == _ledger(
+            name,
+            qkv=qk,
+            qkv_write=qk,
+            q_weight=((8,), _BF16),
+            k_weight=((8,), _BF16),
+            cos_sin_cache=((3, 4), _F32),  # positions 0, 1, 2
+            positions=((5,), _I64),
+        )
+        assert flops == 5 * 4 * (4 * 8 + 3 * 4)
+
+    def test_chain_speculative_sampling_prices_the_cheaper_outcome(self):
+        name = "ChainSpeculativeSamplingFwdOp"
+        batch, n, vocab = 2, 3, 10
+        (flops, moved), _call = _evaluated(name, {"B": batch, "N": n, "V": vocab}, {})
+        # With N < V, every draft accepted is cheaper than a rejection at the first: the N
+        # ratio tests and a draw from target row N; the ids, 2 N probabilities, one row.
+        assert moved == _ledger(
+            name,
+            draft_probs=((batch * n,), _F32),
+            draft_token_ids=((batch, n), _I32),
+            target_probs=((batch * (n + vocab),), _F32),
+            seed=((1,), _I64),
+            offset=((1,), _I64),
+            output_token_ids=((batch, n + 1), _I32),
+            num_accepted=((batch,), _I32),
+        )
+        assert flops == batch * (2 * n + 3 * vocab + 1)
+
+    def test_top_k_masks_pay_nothing_on_a_row_k_leaves_whole(self):
+        vocab, ks = 10, [3, 10, 12, 1]
+        row = {"V": vocab, "k_list": ks}
+        (flops, _moved), _call = _evaluated("TopKMaskFwdOp", row, {"T": "float32"})
+        assert flops == sum(2 * vocab for k in ks if k < vocab)
+        (flops, _moved), _call = _evaluated("TopKTopPMaskFwdOp", row, {"T": "float32"})
+        # Top-k where k restricts; over the survivors max, subtract, exp, sum, compare and
+        # accumulate; p times the sum; the final mask.
+        assert flops == sum((vocab if k < vocab else 0) + 6 * min(k, vocab) + 1 + vocab for k in ks)
+
+    def test_mla_varlen_scores_each_request_under_its_causal_mask(self):
+        row = {"T_q": 7, "H": 2, "DN": 4, "PE": 2, "DV": 3, "seq_lens": [3, 4], "is_causal": True}
+        (flops, _moved), _call = _evaluated("MLAVarlenFwdOp", row, {"T": "bfloat16"})
+        scores = sum(i + 1 for n in row["seq_lens"] for i in range(n))
+        assert flops == _attention_flops(2, 6, 3, scores, 7)
+
+    def test_mla_dense_bwd_scores_each_row_under_bottom_right_alignment(self):
+        row = {"B": 2, "S_q": 5, "S_kv": 3, "H": 2, "D_qk": 6, "D_v": 4, "is_causal": True}
+        (flops, _moved), _call = _evaluated("MLADenseBwdOp", row, {"T": "bfloat16"})
+        # Query i sits at key position i - 2: the first two see no key, the rest 1, 2, 3.
+        assert flops == 2 * _attention_bwd_flops(2, 6, 4, 1 + 2 + 3, 3)
+
+    def test_mla_varlen_bwd_scores_each_request_under_its_mask(self):
+        row = {
+            "T_q": 7,
+            "T_kv": 9,
+            "H": 2,
+            "D_qk": 6,
+            "D_v": 4,
+            "q_lens": [3, 4],
+            "kv_lens": [5, 4],
+            "is_causal": True,
+        }
+        (flops, _moved), _call = _evaluated("MLAVarlenBwdOp", row, {"T": "bfloat16"})
+        # Query i of the first request sits at key position i + 2, of the second at i.
+        scores = sum(i + 3 for i in range(3)) + sum(i + 1 for i in range(4))
+        assert flops == _attention_bwd_flops(2, 6, 4, scores, 7)
+
+    def test_gqa_paged_sink_adds_only_normalization_work(self):
+        row = {
+            "T_q": 3,
+            "NP": 4,
+            "PS": 16,
+            "W": 2,
+            "H": 8,
+            "H_kv": 2,
+            "D": 64,
+            "q_lens": [2, 1],
+            "cache_lens": [4, 1],
+        }
+        dtypes = {"T": "float16", "KV": "float16"}
+        plain, _ = _evaluated("GQAPagedFwdOp", row, dtypes)
+        sink, _ = _evaluated("GQAPagedFwdOp", {**row, "some": ["sinks"]}, dtypes)
+        assert sink == (plain[0] + 8 * 3 * 3, plain[1] + 8 * 4)
+
+
+# Coverage levels. Every op, implemented or spec-only, sits at
+# exactly one, and the level says what an independent recount rests on.
 #
-# Broken invariant: every implemented op is AUDITED or EXEMPT.
-# Why: the oracle landed with the SOL metric; cases are added family by
-#   family, highest formula complexity first.
-# Cleanup: PENDING is empty; delete it and this marker.
-PENDING = frozenset(
-    {
-        "AbsFwdOp",
-        "AdaLayerNormFwdOp",
-        "AdaLayerNormZeroFwdOp",
-        "AdaptiveAvgPool2dFwdOp",
-        "AdaptiveMaxPool2dFwdOp",
-        "AdaptiveMaxPool2dIndicesFwdOp",
-        "AlibiFwdOp",
-        "AllFwdOp",
-        "AmaxFwdOp",
-        "AminFwdOp",
-        "AnyFwdOp",
-        "ArgminFwdOp",
-        "AvgPool1dFwdOp",
-        "AvgPool2dFwdOp",
-        "AvgPool3dFwdOp",
-        "BatchNormBwdOp",
-        "BatchNormFwdOp",
-        "BitwiseAndFwdOp",
-        "BitwiseNotFwdOp",
-        "BitwiseOrFwdOp",
-        "BitwiseXorFwdOp",
-        "BmmFp8KNFwdOp",
-        "BmmFp8NKFwdOp",
-        "BmmFwdOp",
-        "CBProducerFwdOp",
-        "CeilFwdOp",
-        "ClampFwdOp",
-        "ClampScalarFwdOp",
-        "Conv1dFwdOp",
-        "Conv3dFwdOp",
-        "CosFwdOp",
-        "CountNonzeroFwdOp",
-        "CumprodFwdOp",
-        "CumsumFwdOp",
-        "DaCumsumFwdOp",
-        "DeepSeekSparseAttentionDecodeWithKVCacheFwdOp",
-        "DeltaNetAutogradOp",
-        "DeltaNetBwdOp",
-        "DeltaNetDecodeFwdOp",
-        "DeltaNetFwdOp",
-        "DivFwdOp",
-        "DropoutFwdOp",
-        "EluFwdOp",
-        "EngramDecodeFwdOp",
-        "EngramGateConvBwdOp",
-        "EngramGateConvFwdOp",
-        "EqFwdOp",
-        "ErfFwdOp",
-        "ExpFwdOp",
-        "Expm1FwdOp",
-        "FFTC2CFwdOp",
-        "FP8LightningIndexerFwdOp",
-        "FP8QuantFwdOp",
-        "FloorDivideFwdOp",
-        "FloorFwdOp",
-        "FusedAddLayerNormFwdOp",
-        "FusedAddRMSNormFwdOp",
-        "FusedMoEExpertsFwdOp",
-        "FusedTopKOp",
-        "GLABwdOp",
-        "GLADecodeFwdOp",
-        "GLAFwdOp",
-        "GatedDeltaNetAutogradOp",
-        "GatedDeltaNetBHTDFwdOp",
-        "GatedDeltaNetBTHDFwdOp",
-        "GatedDeltaNetBwdOp",
-        "GatedDeltaNetDecodeFwdOp",
-        "GatedDeltaNetPrefillBHTDFwdOp",
-        "GatedDeltaNetPrefillBTHDFwdOp",
-        "GeFwdOp",
-        "GeluAndMulFwdOp",
-        "GeluFwdOp",
-        "GeluTanhAndMulFwdOp",
-        "GemmFwdOp",
-        "GroupNormFwdOp",
-        "GroupedGemmFwdOp",
-        "GroupedQueryAttentionBwdOp",
-        "GroupedQueryAttentionDecodePagedWithKVCacheFwdOp",
-        "GroupedQueryAttentionPrefillPagedWithKVCacheFwdOp",
-        "GroupedQueryAttentionPrefillVarlenFwdOp",
-        "GroupedQueryAttentionSlidingWindowVarlenFwdOp",
-        "GtFwdOp",
-        "HardsigmoidFwdOp",
-        "HardswishFwdOp",
-        "HardtanhFwdOp",
-        "InfNormFwdOp",
-        "InstanceNormFwdOp",
-        "IsfiniteFwdOp",
-        "IsinfFwdOp",
-        "IsnanFwdOp",
-        "L1NormFwdOp",
-        "L2NormFwdOp",
-        "LayerNormFwdOp",
-        "LeFwdOp",
-        "LeakyReluFwdOp",
-        "LerpFwdOp",
-        "LerpTensorFwdOp",
-        "Log1pFwdOp",
-        "LogFwdOp",
-        "LogSoftmaxFwdOp",
-        "LogSumExpFwdOp",
-        "LogicalAndFwdOp",
-        "LogicalNotFwdOp",
-        "LogicalOrFwdOp",
-        "LtFwdOp",
-        "MHCPostFwdOp",
-        "MHCPreFwdOp",
-        "Mamba2FwdOp",
-        "MaskedFillFwdOp",
-        "MaskedFillScalarFwdOp",
-        "MaxPool1dFwdOp",
-        "MaxPool1dIndicesFwdOp",
-        "MaxPool2dFwdOp",
-        "MaxPool2dIndicesFwdOp",
-        "MaxPool3dFwdOp",
-        "MaxPool3dIndicesFwdOp",
-        "MaximumFwdOp",
-        "MeanFwdOp",
-        "MeanPoolingFwdOp",
-        "MinimumFwdOp",
-        "MishFwdOp",
-        "MoeExpertMLPFwdOp",
-        "MoeGroupedGemmFwdOp",
-        "MoePermuteAlignFwdOp",
-        "MulFwdOp",
-        "MultiHeadAttentionBwdOp",
-        "MultiHeadAttentionDecodePagedWithKVCacheFwdOp",
-        "MultiHeadLatentAttentionDecodeWithKVCacheFwdOp",
-        "NSACmpFwdVarlenOp",
-        "NSAFwdVarlenOp",
-        "NSATopkVarlenOp",
-        "NanToNumFwdOp",
-        "NeFwdOp",
-        "NegFwdOp",
-        "PowFwdOp",
-        "PreluFwdOp",
-        "ProdFwdOp",
-        "ReciprocalFwdOp",
-        "ReluFwdOp",
-        "RemainderFwdOp",
-        "RopeLlama31FwdOp",
-        "RopeLongRopeFwdOp",
-        "RopeNeoxFwdOp",
-        "RopeNeoxPositionIdsFwdOp",
-        "RopeNonNeoxFwdOp",
-        "RopeYarnFwdOp",
-        "RoundFwdOp",
-        "RsqrtFwdOp",
-        "SSDChunkScanFwdOp",
-        "SSDChunkStateFwdOp",
-        "SSDDecodeFwdOp",
-        "SSDStatePassingFwdOp",
-        "SeluFwdOp",
-        "SigmoidFwdOp",
-        "SignFwdOp",
-        "SiluAndMulFwdOp",
-        "SiluFwdOp",
-        "SinFwdOp",
-        "SinusoidalFwdOp",
-        "SoftmaxFwdOp",
-        "SoftplusFwdOp",
-        "SqrtFwdOp",
-        "StdFwdOp",
-        "SubFwdOp",
-        "SumFwdOp",
-        "TanhFwdOp",
-        "TopkSelectorFwdOp",
-        "TruncFwdOp",
-        "VarFwdOp",
-        "WhereFwdOp",
-    }
-)
+#   one   The binder builds the case from the manifest: signature, one workload
+#         row, dtypes, mutation. It never reads the `roofline` block, and what it
+#         does share with the formula is written down: the minimum-traffic
+#         definition and the checked call. Computed, not listed -- adding an op
+#         earns this level or fails the completeness test below.
+#   two   The binder cannot build the call and a case above does it by hand,
+#         with what the case shares written next to it.
+#
+# Some level-one ops also keep a case above. Those cover a branch one workload
+# row does not reach -- an optional input present and absent, a second dtype
+# pairing -- and do not change the op's level.
+
+# Level two: a case above recounts these by hand. The value says why the
+# generated case cannot, which is what the hand-written one supplies.
+HAND_WRITTEN = {
+    "AvgPool1dFwdOp": "a stride past the kernel leaves input positions no window reads",
+    "DSADenseFwdOp": "it reads the kv rows its top-k indices select, not the cache",
+    "DeltaNetChunkBwdOp": "it reads only the strict-lower triangle of each Aw and Au chunk block",
+    "MaxPool1dFwdOp": "a dilated or strided window leaves input positions no window reads",
+    "MaxPool1dIndicesFwdOp": "a dilated or strided window leaves input positions no window reads",
+    "FusedMoEExpertsFwdOp": "the routed weight reads follow the values in `topk_ids`",
+    "FusedMoEFwdOp": "the routed weight reads follow the routing its experts stage receives",
+    "FusedMoESharedExpertFwdOp": "the routed weight reads follow the routing its experts stage receives",
+    "NSAVarlenFwdOp": "how much it reads follows the values in `block_counts`",
+    "IndexedExpertMLPFwdOp": "the routed weight reads follow the values in `topk_ids`",
+    "GQAPagedFwdOp": "it reads the rows its page table names, not the pool",
+    "MLAPagedFwdOp": "it reads the cache rows its block table reaches, not the pool",
+    "DSAPagedFwdOp": "it reads the cache rows its valid index slots name",
+    "PagedKVCacheWriteFwdOp": "only the tokens `slot_mapping` gives a slot are read and written",
+    "MLAKVCacheWriteFwdOp": "only the tokens `slot_mapping` gives a slot are read and written",
+    "PagedKVCacheGatherFwdOp": "it reads the cache rows each request's range reaches, not the pool",
+    "FusedQKNormRoPEFwdOp": "it leaves the v columns untouched and reads only the named cos/sin rows",
+    "ChainSpeculativeSamplingFwdOp": "where the chain stops is drawn at run time, so it prices the cheaper outcome",
+}
 
 
-def test_every_implemented_op_is_classified():
-    """A new op cannot ship a bytes formula nothing accounts for."""
+def _entries() -> list[str]:
+    """Every entry: a spec-only one is recounted from its signature, needing no implementation."""
     from tileops.manifest import load_manifest
 
-    implemented = {name for name, e in load_manifest().items() if e.get("status") == "implemented"}
-    classified = AUDITED | set(EXEMPT) | PENDING
-    assert implemented - classified == set(), (
-        f"unclassified implemented ops: {sorted(implemented - classified)}; "
-        "add an oracle case (AUDITED), an EXEMPT reason, or a PENDING entry"
+    return sorted(load_manifest())
+
+
+def _draws_metadata(op_name: str) -> bool:
+    """Whether an entry generates some metadata tensor at random."""
+    from tileops.manifest import load_manifest
+    from tileops.manifest.primitives import RANDOM_GENERATORS
+
+    entry = load_manifest()[op_name]
+    inputs = entry["signature"].get("inputs") or {}
+    return any(
+        str(spec.get("values", "")).split("(")[0] in RANDOM_GENERATORS for spec in inputs.values()
     )
-    assert classified - implemented == set(), (
-        f"stale registry entries: {sorted(classified - implemented)}"
-    )
-    assert not (AUDITED & PENDING) and not (AUDITED & set(EXEMPT))
+
+
+def _binder_builds(op_name: str) -> bool:
+    """Whether the manifest alone builds a case for *op_name*.
+
+    The formula is not called here: whether it agrees, or even returns, is a
+    separate question, and a formula that raises is a defect.
+    """
+    from tests.roofline_binder import manifest_cases
+
+    return bool(list(manifest_cases(op_name)))
+
+
+def _binder_agrees(op_name: str) -> bool:
+    """Whether the formula returns what the binder's recount implies."""
+    from tests.roofline_binder import manifest_cases
+
+    try:
+        return all(
+            op.eval_roofline()[1] == oracle for _l, _d, op, oracle, _r in manifest_cases(op_name)
+        )
+    except Exception:
+        return False
+
+
+class TestCoverageLevels:
+    """Every op sits at exactly one level, and the level is the truth."""
+
+    def test_a_generated_case_equals_its_op(self):
+        from tests.roofline_binder import manifest_cases
+
+        checked = 0
+        for op_name in _entries():
+            if op_name in HAND_WRITTEN:
+                continue
+            for label, dtype, op, oracle, _reads in manifest_cases(op_name):
+                assert op.eval_roofline()[1] == oracle, f"{op_name} {label} {dtype}"
+                checked += 1
+        assert checked > 0
+
+    def test_a_generated_case_agrees_on_the_read_half(self):
+        """The audit judges the read side alone, and an op derives it by taking the
+        write side the signature settles off its `bytes`. Where the
+        binder recounts the op, the two halves have to be the same halves."""
+        from tests.roofline_binder import manifest_cases
+
+        checked = 0
+        for op_name in _entries():
+            if op_name in HAND_WRITTEN:
+                continue
+            for label, dtype, op, _oracle, reads in manifest_cases(op_name):
+                declared = op.eval_roofline_read_bytes()
+                assert declared is not None, f"{op_name} {label} {dtype}"
+                assert declared == reads, f"{op_name} {label} {dtype}"
+                checked += 1
+        assert checked > 0
+
+    def test_a_declared_op_is_one_the_manifest_does_not_already_check(self):
+        """Level two is for ops the manifest cannot recount, not a queue.
+
+        An op whose rows draw metadata at random stays at level two however its rows fall:
+        one row's draw agreeing with the recount says nothing of another's
+        (docs/design/roofline.md §4.7).
+        """
+        promotable = sorted(
+            name
+            for name in HAND_WRITTEN
+            if not _draws_metadata(name) and _binder_builds(name) and _binder_agrees(name)
+        )
+        assert not promotable, (
+            f"the binder now recounts {promotable} and the formula agrees; move them out "
+            "of HAND_WRITTEN so the generated case is what checks them"
+        )
+
+    def test_every_level_two_op_has_a_case_that_names_its_tensors(self):
+        """Level two is a hand-written reference, so the reference has to be here,
+        and it has to account for the signature's tensors by name.
+
+        `_ledger` is what makes that mechanical: a case that drops, duplicates or
+        substitutes one of them fails there rather than agreeing with a formula
+        that made the same mistake. It records the op it recounted, so what this
+        reads is the cases that ran, not the text of the file they live in.
+        """
+        if not _RECOUNTED:
+            pytest.skip("this selection ran no hand-written case, so none is recorded")
+        missing = sorted(set(HAND_WRITTEN) - _RECOUNTED)
+        assert not missing, (
+            f"declared level two with no _ledger case above: {missing}; a case that "
+            "sums anonymous tuples cannot be checked against the signature. A case "
+            "another xdist worker ran is not recorded here: run this file in one "
+            "process, or pass --dist loadfile"
+        )

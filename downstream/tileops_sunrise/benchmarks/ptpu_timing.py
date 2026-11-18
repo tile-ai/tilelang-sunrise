@@ -109,6 +109,8 @@ def bench_ptpu(
     max_iters: int,
     min_iters: int,
     count_copies: bool,
+    reset: Optional[Callable[[], None]] = None,
+    allow_events_fallback: bool = False,
 ) -> list[Sample]:
     """Measure each iteration using projected PrivateUse1 events or PTPU events."""
     _bench_meta.copy_policy = "all-projected-device-work"
@@ -131,7 +133,7 @@ def bench_ptpu(
         total_bytes = sum(
             a.nelement() * a.element_size() for a, m in zip(args, tensor_mask, strict=True) if m
         )
-        if total_bytes * _N_CLONES <= _MAX_CLONE_BYTES:
+        if reset is None and total_bytes * _N_CLONES <= _MAX_CLONE_BYTES:
             arg_pool = [
                 tuple(a.clone() if m else a for a, m in zip(args, tensor_mask, strict=True))
                 for _ in range(_N_CLONES)
@@ -157,12 +159,17 @@ def bench_ptpu(
 
     _bench_meta.inputs_cloned = arg_pool is not None or not has_args
 
-    cache.zero_()
+    def _prepare():
+        if reset is not None:
+            reset()
+        cache.zero_()
+
+    _prepare()
     _run(0)
     torch.ptpu.synchronize()
     started = time.perf_counter()
     for i in range(3):
-        cache.zero_()
+        _prepare()
         _run(i)
         torch.ptpu.synchronize()
     per_iter_ms = max((time.perf_counter() - started) * 1000 / 3, 1e-6)
@@ -171,7 +178,7 @@ def bench_ptpu(
     n_trials = 1
     # Warmup (no profiling)
     for i in range(n_warmup):
-        cache.zero_()
+        _prepare()
         _run(i)
     torch.ptpu.synchronize()
 
@@ -194,7 +201,7 @@ def bench_ptpu(
                     ],
                 ) as profiler:
                     for i in range(n_repeat):
-                        cache.zero_()
+                        _prepare()
                         torch.ptpu.synchronize()
                         with torch.profiler.record_function(_KERNEL_REGION):
                             _run(i)
@@ -208,6 +215,11 @@ def bench_ptpu(
                 )
         _bench_meta.timing = "privateuse1-profiler"
     except _ProfilerProjectionError as exc:
+        if not allow_events_fallback:
+            raise RuntimeError(
+                f"PrivateUse1 profiling failed: {exc}. PTPU-events fallback is disabled "
+                "(pass --tileops-allow-events-fallback to allow it)."
+            ) from exc
         _logger.warning(
             "PrivateUse1 profiler projection failed (%s); falling back to PTPU-events "
             "timing, which includes launch overhead",
@@ -223,7 +235,7 @@ def bench_ptpu(
             start_events = [torch.ptpu.Event(enable_timing=True) for _ in range(n_repeat)]
             end_events = [torch.ptpu.Event(enable_timing=True) for _ in range(n_repeat)]
             for i in range(n_repeat):
-                cache.zero_()
+                _prepare()
                 start_events[i].record()
                 _run(i)
                 end_events[i].record()

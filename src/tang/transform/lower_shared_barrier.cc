@@ -10,10 +10,17 @@
  *
  * TANG carries its own copy rather than reusing the CUDA pass of the same name.
  * src/cuda/transform is compiled only when USE_CUDA is on, so an S3 build would
- * not contain that pass at all; and the CUDA rewrite branches on
- * shared.cluster_barrier, which has no TANG counterpart because TANG has no
- * cluster level. The two rewrites share the `barrier_init` contract, so a
- * change to how T.alloc_barrier records arrive counts has to touch both.
+ * not contain that pass at all. The two rewrites share the `barrier_init`
+ * contract, so a change to how T.alloc_barrier records arrive counts has to
+ * touch both.
+ *
+ * A shared.cluster_barrier is initialised here as well, but unlike a
+ * block-scoped barrier its init is published cluster-wide
+ * (storage_sync("cluster") -> tl::cluster_sync(), i.e. sync.all.bkcls 0) so a
+ * peer CTA that arrives on it remotely observes the init first.
+ * T.mbarrier_arrive(mbar, cta_id) keeps both forms: cta_id 0 is rewritten to a
+ * block-scoped local arrive, a non-zero constant rank is left for codegen to
+ * lower to the DSHM remote arrive (tl::cluster_arrive_barrier).
  */
 
 #include "cuda/op/builtin.h"
@@ -57,22 +64,25 @@ private:
     // Only the buffers allocated by THIS block, not those inherited from a
     // parent: each allocation is initialised once, where it appears.
     Array<Buffer> barrier_buffers;
+    // Per-block flag: only THIS block's cluster_barrier allocations publish
+    // their init cluster-wide. Must be local, not a member -- otherwise a
+    // cluster barrier in one block would wrongly flip later block-level
+    // barrier inits to cluster_sync.
+    bool has_cluster_barrier = false;
     for (const Buffer &buffer : op->alloc_buffers) {
       const auto *ptr_type =
           buffer->data->type_annotation.as<PointerTypeNode>();
       if (!ptr_type)
         continue;
       const std::string scope = ptr_type->storage_scope;
-      // A cluster barrier arriving here would be dropped without a word: it is
-      // not a shared.barrier, so nothing below would emit its init. The TANG
-      // pipeline rejects the scope before this pass runs, so reaching this
-      // point means that ordering broke.
-      ICHECK(scope != "shared.cluster_barrier")
-          << "TANG has no cluster level, so shared.cluster_barrier buffer '"
-          << buffer->name
-          << "' must be rejected by the pipeline before barrier lowering";
-      if (scope == "shared.barrier") {
+      // shared.cluster_barrier is initialised like a block mbarrier, but its
+      // init is published cluster-wide below so peer CTAs can arrive on it
+      // remotely.
+      if (scope == "shared.barrier" || scope == "shared.cluster_barrier") {
         barrier_buffers.push_back(buffer);
+        if (scope == "shared.cluster_barrier") {
+          has_cluster_barrier = true;
+        }
       }
     }
 
@@ -163,13 +173,105 @@ private:
     // it.
     new_body.push_back(
         Evaluate(Call(DataType::Handle(), tang_fence_barrier_init(), {})));
-    new_body.push_back(
-        Evaluate(Call(DataType::Handle(), builtin::tvm_storage_sync(),
-                      {StringImm("shared")})));
+    // A cluster-scoped barrier must publish its init to the whole cluster, not
+    // just this CTA: a peer CTA may arrive on it remotely
+    // (ptx_arrive_cluster_barrier) and must observe the init before doing so.
+    // storage_sync("cluster") codegens to tl::cluster_sync() (sync.all.bkcls).
+    new_body.push_back(Evaluate(
+        Call(DataType::Handle(), builtin::tvm_storage_sync(),
+             {StringImm(has_cluster_barrier ? "cluster" : "shared")})));
     new_body.push_back(block->body);
     block.CopyOnWrite()->body = SeqStmt(new_body);
 
     return StmtExprMutator::VisitStmt_(block.get());
+  }
+
+  // cta_id == 0 is this CTA's own shared mbarrier and keeps the cheap
+  // block-scoped arrive. Anything else is a remote arrive: codegen maps the
+  // barrier into the peer CTA's address space (__set_block_rank_mbarrier) and
+  // issues a DSHM mbarrier arrive. A runtime rank is a legitimate remote
+  // arrive too -- the DSHM mapping takes the rank as a register operand.
+  // Returns true when the arrive is local, i.e. the constant 0.
+  static bool IsLocalCta(const PrimExpr &cta_id) {
+    const DataType dtype = cta_id.dtype();
+    if (!dtype.is_scalar() || !(dtype.is_int() || dtype.is_uint())) {
+      LOG(FATAL) << "TANG mbarrier arrive cta_id must be a scalar integer. Got "
+                 << cta_id << " of dtype " << dtype;
+    }
+    const auto *imm = cta_id.as<IntImmNode>();
+    return imm != nullptr && imm->value == 0;
+  }
+
+  // The pred form has no remote counterpart: a DSHM mbarrier arrive is
+  // unconditional, so a predicated remote arrive is rejected rather than
+  // silently dropping the predicate.
+  static void RequireLocalCta(const PrimExpr &cta_id) {
+    if (!IsLocalCta(cta_id)) {
+      LOG(FATAL) << "TANG mbarrier arrive with a predicate only accepts the "
+                    "local cta_id == 0: a DSHM remote arrive is unconditional. "
+                    "Got cta_id="
+                 << cta_id;
+    }
+  }
+
+  // Constant pred is only 0 (skip) or 1 (arrive). Any other constant used to
+  // be rewritten as an unconditional arrive.
+  static bool PredConstant01(const PrimExpr &pred, int64_t *value) {
+    const DataType dtype = pred.dtype();
+    if (!dtype.is_scalar() ||
+        !(dtype.is_int() || dtype.is_uint() || dtype.is_bool())) {
+      LOG(FATAL) << "TANG mbarrier arrive pred must be a scalar integer or "
+                    "bool. Got "
+                 << pred << " of dtype " << dtype;
+    }
+    const auto *imm = pred.as<IntImmNode>();
+    if (imm == nullptr) {
+      return false;
+    }
+    if (imm->value != 0 && imm->value != 1) {
+      LOG(FATAL) << "TANG mbarrier arrive pred must be 0 or 1, got "
+                 << imm->value;
+    }
+    *value = imm->value;
+    return true;
+  }
+
+  Stmt VisitStmt_(const EvaluateNode *op) final {
+    const auto *call = op->value.as<CallNode>();
+    if (call && call->op.same_as(ptx_arrive_cluster_barrier())) {
+      if (call->args.size() != 2) {
+        LOG(FATAL) << "TANG mbarrier arrive(mbar, cta_id) expects 2 arguments, "
+                      "got "
+                   << call->args.size();
+      }
+      if (IsLocalCta(call->args[1])) {
+        return Evaluate(
+            Call(call->dtype, builtin::ptx_arrive_barrier(), {call->args[0]}));
+      }
+      // Remote or runtime-ranked arrive: keep the cluster-scoped call so
+      // codegen emits tl::cluster_arrive_barrier (DSHM remote mbarrier
+      // arrive).
+      return StmtExprMutator::VisitStmt_(op);
+    }
+    if (call && call->op.same_as(builtin::ptx_arrive_barrier()) &&
+        call->args.size() == 3) {
+      RequireLocalCta(call->args[1]);
+      int64_t pred_value = 0;
+      Stmt arrive = Evaluate(
+          Call(call->dtype, builtin::ptx_arrive_barrier(), {call->args[0]}));
+      if (PredConstant01(call->args[2], &pred_value)) {
+        return pred_value == 0 ? Evaluate(IntImm(DataType::Int(32), 0))
+                               : arrive;
+      }
+      return IfThenElse(call->args[2], arrive);
+    }
+    if (call && call->op.same_as(builtin::ptx_arrive_barrier()) &&
+        call->args.size() != 1 && call->args.size() != 3) {
+      LOG(FATAL) << "TANG mbarrier arrive expects (mbarrier) or "
+                    "(mbarrier, cta_id, pred), got "
+                 << call->args.size() << " arguments.";
+    }
+    return StmtExprMutator::VisitStmt_(op);
   }
 
   Stmt VisitStmt_(const AttrStmtNode *op) final {

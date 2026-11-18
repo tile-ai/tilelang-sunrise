@@ -12,139 +12,102 @@ This document holds the contracts those rules emit against.
 
 Per-family protocol variables, declared by L2 bases and overridden by L3 ops.
 
-| Variable      | Family      | Purpose                                                                                                          |
-| ------------- | ----------- | ---------------------------------------------------------------------------------------------------------------- |
-| `_kernel_key` | reduction   | Kernel-map lookup key                                                                                            |
-| `_kernel_cls` | reduction   | Kernel class reference                                                                                           |
-| `_op_kind`    | reduction   | Kernel-dispatch op-kind string (`"sum"` / `"prod"` for `CumulativeOp`; `"sum"`, `"mean"`, … for `_ReduceOpBase`) |
-| `_op_name`    | elementwise | `torch.library.custom_op` registration key                                                                       |
-| `kernel_cls`  | elementwise | Kernel class reference                                                                                           |
+| Variable   | Family    | Purpose                                                                                                          |
+| ---------- | --------- | ---------------------------------------------------------------------------------------------------------------- |
+| `_op_kind` | reduction | Kernel-dispatch op-kind string (`"sum"` / `"prod"` for `CumulativeOp`; `"sum"`, `"mean"`, … for `_ReduceOpBase`) |
 
-**The scaffolding playbook does NOT emit these variables** — kernel-dispatch-convention-dependent (e.g., `VectorNormKernel` uses `{"l1", "l2", "inf"}`, `ReduceKernel` uses `{"sum", "mean", ...}`); Adding a new protocol variable requires updating the L2 base, all concrete ops, and the manifest schema if applicable.
+**The scaffolding playbook does NOT emit these variables** — kernel-dispatch-convention-dependent (e.g., `VectorNormKernel` uses `{"l1", "l2", "inf"}`, `ReduceKernel` uses `{"sum", "mean", ...}`); Adding a new protocol variable requires updating the L2 base and all concrete ops.
 
-### `Op` base class attributes ([`src/tileops/ops/op_base.py`](../../src/tileops/ops/op_base.py))
+### `Op` base class interface ([`src/tileops/_ops/op_base.py`](../../src/tileops/_ops/op_base.py))
 
-| Attribute      | Type                                 | Purpose                                                                                      |
-| -------------- | ------------------------------------ | -------------------------------------------------------------------------------------------- |
-| `kernel`       | `Kernel`                             | Set only by an op that holds one kernel; an op that builds per specialization uses a role    |
-| `kernel_map`   | `Optional[Dict[str, Kernel]]`        | Dispatched kernels keyed by name                                                             |
-| `dtype`        | `Optional[torch.dtype]`              | Dtype of the most recent `forward()`; `None` before the first one                            |
-| `device`       | `Optional[Union[torch.device, str]]` | Device (default `'cuda'`)                                                                    |
-| `input_shapes` | `Optional[list[tuple]]`              | Expected input tensor shapes (for introspection and non-runtime consumers)                   |
-| `tune`         | `bool`                               | Whether kernels this op builds tune themselves; read by a factory when it runs               |
-| `_static_axes` | `frozenset[tuple[int, int]]`         | Static axes as `(input_index, axis)` pairs (default `frozenset()`); consumed by `_cache_key` |
+Abstract interface: `forward()`, the op's computation and the one method every op writes. Construction: `Op.__init__(*, target=None)`, which a subclass calls once its manifest parameters are assigned; it stores the target, checks the parameters and installs the implementations. Methods generated from the manifest entry: the construction and call checks, `_infer_output_shapes`, `eval_roofline`, and, for an entry with a call-time tensor input and no composition, the compile boundary `_call_boundary` with the operators `compile_op_names` names. `__call__` enters `_call_boundary` where the op has one, and runs the executor around `forward` otherwise ([Call protocol](ops-design.md#call-protocol)).
 
-Abstract interface: `default_kernel_map` (property), `forward()`. Manifest-driven methods (codegen-emitted by concrete ops): `_infer_output_shapes`, `_validate_dtypes`, `eval_roofline`.
+The executor's steps, in order: observe the dispatcher state and the specialization; take the Op plan, resolving it through the generated checks on a miss; bind the target on the first call; run `forward` or the target's kernel; check the result; commit the record.
+
+- `kernel_types` (class attribute) is the one declaration of an op's in-tree dispatch keys. Every instance installs all of them, together with the implementations a test added through the internal `register_kernel_type(op, key, kernel_type)` under keys the op does not already have. `interfaces` (class attribute) maps each place the op calls a kernel to its kernel interface.
+- `delegate_types` (class attribute) is the one declaration of the sub-ops an op may hold: stage name to op class, in stage order. Default empty.
+- `last_call` (property) is the `SignatureCall` of the op's last successfully completed call: its `indices`, tensors, effects, metadata tensors, and the checked calls its sub-ops completed during it, by stage. It is built from the call's record when first read. It raises `RuntimeError` before one completes. `eval_roofline` prices it.
 
 #### Kernel caching and enumeration methods
 
-Rationale and the role / entry vocabulary: [ops-design.md § Kernel caching and enumeration](ops-design.md#kernel-caching-and-enumeration).
+Rationale and the interface / entry vocabulary: [ops-design.md § Kernel caching and enumeration](ops-design.md#kernel-caching-and-enumeration).
 
-| Method                                             | Purpose                                                                                                                                                                                                                                                                    |
-| -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `get_or_build_kernel(name, inputs, *, key, build)` | Return the kernel for this call, building it once on a miss. The only get-or-build in L1-L3. `key` and `build` are the in-tree recipe; `inputs` is what an external target's builder is described with, and an op that has not been wired to external targets yet omits it |
-| `built_kernels(name)`                              | Read-only view of a name's entries; empty before its first build. Introspection only, never dispatch                                                                                                                                                                       |
-| `kernel_delegates()`                               | The ops whose kernels this op runs. Default `()`; a composite op overrides it                                                                                                                                                                                              |
-| `iter_kernels()`                                   | Every `Kernel` the op holds, deduplicated: entries and delegates                                                                                                                                                                                                           |
-| `autotune()`                                       | Puts the op in tuned mode: tunes built kernels, and sets `tune` so later builds tune too                                                                                                                                                                                   |
+| Method                          | Purpose                                                                                                                                                                                               |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `kernel_for(interface, call)`   | The in-tree entry serving this call; *call* is a function building the call spec, which the Op plan holds. The only way an op's in-tree implementation reaches a kernel; a target serves the whole op |
+| `call_spec(interface, call)`    | The call spec *call* builds, held by the Op plan; for a `forward` that reads the spec itself                                                                                                          |
+| `key_for(interface, call)`      | The key of the interface's implementation that serves the call. Introspection and tests; `kernel_for` asks it on a miss                                                                               |
+| `_entries_built(interface)`     | Read-only view of an interface's entries, whoever built them; empty before its first build. Introspection only, never dispatch                                                                        |
+| `delegate_for(stage, identity)` | The sub-op held for a stage and identity, built once on a miss with the op's `target`, or the injected one. The only way an op holds a sub-op                                                         |
+| `_held_delegates()`             | The sub-ops `delegate_for` holds, in stage order. Derived; never overridden                                                                                                                           |
+| `iter_kernels()`                | The TileOPs `Kernel` instances the entries hold, deduplicated: the op's interface entries and those of its held sub-ops; a target's kernels are not among them                                        |
+| `kernel_config()`               | The configuration the op's kernels published, a target's included, or `None`                                                                                                                          |
+| `serving_target`                | The target serving the instance: `None` until a call selects it, `BUILTIN` for the in-tree implementation, else the target's name                                                                     |
+| `request_tune()`                | The one way into tuned mode: tunes the built kernels and held sub-ops, and every entry and sub-op built later is tuned as it is built; so are a target's kernels                                      |
 
-### `Kernel` base class attributes ([`src/tileops/kernels/kernel_base.py`](../../src/tileops/kernels/kernel_base.py))
+### `Kernel` base class attributes ([`src/tileops/_kernels/kernel_base.py`](../../src/tileops/_kernels/kernel_base.py))
 
 Unlike `Op`, a `Kernel` **is** constructed for one element type — it compiles a dtype-specialized program, so `dtype` is a ctor argument here. The op supplies it from the tensors at `forward()`.
 
 | Attribute                            | Type                    | Purpose                                                             |
 | ------------------------------------ | ----------------------- | ------------------------------------------------------------------- |
 | `dtype`                              | `Optional[torch.dtype]` | Element type this kernel is specialized for                         |
-| `config`                             | `Dict[str, Any]`        | Tile configuration (block sizes, stages, etc.)                      |
-| `autotune_configs`                   | `Optional[list[dict]]`  | Search space for autotuning                                         |
-| `supported_archs`                    | `Optional[list[int]]`   | GPU SM versions (e.g., `[80, 86, 89, 90]`)                          |
+| `config`                             | `Dict[str, Any]`        | Tile configuration of the published generation; assigning publishes |
+| `autotune_configs`                   | `Optional[list[dict]]`  | Search space for autotuning; the untuned config is timed with it    |
+| `supported_archs`                    | `Optional[list[int]]`   | Architectures of its one device type, e.g. SM `[80, 86, 89, 90]`    |
 | `kernel`                             | `Callable`              | Compiled TileLang kernel function                                   |
 | `autotune_accepts_random_int_inputs` | `bool`                  | Whether autotuning may generate the integer tensor inputs at random |
+| `devices`                            | `frozenset[str]`        | Device types the implementation runs on; default `{"cuda"}`         |
+| `general`                            | `bool`                  | Below every other implementation of its interface; at most one      |
+| `preferred_over`                     | `frozenset[str]`        | Keys of the implementations it wins over, transitively              |
 
-Abstract interface: `forward()`. Key methods: `init_config(config, tune)`, `autotune(warmup, rep)`.
+Abstract interface: `forward()`. Key methods: `init_config(config)`, `request_tune()`, `autotune(warmup, rep)`, and `tuning_candidates(configs, untuned)`, which every tuning loop times, so tuning never keeps a config it measured slower than the one the kernel runs untuned.
+
+A kernel publishes its configuration in generations: assigning `config` publishes one, and a tuning publishes its result only once it succeeds. `program(build, *facts)` returns the published generation's program for the launch facts beyond the configuration, building it on first use; `forward` launches only programs it got there, and one launch reads one generation throughout. Selection classmethods, each with a default ([ops-design.md § Kernel selection](ops-design.md#kernel-selection)): `refusal(call)` returns `None` for a call the implementation serves and the limit it hits otherwise, `unavailable(call)` reads `devices` and `supported_archs`, and `entry_for(call)` returns the build identity and the factory.
+
+- A config field left `None` is resolved per launch by the program builder; a stated value overrides it. Why: some best values depend on a launch fact, such as the row count.
+- A tuning publishes one configuration for the whole kernel. Why: tuning per launch fact costs more than it gains.
+- A requested tuning that raises leaves tuned mode, and a build that raises puts back the kernel handle it found. Why: a failure must not decide a later request or launch.
+- A candidate config key names a parameter of the builder being tuned; a parameter spelled `<key>_arg` has `<key>` in `_AUTOTUNE_PARAM_ALIASES`. Why: TileLang binds candidates by parameter name and raises on a key that names none.
+- A kernel whose integer tensor inputs decide how much work it runs supplies them through `autotune_supply_prog`; one whose integer inputs are data or masks sets `autotune_accepts_random_int_inputs = True`. `tune_jit_kernel` refuses a kernel that does neither. Why: TileLang fills an unsupplied integer tensor from `randint(-2, 3)`, so every candidate times a collapsed kernel.
 
 ## Optional Hooks (Appendix)
 
 Hooks family bases expose for op-specific semantics. The scaffolding playbook does NOT emit these.
 
-| Hook              | Family    | Default                     | Override example                                      |
-| ----------------- | --------- | --------------------------- | ----------------------------------------------------- |
-| `_validate_dim()` | reduction | accept `int` or `list[int]` | `ArgmaxFwdOp._validate_dim` restricts to scalar `int` |
+A restriction on the accepted domain is a refinement of the signature, never a hook. A hook that compensates for what a kernel cannot do belongs to that kernel, not here: the op hands over the tensor its manifest declares.
 
-A hook that compensates for what a kernel cannot do belongs to that kernel, not here: the op hands over the tensor its manifest declares.
-
-### `_cache_key` override (L1-level, not family-specific)
-
-`Op._cache_key(self, *input_shapes) -> Hashable` defaults to projecting non-static axes via `self._static_axes`. Override when the kernel's math permits coarser keying — e.g., RMSNorm only depends on the non-static axis product `M`:
-
-```python
-class RMSNormFwdOp(Op):
-    def _cache_key(self, x_shape):
-        dim = self.dim % len(x_shape)
-        return (math.prod(s for i, s in enumerate(x_shape) if i != dim),)
-```
-
-**When `_static_axes` is empty, override is mandatory** — the default keys by the full input shape (one kernel compile per distinct shape). The base emits a once-per-type `UserWarning` when invoked with empty `_static_axes` and no subclass override.
+| Hook              | Family    | Purpose                                                                                      |
+| ----------------- | --------- | -------------------------------------------------------------------------------------------- |
+| `_empty`          | reduction | The manifest's empty-`dim` mode of `reduced`: `"full"`, `"noop"` or `"reject"`               |
+| `_identity`       | reduction | The result over an empty reduced extent                                                      |
+| `_output`         | reduction | The output dtype of a logical reduction (`torch.bool`, or `torch.int64` for `count_nonzero`) |
+| `_call`           | reduction | The call spec the `reduce` interface takes                                                   |
+| `_output_dtype`   | reduction | The output dtype; the input's by default                                                     |
+| `_scalar_forward` | reduction | The result on a 0-d input                                                                    |
 
 ## Naming Conventions (Appendix) <a id="naming-conventions"></a>
 
-- **Op class:** `{PascalCaseName}{Direction}Op`. `Direction` ∈ {`Fwd`, `Bwd`}, mandatory. Manifest key must equal `cls.__name__`. Abbreviation casing: `RMSNormFwdOp`, `SSDDecodeFwdOp` — fully uppercase per `.claude/rules/code-style.md`. Slot [S6](op-slot-rules.md#slot-s6).
-- **Kernel class:** `{PascalCaseName}{Direction}Kernel`. Same direction-suffix rule.
-- **`kernel_map` keys:** `snake_case`, decoupled from Kernel class names. Values must match the Kernel `cls.__name__`. The table does not describe dispatch strategy. Slot [S14](op-slot-rules.md#slot-s14).
+- **Op class:** `{PascalCaseName}{Direction}Op`. `Direction` ∈ {`Fwd`, `Bwd`}, mandatory. Manifest key must equal `cls.__name__`. Abbreviation casing: `RMSNormFwdOp`, `SSDRecurrentFwdOp` — fully uppercase per [code-style.md](../code-style.md). Slot [S6](op-slot-rules.md#slot-s6).
+- **Kernel class:** `{PascalCaseName}Kernel`, naming the algorithm and its variant, e.g. `BatchNormBwdSplitKernel`. No direction suffix is required: the interface it inherits carries the direction.
+- **Kernel interface:** `{PascalCaseName}{Direction}Interface`, beside the call spec it names: in the family's `call_spec.py`, or in the kernel module of a family with one kernel file. Same direction-suffix rule as the op class: variant words precede the direction, e.g. `BatchNormTrainFwdInterface`. Its `request` names the frozen `CallSpec` subclass; its abstract `forward` states the tensors handed and the value returned.
+- **`kernel_types` keys:** `snake_case`, decoupled from Kernel class names. Values must match the Kernel `cls.__name__`. The table does not describe dispatch strategy. Slot [S14](op-slot-rules.md#slot-s14).
 - **Builder functions:** `snake_case`, e.g. `def rms_norm_fwd(M, N, dtype, ...): ...`.
 - **Filenames:** all-lowercase with underscores. Multi-word abbreviations stay fully lowercase (`rms_norm.py`, `ssd_decode.py`; never `RMSNorm.py` or `Ssd_decode.py`). Norm-related names never contract (`rms_norm`, not `rmsnorm`).
 
 ## Codegen Details (Appendix) <a id="codegen"></a>
 
-The manifest ([`src/tileops/manifest/`](../../src/tileops/manifest/)) is the sole source of truth. Dtype validation and shape inference derive from manifest; roofline codegen is defined in [roofline.md](roofline.md).
+The manifest ([`src/tileops/manifest/`](../../src/tileops/manifest/)) is the sole source of truth. The call checks, dtype validation, shape inference and the fake derive from the signature; roofline codegen is defined in [roofline.md](roofline.md). What the validator holds the code to is [manifest.md § Validation](manifest.md#validation).
 
 ### Parameter design <a id="parameter-design"></a>
 
-Three time points: (1) manifest — constraint structure; (2) `__init__` — user commits `static_dims` values; (3) `forward` — shapes concrete, commitments validated, dtype read from the tensors. See [manifest.md § `static_dims`](manifest.md#static_dims).
-
-**Dtype belongs to time point 3, never to 2.** The tensors carry it, so requiring the caller to restate it at construction only creates a second source that can disagree with the first. Constructing an op therefore commits to shape structure and nothing about element type.
-
-|                          | Fixed-rank op           | Arbitrary-rank op                                            |
-| ------------------------ | ----------------------- | ------------------------------------------------------------ |
-| Manifest has `shape`     | yes                     | no                                                           |
-| `__init__` shape source  | `shape` dimension names | `static_dims`                                                |
-| Undeclared dimensions    | none                    | derived from tensor at forward time                          |
-| Kernel construction time | forward (first call)    | forward (first encounter)                                    |
-| Forward keying           | dtype                   | opaque to L1; carries every input that changes what is built |
+Two time points: `__init__` takes `signature.params`, construction-time tensors among them. At each call, parameters and presence seed inference, construction-time tensors and call-time inputs are unified together, and `let` derives the rest; generators determine indices only when a workload row is instantiated. An input dtype belongs to the call, never to construction: the tensors carry it, so restating it at construction only creates a second source that can disagree with the first. An output dtype the inputs do not determine is a dtype parameter ([manifest.md § Dtypes](manifest.md#dtypes)). Kernels are built at the first `forward` for a specialization, keyed opaquely by every input that changes what is built.
 
 ### Calling conventions
 
-- **Fully static op:** `_infer_output_shapes` called once in `__init__`, result stored as an instance attribute.
-- **Op with dynamic dims:** `_infer_output_shapes` called once dynamic dims resolve, and by the fake while tracing.
-- **Kernel construction:** in `_eager_forward`, through `get_or_build_kernel` — never in the traced `forward`, which is one call to the op's operator ([Compile Dispatch Boundary](ops-design.md#compile-dispatch-boundary)). See [Slot S16](op-slot-rules.md#slot-s16).
-- **`_validate_dtypes`:** runs on every call, and is the only place an op rejects a dtype.
-- **Empty outputs:** a call whose every declared output would hold no elements raises `ValueError` from `get_or_build_kernel` — after `_eager_forward`'s own validation, before the kernel build. The output decides, not the input.
-- **Non-runtime consumers** (validator, graph compiler): call `_infer_output_shapes` with concrete shape tuples without constructing tensors. Roofline consumers use interfaces in [`roofline.md`](roofline.md).
-
-### Inheritance in family-base hierarchies
-
-| Scenario                                             | Codegen method defined at | Concrete op action    |
-| ---------------------------------------------------- | ------------------------- | --------------------- |
-| Family shares logic                                  | L2 family base            | Inherits, no override |
-| Family member has variant logic (e.g., multi-output) | L3 concrete op            | Overrides             |
-| Op inherits L1 directly (T2)                         | L3 concrete op            | Scaffold emits body   |
-
-### Consistency enforcement
-
-| Check                                                    | Mechanism                            |
-| -------------------------------------------------------- | ------------------------------------ |
-| Manifest schema and declared fields are well-formed      | Validator (CI), L0 checks            |
-| `__init__` params match manifest `params`                | Validator signature check (L1)       |
-| `static_dims` keys are `__init__` parameters             | Validator signature check (L1)       |
-| `shape_rules` syntax is valid                            | Validator `shape_rules` parsing (L2) |
-| `_infer_output_shapes` output satisfies `shape_rules`    | Validator infer-shape parity (L2)    |
-| `dtype`/`dtype_combos` strings are valid                 | Validator dtype conformance (L3)     |
-| `_validate_dtypes` matches `dtype_combos` / dtype unions | Validator dtype parity (L3)          |
-| Empty `static_dims` without `_cache_key` override        | `Op` base class runtime warning      |
-
-Checks beyond this table are tracked as separate issues, not as spec status.
-
-**Parity check coverage.** The L2 / L3 parity checks compare the manifest spec against the concrete method the op class defines. When the class has not migrated to the codegen protocol, the validator emits a **warning** naming the missing method — the gap is surfaced, never silently passed. When the method exists, the parity check runs and any disagreement is a hard L2 / L3 error. Ops whose method genuinely cannot be invoked in a CPU-only validator context must declare `status: spec-only`; there is no parity opt-out, and demotion is only legitimate when the implementation truly does not conform.
+- **Kernel construction:** in `forward`, through `kernel_for` — never on a traced path; `forward` runs directly for a plain eager call and inside the registered operator otherwise ([Call protocol](ops-design.md#call-protocol)). See [Slot S16](op-slot-rules.md#slot-s16).
+- **Signature check:** generated, holds every call, and is the only place an op rejects a dtype. A call whose specialization an Op plan holds, nested or top-level, reuses that plan's checked facts ([Call protocol](ops-design.md#call-protocol)).
+- **Non-runtime consumers** (validator, graph compiler): call `_infer_output_shapes` with concrete shape tuples, and the input dtypes (keyword `dtypes`) where an output shape reads a dtype index, without constructing tensors. Roofline consumers use interfaces in [`roofline.md`](roofline.md).
 
 ## Development Path (Appendix) <a id="development-path"></a>
 

@@ -4,9 +4,14 @@
 import pytest
 import torch
 
-from tests.ops.attention.test_gqa_sliding_window import GroupedQueryAttentionSlidingWindowFwdTest
-from tests.test_base import FixtureBase
-from tileops.ops import GroupedQueryAttentionDenseFwdOp
+from tests.compile_contract import compile_fullgraph
+from tests.workload_test_base import FixtureBase, TestBase
+from tileops.attention import GQADenseFwdOp
+from workloads.attention.gqa.dense import GQADensePrefillWorkload
+
+
+class DenseAttentionCompileTest(GQADensePrefillWorkload, TestBase):
+    pass
 
 
 class MhaCompileFixture(FixtureBase):
@@ -25,12 +30,12 @@ class MhaCompileFixture(FixtureBase):
 @pytest.mark.usefixtures("isolated_dynamo")
 @MhaCompileFixture
 def test_mha_kernel_compile(B: int, S: int, H: int, D: int, causal: bool, dtype: torch.dtype):
-    test = GroupedQueryAttentionSlidingWindowFwdTest(B, S, H, H, D, causal, -1, -1, dtype)
-    op = GroupedQueryAttentionDenseFwdOp(is_causal=causal)
+    test = DenseAttentionCompileTest(B, S, S, H, H, D, dtype, is_causal=causal)
+    op = GQADenseFwdOp(is_causal=causal)
     inputs = test.gen_inputs()
     op(*inputs)  # Materialize the lazy kernel before testing its compiled call.
-    compiled_op = torch.compile(op, fullgraph=True, backend="eager")
-    test.check(compiled_op, *inputs, atol=1e-2, rtol=1e-5)
+    compiled_op = compile_fullgraph(op)
+    test.check(op, *inputs, runs=compiled_op)
 
 
 if __name__ == "__main__":

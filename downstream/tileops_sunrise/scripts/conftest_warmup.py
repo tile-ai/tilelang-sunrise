@@ -1,14 +1,12 @@
 """Pytest conftest plugin for kernel cache warmup and validation.
 
-Two modes, activated by environment variables:
+Two modes, selected by ``--tileops-warmup``:
 
-TILEOPS_WARMUP_MODE=1  (parallel warmup)
-  - Skip baseline profiling (only compile/tune tileops kernels)
-  - Cap ThreadPoolExecutor to TILEOPS_WARMUP_MAX_WORKERS
+--tileops-warmup=compile  (parallel warmup)
+  - Cap ThreadPoolExecutor to --tileops-warmup-max-workers
   - Release GPU memory after each test
 
-TILEOPS_WARMUP_VALIDATE=1  (serial validation)
-  - Skip baseline profiling
+--tileops-warmup=validate  (serial validation)
   - Force autotuner cache miss so it re-tunes on a quiet GPU
   - Correct results overwrite the noisy parallel cache
 
@@ -23,40 +21,36 @@ per kernel.
 
 import concurrent.futures
 import gc
-import os
 
 
-def _is_warmup():
-    return os.environ.get("TILEOPS_WARMUP_MODE") == "1"
+def pytest_addoption(parser):
+    """Register the warmup mode and the compile-thread cap."""
+    parser.addoption(
+        "--tileops-warmup",
+        choices=("compile", "validate"),
+        default=None,
+        help="'compile' warms the kernel caches in parallel; 'validate' re-tunes serially.",
+    )
+    parser.addoption(
+        "--tileops-warmup-max-workers",
+        type=int,
+        default=64,
+        help="Max compile threads per autotune call in compile mode (default: 64).",
+    )
 
 
-def _is_validate():
-    return os.environ.get("TILEOPS_WARMUP_VALIDATE") == "1"
+def _mode(config):
+    return config.getoption("--tileops-warmup")
 
 
 def pytest_configure(config):
     """Called in every process (main + xdist workers) before collection."""
-    if not _is_warmup() and not _is_validate():
+    if _mode(config) is None:
         return
 
-    # --- Shared: skip baseline profiling ---
-    from benchmarks.benchmark_base import BenchmarkBase
-    from tileops.ops.op_base import Op
-
-    _orig_profile = BenchmarkBase.profile
-
-    def _warmup_profile(self, functor, *inputs, **kwargs):
-        if isinstance(functor, Op):
-            return _orig_profile(self, functor, *inputs, **kwargs)
-        # Baseline functor — return dummy result to skip profiling
-        return {"latency_ms": 0.0}
-
-    BenchmarkBase.profile = _warmup_profile
-    config._warmup_orig_profile = _orig_profile
-
     # --- Warmup-only: cap compilation parallelism ---
-    if _is_warmup():
-        max_workers = int(os.environ.get("TILEOPS_WARMUP_MAX_WORKERS", "64"))
+    if _mode(config) == "compile":
+        max_workers = config.getoption("--tileops-warmup-max-workers")
         orig_pool = concurrent.futures.ThreadPoolExecutor
         config._warmup_orig_pool = orig_pool
 
@@ -70,7 +64,7 @@ def pytest_configure(config):
         concurrent.futures.ThreadPoolExecutor = _CappedPool
 
     # --- Validate-only: force autotuner cache miss ---
-    if _is_validate():
+    if _mode(config) == "validate":
         from tilelang.autotuner.tuner import AutoTuner
 
         config._validate_orig_load = AutoTuner._load_result_from_disk
@@ -82,7 +76,7 @@ def pytest_configure(config):
 
 def pytest_runtest_teardown(item, nextitem):
     """Release GPU memory after each test to prevent OOM across workers."""
-    if not _is_warmup() and not _is_validate():
+    if _mode(item.config) is None:
         return
     try:
         import torch
@@ -96,12 +90,6 @@ def pytest_runtest_teardown(item, nextitem):
 
 def pytest_unconfigure(config):
     """Cleanup all patches."""
-    orig_profile = getattr(config, "_warmup_orig_profile", None)
-    if orig_profile is not None:
-        from benchmarks.benchmark_base import BenchmarkBase
-
-        BenchmarkBase.profile = orig_profile
-
     orig_pool = getattr(config, "_warmup_orig_pool", None)
     if orig_pool is not None:
         concurrent.futures.ThreadPoolExecutor = orig_pool
